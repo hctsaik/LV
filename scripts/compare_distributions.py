@@ -25,8 +25,12 @@ def get_image_paths(folder: Path) -> list[Path]:
 
 
 def compute_fid(folder_a: str, folder_b: str) -> float:
+    import torch
     from cleanfid import fid as cleanfid
-    return float(cleanfid.compute_fid(folder_a, folder_b))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return float(cleanfid.compute_fid(
+        folder_a, folder_b, device=device, use_dataparallel=False, num_workers=0
+    ))
 
 
 def compute_lpips_score(
