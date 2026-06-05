@@ -73,3 +73,41 @@ def test_discover_images_label_assigned(tmp_path):
 
     records = discover_images(tmp_path, ["apple", "banana", "orange"])
     assert records[0]["label"] == "orange"
+
+
+def _make_records():
+    return [
+        {"path": Path("a.jpg"), "split": "train", "label": "apple"},
+        {"path": Path("b.jpg"), "split": "train", "label": "banana"},
+        {"path": Path("c.jpg"), "split": "test",  "label": "apple"},
+        {"path": Path("d.jpg"), "split": "test",  "label": "mix"},
+    ]
+
+
+def test_build_plotly_figure_has_traces():
+    from visualize_embeddings import build_plotly_figure
+
+    records = _make_records()
+    fig = build_plotly_figure(records, np.random.rand(4, 2), np.random.rand(4, 2))
+    assert len(fig.data) > 0
+
+
+def test_build_plotly_figure_has_two_updatemenus():
+    from visualize_embeddings import build_plotly_figure
+
+    records = _make_records()
+    fig = build_plotly_figure(records, np.random.rand(4, 2), np.random.rand(4, 2))
+    assert len(fig.layout.updatemenus) == 2
+
+
+def test_build_matplotlib_figures_returns_two():
+    import matplotlib.pyplot as plt
+    from visualize_embeddings import build_matplotlib_figures
+
+    records = _make_records()
+    pca_fig, tsne_fig = build_matplotlib_figures(
+        records, np.random.rand(4, 2), np.random.rand(4, 2)
+    )
+    assert pca_fig is not None
+    assert tsne_fig is not None
+    plt.close("all")
