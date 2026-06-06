@@ -287,7 +287,7 @@ def _visualize_embeddings_ui() -> None:
                 folder_records = [r for r in records if r["split"] == folder.name]
                 folder_paths = [r["path"] for r in folder_records]
                 cache_path = (
-                    folder / "embeddings" / model_name / "embeddings.npz"
+                    folder / f"embeddings_{model_name}" / "embeddings.npz"
                 )
                 all_embs.append(
                     extract_embeddings(folder_paths, embed_fn, cache_path=cache_path)
@@ -405,8 +405,8 @@ def _compare_distributions_ui() -> None:
 
     with st.spinner("Computing embeddings, FID, and LPIPS…"):
         embed_fn = load_model(selected_model)
-        cache_a = path_a.parent / "embeddings" / selected_model / "embeddings.npz"
-        cache_b = path_b.parent / "embeddings" / selected_model / "embeddings.npz"
+        cache_a = path_a.parent / f"embeddings_{selected_model}" / "embeddings.npz"
+        cache_b = path_b.parent / f"embeddings_{selected_model}" / "embeddings.npz"
         emb_a = extract_embeddings(paths_a, embed_fn, cache_path=cache_a)
         emb_b = extract_embeddings(paths_b, embed_fn, cache_path=cache_b)
 

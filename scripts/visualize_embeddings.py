@@ -3,15 +3,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
-from _utils import extract_embeddings, load_model, save_figure
+from _utils import available_models, extract_embeddings, load_model
 
 _COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c", "#95a5a6"]
 _SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
@@ -31,13 +28,18 @@ def parse_label_file(label_path: Path, class_names: list[str]) -> str:
     return class_names[cid] if cid < len(class_names) else f"class_{cid}"
 
 
-def discover_images(dataset_dir: Path, class_names: list[str]) -> list[dict]:
-    """探索 train/test/valid 下的影像，回傳 list of {path, split, label}。"""
+def discover_images(folders: list[Path], class_names: list[str]) -> list[dict]:
+    """從指定資料夾列表探索影像（每個資料夾需含 images/ 和 labels/）。
+    split 名稱取自資料夾名稱（e.g. train, test）。
+    回傳 list of {path, split, label}。
+    """
     records = []
-    for split in ("train", "test", "valid"):
-        images_dir = dataset_dir / split / "images"
-        labels_dir = dataset_dir / split / "labels"
+    for folder in folders:
+        images_dir = folder / "images"
+        labels_dir = folder / "labels"
+        split = folder.name
         if not images_dir.exists():
+            print(f"Warning: {images_dir} not found, skipping")
             continue
         for img_path in sorted(
             p for ext in ("*.jpg", "*.jpeg", "*.png") for p in images_dir.glob(ext)
@@ -57,12 +59,20 @@ def _label_color_map(labels: list[str]) -> dict[str, str]:
 
 
 def build_plotly_figure(
-    records: list[dict], pca_2d: np.ndarray, tsne_2d: np.ndarray
+    records: list[dict],
+    embeddings_per_model: dict[str, dict[str, np.ndarray]],
 ) -> go.Figure:
-    """互動式圖表：PCA/t-SNE 切換 + split 篩選按鈕 + legend 類別切換。"""
+    """互動式圖表：model × method 切換 + split 篩選 + legend 類別切換。
+
+    embeddings_per_model: {model_name: {"pca": ndarray(N,2), "tsne": ndarray(N,2)}}
+    """
     unique_labels = sorted({r["label"] for r in records})
     unique_splits = sorted({r["split"] for r in records})
+    model_names = list(embeddings_per_model.keys())
     color_map = _label_color_map(unique_labels)
+
+    first_model = model_names[0]
+    default_coords = embeddings_per_model[first_model]["pca"]
 
     traces: list[go.Scatter] = []
     trace_meta: list[dict] = []
@@ -74,8 +84,8 @@ def build_plotly_figure(
             if not idx:
                 continue
             traces.append(go.Scatter(
-                x=[pca_2d[i, 0] for i in idx],
-                y=[pca_2d[i, 1] for i in idx],
+                x=[default_coords[i, 0] for i in idx],
+                y=[default_coords[i, 1] for i in idx],
                 mode="markers",
                 name=f"{label} ({split})",
                 legendgroup=label,
@@ -89,24 +99,29 @@ def build_plotly_figure(
                               + f"Label: {label}<br>Split: {split}"
                               + "<extra></extra>",
             ))
-            trace_meta.append({
-                "label": label, "split": split,
-                "pca_x": [pca_2d[i, 0] for i in idx],
-                "pca_y": [pca_2d[i, 1] for i in idx],
-                "tsne_x": [tsne_2d[i, 0] for i in idx],
-                "tsne_y": [tsne_2d[i, 1] for i in idx],
-            })
+            meta: dict = {"label": label, "split": split, "coords": {}}
+            for model_name, model_coords in embeddings_per_model.items():
+                for method in ("pca", "tsne"):
+                    key = f"{model_name}_{method}"
+                    meta["coords"][key] = {
+                        "x": [model_coords[method][i, 0] for i in idx],
+                        "y": [model_coords[method][i, 1] for i in idx],
+                    }
+            trace_meta.append(meta)
 
-    method_buttons = [
-        dict(method="restyle", label="PCA", args=[{
-            "x": [m["pca_x"] for m in trace_meta],
-            "y": [m["pca_y"] for m in trace_meta],
-        }]),
-        dict(method="restyle", label="t-SNE", args=[{
-            "x": [m["tsne_x"] for m in trace_meta],
-            "y": [m["tsne_y"] for m in trace_meta],
-        }]),
-    ]
+    # 每個 (model, method) 組合一個按鈕
+    model_method_buttons = []
+    for model_name in model_names:
+        for method, method_label in [("pca", "PCA"), ("tsne", "t-SNE")]:
+            key = f"{model_name}_{method}"
+            model_method_buttons.append(dict(
+                method="restyle",
+                label=f"{model_name} · {method_label}",
+                args=[{
+                    "x": [m["coords"][key]["x"] for m in trace_meta],
+                    "y": [m["coords"][key]["y"] for m in trace_meta],
+                }],
+            ))
 
     split_buttons = [
         dict(method="restyle", label="All Splits",
@@ -120,15 +135,15 @@ def build_plotly_figure(
 
     fig = go.Figure(data=traces)
     fig.update_layout(
-        title="Dataset Embedding Visualization",
+        title=f"Dataset Embedding Visualization  ({', '.join(model_names)})",
         xaxis_title="Component 1",
         yaxis_title="Component 2",
         legend=dict(title="Class (Split)", groupclick="toggleitem"),
         updatemenus=[
-            dict(type="buttons", direction="right", x=0.0, y=1.12,
-                 showactive=True, buttons=method_buttons,
+            dict(type="buttons", direction="right", x=0.0, y=1.15,
+                 showactive=True, buttons=model_method_buttons,
                  bgcolor="#f0f0f0", bordercolor="#ccc"),
-            dict(type="buttons", direction="right", x=0.38, y=1.12,
+            dict(type="buttons", direction="right", x=0.0, y=1.06,
                  showactive=True, buttons=split_buttons,
                  bgcolor="#e8f4fd", bordercolor="#aad4f0"),
         ],
@@ -136,72 +151,51 @@ def build_plotly_figure(
     return fig
 
 
-def build_matplotlib_figures(
-    records: list[dict], pca_2d: np.ndarray, tsne_2d: np.ndarray
-) -> tuple:
-    """回傳 (pca_fig, tsne_fig)，每個類別一種顏色，所有 split 合併。"""
-    unique_labels = sorted({r["label"] for r in records})
-    color_map = _label_color_map(unique_labels)
-
-    figs = []
-    for coords, method_name in [(pca_2d, "PCA"), (tsne_2d, "t-SNE")]:
-        fig, ax = plt.subplots(figsize=(10, 8))
-        for label in unique_labels:
-            idx = [i for i, r in enumerate(records) if r["label"] == label]
-            ax.scatter(
-                coords[idx, 0], coords[idx, 1],
-                c=color_map[label], label=label, alpha=0.7, s=30,
-            )
-        ax.set_title(f"Dataset Embeddings — {method_name}")
-        ax.set_xlabel("Component 1")
-        ax.set_ylabel("Component 2")
-        ax.legend(title="Class", bbox_to_anchor=(1.05, 1), loc="upper left")
-        fig.tight_layout()
-        figs.append(fig)
-    return figs[0], figs[1]
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize dataset embeddings (PCA/t-SNE)")
-    parser.add_argument("--dataset-dir", type=Path, required=True,
-                        help="資料集根目錄（含 train/test/valid 子資料夾）")
-    parser.add_argument("--model", default="siglip2_base",
-                        choices=["dinov2", "siglip2_base", "clip"])
+    parser.add_argument("--folders", nargs="+", type=Path, required=True,
+                        help="一或多個資料夾（每個需含 images/ 和 labels/）")
+    _all_models = available_models()
+    parser.add_argument("--models", nargs="+", default=_all_models, choices=_all_models,
+                        help=f"要比較的模型（可多選，預設全部）。可用：{_all_models}")
     parser.add_argument("--classes", nargs="+", default=["apple", "banana", "orange"],
                         help="YOLO class ID 順序對應的類別名稱（0-indexed）")
     parser.add_argument("--output-dir", type=Path, default=Path("./output"))
     args = parser.parse_args()
 
-    records = discover_images(args.dataset_dir, args.classes)
+    records = discover_images(args.folders, args.classes)
     if not records:
-        print(f"No images found in {args.dataset_dir}")
+        print("No images found in the specified folders.")
         return
 
-    print(f"Found {len(records)} images across {sorted({r['split'] for r in records})} splits")
+    print(f"Found {len(records)} images | Models: {args.models}")
 
-    embed_fn = load_model(args.model)
-    embeddings = extract_embeddings([r["path"] for r in records], embed_fn)
+    embeddings_per_model: dict[str, dict[str, np.ndarray]] = {}
+    for model_name in args.models:
+        print(f"\n[{model_name}]")
+        embed_fn = load_model(model_name)
+        all_embs = []
+        for folder in args.folders:
+            folder_records = [r for r in records if r["split"] == folder.name]
+            folder_paths = [r["path"] for r in folder_records]
+            cache_path = folder / f"embeddings_{model_name}" / "embeddings.npz"
+            all_embs.append(extract_embeddings(folder_paths, embed_fn, cache_path=cache_path))
+        embeddings = np.vstack(all_embs)
 
-    pca = PCA(n_components=2, random_state=42)
-    pca_2d = pca.fit_transform(embeddings)
+        pca = PCA(n_components=2, random_state=42)
+        pca_2d = pca.fit_transform(embeddings)
 
-    perplexity = min(30, max(5, len(records) - 1))
-    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
-    tsne_2d = tsne.fit_transform(embeddings)
+        perplexity = min(30, max(5, len(records) - 1))
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+        tsne_2d = tsne.fit_transform(embeddings)
 
-    plotly_fig = build_plotly_figure(records, pca_2d, tsne_2d)
-    pca_fig, tsne_fig = build_matplotlib_figures(records, pca_2d, tsne_2d)
+        embeddings_per_model[model_name] = {"pca": pca_2d, "tsne": tsne_2d}
 
+    fig = build_plotly_figure(records, embeddings_per_model)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    plotly_fig.write_html(str(args.output_dir / "embeddings_visualization.html"))
-    pca_fig.savefig(str(args.output_dir / "embeddings_pca.png"), dpi=150, bbox_inches="tight")
-    tsne_fig.savefig(str(args.output_dir / "embeddings_tsne.png"), dpi=150, bbox_inches="tight")
-    plt.close("all")
-
-    print(f"\nSaved to {args.output_dir}/")
-    print("  embeddings_visualization.html")
-    print("  embeddings_pca.png")
-    print("  embeddings_tsne.png")
+    out_path = args.output_dir / "embeddings_visualization.html"
+    fig.write_html(str(out_path))
+    print(f"\nSaved → {out_path}")
 
 
 if __name__ == "__main__":

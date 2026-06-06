@@ -5,9 +5,6 @@ import json
 import random
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import torch
@@ -15,7 +12,7 @@ import torchvision.transforms as T
 from PIL import Image
 from sklearn.decomposition import PCA
 
-from _utils import extract_embeddings, load_model, save_figure
+from _utils import available_models, extract_embeddings, load_model
 
 
 def get_image_paths(folder: Path) -> list[Path]:
@@ -98,30 +95,6 @@ def build_projection_figure(
     return fig
 
 
-def build_matplotlib_figure(
-    paths_a: list[Path],
-    paths_b: list[Path],
-    pca_2d: np.ndarray,
-    name_a: str,
-    name_b: str,
-    fid_score: float,
-    lpips_score: float,
-) -> plt.Figure:
-    n_a = len(paths_a)
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.scatter(pca_2d[:n_a, 0], pca_2d[:n_a, 1],
-               c="#3498db", label=name_a, alpha=0.6, s=25)
-    ax.scatter(pca_2d[n_a:, 0], pca_2d[n_a:, 1],
-               c="#e74c3c", label=name_b, alpha=0.6, s=25)
-    ax.set_title(
-        f"{name_a} vs {name_b}  |  FID: {fid_score:.2f}, LPIPS: {lpips_score:.4f}"
-    )
-    ax.set_xlabel("PC 1")
-    ax.set_ylabel("PC 2")
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -129,8 +102,9 @@ def main() -> None:
     )
     parser.add_argument("--folder-a", type=Path, required=True)
     parser.add_argument("--folder-b", type=Path, required=True)
-    parser.add_argument("--model", default="siglip2_base",
-                        choices=["dinov2", "siglip2_base", "clip"])
+    _models = available_models()
+    parser.add_argument("--model", required=True, choices=_models,
+                        help=f"模型名稱，對應 ./models/<model>.pth。可用：{_models}")
     parser.add_argument("--name", default="comparison", help="輸出檔名前綴")
     parser.add_argument("--output-dir", type=Path, default=Path("./output"))
     parser.add_argument("--lpips-pairs", type=int, default=500,
@@ -149,8 +123,10 @@ def main() -> None:
     print(f"Group B ({args.folder_b.name}): {len(paths_b)} images")
 
     embed_fn = load_model(args.model)
-    emb_a = extract_embeddings(paths_a, embed_fn)
-    emb_b = extract_embeddings(paths_b, embed_fn)
+    cache_a = args.folder_a.parent / f"embeddings_{args.model}" / "embeddings.npz"
+    cache_b = args.folder_b.parent / f"embeddings_{args.model}" / "embeddings.npz"
+    emb_a = extract_embeddings(paths_a, embed_fn, cache_path=cache_a)
+    emb_b = extract_embeddings(paths_b, embed_fn, cache_path=cache_b)
 
     combined = np.vstack([emb_a, emb_b])
     pca = PCA(n_components=2, random_state=42)
@@ -169,12 +145,8 @@ def main() -> None:
     plotly_fig = build_projection_figure(
         paths_a, paths_b, pca_2d, name_a, name_b, fid_score, lpips_score
     )
-    mpl_fig = build_matplotlib_figure(
-        paths_a, paths_b, pca_2d, name_a, name_b, fid_score, lpips_score
-    )
-
-    save_figure(plotly_fig, mpl_fig, args.output_dir, f"{args.name}_projection")
-    plt.close("all")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    plotly_fig.write_html(str(args.output_dir / f"{args.name}_projection.html"))
 
     metrics = {
         "fid": round(fid_score, 4),
