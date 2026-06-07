@@ -20,29 +20,11 @@ from compare_distributions import (
     compute_lpips_score,
     get_image_paths,
 )
-from visualize_embeddings import build_plotly_figure, discover_images, parse_label_file
+from visualize_embeddings import build_plotly_figure, discover_images
 
 _VIZ_COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c", "#95a5a6"]
 _VIZ_SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
 _METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap"}
-
-
-def _find_classes_txt(image_dir: Path) -> Path | None:
-    """Search for classes.txt near an image directory (parent or grandparent)."""
-    for candidate in [image_dir.parent / "classes.txt", image_dir.parent.parent / "classes.txt"]:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _get_image_labels(image_paths: list[Path], class_names: list[str]) -> list[str] | None:
-    """Return YOLO class label per image. Returns None if labels/ dir is absent."""
-    if not image_paths:
-        return None
-    labels_dir = image_paths[0].parent.parent / "labels"
-    if not labels_dir.exists():
-        return None
-    return [parse_label_file(labels_dir / f"{p.stem}.txt", class_names) for p in image_paths]
 
 
 def read_classes_txt(folder: Path) -> list[str] | None:
@@ -113,70 +95,30 @@ def _build_cmp_figure(
     proj_2d: np.ndarray,
     name_a: str,
     name_b: str,
-    labels_a: list[str] | None = None,
-    labels_b: list[str] | None = None,
 ) -> go.Figure:
-    """Scatter for the selected projection. When labels provided, color = class, symbol = group."""
+    """Simple scatter showing two groups in the selected projection."""
     n_a = len(paths_a)
-
-    if labels_a is not None and labels_b is not None:
-        all_labels = sorted(set(labels_a) | set(labels_b))
-        color_map = {lbl: _VIZ_COLORS[i % len(_VIZ_COLORS)] for i, lbl in enumerate(all_labels)}
-
-        traces: list[go.Scatter] = []
-        for label in all_labels:
-            idx_a = [i for i, l in enumerate(labels_a) if l == label]
-            if idx_a:
-                traces.append(go.Scatter(
-                    x=[proj_2d[i, 0] for i in idx_a],
-                    y=[proj_2d[i, 1] for i in idx_a],
-                    mode="markers", name=f"{label} ({name_a})",
-                    legendgroup=label,
-                    marker=dict(color=color_map[label], symbol="circle", size=6, opacity=0.75),
-                    text=[paths_a[i].name for i in idx_a],
-                    hovertemplate=f"%{{text}}<br>Class: {label}<br>Group: {name_a}<extra></extra>",
-                ))
-            idx_b = [i for i, l in enumerate(labels_b) if l == label]
-            if idx_b:
-                traces.append(go.Scatter(
-                    x=[proj_2d[n_a + i, 0] for i in idx_b],
-                    y=[proj_2d[n_a + i, 1] for i in idx_b],
-                    mode="markers", name=f"{label} ({name_b})",
-                    legendgroup=label,
-                    marker=dict(color=color_map[label], symbol="square", size=6, opacity=0.75),
-                    text=[paths_b[i].name for i in idx_b],
-                    hovertemplate=f"%{{text}}<br>Class: {label}<br>Group: {name_b}<extra></extra>",
-                ))
-
-        fig = go.Figure(data=traces)
-        fig.update_layout(
-            xaxis_title="Component 1",
-            yaxis_title="Component 2",
-            legend=dict(title=f"Class  ● {name_a}  ■ {name_b}", groupclick="toggleitem"),
-        )
-    else:
-        fig = go.Figure(data=[
-            go.Scatter(
-                x=proj_2d[:n_a, 0].tolist(), y=proj_2d[:n_a, 1].tolist(),
-                mode="markers", name=name_a,
-                marker=dict(color="#3498db", size=6, opacity=0.7),
-                text=[p.name for p in paths_a],
-                hovertemplate="%{text}<br>Group: " + name_a + "<extra></extra>",
-            ),
-            go.Scatter(
-                x=proj_2d[n_a:, 0].tolist(), y=proj_2d[n_a:, 1].tolist(),
-                mode="markers", name=name_b,
-                marker=dict(color="#e74c3c", size=6, opacity=0.7),
-                text=[p.name for p in paths_b],
-                hovertemplate="%{text}<br>Group: " + name_b + "<extra></extra>",
-            ),
-        ])
-        fig.update_layout(
-            xaxis_title="Component 1",
-            yaxis_title="Component 2",
-            legend=dict(title="Group"),
-        )
-
+    fig = go.Figure(data=[
+        go.Scatter(
+            x=proj_2d[:n_a, 0].tolist(), y=proj_2d[:n_a, 1].tolist(),
+            mode="markers", name=name_a,
+            marker=dict(color="#3498db", size=6, opacity=0.7),
+            text=[p.name for p in paths_a],
+            hovertemplate="%{text}<br>Group: " + name_a + "<extra></extra>",
+        ),
+        go.Scatter(
+            x=proj_2d[n_a:, 0].tolist(), y=proj_2d[n_a:, 1].tolist(),
+            mode="markers", name=name_b,
+            marker=dict(color="#e74c3c", size=6, opacity=0.7),
+            text=[p.name for p in paths_b],
+            hovertemplate="%{text}<br>Group: " + name_b + "<extra></extra>",
+        ),
+    ])
+    fig.update_layout(
+        xaxis_title="Component 1",
+        yaxis_title="Component 2",
+        legend=dict(title="Group"),
+    )
     return fig
 
 
@@ -308,10 +250,6 @@ def _compare_distributions_ui() -> None:
             st.error("No .pth models found in ./models/. Add a model file and restart.")
             return
         selected_model = st.selectbox("Model", all_models)
-        class_input = st.text_input(
-            "Class names — fallback if classes.txt not found",
-            value="apple,banana,orange",
-        )
         name = st.text_input("Output name prefix", value="comparison")
         lpips_pairs = st.number_input("LPIPS pairs", min_value=1, value=500, step=50)
         run = st.button("▶ Run", use_container_width=True, key="run_cmp")
@@ -340,19 +278,6 @@ def _compare_distributions_ui() -> None:
             st.error(f"No images found in Folder B: {path_b}")
             return
 
-        # Resolve class names (auto-detect classes.txt, fallback to manual input)
-        classes_file = _find_classes_txt(path_a) or _find_classes_txt(path_b)
-        if classes_file:
-            class_names = [l.strip() for l in classes_file.read_text().splitlines() if l.strip()]
-            st.success(f"Auto-detected {len(class_names)} classes from {classes_file.name}: {', '.join(class_names)}")
-        else:
-            class_names = [c.strip() for c in class_input.split(",") if c.strip()]
-            if class_names:
-                st.info(f"Using manually entered classes: {', '.join(class_names)}")
-
-        labels_a = _get_image_labels(paths_a, class_names) if class_names else None
-        labels_b = _get_image_labels(paths_b, class_names) if class_names else None
-
         with st.spinner("Computing embeddings, FID, and LPIPS…"):
             embed_fn = load_model(selected_model)
             cache_a = path_a.parent / f"embeddings_{selected_model}" / "embeddings.npz"
@@ -377,8 +302,6 @@ def _compare_distributions_ui() -> None:
         st.session_state["cmp_lpips"] = lpips_score
         st.session_state["cmp_paths_a"] = paths_a
         st.session_state["cmp_paths_b"] = paths_b
-        st.session_state["cmp_labels_a"] = labels_a
-        st.session_state["cmp_labels_b"] = labels_b
         st.session_state["cmp_names"] = (path_a.name, path_b.name)
         st.session_state["cmp_name_prefix"] = name
         st.session_state["cmp_model"] = selected_model
@@ -392,8 +315,6 @@ def _compare_distributions_ui() -> None:
     lpips_score = st.session_state["cmp_lpips"]
     paths_a = st.session_state["cmp_paths_a"]
     paths_b = st.session_state["cmp_paths_b"]
-    labels_a = st.session_state["cmp_labels_a"]
-    labels_b = st.session_state["cmp_labels_b"]
     name_a, name_b = st.session_state["cmp_names"]
     name = st.session_state["cmp_name_prefix"]
     selected_model = st.session_state["cmp_model"]
@@ -406,14 +327,13 @@ def _compare_distributions_ui() -> None:
     method_key = _METHOD_KEY[selected_method]
     proj = projections[method_key]
 
-    fig = _build_cmp_figure(paths_a, paths_b, proj, name_a, name_b, labels_a, labels_b)
+    fig = _build_cmp_figure(paths_a, paths_b, proj, name_a, name_b)
     st.plotly_chart(fig, use_container_width=True)
 
     dl_fig = build_projection_figure(
         paths_a, paths_b, projections,
         name_a=name_a, name_b=name_b,
         fid_score=fid_score, lpips_score=lpips_score,
-        labels_a=labels_a, labels_b=labels_b,
     )
     metrics = {
         "fid": round(fid_score, 4),
