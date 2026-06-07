@@ -217,13 +217,13 @@ def _compare_distributions_ui() -> None:
     dl1, dl2 = st.columns(2)
     dl1.download_button(
         "⬇ Download HTML",
-        data=fig.to_html(include_plotlyjs="cdn").encode(),
+        data=fig.to_html(include_plotlyjs="cdn"),
         file_name=f"{name}_projection.html",
         mime="text/html",
     )
     dl2.download_button(
         "⬇ Download JSON",
-        data=json.dumps(metrics, indent=2).encode(),
+        data=json.dumps(metrics, indent=2),
         file_name=f"{name}_metrics.json",
         mime="application/json",
     )
