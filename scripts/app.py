@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import streamlit as st
+import umap
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
@@ -117,14 +118,14 @@ def _visualize_embeddings_ui() -> None:
                     )
             embeddings = np.vstack(all_embs)
 
-            pca = PCA(n_components=2, random_state=42)
-            pca_2d = pca.fit_transform(embeddings)
+            pca_2d = PCA(n_components=2, random_state=42).fit_transform(embeddings)
 
             perplexity = min(30, max(5, len(records) - 1))
-            tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
-            tsne_2d = tsne.fit_transform(embeddings)
+            tsne_2d = TSNE(n_components=2, random_state=42, perplexity=perplexity).fit_transform(embeddings)
 
-            embeddings_per_model[model_name] = {"pca": pca_2d, "tsne": tsne_2d}
+            umap_2d = umap.UMAP(n_components=2, random_state=42).fit_transform(embeddings)
+
+            embeddings_per_model[model_name] = {"pca": pca_2d, "tsne": tsne_2d, "umap": umap_2d}
 
     fig = build_plotly_figure(records, embeddings_per_model)
     st.plotly_chart(fig, use_container_width=True)
@@ -186,8 +187,16 @@ def _compare_distributions_ui() -> None:
         emb_b = extract_embeddings(paths_b, embed_fn, cache_path=cache_b)
 
         combined = np.vstack([emb_a, emb_b])
-        pca = PCA(n_components=2, random_state=42)
-        pca_2d = pca.fit_transform(combined)
+        n = len(combined)
+
+        pca_2d = PCA(n_components=2, random_state=42).fit_transform(combined)
+
+        perplexity = min(30, max(5, n - 1))
+        tsne_2d = TSNE(n_components=2, random_state=42, perplexity=perplexity).fit_transform(combined)
+
+        umap_2d = umap.UMAP(n_components=2, random_state=42).fit_transform(combined)
+
+        projections = {"pca": pca_2d, "tsne": tsne_2d, "umap": umap_2d}
 
         fid_score = compute_fid(str(path_a), str(path_b))
         lpips_score = compute_lpips_score(paths_a, paths_b, n_pairs=int(lpips_pairs))
@@ -197,7 +206,7 @@ def _compare_distributions_ui() -> None:
     col2.metric("LPIPS", f"{lpips_score:.4f}")
 
     fig = build_projection_figure(
-        paths_a, paths_b, pca_2d,
+        paths_a, paths_b, projections,
         name_a=path_a.name,
         name_b=path_b.name,
         fid_score=fid_score,

@@ -64,7 +64,7 @@ def build_plotly_figure(
 ) -> go.Figure:
     """互動式圖表：model × method 切換 + split 篩選 + legend 類別切換。
 
-    embeddings_per_model: {model_name: {"pca": ndarray(N,2), "tsne": ndarray(N,2)}}
+    embeddings_per_model: {model_name: {"pca": ndarray(N,2), "tsne": ndarray(N,2), "umap": ndarray(N,2)}}
     """
     unique_labels = sorted({r["label"] for r in records})
     unique_splits = sorted({r["split"] for r in records})
@@ -101,7 +101,7 @@ def build_plotly_figure(
             ))
             meta: dict = {"label": label, "split": split, "coords": {}}
             for model_name, model_coords in embeddings_per_model.items():
-                for method in ("pca", "tsne"):
+                for method in model_coords:
                     key = f"{model_name}_{method}"
                     meta["coords"][key] = {
                         "x": [model_coords[method][i, 0] for i in idx],
@@ -110,9 +110,12 @@ def build_plotly_figure(
             trace_meta.append(meta)
 
     # 每個 (model, method) 組合一個按鈕
+    _method_labels = {"pca": "PCA", "tsne": "t-SNE", "umap": "UMAP"}
+    available_methods = list(embeddings_per_model[first_model].keys())
     model_method_buttons = []
     for model_name in model_names:
-        for method, method_label in [("pca", "PCA"), ("tsne", "t-SNE")]:
+        for method in available_methods:
+            method_label = _method_labels.get(method, method.upper())
             key = f"{model_name}_{method}"
             model_method_buttons.append(dict(
                 method="restyle",

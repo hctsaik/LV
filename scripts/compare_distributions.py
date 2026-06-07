@@ -10,7 +10,9 @@ import plotly.graph_objects as go
 import torch
 import torchvision.transforms as T
 from PIL import Image
+import umap
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 
 from _utils import available_models, extract_embeddings, load_model
 
@@ -57,40 +59,62 @@ def compute_lpips_score(
     return total / n
 
 
+_METHOD_LABELS = {"pca": "PCA", "tsne": "t-SNE", "umap": "UMAP"}
+
+
 def build_projection_figure(
     paths_a: list[Path],
     paths_b: list[Path],
-    pca_2d: np.ndarray,
+    projections: dict[str, np.ndarray],
     name_a: str,
     name_b: str,
     fid_score: float,
     lpips_score: float,
 ) -> go.Figure:
+    """projections: {"pca": ndarray(N,2), "tsne": ndarray(N,2), "umap": ndarray(N,2)}"""
     n_a = len(paths_a)
-    fig = go.Figure(data=[
+    default = next(iter(projections.values()))
+    traces = [
         go.Scatter(
-            x=pca_2d[:n_a, 0].tolist(), y=pca_2d[:n_a, 1].tolist(),
+            x=default[:n_a, 0].tolist(), y=default[:n_a, 1].tolist(),
             mode="markers", name=name_a,
             marker=dict(color="#3498db", size=6, opacity=0.7),
             text=[p.name for p in paths_a],
             hovertemplate="%{text}<br>Group: " + name_a + "<extra></extra>",
         ),
         go.Scatter(
-            x=pca_2d[n_a:, 0].tolist(), y=pca_2d[n_a:, 1].tolist(),
+            x=default[n_a:, 0].tolist(), y=default[n_a:, 1].tolist(),
             mode="markers", name=name_b,
             marker=dict(color="#e74c3c", size=6, opacity=0.7),
             text=[p.name for p in paths_b],
             hovertemplate="%{text}<br>Group: " + name_b + "<extra></extra>",
         ),
-    ])
+    ]
+    method_buttons = [
+        dict(
+            method="restyle",
+            label=_METHOD_LABELS.get(key, key.upper()),
+            args=[{
+                "x": [proj[:n_a, 0].tolist(), proj[n_a:, 0].tolist()],
+                "y": [proj[:n_a, 1].tolist(), proj[n_a:, 1].tolist()],
+            }],
+        )
+        for key, proj in projections.items()
+    ]
+    fig = go.Figure(data=traces)
     fig.update_layout(
         title=(
             f"Distribution Comparison: {name_a} vs {name_b}<br>"
             f"<sub>FID: {fid_score:.2f} | LPIPS: {lpips_score:.4f}</sub>"
         ),
-        xaxis_title="PC 1",
-        yaxis_title="PC 2",
+        xaxis_title="Component 1",
+        yaxis_title="Component 2",
         legend=dict(title="Group"),
+        updatemenus=[
+            dict(type="buttons", direction="right", x=0.0, y=1.12,
+                 showactive=True, buttons=method_buttons,
+                 bgcolor="#f0f0f0", bordercolor="#ccc"),
+        ] if len(projections) > 1 else [],
     )
     return fig
 
@@ -129,8 +153,14 @@ def main() -> None:
     emb_b = extract_embeddings(paths_b, embed_fn, cache_path=cache_b)
 
     combined = np.vstack([emb_a, emb_b])
-    pca = PCA(n_components=2, random_state=42)
-    pca_2d = pca.fit_transform(combined)
+    n = len(combined)
+
+    pca_2d = PCA(n_components=2, random_state=42).fit_transform(combined)
+
+    perplexity = min(30, max(5, n - 1))
+    tsne_2d = TSNE(n_components=2, random_state=42, perplexity=perplexity).fit_transform(combined)
+
+    umap_2d = umap.UMAP(n_components=2, random_state=42).fit_transform(combined)
 
     print("Computing FID...")
     fid_score = compute_fid(str(args.folder_a), str(args.folder_b))
@@ -140,10 +170,11 @@ def main() -> None:
     lpips_score = compute_lpips_score(paths_a, paths_b, n_pairs=args.lpips_pairs)
     print(f"  LPIPS: {lpips_score:.4f}")
 
+    projections = {"pca": pca_2d, "tsne": tsne_2d, "umap": umap_2d}
     name_a = args.folder_a.name
     name_b = args.folder_b.name
     plotly_fig = build_projection_figure(
-        paths_a, paths_b, pca_2d, name_a, name_b, fid_score, lpips_score
+        paths_a, paths_b, projections, name_a, name_b, fid_score, lpips_score
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     plotly_fig.write_html(str(args.output_dir / f"{args.name}_projection.html"))

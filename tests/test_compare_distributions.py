@@ -36,8 +36,8 @@ def test_build_projection_figure_has_two_traces():
 
     paths_a = [Path(f"a{i}.jpg") for i in range(3)]
     paths_b = [Path(f"b{i}.jpg") for i in range(2)]
-    pca_2d = np.random.rand(5, 2)
-    fig = build_projection_figure(paths_a, paths_b, pca_2d, "train", "test", 10.5, 0.35)
+    projections = {"pca": np.random.rand(5, 2)}
+    fig = build_projection_figure(paths_a, paths_b, projections, "train", "test", 10.5, 0.35)
     assert len(fig.data) == 2
 
 
@@ -46,9 +46,24 @@ def test_build_projection_figure_title_contains_metrics():
 
     paths_a = [Path(f"a{i}.jpg") for i in range(2)]
     paths_b = [Path(f"b{i}.jpg") for i in range(2)]
-    pca_2d = np.random.rand(4, 2)
-    fig = build_projection_figure(paths_a, paths_b, pca_2d, "A", "B", 12.34, 0.56)
+    projections = {"pca": np.random.rand(4, 2)}
+    fig = build_projection_figure(paths_a, paths_b, projections, "A", "B", 12.34, 0.56)
     assert "12.34" in fig.layout.title.text
     assert "0.56" in fig.layout.title.text
+
+
+def test_build_projection_figure_multi_method_buttons():
+    from compare_distributions import build_projection_figure
+
+    paths_a = [Path(f"a{i}.jpg") for i in range(3)]
+    paths_b = [Path(f"b{i}.jpg") for i in range(2)]
+    projections = {
+        "pca": np.random.rand(5, 2),
+        "tsne": np.random.rand(5, 2),
+        "umap": np.random.rand(5, 2),
+    }
+    fig = build_projection_figure(paths_a, paths_b, projections, "A", "B", 1.0, 0.1)
+    assert len(fig.layout.updatemenus) == 1
+    assert len(fig.layout.updatemenus[0].buttons) == 3
 
 

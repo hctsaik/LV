@@ -9,3 +9,4 @@ plotly>=5.18.0
 clean-fid>=0.1.35
 lpips>=0.1.4
 streamlit>=1.32.0
+umap-learn>=0.5.0
