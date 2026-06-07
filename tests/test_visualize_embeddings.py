@@ -40,13 +40,16 @@ def test_parse_label_empty_file_is_unknown(tmp_path):
 def test_discover_images_finds_multiple_splits(tmp_path):
     from visualize_embeddings import discover_images
 
+    folders = []
     for split in ("train", "test"):
-        (tmp_path / split / "images").mkdir(parents=True)
-        (tmp_path / split / "labels").mkdir(parents=True)
-        (tmp_path / split / "images" / "apple_1.jpg").write_bytes(b"fake")
-        (tmp_path / split / "labels" / "apple_1.txt").write_text("0 0.5 0.5 0.3 0.4\n")
+        folder = tmp_path / split
+        (folder / "images").mkdir(parents=True)
+        (folder / "labels").mkdir(parents=True)
+        (folder / "images" / "apple_1.jpg").write_bytes(b"fake")
+        (folder / "labels" / "apple_1.txt").write_text("0 0.5 0.5 0.3 0.4\n")
+        folders.append(folder)
 
-    records = discover_images(tmp_path, ["apple", "banana"])
+    records = discover_images(folders, ["apple", "banana"])
     assert len(records) == 2
     assert {r["split"] for r in records} == {"train", "test"}
 
@@ -54,24 +57,26 @@ def test_discover_images_finds_multiple_splits(tmp_path):
 def test_discover_images_skips_absent_split(tmp_path):
     from visualize_embeddings import discover_images
 
-    (tmp_path / "train" / "images").mkdir(parents=True)
-    (tmp_path / "train" / "labels").mkdir(parents=True)
-    (tmp_path / "train" / "images" / "x.jpg").write_bytes(b"fake")
-    (tmp_path / "train" / "labels" / "x.txt").write_text("0 0.5 0.5 0.3 0.4\n")
+    folder = tmp_path / "train"
+    (folder / "images").mkdir(parents=True)
+    (folder / "labels").mkdir(parents=True)
+    (folder / "images" / "x.jpg").write_bytes(b"fake")
+    (folder / "labels" / "x.txt").write_text("0 0.5 0.5 0.3 0.4\n")
 
-    records = discover_images(tmp_path, ["apple"])
+    records = discover_images([folder], ["apple"])
     assert all(r["split"] == "train" for r in records)
 
 
 def test_discover_images_label_assigned(tmp_path):
     from visualize_embeddings import discover_images
 
-    (tmp_path / "train" / "images").mkdir(parents=True)
-    (tmp_path / "train" / "labels").mkdir(parents=True)
-    (tmp_path / "train" / "images" / "img.jpg").write_bytes(b"fake")
-    (tmp_path / "train" / "labels" / "img.txt").write_text("2 0.5 0.5 0.3 0.4\n")
+    folder = tmp_path / "train"
+    (folder / "images").mkdir(parents=True)
+    (folder / "labels").mkdir(parents=True)
+    (folder / "images" / "img.jpg").write_bytes(b"fake")
+    (folder / "labels" / "img.txt").write_text("2 0.5 0.5 0.3 0.4\n")
 
-    records = discover_images(tmp_path, ["apple", "banana", "orange"])
+    records = discover_images([folder], ["apple", "banana", "orange"])
     assert records[0]["label"] == "orange"
 
 
@@ -84,30 +89,36 @@ def _make_records():
     ]
 
 
+def _make_embeddings_per_model():
+    return {
+        "resnet18": {
+            "pca":  np.random.rand(4, 2),
+            "tsne": np.random.rand(4, 2),
+        }
+    }
+
+
 def test_build_plotly_figure_has_traces():
     from visualize_embeddings import build_plotly_figure
 
-    records = _make_records()
-    fig = build_plotly_figure(records, np.random.rand(4, 2), np.random.rand(4, 2))
+    fig = build_plotly_figure(_make_records(), _make_embeddings_per_model())
     assert len(fig.data) > 0
 
 
 def test_build_plotly_figure_has_two_updatemenus():
     from visualize_embeddings import build_plotly_figure
 
-    records = _make_records()
-    fig = build_plotly_figure(records, np.random.rand(4, 2), np.random.rand(4, 2))
+    fig = build_plotly_figure(_make_records(), _make_embeddings_per_model())
     assert len(fig.layout.updatemenus) == 2
 
 
-def test_build_matplotlib_figures_returns_two():
-    import matplotlib.pyplot as plt
-    from visualize_embeddings import build_matplotlib_figures
+def test_build_plotly_figure_multi_model_buttons():
+    from visualize_embeddings import build_plotly_figure
 
-    records = _make_records()
-    pca_fig, tsne_fig = build_matplotlib_figures(
-        records, np.random.rand(4, 2), np.random.rand(4, 2)
-    )
-    assert pca_fig is not None
-    assert tsne_fig is not None
-    plt.close("all")
+    emb = {
+        "resnet18":     {"pca": np.random.rand(4, 2), "tsne": np.random.rand(4, 2)},
+        "dinov2_vits14": {"pca": np.random.rand(4, 2), "tsne": np.random.rand(4, 2)},
+    }
+    fig = build_plotly_figure(_make_records(), emb)
+    # model×method buttons: 2 models × 2 methods = 4
+    assert len(fig.layout.updatemenus[0].buttons) == 4

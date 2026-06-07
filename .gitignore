@@ -1,0 +1,26 @@
+**/__pycache__/
+**/bin/
+**/include/
+**/lib/
+**/share/
+pyvenv.cfg
+**/Dinov2_model
+**/output/
+**/quary/
+**/tracing/
+.venv/
+.pycache_local/
+.DS_Store
+CLAUDE.md
+
+# Model weights (large binaries — store separately)
+models/*.pth
+models/*.pt
+*.pt
+
+# Dataset & goal images
+dataset/
+goal/
+
+# Embedding caches (regenerated on first run)
+**/embeddings_*/
