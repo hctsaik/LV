@@ -47,9 +47,14 @@ def test_build_projection_figure_title_contains_metrics():
     paths_a = [Path(f"a{i}.jpg") for i in range(2)]
     paths_b = [Path(f"b{i}.jpg") for i in range(2)]
     projections = {"pca": np.random.rand(4, 2)}
-    fig = build_projection_figure(paths_a, paths_b, projections, "A", "B", 12.34, 0.56)
+    fig = build_projection_figure(
+        paths_a, paths_b, projections, "A", "B",
+        fid_score=12.34, lpips_score=0.56, kid_score=0.001234, ssim_score=0.75,
+    )
     assert "12.34" in fig.layout.title.text
     assert "0.56" in fig.layout.title.text
+    assert "0.001234" in fig.layout.title.text
+    assert "0.75" in fig.layout.title.text
 
 
 def test_build_projection_figure_multi_method_buttons():
@@ -62,8 +67,29 @@ def test_build_projection_figure_multi_method_buttons():
         "tsne": np.random.rand(5, 2),
         "umap": np.random.rand(5, 2),
     }
-    fig = build_projection_figure(paths_a, paths_b, projections, "A", "B", 1.0, 0.1)
+    fig = build_projection_figure(
+        paths_a, paths_b, projections, "A", "B",
+        fid_score=1.0, lpips_score=0.1, kid_score=0.001, ssim_score=0.8,
+    )
     assert len(fig.layout.updatemenus) == 1
     assert len(fig.layout.updatemenus[0].buttons) == 3
+
+
+def test_compute_ssim_score_range(tmp_path):
+    from compare_distributions import compute_ssim_score
+
+    paths_a = _make_images(tmp_path / "a", 5)
+    paths_b = _make_images(tmp_path / "b", 5)
+    score = compute_ssim_score(paths_a, paths_b, n_pairs=3)
+    assert 0.0 <= score <= 1.0
+
+
+def test_compute_ssim_score_identical_images(tmp_path):
+    from compare_distributions import compute_ssim_score
+
+    # n_pairs=1 forces the single path to be picked from both lists, comparing image to itself
+    paths = _make_images(tmp_path / "imgs", 1)
+    score = compute_ssim_score(paths, paths, n_pairs=1)
+    assert score > 0.99
 
 

@@ -32,6 +32,16 @@ def compute_fid(folder_a: str, folder_b: str) -> float:
     ))
 
 
+def compute_kid(folder_a: str, folder_b: str) -> float:
+    """Kernel Inception Distance — MMD-based, more reliable than FID on small datasets. Lower = more similar."""
+    import torch
+    from cleanfid import fid as cleanfid
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return float(cleanfid.compute_kid(
+        folder_a, folder_b, device=device, use_dataparallel=False, num_workers=0
+    ))
+
+
 def compute_lpips_score(
     paths_a: list[Path], paths_b: list[Path], n_pairs: int = 500
 ) -> float:
@@ -59,6 +69,25 @@ def compute_lpips_score(
     return total / n
 
 
+def compute_ssim_score(
+    paths_a: list[Path], paths_b: list[Path], n_pairs: int = 500
+) -> float:
+    """Structural Similarity Index averaged over random cross-group pairs. Higher = more similar (max 1.0)."""
+    import numpy as np
+    from skimage.metrics import structural_similarity as ssim
+
+    n = min(n_pairs, len(paths_a), len(paths_b))
+    sampled_a = random.sample(paths_a, n)
+    sampled_b = random.sample(paths_b, n)
+
+    total = 0.0
+    for pa, pb in zip(sampled_a, sampled_b):
+        ia = np.array(Image.open(pa).convert("RGB").resize((256, 256)))
+        ib = np.array(Image.open(pb).convert("RGB").resize((256, 256)))
+        total += ssim(ia, ib, channel_axis=2, data_range=255)
+    return total / n
+
+
 _METHOD_LABELS = {"pca": "PCA", "tsne": "t-SNE", "umap": "UMAP"}
 
 
@@ -70,6 +99,8 @@ def build_projection_figure(
     name_b: str,
     fid_score: float,
     lpips_score: float,
+    kid_score: float = 0.0,
+    ssim_score: float = 0.0,
 ) -> go.Figure:
     """projections: {"pca": ndarray(N,2), "tsne": ndarray(N,2), "umap": ndarray(N,2)}"""
     n_a = len(paths_a)
@@ -105,7 +136,7 @@ def build_projection_figure(
     fig.update_layout(
         title=(
             f"Distribution Comparison: {name_a} vs {name_b}<br>"
-            f"<sub>FID: {fid_score:.2f} | LPIPS: {lpips_score:.4f}</sub>"
+            f"<sub>FID: {fid_score:.2f} | KID: {kid_score:.6f} | LPIPS: {lpips_score:.4f} | SSIM: {ssim_score:.4f}</sub>"
         ),
         xaxis_title="Component 1",
         yaxis_title="Component 2",
@@ -131,8 +162,8 @@ def main() -> None:
                         help=f"模型名稱，對應 ./models/<model>.pth。可用：{_models}")
     parser.add_argument("--name", default="comparison", help="輸出檔名前綴")
     parser.add_argument("--output-dir", type=Path, default=Path("./output"))
-    parser.add_argument("--lpips-pairs", type=int, default=500,
-                        help="LPIPS 最大 cross-group pair 數")
+    parser.add_argument("--n-pairs", type=int, default=500,
+                        help="LPIPS / SSIM 最大 cross-group pair 數")
     args = parser.parse_args()
 
     paths_a = get_image_paths(args.folder_a)
@@ -166,22 +197,34 @@ def main() -> None:
     fid_score = compute_fid(str(args.folder_a), str(args.folder_b))
     print(f"  FID: {fid_score:.4f}")
 
+    print("Computing KID...")
+    kid_score = compute_kid(str(args.folder_a), str(args.folder_b))
+    print(f"  KID: {kid_score:.6f}")
+
     print("Computing LPIPS...")
-    lpips_score = compute_lpips_score(paths_a, paths_b, n_pairs=args.lpips_pairs)
+    lpips_score = compute_lpips_score(paths_a, paths_b, n_pairs=args.n_pairs)
     print(f"  LPIPS: {lpips_score:.4f}")
+
+    print("Computing SSIM...")
+    ssim_score = compute_ssim_score(paths_a, paths_b, n_pairs=args.n_pairs)
+    print(f"  SSIM: {ssim_score:.4f}")
 
     projections = {"pca": pca_2d, "tsne": tsne_2d, "umap": umap_2d}
     name_a = args.folder_a.name
     name_b = args.folder_b.name
     plotly_fig = build_projection_figure(
-        paths_a, paths_b, projections, name_a, name_b, fid_score, lpips_score
+        paths_a, paths_b, projections, name_a, name_b,
+        fid_score=fid_score, lpips_score=lpips_score,
+        kid_score=kid_score, ssim_score=ssim_score,
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     plotly_fig.write_html(str(args.output_dir / f"{args.name}_projection.html"))
 
     metrics = {
         "fid": round(fid_score, 4),
+        "kid": round(kid_score, 6),
         "lpips": round(lpips_score, 4),
+        "ssim": round(ssim_score, 4),
         "n_a": len(paths_a),
         "n_b": len(paths_b),
         "folder_a": str(args.folder_a),

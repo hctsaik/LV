@@ -17,7 +17,9 @@ from _utils import available_models, extract_embeddings, load_model
 from compare_distributions import (
     build_projection_figure,
     compute_fid,
+    compute_kid,
     compute_lpips_score,
+    compute_ssim_score,
     get_image_paths,
 )
 from visualize_embeddings import build_plotly_figure, discover_images
@@ -251,7 +253,11 @@ def _compare_distributions_ui() -> None:
             return
         selected_model = st.selectbox("Model", all_models)
         name = st.text_input("Output name prefix", value="comparison")
-        lpips_pairs = st.number_input("LPIPS pairs", min_value=1, value=500, step=50)
+        n_pairs = st.number_input(
+            "Pairwise metric samples",
+            min_value=1, value=500, step=50,
+            help="隨機配對數量，用於 LPIPS 和 SSIM。越大越穩定，但計算越慢。",
+        )
         run = st.button("▶ Run", use_container_width=True, key="run_cmp")
 
     if run:
@@ -278,7 +284,7 @@ def _compare_distributions_ui() -> None:
             st.error(f"No images found in Folder B: {path_b}")
             return
 
-        with st.spinner("Computing embeddings, FID, and LPIPS…"):
+        with st.spinner("Computing embeddings, FID, KID, LPIPS, SSIM…"):
             embed_fn = load_model(selected_model)
             cache_a = path_a.parent / f"embeddings_{selected_model}" / "embeddings.npz"
             cache_b = path_b.parent / f"embeddings_{selected_model}" / "embeddings.npz"
@@ -286,20 +292,24 @@ def _compare_distributions_ui() -> None:
             emb_b = extract_embeddings(paths_b, embed_fn, cache_path=cache_b)
 
             combined = np.vstack([emb_a, emb_b])
-            n = len(combined)
+            n_emb = len(combined)
 
             pca_2d = PCA(n_components=2, random_state=42).fit_transform(combined)
-            perplexity = min(30, max(5, n - 1))
+            perplexity = min(30, max(5, n_emb - 1))
             tsne_2d = TSNE(n_components=2, random_state=42, perplexity=perplexity).fit_transform(combined)
             umap_2d = umap.UMAP(n_components=2, random_state=42).fit_transform(combined)
 
             projections = {"pca": pca_2d, "tsne": tsne_2d, "umap": umap_2d}
             fid_score = compute_fid(str(path_a), str(path_b))
-            lpips_score = compute_lpips_score(paths_a, paths_b, n_pairs=int(lpips_pairs))
+            kid_score = compute_kid(str(path_a), str(path_b))
+            lpips_score = compute_lpips_score(paths_a, paths_b, n_pairs=int(n_pairs))
+            ssim_score = compute_ssim_score(paths_a, paths_b, n_pairs=int(n_pairs))
 
         st.session_state["cmp_projections"] = projections
         st.session_state["cmp_fid"] = fid_score
+        st.session_state["cmp_kid"] = kid_score
         st.session_state["cmp_lpips"] = lpips_score
+        st.session_state["cmp_ssim"] = ssim_score
         st.session_state["cmp_paths_a"] = paths_a
         st.session_state["cmp_paths_b"] = paths_b
         st.session_state["cmp_names"] = (path_a.name, path_b.name)
@@ -312,16 +322,20 @@ def _compare_distributions_ui() -> None:
 
     projections = st.session_state["cmp_projections"]
     fid_score = st.session_state["cmp_fid"]
+    kid_score = st.session_state["cmp_kid"]
     lpips_score = st.session_state["cmp_lpips"]
+    ssim_score = st.session_state["cmp_ssim"]
     paths_a = st.session_state["cmp_paths_a"]
     paths_b = st.session_state["cmp_paths_b"]
     name_a, name_b = st.session_state["cmp_names"]
     name = st.session_state["cmp_name_prefix"]
     selected_model = st.session_state["cmp_model"]
 
-    col1, col2 = st.columns(2)
-    col1.metric("FID", f"{fid_score:.4f}")
-    col2.metric("LPIPS", f"{lpips_score:.4f}")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("FID ↓", f"{fid_score:.4f}")
+    col2.metric("KID ↓", f"{kid_score:.6f}")
+    col3.metric("LPIPS ↓", f"{lpips_score:.4f}")
+    col4.metric("SSIM ↑", f"{ssim_score:.4f}")
 
     selected_method = st.selectbox("Method", list(_METHOD_KEY))
     method_key = _METHOD_KEY[selected_method]
@@ -334,10 +348,13 @@ def _compare_distributions_ui() -> None:
         paths_a, paths_b, projections,
         name_a=name_a, name_b=name_b,
         fid_score=fid_score, lpips_score=lpips_score,
+        kid_score=kid_score, ssim_score=ssim_score,
     )
     metrics = {
         "fid": round(fid_score, 4),
+        "kid": round(kid_score, 6),
         "lpips": round(lpips_score, 4),
+        "ssim": round(ssim_score, 4),
         "n_a": len(paths_a),
         "n_b": len(paths_b),
         "model": selected_model,

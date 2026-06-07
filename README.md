@@ -7,7 +7,7 @@ A Streamlit web app for visualising and comparing image dataset distributions us
 | Tool | Description |
 |---|---|
 | **Visualize Embeddings** | Extract features from one or more image folders, reduce to 2-D with PCA / t-SNE / UMAP, colour by class label |
-| **Compare Distributions** | Compare two image folders via FID and LPIPS scores, visualise the joint embedding space |
+| **Compare Distributions** | Compare two image folders via FID, KID, LPIPS, and SSIM scores, visualise the joint embedding space |
 
 Both tools run **fully offline** — model architectures and weights are loaded from local files only.
 
@@ -111,8 +111,8 @@ App opens at `http://localhost:8501`.
    Folder A: dataset/train/images
    Folder B: goal/images
    ```
-2. Select a model, set LPIPS pairs, click **▶ Run**.
-3. Metrics (FID ↓, LPIPS ↓) appear above the plot.
+2. Select a model, set **Pairwise metric samples** (used for LPIPS and SSIM), click **▶ Run**.
+3. Metrics (FID ↓, KID ↓, LPIPS ↓, SSIM ↑) appear above the plot.
 4. Use the **Method** dropdown to switch between PCA / t-SNE / UMAP.
 5. Download HTML or JSON metrics with the **⬇** buttons.
 
@@ -149,6 +149,7 @@ python scripts/compare_distributions.py \
   --folder-b goal/images \
   --model resnet18 \
   --name my_comparison \
+  --n-pairs 500 \
   --output-dir output/
 ```
 
