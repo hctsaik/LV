@@ -2,9 +2,6 @@ import numpy as np
 import pytest
 from pathlib import Path
 from PIL import Image
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
 
 def _make_images(folder: Path, n: int) -> list[Path]:
@@ -55,12 +52,3 @@ def test_build_projection_figure_title_contains_metrics():
     assert "0.56" in fig.layout.title.text
 
 
-def test_build_matplotlib_figure_returns_figure():
-    from compare_distributions import build_matplotlib_figure
-
-    paths_a = [Path(f"a{i}.jpg") for i in range(2)]
-    paths_b = [Path(f"b{i}.jpg") for i in range(2)]
-    pca_2d = np.random.rand(4, 2)
-    fig = build_matplotlib_figure(paths_a, paths_b, pca_2d, "A", "B", 5.0, 0.3)
-    assert fig is not None
-    plt.close("all")

@@ -157,14 +157,12 @@ def main() -> None:
         "folder_b": str(args.folder_b),
         "model": args.model,
     }
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / f"{args.name}_metrics.json").write_text(
         json.dumps(metrics, indent=2)
     )
 
     print(f"\nSaved to {args.output_dir}/")
     print(f"  {args.name}_projection.html")
-    print(f"  {args.name}_projection.png")
     print(f"  {args.name}_metrics.json")
 
 

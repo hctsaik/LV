@@ -111,9 +111,10 @@ def _visualize_embeddings_ui() -> None:
                 cache_path = (
                     folder / f"embeddings_{model_name}" / "embeddings.npz"
                 )
-                all_embs.append(
-                    extract_embeddings(folder_paths, embed_fn, cache_path=cache_path)
-                )
+                if folder_paths:
+                    all_embs.append(
+                        extract_embeddings(folder_paths, embed_fn, cache_path=cache_path)
+                    )
             embeddings = np.vstack(all_embs)
 
             pca = PCA(n_components=2, random_state=42)
