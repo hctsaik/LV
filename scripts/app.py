@@ -97,6 +97,10 @@ def _visualize_embeddings_ui() -> None:
             st.error("No images found in the specified folders.")
             return
 
+        empty_folders = [f.name for f in folders if not any(r["split"] == f.name for r in records)]
+        if empty_folders:
+            st.warning(f"No images found in folder(s): {', '.join(empty_folders)}")
+
         embeddings_per_model: dict[str, dict[str, np.ndarray]] = {}
         for model_name in selected_models:
             embed_fn = load_model(model_name)
