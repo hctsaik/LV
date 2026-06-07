@@ -136,7 +136,97 @@ def _visualize_embeddings_ui() -> None:
 
 
 def _compare_distributions_ui() -> None:
-    pass  # Task 4
+    st.header("Compare Distributions")
+
+    with st.sidebar:
+        folder_a = st.text_input("Folder A (direct image folder)", placeholder="dataset/train/images")
+        folder_b = st.text_input("Folder B (direct image folder)", placeholder="goal/images")
+        all_models = available_models()
+        if not all_models:
+            st.error("No .pth models found in ./models/. Add a model file and restart.")
+            return
+        selected_model = st.selectbox("Model", all_models)
+        name = st.text_input("Output name prefix", value="comparison")
+        lpips_pairs = st.number_input("LPIPS pairs", min_value=1, value=500, step=50)
+        run = st.button("▶ Run", use_container_width=True, key="run_cmp")
+
+    if not run:
+        st.info("Configure inputs in the sidebar and click ▶ Run.")
+        return
+
+    path_a = Path(folder_a.strip()) if folder_a.strip() else None
+    path_b = Path(folder_b.strip()) if folder_b.strip() else None
+
+    if not path_a or not path_b:
+        st.error("Enter both Folder A and Folder B paths.")
+        return
+    if not path_a.exists():
+        st.error(f"Folder A not found: {path_a}")
+        return
+    if not path_b.exists():
+        st.error(f"Folder B not found: {path_b}")
+        return
+
+    paths_a = get_image_paths(path_a)
+    paths_b = get_image_paths(path_b)
+
+    if not paths_a:
+        st.error(f"No images found in Folder A: {path_a}")
+        return
+    if not paths_b:
+        st.error(f"No images found in Folder B: {path_b}")
+        return
+
+    with st.spinner("Computing embeddings, FID, and LPIPS…"):
+        embed_fn = load_model(selected_model)
+        cache_a = path_a.parent / f"embeddings_{selected_model}" / "embeddings.npz"
+        cache_b = path_b.parent / f"embeddings_{selected_model}" / "embeddings.npz"
+        emb_a = extract_embeddings(paths_a, embed_fn, cache_path=cache_a)
+        emb_b = extract_embeddings(paths_b, embed_fn, cache_path=cache_b)
+
+        combined = np.vstack([emb_a, emb_b])
+        pca = PCA(n_components=2, random_state=42)
+        pca_2d = pca.fit_transform(combined)
+
+        fid_score = compute_fid(str(path_a), str(path_b))
+        lpips_score = compute_lpips_score(paths_a, paths_b, n_pairs=int(lpips_pairs))
+
+    col1, col2 = st.columns(2)
+    col1.metric("FID", f"{fid_score:.4f}")
+    col2.metric("LPIPS", f"{lpips_score:.4f}")
+
+    fig = build_projection_figure(
+        paths_a, paths_b, pca_2d,
+        name_a=path_a.name,
+        name_b=path_b.name,
+        fid_score=fid_score,
+        lpips_score=lpips_score,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    metrics = {
+        "fid": round(fid_score, 4),
+        "lpips": round(lpips_score, 4),
+        "n_a": len(paths_a),
+        "n_b": len(paths_b),
+        "folder_a": str(path_a),
+        "folder_b": str(path_b),
+        "model": selected_model,
+    }
+
+    dl1, dl2 = st.columns(2)
+    dl1.download_button(
+        "⬇ Download HTML",
+        data=fig.to_html(include_plotlyjs="cdn").encode(),
+        file_name=f"{name}_projection.html",
+        mime="text/html",
+    )
+    dl2.download_button(
+        "⬇ Download JSON",
+        data=json.dumps(metrics, indent=2).encode(),
+        file_name=f"{name}_metrics.json",
+        mime="application/json",
+    )
 
 
 def main() -> None:
