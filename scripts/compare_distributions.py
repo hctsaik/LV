@@ -60,6 +60,7 @@ def compute_lpips_score(
 
 
 _METHOD_LABELS = {"pca": "PCA", "tsne": "t-SNE", "umap": "UMAP"}
+_CMP_COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c", "#95a5a6"]
 
 
 def build_projection_figure(
@@ -70,37 +71,88 @@ def build_projection_figure(
     name_b: str,
     fid_score: float,
     lpips_score: float,
+    labels_a: list[str] | None = None,
+    labels_b: list[str] | None = None,
 ) -> go.Figure:
-    """projections: {"pca": ndarray(N,2), "tsne": ndarray(N,2), "umap": ndarray(N,2)}"""
+    """projections: {"pca": ndarray(N,2), ...}
+    When labels_a/labels_b provided, traces are split by class (color) × group (symbol ●/■).
+    """
     n_a = len(paths_a)
-    default = next(iter(projections.values()))
-    traces = [
-        go.Scatter(
-            x=default[:n_a, 0].tolist(), y=default[:n_a, 1].tolist(),
-            mode="markers", name=name_a,
-            marker=dict(color="#3498db", size=6, opacity=0.7),
-            text=[p.name for p in paths_a],
-            hovertemplate="%{text}<br>Group: " + name_a + "<extra></extra>",
-        ),
-        go.Scatter(
-            x=default[n_a:, 0].tolist(), y=default[n_a:, 1].tolist(),
-            mode="markers", name=name_b,
-            marker=dict(color="#e74c3c", size=6, opacity=0.7),
-            text=[p.name for p in paths_b],
-            hovertemplate="%{text}<br>Group: " + name_b + "<extra></extra>",
-        ),
-    ]
-    method_buttons = [
-        dict(
-            method="restyle",
-            label=_METHOD_LABELS.get(key, key.upper()),
-            args=[{
-                "x": [proj[:n_a, 0].tolist(), proj[n_a:, 0].tolist()],
-                "y": [proj[:n_a, 1].tolist(), proj[n_a:, 1].tolist()],
-            }],
-        )
-        for key, proj in projections.items()
-    ]
+    first_proj = next(iter(projections.values()))
+
+    if labels_a is not None and labels_b is not None:
+        all_labels = sorted(set(labels_a) | set(labels_b))
+        color_map = {lbl: _CMP_COLORS[i % len(_CMP_COLORS)] for i, lbl in enumerate(all_labels)}
+
+        # Each spec: (label, group_name, global_indices_into_combined, file_paths)
+        trace_specs: list[tuple] = []
+        for label in all_labels:
+            idx_a = [i for i, l in enumerate(labels_a) if l == label]
+            if idx_a:
+                trace_specs.append((label, name_a, idx_a, [paths_a[i] for i in idx_a]))
+            idx_b = [n_a + i for i, l in enumerate(labels_b) if l == label]
+            if idx_b:
+                trace_specs.append((label, name_b, idx_b, [paths_b[i - n_a] for i in idx_b]))
+
+        traces = []
+        for label, group, indices, paths in trace_specs:
+            traces.append(go.Scatter(
+                x=[first_proj[i, 0] for i in indices],
+                y=[first_proj[i, 1] for i in indices],
+                mode="markers",
+                name=f"{label} ({group})",
+                legendgroup=label,
+                marker=dict(
+                    color=color_map[label],
+                    symbol="circle" if group == name_a else "square",
+                    size=6, opacity=0.75,
+                ),
+                text=[p.name for p in paths],
+                hovertemplate=f"%{{text}}<br>Class: {label}<br>Group: {group}<extra></extra>",
+            ))
+
+        method_buttons = []
+        for key, proj in projections.items():
+            method_buttons.append(dict(
+                method="restyle",
+                label=_METHOD_LABELS.get(key, key.upper()),
+                args=[{
+                    "x": [[proj[i, 0] for i in indices] for _, _, indices, _ in trace_specs],
+                    "y": [[proj[i, 1] for i in indices] for _, _, indices, _ in trace_specs],
+                }],
+            ))
+
+        legend_title = f"Class  ● {name_a}  ■ {name_b}"
+    else:
+        traces = [
+            go.Scatter(
+                x=first_proj[:n_a, 0].tolist(), y=first_proj[:n_a, 1].tolist(),
+                mode="markers", name=name_a,
+                marker=dict(color="#3498db", size=6, opacity=0.7),
+                text=[p.name for p in paths_a],
+                hovertemplate="%{text}<br>Group: " + name_a + "<extra></extra>",
+            ),
+            go.Scatter(
+                x=first_proj[n_a:, 0].tolist(), y=first_proj[n_a:, 1].tolist(),
+                mode="markers", name=name_b,
+                marker=dict(color="#e74c3c", size=6, opacity=0.7),
+                text=[p.name for p in paths_b],
+                hovertemplate="%{text}<br>Group: " + name_b + "<extra></extra>",
+            ),
+        ]
+        method_buttons = [
+            dict(
+                method="restyle",
+                label=_METHOD_LABELS.get(key, key.upper()),
+                args=[{
+                    "x": [proj[:n_a, 0].tolist(), proj[n_a:, 0].tolist()],
+                    "y": [proj[:n_a, 1].tolist(), proj[n_a:, 1].tolist()],
+                }],
+            )
+            for key, proj in projections.items()
+        ]
+        legend_title = "Group"
+
     fig = go.Figure(data=traces)
     fig.update_layout(
         title=(
@@ -109,7 +161,7 @@ def build_projection_figure(
         ),
         xaxis_title="Component 1",
         yaxis_title="Component 2",
-        legend=dict(title="Group"),
+        legend=dict(title=legend_title, groupclick="toggleitem"),
         updatemenus=[
             dict(type="buttons", direction="right", x=0.0, y=1.12,
                  showactive=True, buttons=method_buttons,

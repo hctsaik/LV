@@ -92,3 +92,29 @@ def test_build_cmp_figure_group_names():
     names = [t.name for t in fig.data]
     assert "GroupA" in names
     assert "GroupB" in names
+
+
+def test_build_cmp_figure_with_labels_splits_by_class():
+    paths_a = [Path(f"a{i}.jpg") for i in range(3)]
+    paths_b = [Path(f"b{i}.jpg") for i in range(3)]
+    proj = np.random.rand(6, 2)
+    labels_a = ["apple", "apple", "banana"]
+    labels_b = ["apple", "banana", "banana"]
+    fig = _build_cmp_figure(paths_a, paths_b, proj, "train", "goal",
+                            labels_a=labels_a, labels_b=labels_b)
+    # apple×train, apple×goal, banana×train, banana×goal = 4 traces
+    assert len(fig.data) == 4
+    trace_names = {t.name for t in fig.data}
+    assert "apple (train)" in trace_names
+    assert "banana (goal)" in trace_names
+
+
+def test_build_cmp_figure_labels_circle_for_a_square_for_b():
+    paths_a = [Path("a0.jpg")]
+    paths_b = [Path("b0.jpg")]
+    proj = np.random.rand(2, 2)
+    fig = _build_cmp_figure(paths_a, paths_b, proj, "A", "B",
+                            labels_a=["cat"], labels_b=["cat"])
+    symbols = {t.name: t.marker.symbol for t in fig.data}
+    assert symbols["cat (A)"] == "circle"
+    assert symbols["cat (B)"] == "square"
