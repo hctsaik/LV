@@ -178,23 +178,19 @@ def _visualize_embeddings_ui() -> None:
             "模式", ["Object Detector", "Image Classifier"],
             key="viz_mode", horizontal=True,
         )
-        # 切換模式時清除舊結果
+        # 切換模式時清除舊結果與資料夾列表
         if st.session_state.get("_viz_mode_prev") != mode:
             st.session_state["_viz_mode_prev"] = mode
             st.session_state.pop("viz_records", None)
             st.session_state.pop("viz_embeddings", None)
+            st.session_state["viz_folder_list"] = []
 
         st.divider()
 
         if "viz_folder_list" not in st.session_state:
             st.session_state["viz_folder_list"] = []
 
-        folder_hint = (
-            "images/ + labels/ 結構" if mode == "Object Detector"
-            else "class_name/ 子資料夾結構"
-        )
-        if st.button(f"📁 新增資料夾（{folder_hint}）",
-                     use_container_width=True, key="add_viz_folder"):
+        if st.button("📁 新增資料夾", use_container_width=True, key="add_viz_folder"):
             _pick_folder_append("viz_folder_list")
             st.rerun()
 
@@ -311,16 +307,19 @@ def _visualize_embeddings_ui() -> None:
             _step += 1
             _prog.progress(_step / _n_steps, text=f"[{model_name}] 特徵向量提取完成")
 
-            pca_2d = PCA(n_components=3, random_state=42).fit_transform(embeddings)
+            n_samples = len(embeddings)
+            n_comps = min(3, max(1, n_samples - 2))
+            pca_2d = PCA(n_components=n_comps, random_state=42).fit_transform(embeddings)
             _step += 1
             _prog.progress(_step / _n_steps, text=f"[{model_name}] PCA 完成")
 
-            perplexity = min(30, max(5, len(records) - 1))
-            tsne_2d = TSNE(n_components=3, random_state=42, perplexity=perplexity).fit_transform(embeddings)
+            perplexity = min(30, max(1, n_samples - 1))
+            tsne_2d = TSNE(n_components=n_comps, random_state=42, perplexity=perplexity).fit_transform(embeddings)
             _step += 1
             _prog.progress(_step / _n_steps, text=f"[{model_name}] t-SNE 完成")
 
-            umap_2d = umap.UMAP(n_components=3, random_state=42).fit_transform(embeddings)
+            n_neighbors = min(15, max(2, n_samples - 1))
+            umap_2d = umap.UMAP(n_components=n_comps, n_neighbors=n_neighbors, random_state=42).fit_transform(embeddings)
             _step += 1
             _prog.progress(_step / _n_steps, text=f"[{model_name}] UMAP 完成")
 
@@ -450,14 +449,16 @@ def _compare_distributions_ui() -> None:
         combined = np.vstack([emb_a, emb_b])
         n_emb = len(combined)
 
-        pca_2d = PCA(n_components=3, random_state=42).fit_transform(combined)
+        n_comps = min(3, max(1, n_emb - 2))
+        pca_2d = PCA(n_components=n_comps, random_state=42).fit_transform(combined)
         _step += 1; _prog.progress(_step / _CMP_STEPS, text="PCA 完成")
 
-        perplexity = min(30, max(5, n_emb - 1))
-        tsne_2d = TSNE(n_components=3, random_state=42, perplexity=perplexity).fit_transform(combined)
+        perplexity = min(30, max(1, n_emb - 1))
+        tsne_2d = TSNE(n_components=n_comps, random_state=42, perplexity=perplexity).fit_transform(combined)
         _step += 1; _prog.progress(_step / _CMP_STEPS, text="t-SNE 完成")
 
-        umap_2d = umap.UMAP(n_components=3, random_state=42).fit_transform(combined)
+        n_neighbors = min(15, max(2, n_emb - 1))
+        umap_2d = umap.UMAP(n_components=n_comps, n_neighbors=n_neighbors, random_state=42).fit_transform(combined)
         _step += 1; _prog.progress(_step / _CMP_STEPS, text="UMAP 完成")
 
         projections = {"pca": pca_2d, "tsne": tsne_2d, "umap": umap_2d}
