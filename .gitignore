@@ -13,10 +13,14 @@ pyvenv.cfg
 .DS_Store
 CLAUDE.md
 
-# Model weights (large binaries — store separately)
+# Model weights (large binaries — store separately, via Git LFS for model/)
 models/*.pth
 models/*.pt
 *.pt
+!model/**/*.pth
+!model/**/*.pt
+!model/*.pt
+!model/*.pth
 
 # Dataset & goal images
 dataset/

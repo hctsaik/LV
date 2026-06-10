@@ -16,6 +16,19 @@ from sklearn.manifold import TSNE
 
 from _utils import available_models, extract_embeddings, load_model
 
+_MODEL_DIR = Path("model")
+
+
+def _load_inception(device: torch.device):
+    from cleanfid.inception_torchscript import InceptionV3W
+    if not (_MODEL_DIR / "inception-2015-12-05.pt").exists():
+        raise FileNotFoundError(
+            f"InceptionV3 model not found: {_MODEL_DIR / 'inception-2015-12-05.pt'}\n"
+            "Place inception-2015-12-05.pt in the model/ directory."
+        )
+    model = InceptionV3W(str(_MODEL_DIR), download=False, resize_inside=False)
+    return model.to(device).eval()
+
 
 def get_image_paths(folder: Path) -> list[Path]:
     return sorted(
@@ -24,22 +37,26 @@ def get_image_paths(folder: Path) -> list[Path]:
 
 
 def compute_fid(folder_a: str, folder_b: str) -> float:
-    import torch
-    from cleanfid import fid as cleanfid
+    from cleanfid import fid as cleanfid_fid
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return float(cleanfid.compute_fid(
-        folder_a, folder_b, device=device, use_dataparallel=False, num_workers=0
+    feat_model = _load_inception(device)
+    return float(cleanfid_fid.compute_fid(
+        folder_a, folder_b,
+        device=device, use_dataparallel=False, num_workers=0,
+        custom_feat_extractor=feat_model,
     ))
 
 
 def compute_kid(folder_a: str, folder_b: str) -> float:
     """Kernel Inception Distance — MMD-based, more reliable than FID on small datasets. Lower = more similar."""
-    import torch
-    from cleanfid import fid as cleanfid
+    from cleanfid.fid import get_folder_features, kernel_distance
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return float(cleanfid.compute_kid(
-        folder_a, folder_b, device=device, use_dataparallel=False, num_workers=0
-    ))
+    feat_model = _load_inception(device)
+    feats1 = get_folder_features(folder_a, feat_model, num_workers=0,
+                                  device=device, mode="clean", verbose=False)
+    feats2 = get_folder_features(folder_b, feat_model, num_workers=0,
+                                  device=device, mode="clean", verbose=False)
+    return float(kernel_distance(feats1, feats2))
 
 
 def compute_lpips_score(
@@ -47,7 +64,18 @@ def compute_lpips_score(
 ) -> float:
     import lpips
 
-    loss_fn = lpips.LPIPS(net="alex")
+    lpips_head = _MODEL_DIR / "lpips" / "v0.1" / "alex.pth"
+    if not lpips_head.exists():
+        raise FileNotFoundError(
+            f"LPIPS weights not found: {lpips_head}\n"
+            "Place alex.pth in model/lpips/v0.1/."
+        )
+    _prev_hub = torch.hub.get_dir()
+    torch.hub.set_dir(str(_MODEL_DIR / "hub"))
+    try:
+        loss_fn = lpips.LPIPS(net="alex", model_path=str(lpips_head), verbose=False)
+    finally:
+        torch.hub.set_dir(_prev_hub)
     loss_fn.eval()
 
     n = min(n_pairs, len(paths_a), len(paths_b))
@@ -88,7 +116,181 @@ def compute_ssim_score(
     return total / n
 
 
+def compute_psnr_score(
+    paths_a: list[Path], paths_b: list[Path], n_pairs: int = 500
+) -> float:
+    """Peak Signal-to-Noise Ratio averaged over random cross-group pairs. Higher = more similar (dB)."""
+    n = min(n_pairs, len(paths_a), len(paths_b))
+    sampled_a = random.sample(paths_a, n)
+    sampled_b = random.sample(paths_b, n)
+    total = 0.0
+    for pa, pb in zip(sampled_a, sampled_b):
+        ia = np.array(Image.open(pa).convert("RGB").resize((256, 256)), dtype=np.float64)
+        ib = np.array(Image.open(pb).convert("RGB").resize((256, 256)), dtype=np.float64)
+        mse = np.mean((ia - ib) ** 2)
+        total += 100.0 if mse == 0 else 20 * np.log10(255.0) - 10 * np.log10(mse)
+    return total / n
+
+
+def compute_inception_score(
+    folder: str, n_splits: int = 10, batch_size: int = 32
+) -> tuple[float, float]:
+    """Inception Score for a single folder. Higher = better quality & diversity. Returns (mean, std)."""
+    import torch.nn.functional as F
+    import torchvision.models as tvm
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    weights_path = _MODEL_DIR / "hub" / "checkpoints" / "inception_v3_google-0cc3c7bd.pth"
+    if not weights_path.exists():
+        raise FileNotFoundError(
+            f"InceptionV3 weights not found: {weights_path}\n"
+            "Run once with internet to auto-download, or copy "
+            "inception_v3_google-0cc3c7bd.pth to model/hub/checkpoints/."
+        )
+
+    _prev_hub = torch.hub.get_dir()
+    torch.hub.set_dir(str(_MODEL_DIR / "hub"))
+    try:
+        from torchvision.models import Inception_V3_Weights
+        model = tvm.inception_v3(weights=Inception_V3_Weights.DEFAULT)
+    finally:
+        torch.hub.set_dir(_prev_hub)
+    model = model.to(device).eval()
+
+    transform = T.Compose([
+        T.Resize(299),
+        T.CenterCrop(299),
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    paths = get_image_paths(Path(folder))
+    if not paths:
+        raise ValueError(f"No images found in {folder}")
+
+    preds = []
+    with torch.no_grad():
+        for i in range(0, len(paths), batch_size):
+            batch = torch.stack([
+                transform(Image.open(p).convert("RGB")) for p in paths[i: i + batch_size]
+            ]).to(device)
+            probs = F.softmax(model(batch), dim=1)
+            preds.append(probs.cpu().numpy())
+
+    preds = np.concatenate(preds, axis=0)  # (N, 1000)
+    n = len(preds)
+    n_splits = min(n_splits, n)
+    split_size = max(1, n // n_splits)
+    scores = []
+    for i in range(n_splits):
+        part = preds[i * split_size: (i + 1) * split_size]
+        if len(part) == 0:
+            continue
+        py = part.mean(axis=0)
+        kl = part * (np.log(part + 1e-10) - np.log(py[np.newaxis] + 1e-10))
+        scores.append(float(np.exp(np.mean(np.sum(kl, axis=1)))))
+
+    return float(np.mean(scores)), float(np.std(scores))
+
+
 _METHOD_LABELS = {"pca": "PCA", "tsne": "t-SNE", "umap": "UMAP"}
+
+
+def compute_coverage_gaps(
+    emb_a: np.ndarray,
+    emb_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    最近鄰距離（cosine）用於覆蓋缺口分析。
+    回傳 (d_a_to_a, d_a_to_b, d_b_to_a, d_b_to_b)：
+      d_x_to_y[i] = x[i] 到 y 中最近鄰的距離（同群組時排除自身）。
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    def _nn(query: np.ndarray, index: np.ndarray, exclude_self: bool) -> np.ndarray:
+        k = 2 if exclude_self and len(index) > 1 else 1
+        dists, _ = NearestNeighbors(n_neighbors=k, metric="cosine").fit(index).kneighbors(query)
+        return dists[:, k - 1]
+
+    return (
+        _nn(emb_a, emb_a, exclude_self=True),
+        _nn(emb_a, emb_b, exclude_self=False),
+        _nn(emb_b, emb_a, exclude_self=False),
+        _nn(emb_b, emb_b, exclude_self=True),
+    )
+
+
+def build_coverage_figure(
+    d_a_to_a: np.ndarray,
+    d_a_to_b: np.ndarray,
+    d_b_to_a: np.ndarray,
+    d_b_to_b: np.ndarray,
+    paths_a: list[Path],
+    paths_b: list[Path],
+    name_a: str,
+    name_b: str,
+) -> go.Figure:
+    """d_A vs d_B 散佈圖，以象限標示分布盲點風險。"""
+    all_d_a = np.concatenate([d_a_to_a, d_b_to_a])
+    all_d_b = np.concatenate([d_a_to_b, d_b_to_b])
+    thr_a = float(np.percentile(all_d_a, 50))
+    thr_b = float(np.percentile(all_d_b, 50))
+    x_max = float(np.max(all_d_a)) * 1.08
+    y_max = float(np.max(all_d_b)) * 1.08
+
+    fig = go.Figure()
+
+    # 象限背景色塊：標籤貼到外角，避免與資料點和閾值線重疊
+    quads = [
+        # (x0, x1, y0, y1, color, label, lx,         ly,         xanchor, yanchor)
+        (0,     thr_a, 0,     thr_b, "#f39c12", "邊界重疊（誤報風險）",
+         thr_a * 0.02, thr_b * 0.02, "left",  "bottom"),
+        (0,     thr_a, thr_b, y_max, "#3498db", f"明確 {name_a} 區",
+         thr_a * 0.02, y_max * 0.98, "left",  "top"),
+        (thr_a, x_max, 0,     thr_b, "#e74c3c", f"明確 {name_b} 區",
+         x_max * 0.98, thr_b * 0.02, "right", "bottom"),
+        (thr_a, x_max, thr_b, y_max, "#9b59b6", "盲點 / 異常（漏抓風險）",
+         x_max * 0.98, y_max * 0.98, "right", "top"),
+    ]
+    for x0, x1, y0, y1, color, label, lx, ly, xanc, yanc in quads:
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1,
+                      fillcolor=color, opacity=0.07, line_width=0, layer="below")
+        fig.add_annotation(
+            x=lx, y=ly, text=label, showarrow=False,
+            font=dict(size=9, color=color),
+            xanchor=xanc, yanchor=yanc,
+            bgcolor="rgba(255,255,255,0.65)", borderpad=3,
+        )
+
+    fig.add_trace(go.Scatter(
+        x=d_a_to_a.tolist(), y=d_a_to_b.tolist(),
+        mode="markers", name=name_a,
+        marker=dict(color="#3498db", size=6, opacity=0.75),
+        text=[p.name for p in paths_a],
+        hovertemplate="%{text}<br>d_A=%{x:.4f}, d_B=%{y:.4f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=d_b_to_a.tolist(), y=d_b_to_b.tolist(),
+        mode="markers", name=name_b,
+        marker=dict(color="#e74c3c", size=6, opacity=0.75),
+        text=[p.name for p in paths_b],
+        hovertemplate="%{text}<br>d_A=%{x:.4f}, d_B=%{y:.4f}<extra></extra>",
+    ))
+
+    # 閾值線本身不帶 annotation，改在軸上標示數值，避免與象限標籤重疊
+    fig.add_vline(x=thr_a, line_dash="dash", line_color="#555", line_width=1.2)
+    fig.add_hline(y=thr_b, line_dash="dash", line_color="#555", line_width=1.2)
+
+    fig.update_layout(
+        title=f"Coverage Gap Analysis — {name_a} (A) vs {name_b} (B)",
+        xaxis_title=f"d_A：到最近 {name_a} 樣本的距離（cosine）",
+        yaxis_title=f"d_B：到最近 {name_b} 樣本的距離（cosine）",
+        xaxis=dict(range=[0, x_max]),
+        yaxis=dict(range=[0, y_max]),
+        legend=dict(title="Group"),
+    )
+    return fig
 
 
 def build_projection_figure(
@@ -133,11 +335,13 @@ def build_projection_figure(
         for key, proj in projections.items()
     ]
     fig = go.Figure(data=traces)
+    if fid_score is not None:
+        subtitle = f"FID: {fid_score:.2f} | KID: {kid_score:.6f} | LPIPS: {lpips_score:.4f} | SSIM: {ssim_score:.4f}"
+        title_str = f"Distribution Comparison: {name_a} vs {name_b}<br><sub>{subtitle}</sub>"
+    else:
+        title_str = f"Distribution Comparison: {name_a} vs {name_b}"
     fig.update_layout(
-        title=(
-            f"Distribution Comparison: {name_a} vs {name_b}<br>"
-            f"<sub>FID: {fid_score:.2f} | KID: {kid_score:.6f} | LPIPS: {lpips_score:.4f} | SSIM: {ssim_score:.4f}</sub>"
-        ),
+        title=title_str,
         xaxis_title="Component 1",
         yaxis_title="Component 2",
         legend=dict(title="Group"),

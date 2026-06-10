@@ -28,6 +28,23 @@ def parse_label_file(label_path: Path, class_names: list[str]) -> str:
     return class_names[cid] if cid < len(class_names) else f"class_{cid}"
 
 
+def discover_images_classifier(folders: list[Path]) -> list[dict]:
+    """從分類資料集探索影像。
+    結構：folder/class_name/image.jpg，split 取自 folder 名稱。
+    回傳 list of {path, split, label}。
+    """
+    records = []
+    for folder in folders:
+        split = folder.name
+        for class_dir in sorted(d for d in folder.iterdir() if d.is_dir()):
+            label = class_dir.name
+            for img_path in sorted(
+                p for ext in ("*.jpg", "*.jpeg", "*.png") for p in class_dir.glob(ext)
+            ):
+                records.append({"path": img_path, "split": split, "label": label})
+    return records
+
+
 def discover_images(folders: list[Path], class_names: list[str]) -> list[dict]:
     """從指定資料夾列表探索影像（每個資料夾需含 images/ 和 labels/）。
     split 名稱取自資料夾名稱（e.g. train, test）。
