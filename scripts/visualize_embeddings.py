@@ -89,7 +89,8 @@ def build_plotly_figure(
     color_map = _label_color_map(unique_labels)
 
     first_model = model_names[0]
-    default_coords = embeddings_per_model[first_model]["pca"]
+    # not every run computes every projection — default to the first one present
+    default_coords = next(iter(embeddings_per_model[first_model].values()))
 
     traces: list[go.Scatter] = []
     trace_meta: list[dict] = []

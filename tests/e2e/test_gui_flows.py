@@ -1,0 +1,455 @@
+"""Playwright E2E flows for the two-column linked-view UI (run in file order).
+
+The module shares one browser page + one Streamlit session: the pipeline is
+Run once (cold, proving progress streaming) and the interaction features are
+exercised on the resulting state. Logic-level guarantees (sortedness, dedupe,
+csv columns, thumbnails...) live in tests/test_interaction.py; these tests
+prove the GUI wiring works end-to-end, including the UX-review acceptance
+criteria: zero-scroll linked view, selection persistence across views,
+default outlier grid with honest disclaimer, and export-list round trips.
+"""
+from __future__ import annotations
+
+import io
+import re
+import time
+import zipfile
+from pathlib import Path
+
+import pytest
+from playwright.sync_api import expect
+
+from .conftest import load_app, wait_idle
+
+pytestmark = pytest.mark.e2e
+
+expect.set_options(timeout=15000)
+
+
+@pytest.fixture(scope="module")
+def flow_page(app_server, browser, synthetic_dataset):
+    ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+    page = ctx.new_page()
+    page.set_default_timeout(20000)
+    load_app(page, app_server)
+    yield page
+    ctx.close()
+
+
+def _no_exception(page) -> None:
+    expect(page.locator('[data-testid="stException"]')).to_have_count(0)
+
+
+def _status_text(page) -> str:
+    return page.locator('.st-key-viz_status_line').inner_text()
+
+
+def _selected_count(page) -> int:
+    m = re.search(r"已選取 (\d+) 個點", _status_text(page))
+    return int(m.group(1)) if m else 0
+
+
+def _grid_imgs(page):
+    return page.locator('.st-key-viz_grid [data-testid="stImage"] img')
+
+
+def _switch_panel(page, label: str) -> None:
+    page.locator('.st-key-viz_panel_view').get_by_text(label, exact=True).click()
+    wait_idle(page)
+
+
+def _click_wait_status(page, css: str, timeout: int = 10000) -> None:
+    """Click a button whose effect shows up in the status line.
+
+    Fragment reruns can be fast enough that wait_idle alone races them —
+    explicitly wait for the status text to change before returning.
+    """
+    before = _status_text(page)
+    page.locator(css).click()
+    try:
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.st-key-viz_status_line');
+                return el && el.innerText !== prev;
+            }""",
+            arg=before, timeout=timeout,
+        )
+    except Exception:
+        pass
+    wait_idle(page)
+
+
+def _select_option(page, key: str, label: str) -> None:
+    page.locator(f'.st-key-{key} [data-baseweb="select"]').click()
+    page.get_by_role("option", name=label, exact=True).click()
+    wait_idle(page, timeout=60000)
+
+
+def _click_marker(page, group_idx: int, path_idx: int, shift: bool = False) -> None:
+    """Click the centre of one scatter marker (bbox re-queried fresh).
+
+    The click → rerun → status-line update is asynchronous; wait for the
+    status line to actually change before returning (clicking an already
+    selected point legitimately changes nothing — swallow that timeout).
+    """
+    before = _status_text(page)
+    groups = page.locator('.st-key-viz_scatter_wrap g.points')
+    g = groups.nth(min(group_idx, groups.count() - 1))
+    paths = g.locator('path')
+    p = paths.nth(min(path_idx, paths.count() - 1))
+    bb = p.bounding_box()
+    assert bb is not None
+    if shift:
+        page.keyboard.down("Shift")
+    page.mouse.click(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+    if shift:
+        page.keyboard.up("Shift")
+    try:
+        page.wait_for_function(
+            """(prev) => {
+                const el = document.querySelector('.st-key-viz_status_line');
+                return el && el.innerText !== prev;
+            }""",
+            arg=before, timeout=5000,
+        )
+    except Exception:
+        pass
+    wait_idle(page)
+
+
+# ── (a) cold load ───────────────────────────────────────────────────────
+
+def test_a_cold_load(flow_page):
+    expect(flow_page.get_by_text("Dataset Analysis Tools")).to_be_visible()
+    expect(flow_page.locator('[data-testid="stSidebar"]')).to_be_visible()
+    _no_exception(flow_page)
+
+
+# ── (b) run pipeline; prove streaming progress; scatter appears ────────
+
+def test_b_run_with_streaming_progress(flow_page, synthetic_dataset):
+    page = flow_page
+    page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
+    wait_idle(page)
+    page.locator('.st-key-viz_folder_text textarea').fill(str(synthetic_dataset))
+    page.locator('.st-key-run_viz button').click()
+
+    progress_texts: set[str] = set()
+    deadline = time.time() + 150
+    scatter_ready = False
+    while time.time() < deadline:
+        prog = page.locator('[data-testid="stProgress"]')
+        try:
+            if prog.count():
+                t = prog.first.inner_text(timeout=300).strip()
+                if t:
+                    progress_texts.add(t)
+        except Exception:
+            pass
+        if page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0:
+            scatter_ready = True
+            break
+        time.sleep(0.15)
+
+    assert scatter_ready, "scatter plot never appeared after Run"
+    assert len(progress_texts) >= 2, f"progress did not stream: {progress_texts}"
+    wait_idle(page, timeout=60000)
+    _no_exception(page)
+    expect(page.get_by_text(re.compile("自動偵測到 2 個類別"))).to_be_visible()
+
+
+# ── (c) zero-scroll linked view + default outlier grid ──────────────────
+
+def test_c_two_column_default_outlier_grid(flow_page):
+    page = flow_page
+    # acceptance: scatter and grid share the screen with no page scroll
+    assert page.evaluate(
+        "() => document.body.scrollHeight <= window.innerHeight + 1"
+    ), "page must not scroll: scatter and thumbnail wall share one screen"
+    # honest default: top-N by outlier-ness, explicitly NOT a quality verdict
+    status = _status_text(page)
+    assert "未選取" in status and "非品質判定" in status, status
+    expect(_grid_imgs(page)).to_have_count(24)  # min(50, n_records)
+    # viewer slot is present (empty placeholder state)
+    expect(page.locator('.st-key-viz_image_viewer')).to_be_visible()
+    _no_exception(page)
+
+
+# ── (d) click a point → selection feeds the grid, zero scroll ───────────
+
+def test_d_click_point_selects(flow_page):
+    page = flow_page
+    _click_marker(page, 0, 2)
+    assert _selected_count(page) == 1
+    expect(_grid_imgs(page)).to_have_count(1)
+    # acceptance: first thumbnail fully inside the viewport without scrolling
+    assert page.evaluate(
+        """() => {
+            const img = document.querySelector('.st-key-viz_grid img');
+            if (!img) return false;
+            const r = img.getBoundingClientRect();
+            return r.top >= 0 && r.bottom <= window.innerHeight;
+        }"""
+    ), "selected thumbnail must be visible without page scrolling"
+    _no_exception(page)
+
+
+# ── (e) card click → viewer slot swaps content ──────────────────────────
+
+def test_e_card_click_opens_viewer_slot(flow_page):
+    page = flow_page
+    # the grid also contains st.image fullscreen buttons — target the card
+    # button via its widget key class
+    page.locator('.st-key-viz_grid [class*="st-key-viz_card_"] button').first.click()
+    wait_idle(page)
+    viewer = page.locator('.st-key-viz_image_viewer')
+    img = viewer.locator('[data-testid="stImage"] img').first
+    expect(img).to_be_visible()
+    assert page.evaluate("el => el.naturalWidth", img.element_handle()) > 0
+    expect(viewer.get_by_text(re.compile(r"1/1"))).to_be_visible()
+    _no_exception(page)
+
+
+# ── (f) selection persists across model/method/split/dim views (W2) ─────
+
+def test_f_selection_persists_across_views(flow_page):
+    page = flow_page
+    n = _selected_count(page)
+    assert n >= 1
+    _select_option(page, "viz_method_select", "t-SNE")
+    assert _selected_count(page) == n, "selection must survive a method change"
+    _select_option(page, "viz_split_select", "train")
+    assert _selected_count(page) == n, "selection must survive a split change"
+    _select_option(page, "viz_split_select", "All")
+    _select_option(page, "viz_method_select", "PCA")
+    assert _selected_count(page) == n
+    _no_exception(page)
+
+
+# ── (g) find similar: panel switch, k results, chain re-query ───────────
+
+def test_g_find_similar(flow_page):
+    page = flow_page
+    page.locator('.st-key-viz_similar_btn button').click()
+    wait_idle(page)
+    panel = page.locator('.st-key-viz_similar_panel')
+    expect(panel).to_be_visible()
+    imgs = panel.locator('[data-testid="stImage"] img')
+    expect(imgs).to_have_count(9)  # default k = min(9, n-1)
+    # chain re-query: click ↻ on the first result → 2 chips
+    panel.get_by_text("↻ 以此為查詢").first.click()
+    expect(panel.locator('button:has-text("#")')).to_have_count(2)  # chain grew
+    wait_idle(page)
+    expect(panel.locator('[data-testid="stImage"] img')).to_have_count(9)
+    page.locator('.st-key-viz_similar_close button').click()
+    wait_idle(page)
+    _switch_panel(page, "選取")
+    _no_exception(page)
+
+
+# ── (h) shift-click accumulation (regression: fragment must not eat
+#         plotly selection state) ────────────────────────────────────────
+
+def test_h_multi_select(flow_page):
+    page = flow_page
+    chart = page.locator('.st-key-viz_scatter_wrap')
+    chart.scroll_into_view_if_needed()
+    drag = chart.locator('.nsewdrag').first
+    bb = drag.bounding_box()
+    page.mouse.dblclick(bb["x"] + bb["width"] * 0.5, bb["y"] + 5)
+    wait_idle(page)
+
+    _click_marker(page, 0, 2)
+    assert _selected_count(page) == 1, "first click should select exactly 1 point"
+    # plotly re-applies the restored selection asynchronously after the
+    # rerun re-mounts the chart; retry shift-clicks on new points.
+    selected = 1
+    for attempt in range(3):
+        _click_marker(page, 1, 2 + attempt, shift=True)
+        selected = _selected_count(page)
+        if selected >= 2:
+            break
+    assert selected >= 2, f"shift-click accumulated only {selected} points"
+    _no_exception(page)
+
+
+# ── (i) batch add → export list → CSV + ZIP round trip (W6) ─────────────
+
+def test_i_export_list_round_trip(flow_page):
+    page = flow_page
+    n_sel = _selected_count(page)
+    assert n_sel >= 2
+    page.locator('.st-key-viz_add_btn button').click()
+    wait_idle(page)
+    _switch_panel(page, "匯出清單")
+    expect(page.get_by_text(re.compile(rf"共 {n_sel} 張"))).to_be_visible()
+
+    with page.expect_download() as dl:
+        page.locator('.st-key-viz_export_csv button').click()
+    text = Path(dl.value.path()).read_text(encoding="utf-8")
+    lines = text.splitlines()
+    assert lines[0] == "index,filename,path,label,split"
+    assert len(lines) == 1 + n_sel, "CSV rows must equal export-list size"
+
+    with page.expect_download() as dl:
+        page.locator('.st-key-viz_export_zip button').click()
+    data = Path(dl.value.path()).read_bytes()
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    names = zf.namelist()
+    assert "manifest.csv" in names
+    assert sum(1 for x in names if x.startswith("images/")) == n_sel
+
+    _switch_panel(page, "選取")
+    _no_exception(page)
+
+
+# ── (j) 3D mode keeps the selection (was: invalidated) ──────────────────
+
+def test_j_3d_mode_preserves_selection(flow_page):
+    page = flow_page
+    n = _selected_count(page)
+    assert n >= 1
+    page.locator('.st-key-viz_dim_radio').get_by_text("3D").click()
+    wait_idle(page, timeout=30000)
+    expect(page.get_by_text(re.compile("切回 2D 後選取仍會保留"))).to_be_visible()
+    _no_exception(page)
+    page.locator('.st-key-viz_dim_radio').get_by_text("2D").click()
+    wait_idle(page, timeout=30000)
+    assert _selected_count(page) == n, "selection must survive a 2D↔3D round trip"
+    _no_exception(page)
+
+
+# ── (k) explicit clear → back to honest default grid ────────────────────
+
+def test_k_clear_selection(flow_page):
+    page = flow_page
+    assert _selected_count(page) >= 1
+    _click_wait_status(page, '.st-key-viz_clear_btn button')
+    status = _status_text(page)
+    assert "未選取" in status and "非品質判定" in status, status
+    expect(_grid_imgs(page)).to_have_count(24)
+    # one-way data flow: an unrelated full rerun must NOT resurrect the
+    # cleared selection from a stale widget event
+    page.locator('.st-key-viz_dim_radio').get_by_text("3D").click()
+    wait_idle(page, timeout=30000)
+    page.locator('.st-key-viz_dim_radio').get_by_text("2D").click()
+    wait_idle(page, timeout=30000)
+    assert "未選取" in _status_text(page), "cleared selection must stay cleared"
+    _no_exception(page)
+
+
+# ── (l) re-Run: selection resets, export list survives (data-token) ─────
+
+def test_l_rerun_resets_selection_keeps_export_list(flow_page):
+    page = flow_page
+    _click_marker(page, 0, 1)
+    assert _selected_count(page) >= 1
+    page.locator('.st-key-run_viz button').click()
+    # the warm re-Run can finish before wait_idle even sees the runner —
+    # wait directly for the reset status text instead
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('.st-key-viz_status_line');
+            return el && el.innerText.includes('未選取');
+        }""",
+        timeout=120000,
+    )
+    wait_idle(page, timeout=120000)
+    assert "未選取" in _status_text(page), "re-Run (new data token) must reset the selection"
+    # export list is keyed by image path — it survives a re-Run
+    _switch_panel(page, "匯出清單")
+    expect(page.get_by_text(re.compile(r"共 [1-9]\d* 張"))).to_be_visible()
+    assert page.locator('.st-key-viz_export_grid [data-testid="stImage"] img').count() >= 1
+    _switch_panel(page, "選取")
+    _no_exception(page)
+
+
+# ── (m) selection feedback latency (soft SLA: warm, 24 cards) ───────────
+
+def test_m_selection_latency(flow_page):
+    page = flow_page
+    timings = []
+    for path_idx in (1, 3, 5):
+        # clean slate so the click flips the status 未選取 → 已選取
+        if _selected_count(page) >= 1:
+            _click_wait_status(page, '.st-key-viz_clear_btn button')
+        groups = page.locator('.st-key-viz_scatter_wrap g.points')
+        p = groups.nth(0).locator('path').nth(path_idx)
+        bb = p.bounding_box()
+        t0 = time.perf_counter()
+        page.mouse.click(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+        page.wait_for_function(
+            """() => {
+                const el = document.querySelector('.st-key-viz_status_line');
+                return el && el.innerText.includes('已選取');
+            }""",
+            timeout=10000,
+        )
+        timings.append(time.perf_counter() - t0)
+        wait_idle(page)
+    timings.sort()
+    median = timings[len(timings) // 2]
+    assert median <= 2.5, f"selection→grid feedback too slow: median {median:.2f}s of {timings}"
+    _no_exception(page)
+
+
+# ── (n) error path: nonexistent folder → st.error, no traceback ─────────
+
+def test_n_invalid_folder_error(app_page):
+    page = app_page
+    page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
+    wait_idle(page)
+    page.locator('.st-key-viz_folder_text textarea').fill(r"C:\does\not\exist\nope")
+    page.locator('.st-key-run_viz button').click()
+    wait_idle(page, timeout=30000)
+    expect(page.get_by_text(re.compile("資料夾不存在"))).to_be_visible()
+    _no_exception(page)
+
+
+# ── (o) projection-method opt-out: only PCA runs, no t-SNE anywhere ─────
+
+def test_o_projection_method_skip(app_page, synthetic_dataset):
+    page = app_page
+    page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
+    wait_idle(page)
+    page.locator('.st-key-viz_folder_text textarea').fill(str(synthetic_dataset))
+    # drop t-SNE and UMAP from the 投影方法 multiselect. Each removal
+    # triggers a rerun that can swallow the next keypress — retry until
+    # only PCA's tag remains.
+    ms_input = page.locator('.st-key-viz_methods input')
+    tags = page.locator('.st-key-viz_methods span[data-baseweb="tag"]')
+    for _ in range(8):
+        if tags.count() <= 1:
+            break
+        ms_input.click()
+        page.keyboard.press("Backspace")
+        page.wait_for_timeout(400)
+        wait_idle(page)
+    page.keyboard.press("Escape")
+    expect(tags).to_have_count(1)
+    page.locator('.st-key-run_viz button').click()
+
+    progress_texts: set[str] = set()
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        prog = page.locator('[data-testid="stProgress"]')
+        try:
+            if prog.count():
+                t = prog.first.inner_text(timeout=300).strip()
+                if t:
+                    progress_texts.add(t)
+        except Exception:
+            pass
+        if page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0:
+            break
+        time.sleep(0.1)
+    wait_idle(page, timeout=60000)
+
+    assert not any("t-SNE" in t or "UMAP" in t for t in progress_texts), progress_texts
+    # Method dropdown offers only PCA
+    page.locator('.st-key-viz_method_select').click()
+    options = page.get_by_role("option")
+    expect(options).to_have_count(1)
+    expect(options.first).to_have_text("PCA")
+    page.keyboard.press("Escape")
+    _no_exception(page)

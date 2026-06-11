@@ -1,3 +1,7 @@
+[tool.pytest.ini_options]
+markers = ["e2e: browser end-to-end tests (slow, needs chromium)"]
+addopts = "-ra"
+
 [tool.black]
 line-length = 88
 target-version = ["py310"]
