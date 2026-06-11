@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VisualLatent — 資料引擎功能規劃討論</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2129;
+    --panel2: #222b35;
+    --border: #2e3a46;
+    --text: #d8e1ea;
+    --muted: #8aa0b4;
+    --accent: #4fc3f7;
+    --p0: #e74c3c;
+    --p1: #f39c12;
+    --p2: #2ecc71;
+    --p3: #9b59b6;
+    --done: #3498db;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", "Microsoft JhengHei", system-ui, sans-serif;
+    line-height: 1.65; padding: 32px 20px 80px;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 1.7rem; margin-bottom: 4px; }
+  h1 .sub { color: var(--muted); font-size: 1rem; font-weight: 400; display: block; margin-top: 4px; }
+  h2 { font-size: 1.25rem; margin: 44px 0 14px; padding-bottom: 8px; border-bottom: 2px solid var(--border); color: var(--accent); }
+  h3 { font-size: 1.02rem; }
+  p.lead { color: var(--muted); margin-top: 10px; max-width: 860px; }
+  .key-insight {
+    margin-top: 18px; padding: 14px 18px; border-left: 4px solid var(--accent);
+    background: var(--panel); border-radius: 0 8px 8px 0; max-width: 860px;
+  }
+  .key-insight b { color: var(--accent); }
+
+  /* ── 現況盤點 ── */
+  table.status { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  table.status th, table.status td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  table.status th { color: var(--muted); font-weight: 600; font-size: 0.85rem; }
+  .chip { display: inline-block; padding: 1px 10px; border-radius: 99px; font-size: 0.78rem; font-weight: 600; white-space: nowrap; }
+  .chip.have   { background: rgba(52,152,219,.18); color: #6ec1f5; border: 1px solid rgba(52,152,219,.5); }
+  .chip.half   { background: rgba(243,156,18,.15); color: #f5b95e; border: 1px solid rgba(243,156,18,.5); }
+  .chip.none   { background: rgba(231,76,60,.12); color: #ef8a7d; border: 1px solid rgba(231,76,60,.45); }
+
+  /* ── ROI 矩陣 ── */
+  .matrix-box { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start; }
+  .matrix {
+    position: relative; width: 560px; height: 420px; flex: none;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  }
+  .matrix .axis-y { position: absolute; left: -14px; top: 50%; transform: rotate(-90deg) translateX(50%); transform-origin: left; color: var(--muted); font-size: 0.8rem; letter-spacing: 2px; }
+  .matrix .axis-x { position: absolute; bottom: 6px; left: 50%; transform: translateX(-50%); color: var(--muted); font-size: 0.8rem; letter-spacing: 2px; }
+  .matrix .quad { position: absolute; color: var(--muted); font-size: 0.74rem; opacity: .65; }
+  .matrix .midv { position: absolute; left: 50%; top: 0; bottom: 0; border-left: 1px dashed var(--border); }
+  .matrix .midh { position: absolute; top: 50%; left: 0; right: 0; border-top: 1px dashed var(--border); }
+  .dot {
+    position: absolute; transform: translate(-50%, -50%);
+    padding: 4px 11px; border-radius: 99px; font-size: 0.8rem; font-weight: 600;
+    cursor: pointer; white-space: nowrap; border: 1.5px solid; transition: all .15s;
+  }
+  .dot:hover { transform: translate(-50%, -50%) scale(1.12); z-index: 5; }
+  .dot.p0 { background: rgba(231,76,60,.2);  border-color: var(--p0); color: #ff9d92; }
+  .dot.p1 { background: rgba(243,156,18,.18); border-color: var(--p1); color: #ffce7a; }
+  .dot.p2 { background: rgba(46,204,113,.15); border-color: var(--p2); color: #7fe5ab; }
+  .dot.p3 { background: rgba(155,89,182,.18); border-color: var(--p3); color: #cfa3e8; }
+  .legend { font-size: 0.85rem; color: var(--muted); flex: 1; min-width: 260px; }
+  .legend .row { margin-bottom: 10px; display: flex; gap: 10px; align-items: baseline; }
+  .legend .sw { width: 14px; height: 14px; border-radius: 4px; flex: none; position: relative; top: 2px; }
+
+  /* ── 功能卡片 ── */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(540px, 1fr)); gap: 16px; }
+  @media (max-width: 1180px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 20px; position: relative;
+  }
+  .card.p0 { border-left: 4px solid var(--p0); }
+  .card.p1 { border-left: 4px solid var(--p1); }
+  .card.p2 { border-left: 4px solid var(--p2); }
+  .card.p3 { border-left: 4px solid var(--p3); }
+  .card .head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  .badge { font-size: 0.72rem; font-weight: 700; padding: 2px 9px; border-radius: 5px; letter-spacing: .5px; }
+  .badge.p0 { background: var(--p0); color: #fff; }
+  .badge.p1 { background: var(--p1); color: #fff; }
+  .badge.p2 { background: var(--p2); color: #08351c; }
+  .badge.p3 { background: var(--p3); color: #fff; }
+  .meta { font-size: 0.78rem; color: var(--muted); }
+  .card p { font-size: 0.9rem; margin: 6px 0; }
+  .card .why  b, .card .how b { color: var(--accent); font-size: 0.84rem; }
+  .card .dep { font-size: 0.8rem; color: var(--muted); margin-top: 8px; }
+  details { margin-top: 8px; }
+  details summary { cursor: pointer; color: var(--accent); font-size: 0.85rem; user-select: none; }
+  details[open] summary { margin-bottom: 6px; }
+  details .inner { font-size: 0.86rem; color: var(--text); background: var(--panel2); padding: 10px 14px; border-radius: 8px; }
+  details .inner code { background: #0d1318; padding: 1px 6px; border-radius: 4px; font-size: 0.82rem; color: #8fd3f4; }
+
+  /* ── 討論控制 ── */
+  .vote { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .vote .opts { display: flex; gap: 4px; }
+  .vote button {
+    background: var(--panel2); color: var(--muted); border: 1px solid var(--border);
+    padding: 4px 13px; border-radius: 6px; cursor: pointer; font-size: 0.82rem; font-family: inherit;
+  }
+  .vote button.sel-yes   { background: rgba(46,204,113,.25); color: #7fe5ab; border-color: var(--p2); }
+  .vote button.sel-maybe { background: rgba(243,156,18,.22); color: #ffce7a; border-color: var(--p1); }
+  .vote button.sel-no    { background: rgba(231,76,60,.2);   color: #ff9d92; border-color: var(--p0); }
+  .vote input[type=text] {
+    flex: 1; min-width: 180px; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; color: var(--text); font-size: 0.84rem; font-family: inherit;
+  }
+  .vote input[type=text]:focus { outline: none; border-color: var(--accent); }
+
+  /* ── 路線圖 ── */
+  .phases { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .phase { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .phase h3 { margin-bottom: 8px; }
+  .phase ul { margin-left: 18px; font-size: 0.87rem; }
+  .phase li { margin: 4px 0; }
+  .phase .tag { font-size: 0.74rem; color: var(--muted); }
+
+  /* ── 匯出列 ── */
+  .exportbar {
+    position: fixed; bottom: 0; left: 0; right: 0; background: rgba(15,20,25,.95);
+    border-top: 1px solid var(--border); padding: 12px 20px; display: flex; gap: 14px;
+    align-items: center; justify-content: center; backdrop-filter: blur(6px); z-index: 50;
+  }
+  .exportbar button {
+    background: var(--accent); color: #06222e; font-weight: 700; border: none;
+    padding: 9px 22px; border-radius: 8px; cursor: pointer; font-size: 0.92rem; font-family: inherit;
+  }
+  .exportbar button:hover { filter: brightness(1.12); }
+  .exportbar .hint { color: var(--muted); font-size: 0.82rem; }
+  #toast {
+    position: fixed; bottom: 70px; left: 50%; transform: translateX(-50%);
+    background: var(--p2); color: #08351c; font-weight: 700; padding: 8px 22px;
+    border-radius: 8px; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 60;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>VisualLatent → 資料引擎
+    <span class="sub">功能規劃討論文件 · 2026-06-12 · 由現有程式碼盤點 + 資料引擎策略文整理</span>
+  </h1>
+
+  <div class="key-insight">
+    <b>核心洞察:</b>文章說策展的第一步是「一次性投資 embedding 基礎建設」——
+    這層 VisualLatent <b>已經做了一半</b>(embedding 抽取 + 快取 + UMAP 視覺化 + 覆蓋缺口分析)。
+    所以最高 ROI 的路線不是引入新平台,而是<b>把既有的 embedding 快取升級成可查詢的策展底座</b>:
+    定 manifest 合約 → 加向量索引 → 在現有散點圖上長出「看圖、搜圖、去重、稽核」。
+  </div>
+
+  <!-- ════════════ 現況盤點 ════════════ -->
+  <h2>① 現況盤點 — 文章功能 vs. 專案現狀</h2>
+  <table class="status">
+    <tr><th>資料引擎環節</th><th>文章建議工具</th><th>VisualLatent 現狀</th><th>狀態</th></tr>
+    <tr>
+      <td>Embedding 基礎建設</td><td>CLIP / DINOv2 + FAISS</td>
+      <td>ResNet / DINOv2 抽取 ✓,<code>embeddings.npz</code> 逐資料夾快取 ✓;<b>無向量索引、無法查詢</b></td>
+      <td><span class="chip half">一半</span></td>
+    </tr>
+    <tr>
+      <td>分布視覺化</td><td>UMAP 投影上色</td>
+      <td>PCA / t-SNE / UMAP,2D/3D,按 class+split 上色,可匯出 HTML</td>
+      <td><span class="chip have">已有</span></td>
+    </tr>
+    <tr>
+      <td>分布比較 / 缺口分析</td><td>—(文章未提,是本專案特色)</td>
+      <td>FID / KID / LPIPS / SSIM / PSNR / IS;Coverage Gap(雙向最近鄰距離 → 盲點/重疊)</td>
+      <td><span class="chip have">已有</span></td>
+    </tr>
+    <tr>
+      <td>Manifest(資料合約)</td><td><b>「只能先做一件事就做這個」</b></td>
+      <td>無。標籤散落在 YOLO txt / 資料夾名,快取 npz 無 hash、無 lineage</td>
+      <td><span class="chip none">缺</span></td>
+    </tr>
+    <tr>
+      <td>相似搜尋 / 以文搜圖</td><td>FAISS / Qdrant + CLIP</td>
+      <td>無(embedding 已在手,只差索引層)</td>
+      <td><span class="chip none">缺</span></td>
+    </tr>
+    <tr>
+      <td>去重 / 洩漏檢查</td><td>pHash + embedding 距離</td>
+      <td>無(但 Coverage Gap 已有跨群最近鄰距離計算,可直接改造)</td>
+      <td><span class="chip none">缺</span></td>
+    </tr>
+    <tr>
+      <td>標籤品質稽核</td><td>Cleanlab / mistakenness</td>
+      <td>無(embedding + label 都已載入,差排序邏輯)</td>
+      <td><span class="chip none">缺</span></td>
+    </tr>
+    <tr>
+      <td>主動學習 / 選樣</td><td>Lightly / coreset</td>
+      <td>無</td>
+      <td><span class="chip none">缺</span></td>
+    </tr>
+    <tr>
+      <td>資料版本控制</td><td>DVC / lakeFS</td>
+      <td>無(與工具正交,manifest 定好後即可外掛)</td>
+      <td><span class="chip none">缺</span></td>
+    </tr>
+    <tr>
+      <td>標註工作流 / 預標註</td><td>CVAT / Label Studio</td>
+      <td>無(可先用「匯出待標清單」低成本對接)</td>
+      <td><span class="chip none">缺</span></td>
+    </tr>
+  </table>
+
+  <!-- ════════════ ROI 矩陣 ════════════ -->
+  <h2>② 價值 × 工作量矩陣</h2>
+  <div class="matrix-box">
+    <div class="matrix">
+      <div class="midv"></div><div class="midh"></div>
+      <div class="axis-y">價值 →</div>
+      <div class="axis-x">工作量 →</div>
+      <div class="quad" style="left:12px; top:8px;">高價值・低工作量(先做)</div>
+      <div class="quad" style="right:12px; top:8px;">高價值・高工作量(規劃做)</div>
+      <div class="quad" style="left:12px; bottom:26px;">順手做</div>
+      <div class="quad" style="right:12px; bottom:26px;">最後做</div>
+      <div class="dot p0" style="left:14%; top:14%;" title="F1">F1 Manifest</div>
+      <div class="dot p0" style="left:21%; top:26%;" title="F2">F2 點圖看圖</div>
+      <div class="dot p0" style="left:36%; top:18%;" title="F3">F3 相似搜尋</div>
+      <div class="dot p1" style="left:46%; top:24%;" title="F4">F4 去重/洩漏</div>
+      <div class="dot p1" style="left:52%; top:34%;" title="F5">F5 標籤稽核</div>
+      <div class="dot p2" style="left:58%; top:44%;" title="F6">F6 選樣</div>
+      <div class="dot p2" style="left:68%; top:36%;" title="F7">F7 CLIP 文搜</div>
+      <div class="dot p2" style="left:30%; top:58%;" title="F8">F8 DVC</div>
+      <div class="dot p3" style="left:84%; top:30%;" title="F9">F9 標註整合</div>
+    </div>
+    <div class="legend">
+      <div class="row"><span class="sw" style="background:var(--p0)"></span><span><b>P0 — 立刻做(1–2 週)</b>:全部站在既有 embedding 快取上,投入小、解鎖大。</span></div>
+      <div class="row"><span class="sw" style="background:var(--p1)"></span><span><b>P1 — 接著做</b>:直接保護「驗證指標可信度」,文章說修錯標常比加資料更有效。</span></div>
+      <div class="row"><span class="sw" style="background:var(--p2)"></span><span><b>P2 — 規劃做</b>:價值高但各有依賴(新模型權重 / 流程接口)。</span></div>
+      <div class="row"><span class="sw" style="background:var(--p3)"></span><span><b>P3 — 等規模到了再做</b>:工作量重,先用「匯出清單」低成本替代。</span></div>
+    </div>
+  </div>
+
+  <!-- ════════════ 功能卡片 ════════════ -->
+  <h2>③ 功能提案 — 點選你的立場、留下意見,最後按底部「匯出討論結果」貼回給我</h2>
+  <div class="cards">
+
+    <div class="card p0" data-fid="F1" data-title="Manifest 資料合約">
+      <div class="head"><span class="badge p0">P0</span><h3>F1 · Manifest 資料合約</h3>
+        <span class="meta">工作量:小(2–3 天) · 價值:極高</span></div>
+      <p class="why"><b>為什麼:</b>文章明說「只能先做一件事,就把 manifest 格式定下來」。目前標籤散在 YOLO txt、快取 npz 沒有 hash 與來源資訊——之後的去重、lineage、迴歸測試、難例回流全都掛在這份清單上,越晚定改動成本越高。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        每個資料集根目錄一份 <code>manifest.jsonl</code>,每列一張圖:<code>{path, sha256, phash, split, labels[], source, captured_at, embedding_ref}</code>。
+        <code>_utils.extract_embeddings()</code> 寫快取時同步寫入/更新 manifest;app 載入時優先讀 manifest,YOLO txt 退為匯入來源。後續所有功能(F3–F9)都以 manifest 為唯一入口。
+      </div></details>
+      <div class="dep">依賴:無 · 解鎖:F3 F4 F8 F9 全部</div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p0" data-fid="F2" data-title="點圖看圖(縮圖預覽)">
+      <div class="head"><span class="badge p0">P0</span><h3>F2 · 點圖看圖 — 散點圖縮圖預覽</h3>
+        <span class="meta">工作量:小(1–2 天) · 價值:極高</span></div>
+      <p class="why"><b>為什麼:</b>策展工具的靈魂是「看到圖」。現在 hover 只顯示檔名,找 edge case、看離群點等於瞎子摸象。這是把現有 UMAP 圖從「報表」變成「策展介面」的最小一步,也是 FiftyOne 最被依賴的互動。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        Plotly <code>on_select</code> / lasso 圈選 → Streamlit 下方 grid 顯示縮圖(st.image);點縮圖看大圖 + label + 路徑。
+        順手加「把圈選結果匯出成清單」——這就是之後難例回流和送標的出口。
+      </div></details>
+      <div class="dep">依賴:無 · 解鎖:人工 edge-case 巡檢、F4/F5 的複核介面</div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p0" data-fid="F3" data-title="相似搜尋(以圖搜圖)">
+      <div class="head"><span class="badge p0">P0</span><h3>F3 · 相似搜尋 — 以圖搜圖</h3>
+        <span class="meta">工作量:中小(2–4 天) · 價值:極高</span></div>
+      <p class="why"><b>為什麼:</b>embedding 已經算好躺在快取裡,只差一層索引就能查詢。找到一個 edge case 後「撈出全庫長得像的」是難例擴散的核心動作;去重(F4)和選樣(F6)也都複用同一層索引。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        資料量 &lt; 10 萬張:<code>sklearn.NearestNeighbors</code>(cosine)就夠,零新依賴;更大再上 FAISS。
+        UI:在 F2 的縮圖上加「找相似」按鈕 → 顯示 top-k + 距離;支援跨資料夾查詢(用既有多資料夾載入)。
+      </div></details>
+      <div class="dep">依賴:F2(介面) · 解鎖:F4 F6 難例回流</div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p1" data-fid="F4" data-title="去重 + train/val 洩漏檢查">
+      <div class="head"><span class="badge p1">P1</span><h3>F4 · 去重 + Train/Val 洩漏檢查</h3>
+        <span class="meta">工作量:中(3–5 天) · 價值:高</span></div>
+      <p class="why"><b>為什麼:</b>重複資料讓驗證指標虛高、上線才現形——這是文章點名的隱形殺手。Compare Distributions 的 Coverage Gap 已經在算跨群最近鄰距離,左下角(兩距離皆小)其實就是洩漏候選,改造成本低。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        兩層:<code>pHash</code>(imagehash,抓近重複)+ embedding cosine 距離閾值(抓語意重複)。
+        新增「Dedup / Leakage」分頁:選 train 與 val 資料夾 → 列出疑似重複 pair 縮圖對照 → 一鍵產生排除清單寫回 manifest。
+      </div></details>
+      <div class="dep">依賴:F1(manifest 記 phash)、F3(索引) </div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p1" data-fid="F5" data-title="標籤品質稽核">
+      <div class="head"><span class="badge p1">P1</span><h3>F5 · 標籤品質稽核(mistakenness)</h3>
+        <span class="meta">工作量:中(3–5 天) · 價值:高</span></div>
+      <p class="why"><b>為什麼:</b>「修錯標經常比加新資料對指標更有效」。embedding 和 label 都已經在手上,只差排序邏輯——這是現有資產轉化率最高的功能之一。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        先做零依賴版:kNN label disagreement(一張圖的 k 近鄰多數標籤 ≠ 自身標籤 → 可疑),按可疑度排序送 F2 的縮圖介面人工複核。
+        進階再接 <code>cleanlab</code>(需要模型預測機率,classifier mode 已有資料夾結構可訓 probe)。
+      </div></details>
+      <div class="dep">依賴:F2(複核介面)、F3(kNN)</div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p2" data-fid="F6" data-title="多樣性選樣 / 主動學習">
+      <div class="head"><span class="badge p2">P2</span><h3>F6 · 多樣性選樣 / 主動學習</h3>
+        <span class="meta">工作量:中(1 週) · 價值:中高</span></div>
+      <p class="why"><b>為什麼:</b>「未標資料海量、標註預算有限」時,讓 embedding 替你挑最值得標的 N 張,而不是盲目全標。對應 Lightly 的核心價值,但用現有快取自己做 coreset 成本不高。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        k-center greedy / farthest-point sampling 在 embedding 空間選多樣性子集;若有模型預測,加 uncertainty(低信心優先)混合排序。
+        輸出:待標清單(路徑 + 縮圖預覽),直接餵給 CVAT / Label Studio 的匯入格式。
+      </div></details>
+      <div class="dep">依賴:F1 F3 · 觸發時機:未標池大到人工看不完時</div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p2" data-fid="F7" data-title="CLIP 以文搜圖">
+      <div class="head"><span class="badge p2">P2</span><h3>F7 · CLIP 以文搜圖</h3>
+        <span class="meta">工作量:中高(1 週) · 價值:中高</span></div>
+      <p class="why"><b>為什麼:</b>用文字 query(「夜間反光」「部分遮擋的工件」)從未標池撈特定情境,是找訓練資料缺口最直覺的方式。但需要引入 CLIP 模型 + 對全庫重算一份 CLIP embedding,是 P0–P1 之外的新投資。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        維持全離線原則:<code>open_clip</code> 本地權重(ViT-B/32 約 600MB),放進現有 <code>models/</code> 機制。
+        中文 query 可選 multilingual CLIP 或先翻譯。CLIP embedding 與既有模型 embedding 並存於快取(各自一個 <code>embeddings_clip/</code>)。
+      </div></details>
+      <div class="dep">依賴:F1 F3 + 新模型權重 · 注意:離線部署需預先放權重</div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p2" data-fid="F8" data-title="DVC 資料版本控制">
+      <div class="head"><span class="badge p2">P2</span><h3>F8 · 資料版本控制(DVC)</h3>
+        <span class="meta">工作量:小(設定為主) · 價值:中</span></div>
+      <p class="why"><b>為什麼:</b>讓 dataset 像 code 一樣 diff / tag / 回滾。與本工具正交——manifest(F1)定好之後,DVC 追蹤 manifest + 影像目錄即可,幾乎不用寫程式。價值在流程紀律,不在功能。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        <code>dvc init</code> + <code>dvc add dataset/</code>,remote 指向 NAS 或雲端;manifest.jsonl 進 git,影像進 DVC cache。
+        每次資料集變更 = 一個 git commit,訓練 run 記錄對應 commit hash 即得 lineage。
+      </div></details>
+      <div class="dep">依賴:F1 · 性質:流程導入,非工具開發</div>
+      <div class="vote"></div>
+    </div>
+
+    <div class="card p3" data-fid="F9" data-title="標註工具整合 + 預標註">
+      <div class="head"><span class="badge p3">P3</span><h3>F9 · 標註工具整合 + 預標註</h3>
+        <span class="meta">工作量:大(2 週+) · 價值:高(但可延後)</span></div>
+      <p class="why"><b>為什麼:</b>預標註能省一半以上標註人力,是文章認證的關鍵。但完整整合 CVAT / Label Studio(API 對接、任務派發、品質稽核迴圈)工作量重。前期可用低成本替代:F2/F6 匯出清單 + 模型預測轉成 Label Studio 預標 JSON,人工匯入。</p>
+      <details><summary>怎麼做</summary><div class="inner">
+        階段一(便宜):匯出待標清單 + YOLO 預測 → Label Studio import 格式轉換腳本。
+        階段二(完整):Label Studio API 自動建任務、收回標註寫回 manifest、標註品質抽查(雙標一致率)。
+      </div></details>
+      <div class="dep">依賴:F1 F6 + 標註團隊流程 · 觸發時機:標註量產化之後</div>
+      <div class="vote"></div>
+    </div>
+
+  </div>
+
+  <!-- ════════════ 路線圖 ════════════ -->
+  <h2>④ 建議路線圖(最小可行組合)</h2>
+  <div class="phases">
+    <div class="phase">
+      <h3 style="color:var(--p0)">Phase 1 · 策展底座</h3>
+      <div class="tag">約 1–2 週,全站在現有快取上</div>
+      <ul><li>F1 Manifest 合約</li><li>F2 點圖看圖</li><li>F3 相似搜尋</li></ul>
+    </div>
+    <div class="phase">
+      <h3 style="color:var(--p1)">Phase 2 · 指標可信度</h3>
+      <div class="tag">約 1–2 週</div>
+      <ul><li>F4 去重 / 洩漏檢查</li><li>F5 標籤品質稽核</li></ul>
+    </div>
+    <div class="phase">
+      <h3 style="color:var(--p2)">Phase 3 · 主動策展</h3>
+      <div class="tag">未標池變大後</div>
+      <ul><li>F6 多樣性選樣</li><li>F7 CLIP 以文搜圖</li><li>F8 DVC 流程導入</li></ul>
+    </div>
+    <div class="phase">
+      <h3 style="color:var(--p3)">Phase 4 · 標註量產</h3>
+      <div class="tag">團隊 / 標註規模到位後</div>
+      <ul><li>F9 預標註 + CVAT / Label Studio 完整整合</li></ul>
+    </div>
+  </div>
+
+  <h2>⑤ 留給討論的開放問題</h2>
+  <div class="key-insight" style="border-color:var(--p1)">
+    <ol style="margin-left:18px;">
+      <li style="margin:6px 0;"><b>資料規模?</b>目前/預期的影像總量與未標池大小,決定 F3 用 sklearn 還是 FAISS、F6 何時觸發。</li>
+      <li style="margin:6px 0;"><b>任務型態?</b>偵測(YOLO)為主還是分類為主?影響 F5 稽核演算法與 F9 預標格式。</li>
+      <li style="margin:6px 0;"><b>離線限制是硬需求嗎?</b>是 → F7 的 CLIP 權重要預先佈署;否 → 選項更多。</li>
+      <li style="margin:6px 0;"><b>誰在用?</b>只有你一人 → Streamlit 夠用;多人協作 → 才需要考慮 FiftyOne / 商用平台。</li>
+    </ol>
+  </div>
+
+</div>
+
+<div class="exportbar">
+  <button onclick="exportResult()">📋 匯出討論結果(複製到剪貼簿)</button>
+  <span class="hint">勾選每張卡片的立場 + 備註後匯出,貼回對話即可繼續討論。意見會自動存在瀏覽器。</span>
+</div>
+<div id="toast">已複製!貼回 Claude 對話即可</div>
+
+<script>
+const STORE_KEY = 'vl-feature-discussion-v1';
+const state = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+
+document.querySelectorAll('.card').forEach(card => {
+  const fid = card.dataset.fid;
+  const vote = card.querySelector('.vote');
+  const opts = document.createElement('div');
+  opts.className = 'opts';
+  const labels = [['yes','✅ 要做'],['maybe','🤔 再議'],['no','❌ 不做']];
+  labels.forEach(([val, text]) => {
+    const b = document.createElement('button');
+    b.textContent = text;
+    b.onclick = () => {
+      state[fid] = state[fid] || {};
+      state[fid].stance = (state[fid].stance === val) ? null : val;
+      save(); render(card);
+    };
+    b.dataset.val = val;
+    opts.appendChild(b);
+  });
+  const note = document.createElement('input');
+  note.type = 'text';
+  note.placeholder = '備註 / 疑問…';
+  note.oninput = () => { state[fid] = state[fid] || {}; state[fid].note = note.value; save(); };
+  vote.appendChild(opts);
+  vote.appendChild(note);
+  render(card);
+});
+
+function render(card) {
+  const fid = card.dataset.fid, s = state[fid] || {};
+  card.querySelectorAll('.opts button').forEach(b => {
+    b.className = (s.stance === b.dataset.val) ? 'sel-' + b.dataset.val : '';
+  });
+  const note = card.querySelector('input[type=text]');
+  if (note.value !== (s.note || '')) note.value = s.note || '';
+}
+
+function save() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
+
+function exportResult() {
+  const stanceTxt = { yes: '✅ 要做', maybe: '🤔 再議', no: '❌ 不做' };
+  let md = '## VisualLatent 功能討論結果 (' + new Date().toISOString().slice(0,10) + ')\n\n';
+  md += '| 功能 | 立場 | 備註 |\n|---|---|---|\n';
+  document.querySelectorAll('.card').forEach(card => {
+    const fid = card.dataset.fid, title = card.dataset.title, s = state[fid] || {};
+    md += `| ${fid} ${title} | ${stanceTxt[s.stance] || '（未選）'} | ${s.note || ''} |\n`;
+  });
+  navigator.clipboard.writeText(md).then(() => {
+    const t = document.getElementById('toast');
+    t.style.opacity = 1;
+    setTimeout(() => t.style.opacity = 0, 2200);
+  });
+}
+</script>
+</body>
+</html>
