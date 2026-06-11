@@ -28,3 +28,8 @@ goal/
 
 # Embedding caches (regenerated on first run)
 **/embeddings_*/
+# Local data & generated artifacts (not for version control)
+datasets/
+demo/
+streamlit_log.txt
+**/.thumbs/
