@@ -47,32 +47,69 @@ def load_model(
     return embed_fn
 
 
+def _cache_rows_for_keys(data, cache_keys: list[str]) -> np.ndarray | None:
+    """Match a loaded cache against per-image content keys → row order.
+
+    Returns the reordered embeddings, or None on any mismatch (treated as
+    a cache miss). Duplicate keys (byte-identical images) can't be mapped
+    by set — they only hit when the full key sequence matches exactly.
+    """
+    if "keys" not in data.files:
+        return None  # legacy filename-validated cache → stale by definition
+    cached = data["keys"].tolist()
+    if cached == cache_keys:
+        return data["embeddings"]
+    if len(set(cached)) != len(cached) or len(set(cache_keys)) != len(cache_keys):
+        return None
+    if set(cached) != set(cache_keys):
+        return None
+    key_to_idx = {k: i for i, k in enumerate(cached)}
+    return data["embeddings"][[key_to_idx[k] for k in cache_keys]]
+
+
 def extract_embeddings(
     image_paths: list[Path],
     embed_fn: Callable[[Path], np.ndarray],
     cache_path: Path | None = None,
     progress_cb: Callable[[int, int], None] | None = None,
+    cache_keys: list[str] | None = None,
 ) -> np.ndarray:
     """Extract embeddings for all images. Returns shape (N, D).
 
-    If cache_path is given, loads from cache when filenames match;
+    If cache_path is given, loads from cache when the images match;
     otherwise extracts and saves to cache_path.
+
+    cache_keys, when given, are per-image CONTENT keys (e.g. the manifest's
+    sha256) used to validate and reorder the cache instead of bare
+    filenames — a changed file with an unchanged name can then never serve
+    stale embeddings. Caches written before keys existed are treated as
+    stale when keys are provided. Without cache_keys the legacy
+    filename-set validation applies (back-compat for CLI callers).
 
     progress_cb, when given, is called as progress_cb(done, total) after
     each image; on a cache hit it is called exactly once with (total, total).
     """
     n_total = len(image_paths)
+    if cache_keys is not None and len(cache_keys) != n_total:
+        raise ValueError(
+            f"cache_keys length {len(cache_keys)} != image count {n_total}")
     if cache_path is not None and cache_path.exists():
         data = np.load(str(cache_path), allow_pickle=False)
-        cached_names = data["filenames"].tolist()
-        current_names = [p.name for p in image_paths]
-        if set(cached_names) == set(current_names):
+        cached_rows = None
+        if cache_keys is not None:
+            cached_rows = _cache_rows_for_keys(data, cache_keys)
+        else:
+            cached_names = data["filenames"].tolist()
+            current_names = [p.name for p in image_paths]
+            if set(cached_names) == set(current_names):
+                name_to_idx = {name: i for i, name in enumerate(cached_names)}
+                cached_rows = data["embeddings"][[name_to_idx[p.name]
+                                                  for p in image_paths]]
+        if cached_rows is not None:
             print(f"  [cache] {cache_path}")
             if progress_cb is not None:
                 progress_cb(n_total, n_total)
-            name_to_idx = {name: i for i, name in enumerate(cached_names)}
-            indices = [name_to_idx[p.name] for p in image_paths]
-            return data["embeddings"][indices]
+            return cached_rows
 
     emb_list = []
     for i, p in enumerate(tqdm(image_paths, desc="Extracting embeddings")):
@@ -83,11 +120,13 @@ def extract_embeddings(
 
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez(
-            str(cache_path),
+        arrays = dict(
             embeddings=embeddings,
             filenames=np.array([p.name for p in image_paths]),
         )
+        if cache_keys is not None:
+            arrays["keys"] = np.array(cache_keys)
+        np.savez(str(cache_path), **arrays)
         print(f"  [cache] Saved → {cache_path}")
 
     return embeddings

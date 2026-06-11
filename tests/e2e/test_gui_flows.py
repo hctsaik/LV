@@ -157,6 +157,19 @@ def test_b_run_with_streaming_progress(flow_page, synthetic_dataset):
     _no_exception(page)
     expect(page.get_by_text(re.compile("自動偵測到 2 個類別"))).to_be_visible()
 
+    # F1 data contract: Run writes/updates manifest.jsonl in the dataset
+    # folder — one line per image, content-hashed, with embedding refs
+    import json
+    mpath = synthetic_dataset / "manifest.jsonl"
+    assert mpath.exists(), "Run must write manifest.jsonl"
+    entries = [json.loads(ln) for ln in
+               mpath.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(entries) == 24
+    for e in entries[:3]:
+        assert len(e["sha256"]) == 64
+        assert e["embedding_refs"], "embedding_refs must be filled after Run"
+        assert e["labels"] and e["split"] == "train"
+
 
 # ── (c) zero-scroll linked view + default outlier grid ──────────────────
 
@@ -288,8 +301,11 @@ def test_i_export_list_round_trip(flow_page):
         page.locator('.st-key-viz_export_csv button').click()
     text = Path(dl.value.path()).read_text(encoding="utf-8")
     lines = text.splitlines()
-    assert lines[0] == "index,filename,path,label,split"
+    assert lines[0] == "index,filename,path,label,split,sha256"
     assert len(lines) == 1 + n_sel, "CSV rows must equal export-list size"
+    for row in lines[1:]:
+        sha = row.rsplit(",", 1)[1]
+        assert len(sha) == 64, "exported rows must be content-addressed (manifest sha256)"
 
     with page.expect_download() as dl:
         page.locator('.st-key-viz_export_zip button').click()

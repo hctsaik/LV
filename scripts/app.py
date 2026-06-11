@@ -29,10 +29,13 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     parse_folder_paths,
     records_to_csv,
     selection_points_to_indices,
+    snapshots_to_csv,
     spatial_order,
+    thumbnail_path_for,
     yolo_label_path_for,
     zip_selected_images,
 )
+from manifest import rel_key, set_embedding_refs, update_manifest, write_manifest
 from compare_distributions import (
     build_projection_figure,
     compute_fid,
@@ -286,8 +289,10 @@ def _load_more() -> None:
 def _export_entry(records: list[dict], i: int) -> dict:
     r = records[i]
     p = Path(r["path"])
+    man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
     return {"index": i, "filename": p.name, "path": str(p),
-            "label": r.get("label", ""), "split": r.get("split", "")}
+            "label": r.get("label", ""), "split": r.get("split", ""),
+            "sha256": man.get("sha256") if man else None}
 
 
 def _add_to_export(records: list[dict], indices: list[int]) -> tuple[int, int]:
@@ -571,7 +576,7 @@ def _render_export_view() -> None:
     d1, d2 = st.columns(2)
     d1.download_button(
         "⬇ 匯出 CSV",
-        data=records_to_csv(pseudo_records, list(range(len(pseudo_records)))),
+        data=snapshots_to_csv(snapshots),
         file_name="selection.csv", mime="text/csv",
         key="viz_export_csv", use_container_width=True,
     )
@@ -632,7 +637,7 @@ def _visualize_embeddings_ui() -> None:
                       "viz_data_token", "viz_nn_index", "viz_class_names",
                       "viz_selection", "viz_active_image", "viz_viewer_ctx",
                       "viz_query_chain", "viz_outlier_scores", "viz_grid_limit",
-                      "viz_export_list", "viz_panel_view"):
+                      "viz_export_list", "viz_panel_view", "viz_manifest"):
                 st.session_state.pop(k, None)
             st.session_state["viz_folder_list"] = []
 
@@ -759,9 +764,17 @@ def _visualize_embeddings_ui() -> None:
         if empty_folders:
             st.warning(f"No images found in folder(s): {', '.join(empty_folders)}")
 
+        def _thumb_lookup(p: Path) -> Path | None:
+            try:
+                t = thumbnail_path_for(p)
+                return t if t.exists() else None
+            except OSError:
+                return None
+
         embeddings_per_model: dict[str, dict[str, np.ndarray]] = {}
         raw_per_model: dict[str, np.ndarray] = {}
-        _n_steps = 1 + len(selected_models) * (1 + len(method_pairs))
+        manifest_by_folder: dict[Path, dict[str, dict]] = {}
+        _n_steps = 2 + len(selected_models) * (1 + len(method_pairs))
         _step = 0
         with st.status("計算中…", expanded=True) as _status:
             _bar = st.progress(0.0, text="縮圖快取…")
@@ -773,6 +786,27 @@ def _visualize_embeddings_ui() -> None:
             ensure_thumbnails([r["path"] for r in records], progress_cb=_thumb_cb)
             _step += 1
             _bar.progress(_step / _n_steps, text="縮圖快取完成")
+
+            # Manifest（F1 資料合約）：增量更新，未變更的檔案不重算 hash
+            _m_done, _m_total = 0, len(records)
+            for folder in folders:
+                folder_records = [r for r in records if r["split"] == folder.name]
+                if not folder_records:
+                    continue
+
+                def _mcb(done: int, total: int, _base=_m_done) -> None:
+                    _bar.progress(
+                        min((_step + (_base + done) / max(_m_total, 1)) / _n_steps, 1.0),
+                        text=f"Manifest 更新 {_base + done}/{_m_total}",
+                    )
+
+                manifest_by_folder[folder] = update_manifest(
+                    folder, folder_records,
+                    thumb_lookup=_thumb_lookup, progress_cb=_mcb,
+                )
+                _m_done += len(folder_records)
+            _step += 1
+            _bar.progress(_step / _n_steps, text="Manifest 更新完成")
 
             for model_name in selected_models:
                 embed_fn = load_model(model_name)
@@ -787,10 +821,15 @@ def _visualize_embeddings_ui() -> None:
                                 min((_s + done / max(total, 1)) / _n_steps, 1.0),
                                 text=f"[{_m}] {_f}: 特徵擷取 {done}/{total}",
                             )
+                        m_entries = manifest_by_folder.get(folder, {})
+                        keys = [m_entries[rel_key(folder, p)]["sha256"]
+                                for p in folder_paths]
                         all_embs.append(
                             extract_embeddings(folder_paths, embed_fn,
-                                               cache_path=cache_path, progress_cb=_cb)
+                                               cache_path=cache_path,
+                                               progress_cb=_cb, cache_keys=keys)
                         )
+                        set_embedding_refs(m_entries, folder, model_name, folder_paths)
                 embeddings = np.vstack(all_embs)
                 raw_per_model[model_name] = embeddings
                 _step += 1
@@ -815,6 +854,10 @@ def _visualize_embeddings_ui() -> None:
                     _bar.progress(_step / _n_steps, text=f"[{model_name}] {mlabel} 完成")
 
                 embeddings_per_model[model_name] = proj
+
+            # embedding_refs 填完才落盤 — manifest 是後續策展功能的唯一入口
+            for folder, m_entries in manifest_by_folder.items():
+                write_manifest(folder, m_entries)
             _status.update(label="完成", state="complete", expanded=False)
 
         # 離群度自動算（UX 評審 W7）：Run 完即排序可用，毋須手動觸發
@@ -825,9 +868,15 @@ def _visualize_embeddings_ui() -> None:
                 outlier_scores[m] = compute_outlier_scores(
                     raw, raw, k=k_out, candidates_in_reference=True)
 
+        manifest_lookup: dict[str, dict] = {}
+        for folder, m_entries in manifest_by_folder.items():
+            for key, e in m_entries.items():
+                manifest_lookup[str((folder / key).resolve())] = e
+
         st.session_state["viz_records"] = records
         st.session_state["viz_embeddings"] = embeddings_per_model
         st.session_state["viz_raw_embeddings"] = raw_per_model
+        st.session_state["viz_manifest"] = manifest_lookup
         st.session_state["viz_outlier_scores"] = outlier_scores
         st.session_state["viz_data_token"] = uuid.uuid4().hex
         st.session_state["viz_nn_index"] = {}

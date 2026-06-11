@@ -130,6 +130,24 @@ def selection_points_to_indices(points: list[dict]) -> list[int]:
 
 
 _CSV_HEADER = ["index", "filename", "path", "label", "split"]
+_EXPORT_HEADER = [*_CSV_HEADER, "sha256"]
+
+
+def snapshots_to_csv(snapshots: list[dict]) -> str:
+    """Serialize export-list snapshots to CSV (header always emitted).
+
+    Each snapshot carries its manifest sha256 when available, so exported
+    lists are content-addressed — traceable across renames and moves.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow(_EXPORT_HEADER)
+    for i, s in enumerate(snapshots):
+        writer.writerow([
+            i, s.get("filename", ""), s.get("path", ""),
+            s.get("label", ""), s.get("split", ""), s.get("sha256") or "",
+        ])
+    return buf.getvalue()
 
 
 def records_to_csv(records: list[dict], indices: list[int]) -> str:
