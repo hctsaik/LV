@@ -33,3 +33,4 @@ datasets/
 demo/
 streamlit_log.txt
 **/.thumbs/
+tests/e2e/_server.log
