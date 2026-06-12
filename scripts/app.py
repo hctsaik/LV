@@ -18,7 +18,13 @@ from sklearn.manifold import TSNE
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from _utils import available_models, extract_embeddings, load_model
+from _utils import (
+    available_models,
+    extract_embeddings,
+    load_model,
+    load_text_encoder,
+    supports_text_query,
+)
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
     build_nn_index,
     compute_label_disagreement,
@@ -28,6 +34,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     find_duplicate_pairs_embedding,
     find_duplicate_pairs_phash,
     find_similar_indices,
+    find_similar_to_vector,
     make_thumbnail,
     parse_folder_paths,
     records_to_csv,
@@ -512,11 +519,80 @@ def _render_select_view(
                      use_container_width=True, height=220)
 
 
+def _pivot_to_image_query(idx: int) -> None:
+    """A text-search hit becomes the root of an image query chain."""
+    st.session_state["viz_query_chain"] = [idx]
+    st.session_state["viz_text_query"] = ""
+
+
+def _encode_text_cached(model_name: str, q_text: str) -> np.ndarray:
+    """Encode a text query; memoize the encoder and the last query vector."""
+    memo = st.session_state.get("_viz_text_vec")
+    if memo and memo[0] == model_name and memo[1] == q_text:
+        return memo[2]
+    enc_store = st.session_state.setdefault("viz_text_encoders", {})
+    if model_name not in enc_store:
+        with st.spinner("載入文字編碼器…"):
+            enc_store[model_name] = load_text_encoder(model_name)
+    vec = enc_store[model_name](q_text)
+    st.session_state["_viz_text_vec"] = (model_name, q_text, vec)
+    return vec
+
+
+def _render_text_search(records: list[dict], model_name: str,
+                        raw: np.ndarray, q_text: str) -> None:
+    """F7: text-to-image search over the shared Chinese-CLIP space."""
+    vec = _encode_text_cached(model_name, q_text)
+    k = st.number_input(
+        "k（回傳數量）", min_value=1, max_value=max(1, len(records)),
+        value=min(9, len(records)), key="viz_text_k",
+    )
+    idxs, dists = find_similar_to_vector(raw, vec, k=int(k),
+                                         nn_index=_nn_index_for(model_name))
+    if not idxs:
+        st.info("沒有可比對的影像。")
+        return
+    st.caption(f"「{q_text}」的前 {len(idxs)} 名 — cosine 距離越小越相符。")
+    with st.container(height=380):
+        cols = st.columns(3)
+        for j, (i, d) in enumerate(zip(idxs, dists)):
+            with cols[j % 3]:
+                p = Path(records[i]["path"])
+                thumb = _thumb_or_none(p)
+                if thumb is not None:
+                    st.image(thumb, use_container_width=True,
+                             caption=f"#{i} · d={d:.4f}")
+                else:
+                    st.warning(f"缺檔：{p.name}")
+                st.button("↻ 以此圖續查", key=f"viz_textpivot_{i}",
+                          use_container_width=True,
+                          on_click=_pivot_to_image_query, args=(i,))
+                st.button("⬇ 加入清單", key=f"viz_textadd_{i}",
+                          use_container_width=True,
+                          on_click=_add_one, args=(records, i))
+    st.download_button(
+        "⬇ 匯出此結果 CSV", data=records_to_csv(records, idxs),
+        file_name="text_search.csv", mime="text/csv", key="viz_export_textsearch",
+    )
+
+
 def _render_similar_view(records: list[dict], model_name: str) -> None:
     _render_viewer_slot(records, [])
     with st.container(key="viz_similar_panel"):
         chain = st.session_state.get("viz_query_chain", [])
         raw = st.session_state.get("viz_raw_embeddings", {}).get(model_name)
+        # F7 以文搜圖 — 只在文字塔與影像塔同空間的模型（chinese-clip）開放
+        if supports_text_query(model_name) and raw is not None and len(raw) > 0:
+            q_text = st.text_input(
+                "以文搜圖（中文）", key="viz_text_query",
+                placeholder="例：斑馬、夜間反光、部分遮擋的工件",
+            )
+            if q_text.strip():
+                _render_text_search(records, model_name, raw, q_text.strip())
+                return
+        elif raw is not None and any(supports_text_query(m) for m in
+                                     st.session_state.get("viz_raw_embeddings", {})):
+            st.caption("ℹ 將上方 Model 切換為 chinese-clip 模型即可使用以文搜圖。")
         if not chain:
             st.info("在「選取」面板選定影像後按「🔎 找相似」，或在檢視槽按「以此找相似」。")
             return

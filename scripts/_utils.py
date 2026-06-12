@@ -6,45 +6,88 @@ from typing import Callable
 import numpy as np
 from tqdm import tqdm
 
-from models import Dinov2Extractor, ImagePreprocessor, ResNetExtractor
+from models import (
+    ChineseClipExtractor,
+    ChineseClipTextEncoder,
+    Dinov2Extractor,
+    ImagePreprocessor,
+    ResNetExtractor,
+)
 
 _DEFAULT_MODELS_DIR = Path(__file__).parent.parent / "models"
 
 
 def available_models(models_dir: Path = _DEFAULT_MODELS_DIR) -> list[str]:
-    """Return model names found in models_dir (*.pth stems)."""
+    """Return model names found in models_dir: *.pth stems plus HF-style
+    chinese-clip* directories (downloaded via scripts/download_chinese_clip.py)."""
     if not models_dir.exists():
         return []
-    return sorted(p.stem for p in models_dir.glob("*.pth"))
+    names = [p.stem for p in models_dir.glob("*.pth")]
+    names += [
+        d.name for d in models_dir.iterdir()
+        if d.is_dir() and d.name.startswith("chinese-clip")
+        and (d / "config.json").exists()
+    ]
+    return sorted(names)
+
+
+def supports_text_query(model_name: str) -> bool:
+    """True when the model has a text tower in the same space as its image
+    tower — i.e. text-to-image search (F7) is meaningful."""
+    return model_name.startswith("chinese-clip")
 
 
 def load_model(
     model_name: str, models_dir: Path = _DEFAULT_MODELS_DIR
 ) -> Callable[[Path], np.ndarray]:
-    """Load a model from models_dir/<model_name>.pth. Returns embed_fn(path) -> np.ndarray."""
-    pth_path = models_dir / f"{model_name}.pth"
-    if not pth_path.exists():
-        raise FileNotFoundError(
-            f"Model file not found: {pth_path}\n"
-            f"Available: {available_models(models_dir)}"
-        )
-
+    """Load a model by name. Returns embed_fn(path) -> np.ndarray."""
     preprocessor = ImagePreprocessor()
 
-    if model_name.startswith("resnet"):
-        extractor = ResNetExtractor(arch=model_name, pth_path=pth_path)
-    elif model_name.startswith("dinov2"):
-        extractor = Dinov2Extractor(model_name=model_name, pth_path=pth_path)
+    if supports_text_query(model_name):
+        model_dir = models_dir / model_name
+        if not (model_dir / "config.json").exists():
+            raise FileNotFoundError(
+                f"Chinese-CLIP weights not found: {model_dir}\n"
+                "Run scripts/download_chinese_clip.py first."
+            )
+        extractor = ChineseClipExtractor(model_dir)
     else:
-        raise ValueError(
-            f"Unknown model type '{model_name}'. "
-            f"Name must start with 'resnet' or 'dinov2'."
-        )
+        pth_path = models_dir / f"{model_name}.pth"
+        if not pth_path.exists():
+            raise FileNotFoundError(
+                f"Model file not found: {pth_path}\n"
+                f"Available: {available_models(models_dir)}"
+            )
+        if model_name.startswith("resnet"):
+            extractor = ResNetExtractor(arch=model_name, pth_path=pth_path)
+        elif model_name.startswith("dinov2"):
+            extractor = Dinov2Extractor(model_name=model_name, pth_path=pth_path)
+        else:
+            raise ValueError(
+                f"Unknown model type '{model_name}'. "
+                f"Name must start with 'resnet', 'dinov2' or 'chinese-clip'."
+            )
 
     def embed_fn(path: Path) -> np.ndarray:
         return extractor(preprocessor.preprocess(path))
 
     return embed_fn
+
+
+def load_text_encoder(
+    model_name: str, models_dir: Path = _DEFAULT_MODELS_DIR
+) -> Callable[[str], np.ndarray]:
+    """Text tower for a text-capable model. Returns text_fn(query) -> vector
+    in the same space as that model's image embeddings."""
+    if not supports_text_query(model_name):
+        raise ValueError(f"Model '{model_name}' has no text tower.")
+    model_dir = models_dir / model_name
+    if not (model_dir / "config.json").exists():
+        raise FileNotFoundError(
+            f"Chinese-CLIP weights not found: {model_dir}\n"
+            "Run scripts/download_chinese_clip.py first."
+        )
+    return ChineseClipTextEncoder(model_dir)
 
 
 def _cache_rows_for_keys(data, cache_keys: list[str]) -> np.ndarray | None:

@@ -576,3 +576,30 @@ def test_p_duplicate_leakage_scan(app_page, leakage_dataset):
     _switch_panel(page, "匯出清單")
     expect(page.get_by_text(re.compile(r"共 [1-9]\d* 張"))).to_be_visible()
     _no_exception(page)
+
+
+# ── (q) F7 text-to-image search (needs Chinese-CLIP weights on disk) ────
+
+_CLIP_DIR = (Path(__file__).resolve().parent.parent.parent
+             / "models" / "chinese-clip-vit-base-patch16")
+
+
+@pytest.mark.skipif(not (_CLIP_DIR / "config.json").exists(),
+                    reason="Chinese-CLIP weights not downloaded")
+def test_q_text_to_image_search(flow_page):
+    page = flow_page
+    _select_option(page, "viz_model_select", _CLIP_DIR.name)
+    _switch_panel(page, "相似")
+    box = page.locator('.st-key-viz_text_query input')
+    expect(box).to_be_visible()
+    box.fill("斑馬")
+    page.keyboard.press("Enter")
+    wait_idle(page, timeout=120000)  # first query loads the text tower
+    panel = page.locator('.st-key-viz_similar_panel')
+    expect(page.get_by_text(re.compile("「斑馬」的前 \\d+ 名"))).to_be_visible()
+    expect(panel.locator('[data-testid="stImage"] img')).to_have_count(9)
+    # pivot: a text hit becomes the root of an image query chain
+    panel.get_by_text("↻ 以此圖續查").first.click()
+    expect(panel.locator('button:has-text("#")').first).to_be_visible()
+    expect(page.locator('.st-key-viz_text_query input')).to_have_value("")
+    _no_exception(page)

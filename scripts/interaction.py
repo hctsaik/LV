@@ -12,6 +12,7 @@ import zipfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import hnswlib
 import numpy as np
 from PIL import Image, ImageDraw
 from sklearn.neighbors import NearestNeighbors
@@ -34,18 +35,39 @@ def parse_folder_paths(text: str) -> list[Path]:
     return paths
 
 
-def build_nn_index(emb_matrix: np.ndarray) -> NearestNeighbors:
-    """Fit a cosine NearestNeighbors index over ``emb_matrix`` (N, D)."""
-    nn = NearestNeighbors(metric="cosine")
-    nn.fit(np.asarray(emb_matrix))
-    return nn
+def build_nn_index(emb_matrix: np.ndarray) -> hnswlib.Index:
+    """Build a cosine HNSW index (hnswlib) over ``emb_matrix`` (N, D).
+
+    The interactive query layer for F3 image-query and F7 text-query.
+    HNSW is approximate by design; with these parameters (M=16,
+    ef_construction=200, query ef >= 4k) recall is effectively 100% at the
+    few-thousand-image scale this tool targets. Batch statistics
+    (outlier-ness, label disagreement, dup radius scan) stay on sklearn
+    exact search.
+    """
+    emb = np.ascontiguousarray(np.asarray(emb_matrix), dtype=np.float32)
+    n, dim = emb.shape
+    index = hnswlib.Index(space="cosine", dim=dim)
+    index.init_index(max_elements=max(n, 1), ef_construction=200, M=16,
+                     random_seed=42)
+    if n:
+        index.add_items(emb, np.arange(n))
+    return index
+
+
+def _knn_query(nn_index: hnswlib.Index, vec: np.ndarray, k: int):
+    nn_index.set_ef(max(64, k * 4))
+    labels, dists = nn_index.knn_query(
+        np.ascontiguousarray(vec, dtype=np.float32).reshape(1, -1), k=k)
+    # float32 rounding can give ~-1e-7 for identical vectors — clamp
+    return labels[0], np.maximum(dists[0], 0.0)
 
 
 def find_similar_indices(
     emb_matrix: np.ndarray,
     query_idx: int,
     k: int = 9,
-    nn_index: NearestNeighbors | None = None,
+    nn_index: hnswlib.Index | None = None,
 ) -> tuple[list[int], list[float]]:
     """Return (indices, cosine_distances) of the k nearest neighbours to
     ``emb_matrix[query_idx]``, EXCLUDING the query itself.
@@ -62,15 +84,42 @@ def find_similar_indices(
         return [], []
     if nn_index is None:
         nn_index = build_nn_index(emb_matrix)
-    dist, idx = nn_index.kneighbors(emb_matrix[query_idx : query_idx + 1], n_neighbors=k + 1)
+    idx, dist = _knn_query(nn_index, emb_matrix[query_idx], min(k + 1, n))
     out_idx, out_dist = [], []
-    for d, i in zip(dist[0], idx[0]):
+    for i, d in zip(idx, dist):
         if int(i) == query_idx:
             continue
         out_idx.append(int(i))
         out_dist.append(float(d))
     # if the query wasn't among the k+1 (duplicate rows), trim to k
     return out_idx[:k], out_dist[:k]
+
+
+def find_similar_to_vector(
+    emb_matrix: np.ndarray,
+    query_vec: np.ndarray,
+    k: int = 9,
+    nn_index: hnswlib.Index | None = None,
+) -> tuple[list[int], list[float]]:
+    """Return (indices, cosine_distances) of the k nearest rows to an
+    EXTERNAL query vector — e.g. a Chinese-CLIP text embedding (F7).
+
+    No self-exclusion (the query is not a library row). ``k`` is clamped
+    to N. The query's dimensionality must match the matrix.
+    """
+    emb_matrix = np.asarray(emb_matrix)
+    n = len(emb_matrix)
+    if n == 0:
+        return [], []
+    query_vec = np.asarray(query_vec).reshape(-1)
+    if query_vec.shape[0] != emb_matrix.shape[1]:
+        raise ValueError(
+            f"query dim {query_vec.shape[0]} != embedding dim {emb_matrix.shape[1]}")
+    k = max(1, min(k, n))
+    if nn_index is None:
+        nn_index = build_nn_index(emb_matrix)
+    idx, dist = _knn_query(nn_index, query_vec, k)
+    return [int(i) for i in idx], [float(d) for d in dist]
 
 
 def compute_outlier_scores(

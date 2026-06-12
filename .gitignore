@@ -34,3 +34,6 @@ demo/
 streamlit_log.txt
 **/.thumbs/
 tests/e2e/_server.log
+
+# Chinese-CLIP weights (~1.4GB) - run scripts/download_chinese_clip.py instead
+models/chinese-clip*/

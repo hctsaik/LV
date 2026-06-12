@@ -54,6 +54,55 @@ class ResNetExtractor:
         return feat.squeeze(0).cpu().numpy()
 
 
+_CHINESE_CLIP_CACHE: dict[str, tuple] = {}
+
+
+def _load_chinese_clip(model_dir: Path):
+    """Load (model, processor) once per directory — the image extractor and
+    the text encoder share the same ~700MB tower pair."""
+    key = str(model_dir)
+    if key not in _CHINESE_CLIP_CACHE:
+        from transformers import ChineseCLIPModel, ChineseCLIPProcessor
+        model = ChineseCLIPModel.from_pretrained(key, local_files_only=True)
+        model = model.to(_DEVICE)
+        model.eval()
+        processor = ChineseCLIPProcessor.from_pretrained(key, local_files_only=True)
+        _CHINESE_CLIP_CACHE[key] = (model, processor)
+    return _CHINESE_CLIP_CACHE[key]
+
+
+class ChineseClipExtractor:
+    """Chinese-CLIP image tower — embeddings live in the SAME space as the
+    text tower, which is what makes text-to-image search (F7) possible.
+    Not interchangeable with ResNet/DINOv2 embeddings."""
+
+    def __init__(self, model_dir: Path) -> None:
+        self.device = _DEVICE
+        self.model, self.processor = _load_chinese_clip(Path(model_dir))
+
+    def __call__(self, image: Any) -> np.ndarray:
+        inputs = self.processor(images=image, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            feat = self.model.get_image_features(**inputs)
+        return feat.squeeze(0).cpu().numpy()
+
+
+class ChineseClipTextEncoder:
+    """Chinese-CLIP text tower — encodes a (Chinese) query string into the
+    shared text-image space."""
+
+    def __init__(self, model_dir: Path) -> None:
+        self.device = _DEVICE
+        self.model, self.processor = _load_chinese_clip(Path(model_dir))
+
+    def __call__(self, text: str) -> np.ndarray:
+        inputs = self.processor(text=[text], padding=True,
+                                return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            feat = self.model.get_text_features(**inputs)
+        return feat.squeeze(0).cpu().numpy()
+
+
 _DINOV2_HUB_DIR = Path(__file__).parent / "dinov2_hub"
 
 
