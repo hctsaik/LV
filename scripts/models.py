@@ -55,6 +55,27 @@ class ResNetExtractor:
 
 
 _CHINESE_CLIP_CACHE: dict[str, tuple] = {}
+_OPENCC_T2S = None
+
+
+def normalize_zh_query(text: str) -> str:
+    """Traditional→Simplified normalization for text queries.
+
+    Chinese-CLIP's training corpus is predominantly Simplified; converting
+    Traditional queries (the primary input here) closes that gap. ASCII /
+    English passes through untouched, so mixed and English-only queries
+    are unaffected. Falls back to the raw text if opencc is unavailable.
+    """
+    global _OPENCC_T2S
+    if _OPENCC_T2S is None:
+        try:
+            from opencc import OpenCC
+            _OPENCC_T2S = OpenCC("t2s")
+        except ImportError:
+            _OPENCC_T2S = False
+    if _OPENCC_T2S:
+        return _OPENCC_T2S.convert(text)
+    return text
 
 
 def _load_chinese_clip(model_dir: Path):
@@ -96,7 +117,7 @@ class ChineseClipTextEncoder:
         self.model, self.processor = _load_chinese_clip(Path(model_dir))
 
     def __call__(self, text: str) -> np.ndarray:
-        inputs = self.processor(text=[text], padding=True,
+        inputs = self.processor(text=[normalize_zh_query(text)], padding=True,
                                 return_tensors="pt").to(self.device)
         with torch.no_grad():
             feat = self.model.get_text_features(**inputs)

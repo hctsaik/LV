@@ -584,8 +584,9 @@ def _render_similar_view(records: list[dict], model_name: str) -> None:
         # F7 以文搜圖 — 只在文字塔與影像塔同空間的模型（chinese-clip）開放
         if supports_text_query(model_name) and raw is not None and len(raw) > 0:
             q_text = st.text_input(
-                "以文搜圖（中文）", key="viz_text_query",
-                placeholder="例：斑馬、夜間反光、部分遮擋的工件",
+                "以文搜圖（繁／簡中文，英文次之）", key="viz_text_query",
+                placeholder="例：斑馬、長頸鹿、夜間反光、zebra",
+                help="繁體查詢會自動正規化為簡體再編碼（Chinese-CLIP 訓練語料以簡體為主）；英文可用但精度次之。",
             )
             if q_text.strip():
                 _render_text_search(records, model_name, raw, q_text.strip())

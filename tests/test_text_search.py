@@ -84,3 +84,22 @@ def test_chinese_clip_text_and_image_share_space(tmp_path):
 def test_available_models_lists_chinese_clip():
     from _utils import available_models
     assert _CLIP_DIR.name in available_models()
+
+
+# ── 繁→簡 query normalization（繁體優先、英文次之）─────────────────────
+
+def test_normalize_zh_query_t2s_and_ascii_passthrough():
+    from models import normalize_zh_query
+    assert normalize_zh_query("斑馬") == "斑马"
+    assert normalize_zh_query("長頸鹿標籤") == "长颈鹿标签"
+    assert normalize_zh_query("zebra ABC 123") == "zebra ABC 123"
+    assert normalize_zh_query("夜間反光 zebra") == "夜间反光 zebra"
+
+
+@pytest.mark.skipif(not _HAS_CLIP, reason="Chinese-CLIP weights not downloaded")
+def test_traditional_and_simplified_queries_encode_identically():
+    from _utils import load_text_encoder
+    text_fn = load_text_encoder(_CLIP_DIR.name)
+    v_trad = text_fn("長頸鹿")   # traditional
+    v_simp = text_fn("长颈鹿")   # simplified
+    assert np.allclose(v_trad, v_simp)  # normalization closes the gap exactly
