@@ -21,9 +21,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _utils import available_models, extract_embeddings, load_model
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
     build_nn_index,
+    compute_label_disagreement,
     compute_outlier_scores,
     draw_yolo_boxes,
     ensure_thumbnails,
+    find_duplicate_pairs_embedding,
+    find_duplicate_pairs_phash,
     find_similar_indices,
     make_thumbnail,
     parse_folder_paths,
@@ -445,12 +448,13 @@ def _render_select_view(
     sim_target = focus if focus is not None else (sel_indices[0] if sel_indices else None)
     a2.button("🔎 找相似", key="viz_similar_btn", use_container_width=True,
               disabled=sim_target is None, on_click=_start_query, args=(sim_target,))
-    sort = a3.selectbox("排序", ["空間順序", "離群度", "檔名"], key="viz_grid_sort",
-                        label_visibility="collapsed", disabled=not sel_indices)
+    sort = a3.selectbox("排序", ["空間順序", "離群度", "標籤分歧", "檔名"],
+                        key="viz_grid_sort", label_visibility="collapsed")
     a4.button("✕ 清除", key="viz_clear_btn", use_container_width=True,
               disabled=not sel_indices, on_click=_clear_selection, args=(scatter_key,))
 
     outlier = st.session_state.get("viz_outlier_scores", {}).get(model_name)
+    disagreement = st.session_state.get("viz_label_disagreement", {}).get(model_name)
     show_rank = False
     if sel_indices:
         if selected_split == "All":
@@ -459,6 +463,9 @@ def _render_select_view(
             disp = [i for i in sel_indices if records[i]["split"] == selected_split]
         if sort == "離群度" and outlier is not None:
             order = sorted(disp, key=lambda i: -float(outlier[i]))
+            show_rank = True
+        elif sort == "標籤分歧" and disagreement is not None:
+            order = sorted(disp, key=lambda i: -float(disagreement[i]))
             show_rank = True
         elif sort == "檔名":
             order = sorted(disp, key=lambda i: records[i]["path"].name)
@@ -472,14 +479,20 @@ def _render_select_view(
         status += f" · 已載入 {len(shown)}/{len(disp)} · 排序：{sort}"
         if len(disp) > _GRID_CAP:
             status += f" · ⚠ 僅瀏覽前 {_GRID_CAP} 張，全部 {len(disp)} 筆仍可批次加入清單"
-    elif outlier is not None and len(records) >= 3:
-        order = [int(i) for i in np.argsort(outlier)[::-1][:_DEFAULT_TOP_OUTLIERS]]
-        shown = order
-        show_rank = True
-        status = f"未選取 · 預設顯示離群度前 {len(shown)} 張（僅幾何距離，非品質判定）"
     else:
-        order, shown = [], []
-        status = "未選取"
+        # 未選取的預設視圖：排名分數前 N（離群度，或 F5 的標籤分歧）
+        if sort == "標籤分歧" and disagreement is not None:
+            scores, crit, note = disagreement, "標籤分歧", "僅鄰居標籤統計，非品質判定"
+        else:
+            scores, crit, note = outlier, "離群度", "僅幾何距離，非品質判定"
+        if scores is not None and len(records) >= 3:
+            order = [int(i) for i in np.argsort(scores)[::-1][:_DEFAULT_TOP_OUTLIERS]]
+            shown = order
+            show_rank = True
+            status = f"未選取 · 預設顯示{crit}前 {len(shown)} 張（{note}）"
+        else:
+            order, shown = [], []
+            status = "未選取"
     with st.container(key="viz_status_line"):
         st.caption(status)
 
@@ -550,6 +563,92 @@ def _render_similar_view(records: list[dict], model_name: str) -> None:
         st.button("✕ 關閉相似查詢", key="viz_similar_close", on_click=_close_query)
 
 
+def _scan_duplicates(records: list[dict], model_name: str) -> None:
+    """F4: scan for duplicate / leakage candidate pairs (runs in callback)."""
+    method = st.session_state.get("viz_dup_method", "phash（嚴格重複）")
+    cross = bool(st.session_state.get("viz_dup_cross", False))
+    splits = [r["split"] for r in records]
+    if method.startswith("phash"):
+        thr = int(st.session_state.get("viz_dup_thr_ph", 4))
+        pairs = find_duplicate_pairs_phash(
+            st.session_state.get("viz_phashes", []),
+            max_hamming=thr, splits=splits, cross_split_only=cross)
+        kind = "phash"
+    else:
+        thr = float(st.session_state.get("viz_dup_thr_emb", 0.05))
+        raw = st.session_state.get("viz_raw_embeddings", {}).get(model_name)
+        pairs = [] if raw is None else find_duplicate_pairs_embedding(
+            raw, max_distance=thr, splits=splits, cross_split_only=cross)
+        kind = "embedding"
+    st.session_state["viz_dup_result"] = {
+        "token": st.session_state.get("viz_data_token"),
+        "model": model_name, "kind": kind, "cross": cross, "pairs": pairs,
+    }
+    st.toast(f"掃描完成：{len(pairs)} 對候選", icon="🔍")
+    _log_usage("dup_scan", kind=kind, cross=cross, n_pairs=len(pairs))
+
+
+def _render_dup_view(records: list[dict], model_name: str) -> None:
+    """F4: duplicate / train-val leakage review — pairs side by side,
+    each reviewable in the viewer slot and exportable to the list."""
+    _render_viewer_slot(records, [])
+    with st.container(key="viz_dup_panel"):
+        st.caption(
+            "以 phash（位元近似）或 embedding（語意近似）找出疑似重複的影像對；"
+            "勾「僅跨 split」即 train/val 洩漏候選。僅供人工複核，非自動判決。"
+        )
+        c1, c2, c3, c4 = st.columns([1.7, 1.3, 1.1, 1])
+        method = c1.selectbox("方法", ["phash（嚴格重複）", "embedding（語意重複）"],
+                              key="viz_dup_method", label_visibility="collapsed")
+        c2.toggle("僅跨 split", key="viz_dup_cross", help="只列出跨資料夾的重複＝洩漏候選")
+        if method.startswith("phash"):
+            c3.number_input("漢明 ≤", min_value=0, max_value=16, value=4,
+                            key="viz_dup_thr_ph")
+        else:
+            c3.number_input("cosine ≤", min_value=0.0, max_value=0.5, value=0.05,
+                            step=0.01, format="%.2f", key="viz_dup_thr_emb")
+        c4.button("🔍 掃描", key="viz_dup_scan", use_container_width=True,
+                  on_click=_scan_duplicates, args=(records, model_name))
+
+        res = st.session_state.get("viz_dup_result")
+        if (not res or res.get("token") != st.session_state.get("viz_data_token")
+                or (res.get("kind") == "embedding" and res.get("model") != model_name)):
+            st.info("設定方法與門檻後按「🔍 掃描」。")
+            return
+        pairs = res["pairs"]
+        if not pairs:
+            st.success("在目前條件下未發現重複候選。")
+            return
+        shown_pairs = pairs[:50]
+        st.caption(
+            f"找到 {len(pairs)} 對候選 · 顯示前 {len(shown_pairs)} 對（依距離排序）。"
+            "右側 = 載入順序較後者。"
+        )
+        st.button("⬇ 將全部右側加入匯出清單", key="viz_dup_add_all",
+                  use_container_width=True,
+                  on_click=_batch_add, args=(records, [j for _, j, _ in pairs]))
+        with st.container(height=330, key="viz_dup_list"):
+            for row, (i, j, d) in enumerate(shown_pairs):
+                dd = f"{d}" if isinstance(d, int) else f"{d:.4f}"
+                cc = st.columns([2, 2, 1.5])
+                for side, idx_ in ((0, i), (1, j)):
+                    with cc[side]:
+                        p = Path(records[idx_]["path"])
+                        thumb = _thumb_or_none(p)
+                        if thumb is not None:
+                            st.image(thumb, use_container_width=True)
+                        else:
+                            st.warning("⚠ 檔案遺失")
+                        st.button(f"#{idx_}（{records[idx_]['split']}）",
+                                  key=f"viz_dup_{row}_{side}", use_container_width=True,
+                                  on_click=_set_active_image, args=(idx_, [i, j]))
+                with cc[2]:
+                    st.caption(f"d={dd}")
+                    st.button("⬇ 右側入清單", key=f"viz_dup_addr_{row}",
+                              use_container_width=True,
+                              on_click=_add_one, args=(records, j))
+
+
 def _render_export_view() -> None:
     elist = st.session_state.get("viz_export_list", {})
     st.caption(f"匯出清單 — 共 {len(elist)} 張（session 內有效；匯出後可清空，不寫回資料集）")
@@ -610,7 +709,7 @@ def _render_right_panel(
     """
     st.session_state.setdefault("viz_panel_view", "選取")
     view = st.segmented_control(
-        "面板", ["選取", "相似", "匯出清單"], key="viz_panel_view",
+        "面板", ["選取", "相似", "重複", "匯出清單"], key="viz_panel_view",
         label_visibility="collapsed",
     ) or "選取"
 
@@ -618,6 +717,8 @@ def _render_right_panel(
         _render_select_view(records, coords, model_name, selected_split, scatter_key)
     elif view == "相似":
         _render_similar_view(records, model_name)
+    elif view == "重複":
+        _render_dup_view(records, model_name)
     else:
         _render_export_view()
 
@@ -637,7 +738,8 @@ def _visualize_embeddings_ui() -> None:
                       "viz_data_token", "viz_nn_index", "viz_class_names",
                       "viz_selection", "viz_active_image", "viz_viewer_ctx",
                       "viz_query_chain", "viz_outlier_scores", "viz_grid_limit",
-                      "viz_export_list", "viz_panel_view", "viz_manifest"):
+                      "viz_export_list", "viz_panel_view", "viz_manifest",
+                      "viz_phashes", "viz_label_disagreement", "viz_dup_result"):
                 st.session_state.pop(k, None)
             st.session_state["viz_folder_list"] = []
 
@@ -860,24 +962,36 @@ def _visualize_embeddings_ui() -> None:
                 write_manifest(folder, m_entries)
             _status.update(label="完成", state="complete", expanded=False)
 
-        # 離群度自動算（UX 評審 W7）：Run 完即排序可用，毋須手動觸發
+        # 離群度與標籤分歧自動算（UX 評審 W7 / F5）：Run 完即排序可用
         outlier_scores: dict[str, np.ndarray] = {}
+        label_disagreement: dict[str, np.ndarray] = {}
         if len(records) >= 3:
             k_out = min(5, len(records) - 1)
+            rec_labels = [r["label"] for r in records]
             for m, raw in raw_per_model.items():
                 outlier_scores[m] = compute_outlier_scores(
                     raw, raw, k=k_out, candidates_in_reference=True)
+                label_disagreement[m] = compute_label_disagreement(
+                    raw, rec_labels, k=k_out)
 
         manifest_lookup: dict[str, dict] = {}
         for folder, m_entries in manifest_by_folder.items():
             for key, e in m_entries.items():
                 manifest_lookup[str((folder / key).resolve())] = e
+        # phash list aligned to records order — the F4 dup-scan input
+        phashes = [
+            manifest_lookup.get(str(Path(r["path"]).resolve()), {}).get("phash")
+            for r in records
+        ]
 
         st.session_state["viz_records"] = records
         st.session_state["viz_embeddings"] = embeddings_per_model
         st.session_state["viz_raw_embeddings"] = raw_per_model
         st.session_state["viz_manifest"] = manifest_lookup
+        st.session_state["viz_phashes"] = phashes
         st.session_state["viz_outlier_scores"] = outlier_scores
+        st.session_state["viz_label_disagreement"] = label_disagreement
+        st.session_state.pop("viz_dup_result", None)
         st.session_state["viz_data_token"] = uuid.uuid4().hex
         st.session_state["viz_nn_index"] = {}
         st.session_state["viz_class_names"] = class_names

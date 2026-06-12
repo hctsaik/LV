@@ -101,6 +101,111 @@ def compute_outlier_scores(
     return dist.mean(axis=1)
 
 
+def compute_label_disagreement(
+    embeddings: np.ndarray,
+    labels: Sequence[str],
+    k: int = 5,
+) -> np.ndarray:
+    """Label audit (F5): for each row, the fraction of its k nearest
+    neighbours (self excluded) carrying a DIFFERENT label.
+
+    0 = neighbourhood agrees, 1 = neighbourhood disagrees. This is a
+    neighbourhood statistic, NOT a mislabel verdict — the UI must keep the
+    honest framing. ``k`` is clamped to N-1; with fewer than 2 rows (or a
+    single class) every score is 0.
+    """
+    embeddings = np.asarray(embeddings)
+    labels = list(labels)
+    n = len(labels)
+    if n < 2:
+        return np.zeros(n, dtype=float)
+    k_eff = max(1, min(k, n - 1))
+    nn = NearestNeighbors(metric="cosine")
+    nn.fit(embeddings)
+    # +1 so we can drop each row's own entry (byte-identical duplicates may
+    # shuffle who comes first, so drop by index, not by position)
+    _, idx = nn.kneighbors(embeddings, n_neighbors=min(k_eff + 1, n))
+    arr = np.asarray(labels, dtype=object)
+    scores = np.zeros(n, dtype=float)
+    for i in range(n):
+        neigh = [j for j in idx[i] if j != i][:k_eff]
+        if neigh:
+            scores[i] = float(np.mean(arr[neigh] != arr[i]))
+    return scores
+
+
+def hamming_distance_hex(a: str, b: str) -> int:
+    """Hamming distance between two equal-length hex hash strings."""
+    return bin(int(a, 16) ^ int(b, 16)).count("1")
+
+
+def _filter_pair(i: int, j: int, splits: Sequence[str] | None,
+                 cross_split_only: bool) -> bool:
+    if not cross_split_only:
+        return True
+    return splits is not None and splits[i] != splits[j]
+
+
+def find_duplicate_pairs_phash(
+    phashes: Sequence[str | None],
+    max_hamming: int = 4,
+    splits: Sequence[str] | None = None,
+    cross_split_only: bool = False,
+    max_pairs: int = 200,
+) -> list[tuple[int, int, int]]:
+    """Duplicate candidates (F4) by perceptual hash.
+
+    Returns (i, j, hamming) with i < j, sorted by distance then indices,
+    capped at ``max_pairs``. None hashes (unreadable images) are skipped.
+    With cross_split_only=True only pairs spanning different splits are
+    returned — i.e. train/val leakage candidates. O(N²) in vectorized
+    chunks; fine for the few-thousand-image datasets this tool targets.
+    """
+    idx = [i for i, h in enumerate(phashes) if h]
+    if len(idx) < 2:
+        return []
+    vals = np.array([np.uint64(int(phashes[i], 16)) for i in idx], dtype=np.uint64)
+    pairs: list[tuple[int, int, int]] = []
+    for a in range(len(idx) - 1):
+        xor = (vals[a] ^ vals[a + 1:]).astype(np.uint64)
+        dists = np.unpackbits(xor.view(np.uint8)).reshape(len(xor), -1).sum(axis=1)
+        for off in np.nonzero(dists <= max_hamming)[0]:
+            i, j = idx[a], idx[a + 1 + off]
+            if _filter_pair(i, j, splits, cross_split_only):
+                pairs.append((i, j, int(dists[off])))
+    pairs.sort(key=lambda p: (p[2], p[0], p[1]))
+    return pairs[:max_pairs]
+
+
+def find_duplicate_pairs_embedding(
+    embeddings: np.ndarray,
+    max_distance: float = 0.05,
+    splits: Sequence[str] | None = None,
+    cross_split_only: bool = False,
+    max_pairs: int = 200,
+) -> list[tuple[int, int, float]]:
+    """Duplicate candidates (F4) by embedding cosine distance.
+
+    Semantic near-duplicates that survive resizing/re-encoding, which
+    phash misses. Same return contract as the phash variant.
+    """
+    embeddings = np.asarray(embeddings)
+    if len(embeddings) < 2:
+        return []
+    nn = NearestNeighbors(metric="cosine", radius=max_distance)
+    nn.fit(embeddings)
+    dists, idxs = nn.radius_neighbors(embeddings)
+    pairs: list[tuple[int, int, float]] = []
+    for i, (ds, js) in enumerate(zip(dists, idxs)):
+        for d, j in zip(ds, js):
+            if j <= i:
+                continue
+            if _filter_pair(i, int(j), splits, cross_split_only):
+                pairs.append((i, int(j), float(d)))
+    pairs.sort(key=lambda p: (p[2], p[0], p[1]))
+    return pairs[:max_pairs]
+
+
 def selection_points_to_indices(points: list[dict]) -> list[int]:
     """Extract global record indices from a Streamlit plotly selection.
 

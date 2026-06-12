@@ -354,6 +354,36 @@ def test_k_clear_selection(flow_page):
     _no_exception(page)
 
 
+# ── (k2) F5 label audit: ranking criterion switch on the default grid ───
+
+def test_k2_label_disagreement_ranking(flow_page):
+    page = flow_page
+    assert "未選取" in _status_text(page)
+    page.locator('.st-key-viz_grid_sort [data-baseweb="select"]').click()
+    page.get_by_role("option", name="標籤分歧", exact=True).click()
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('.st-key-viz_status_line');
+            return el && el.innerText.includes('標籤分歧前');
+        }""",
+        timeout=10000,
+    )
+    status = _status_text(page)
+    assert "非品質判定" in status, status  # honest framing survives the switch
+    expect(_grid_imgs(page)).to_have_count(24)
+    # back to the default criterion
+    page.locator('.st-key-viz_grid_sort [data-baseweb="select"]').click()
+    page.get_by_role("option", name="空間順序", exact=True).click()
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('.st-key-viz_status_line');
+            return el && el.innerText.includes('離群度前');
+        }""",
+        timeout=10000,
+    )
+    _no_exception(page)
+
+
 # ── (l) re-Run: selection resets, export list survives (data-token) ─────
 
 def test_l_rerun_resets_selection_keeps_export_list(flow_page):
@@ -468,4 +498,81 @@ def test_o_projection_method_skip(app_page, synthetic_dataset):
     expect(options).to_have_count(1)
     expect(options.first).to_have_text("PCA")
     page.keyboard.press("Escape")
+    _no_exception(page)
+
+
+# ── (p) F4 duplicate / leakage scan on a dataset with a real bit-copy ───
+
+@pytest.fixture()
+def leakage_dataset(tmp_path):
+    """train has 3 unique images + 1 source; val has a BYTE-IDENTICAL copy
+    of that source (classic train/val leakage) + 1 unique image."""
+    import numpy as np
+    from PIL import Image
+    rng = np.random.default_rng(7)
+
+    def _img(d, name, seed):
+        d.mkdir(parents=True, exist_ok=True)
+        arr = np.random.default_rng(seed).integers(0, 255, (64, 64, 3)).astype("uint8")
+        Image.fromarray(arr).save(d / name, quality=90)
+        return d / name
+
+    root = tmp_path / "leakds"
+    for i in range(3):
+        _img(root / "train" / "classA", f"u{i}.jpg", seed=10 + i)
+    src = _img(root / "train" / "classA", "dup.jpg", seed=42)
+    val_dir = root / "val" / "classA"
+    val_dir.mkdir(parents=True, exist_ok=True)
+    (val_dir / "dup_copy.jpg").write_bytes(src.read_bytes())
+    _img(root / "val" / "classA", "v0.jpg", seed=99)
+    return root
+
+
+def test_p_duplicate_leakage_scan(app_page, leakage_dataset):
+    page = app_page
+    page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
+    wait_idle(page)
+    page.locator('.st-key-viz_folder_text textarea').fill(
+        str(leakage_dataset / "train") + "\n" + str(leakage_dataset / "val"))
+    # PCA only — the dup scan does not depend on projections, keep it fast
+    ms_input = page.locator('.st-key-viz_methods input')
+    tags = page.locator('.st-key-viz_methods span[data-baseweb="tag"]')
+    for _ in range(8):
+        if tags.count() <= 1:
+            break
+        ms_input.click()
+        page.keyboard.press("Backspace")
+        page.wait_for_timeout(400)
+        wait_idle(page)
+    page.keyboard.press("Escape")
+    page.locator('.st-key-run_viz button').click()
+    page.wait_for_selector('.st-key-viz_scatter_wrap g.points path', timeout=180000)
+    wait_idle(page, timeout=120000)
+
+    _switch_panel(page, "重複")
+    expect(page.locator('.st-key-viz_dup_panel')).to_be_visible()
+    # default method: phash, hamming <= 4 — the bit-copy must surface
+    page.locator('.st-key-viz_dup_scan button').click()
+    expect(page.get_by_text(re.compile(r"找到 \d+ 對候選"))).to_be_visible()
+    pair_imgs = page.locator('.st-key-viz_dup_list [data-testid="stImage"] img')
+    expect(pair_imgs.nth(1)).to_be_visible()  # auto-waits: pair renders side by side
+    _no_exception(page)
+
+    # leakage filter: the copy spans train/val so it must survive 僅跨 split
+    page.locator('.st-key-viz_dup_cross label').first.click()
+    wait_idle(page)
+    page.locator('.st-key-viz_dup_scan button').click()
+    expect(page.get_by_text(re.compile(r"找到 \d+ 對候選"))).to_be_visible()
+    _no_exception(page)
+
+    # review one side in the viewer slot
+    page.locator('.st-key-viz_dup_list [class*="st-key-viz_dup_0_"] button').first.click()
+    viewer = page.locator('.st-key-viz_image_viewer')
+    expect(viewer.locator('[data-testid="stImage"] img').first).to_be_visible()
+
+    # one-click exclusion list: add all right-hand sides, then verify
+    page.locator('.st-key-viz_dup_add_all button').click()
+    wait_idle(page)
+    _switch_panel(page, "匯出清單")
+    expect(page.get_by_text(re.compile(r"共 [1-9]\d* 張"))).to_be_visible()
     _no_exception(page)
