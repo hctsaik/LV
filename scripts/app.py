@@ -427,6 +427,18 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
                           on_click=_add_one, args=(records, idx))
             st.button("🔎 以此找相似", key="viz_slot_similar", use_container_width=True,
                       on_click=_start_query, args=(idx,))
+            man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
+            if man:
+                # 資料合約可追溯性：複核時一鍵看到這張圖的 manifest 身分
+                with st.popover("📄 Manifest", use_container_width=True):
+                    st.caption(f"sha256：`{man.get('sha256', '—')}`")
+                    st.caption(f"phash：`{man.get('phash') or '—'}`")
+                    st.caption(f"大小：{man.get('size', 0):,} bytes · "
+                               f"檔案時間：{man.get('captured_at', '—')}")
+                    refs = man.get("embedding_refs", {})
+                    if refs:
+                        st.caption("embedding refs：" +
+                                   "、".join(f"{m} → 列 {r}" for m, r in refs.items()))
 
 
 def _render_grid(records: list[dict], shown: list[int], show_rank: bool) -> None:

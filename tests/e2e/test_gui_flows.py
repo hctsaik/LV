@@ -226,6 +226,10 @@ def test_e_card_click_opens_viewer_slot(flow_page):
     expect(img).to_be_visible()
     assert page.evaluate("el => el.naturalWidth", img.element_handle()) > 0
     expect(viewer.get_by_text(re.compile(r"1/1"))).to_be_visible()
+    # manifest provenance (sha256/phash/refs) is one click away
+    viewer.get_by_text("📄 Manifest").click()
+    expect(page.get_by_text("sha256：", exact=False).first).to_be_visible()
+    page.keyboard.press("Escape")
     _no_exception(page)
 
 

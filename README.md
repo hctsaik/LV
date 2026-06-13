@@ -160,3 +160,19 @@ python scripts/compare_distributions.py \
 ```bash
 pytest tests/ -v
 ```
+
+---
+
+## Companion script: Region Synthesis
+
+`utils_region_synthesis.py` is a standalone **Tkinter desktop tool** (not part of the
+Streamlit app) for compositing a reference image onto a target image at a chosen
+position — handy for generating synthetic `goal/` images.
+
+```bash
+python utils_region_synthesis.py
+```
+
+It sits **upstream** of this app: images it produces can be fed straight into
+**Compare Distributions** (e.g. synthesized set as Folder A vs. real set as
+Folder B) to quantify how close the synthetic distribution is to the real one.
