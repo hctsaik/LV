@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>完整度熱力圖 × Compare Distributions：要不要合併？</title>
+<style>
+  :root{--bg:#f7f8fa;--card:#fff;--ink:#1f2733;--mut:#5b6675;--line:#e3e7ee;--accent:#d62728;--ok:#1f9d55;--warn:#e8820c;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 "Noto Sans TC",system-ui,"Microsoft JhengHei",sans-serif;}
+  .wrap{max-width:900px;margin:0 auto;padding:32px 20px 80px;}
+  h1{font-size:27px;margin:0 0 6px;}
+  .sub{color:var(--mut);margin:0 0 16px;}
+  .rules{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 22px;}
+  .rules span{background:#eef2f7;border:1px solid var(--line);border-radius:999px;padding:4px 12px;font-size:13px;color:var(--mut);}
+  h2{font-size:20px;margin:32px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--line);}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.03);}
+  .who{font-weight:700;}
+  .姿萱{color:#b5179e}.小P{color:#3a86ff}.Maya{color:#7209b7}.阿傑{color:#1f6f3d}.Vivian{color:#bc6c00}.老張{color:#9d0208}.Lin{color:#0a7d8c}
+  ul{margin:8px 0;padding-left:22px}li{margin:4px 0}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14.5px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:#eef2f7;}
+  code{background:#eef1f5;padding:1px 5px;border-radius:4px;font-size:14px;}
+  .pri{display:inline-block;font-weight:700;border-radius:6px;padding:1px 8px;font-size:13px;margin-right:6px;color:#fff;}
+  .p0{background:var(--accent)}.p1{background:var(--warn)}.p2{background:#6b7280}
+  .anti li{color:#9d0208}
+  .sumcard{background:#fff7f0;border:1px solid #f3d6b6;border-left:4px solid var(--warn);}
+  .keyfact{background:#eef7ff;border:1px solid #cfe3f5;border-left:4px solid #3a86ff;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>完整度熱力圖 × Compare Distributions：要不要合併？</h1>
+  <p class="sub">multi-agent 深度討論 · 先不寫程式 · 觸發：「想在熱力圖加『兩個資料夾』，這兩個功能是不是更像了？該合併嗎？」</p>
+  <div class="rules"><span>誠實命名（自我參照≠真實分佈）</span><span>探索/治理分離</span><span>框選不重置</span></div>
+
+  <h2>0. 一個常被忽略的事實</h2>
+  <div class="card keyfact">
+    <b>嵌入覆蓋圖「已經」有兩個資料夾了。</b> 它的「候選資料夾」把 B 投影進 A 的特徵空間，依「B 落在 A 多稀疏處」排補洞候選。
+    所以「兩堆點雲在特徵空間比較」熱力圖已在做——只是輸出是<b>補洞候選清單</b>，不是分布指標。使用者直覺沒錯：<b>底層基質本來就重疊</b>。問題是：重疊到該合併嗎？
+  </div>
+
+  <h2>1. 兩堆點雲 A、B 有「三種關係」</h2>
+  <table>
+    <tr><th>關係</th><th>問題</th><th>誰在做</th><th>輸出</th></tr>
+    <tr><td><b>① Mine 採礦</b><br>B＝待挑池</td><td>B 哪些點能補 A 的洞？</td><td>覆蓋圖·候選資料夾</td><td>排序候選（行動）</td></tr>
+    <tr><td><b>② Reference 參照</b><br>B＝真值/參照</td><td>A 相對 B 缺哪些區域？</td><td><b>目前沒有（使用者想要）</b></td><td>A 的缺口（行動+量測）</td></tr>
+    <tr><td><b>③ Compare 比對</b><br>A、B 對等</td><td>A 和 B 整體像不像？</td><td>Compare Distributions</td><td>FID/KID/LPIPS…+疊圖（量測）</td></tr>
+  </table>
+  <div class="card"><b>使用者要加進熱力圖的「兩資料夾」＝②</b>；Compare 做的是③（外加像素級感知指標）；①已在覆蓋圖。三者<b>同源但不同職</b>。</div>
+
+  <h2>2. 「看起來就是同一件事」</h2>
+  <div class="card">
+    <p><span class="who 姿萱">姿萱</span>：覆蓋圖載候選夾、Compare 載 A/B，我腦裡就是「兩堆在特徵空間比一比」。為什麼兩個分頁、兩種資料夾規則、兩套操作？合併成一個不更乾淨？</p>
+    <p><span class="who 小P">小P</span>：我連「該用哪個」都分不出來，名字也看不出關係。</p>
+  </div>
+
+  <h2>3. 同源，但 job-to-be-done 不同</h2>
+  <div class="card">
+    <p><span class="who Vivian">Vivian</span>：底層相似 ≠ 該合併。<b>Compare＝品保/研究的關卡</b>（GAN 像不像真的？val 漂移？→ 報一個數字 FID 28.3）；<b>熱力圖＝策展/蒐集規劃</b>（哪裡缺、該去收什麼？→ 一批要去標的圖）。不同人、不同時刻、不同產物。硬合併＝把「量測」和「行動」塞同一頁，正是購物車×考卷那次說好要分開的。</p>
+    <p><span class="who Lin">Dr. Lin</span>：而且 Compare 的 LPIPS/SSIM/PSNR 是<b>像素級感知相似度</b>、FID/KID 是分布距離——跟「找盲區」是不同數學、不同問題。塞進熱力圖是 bloat，不是統一。</p>
+  </div>
+
+  <h2>4. 誠實命名：自我參照 vs 外部參照</h2>
+  <div class="card">
+    <p><span class="who 老張">老張</span>：覆蓋圖刻意標了「稀疏＝相對你自己資料、<b>未校正真實分佈</b>」。三種關係的基準根本不同：①基準是 A 自己、②基準是 <b>B（外部真值）</b>、③對等無真值。所以使用者要的②<b>不是讓兩工具變一樣，而是讓覆蓋圖第一次有了「外部參照」</b>——補上它誠實承認自己缺的能力。<b>這是加值，不是冗餘。</b></p>
+  </div>
+
+  <h2>5. 技術帳：合併的成本</h2>
+  <div class="card">
+    <p><span class="who 阿傑">阿傑</span>：共用的只有「兩點雲→特徵空間覆蓋」這層（<code>compute_coverage_gaps</code> 就是②的核心）。但 Compare 還掛 FID/KID/LPIPS/SSIM/PSNR/疊圖/linked view，熱力圖掛屬性棋盤/物件級/送考卷。合併＝把兩大包不相干東西塞進一個分頁，維護與認知都爆。對的 DRY 是<b>抽共用引擎</b>，不是合併 UI。</p>
+    <p><span class="who Maya">Maya</span>：屬性棋盤本質<b>單資料集</b>，根本沒有第二個資料夾的位置。能談的只有「覆蓋圖 ↔ Compare」。</p>
+  </div>
+
+  <h2>6. 中間路線（收斂）</h2>
+  <div class="card">
+    <p><span class="who Vivian">Vivian</span>：<b>不合併工具，但合併引擎並互連</b>——</p>
+    <ul>
+      <li>① <b>加②到覆蓋圖</b>（使用者要的）：新增「參照資料夾 B」模式，重用 <code>compute_coverage_gaps</code>，答「A 相對 B 缺哪些」。給覆蓋圖第一次的外部參照。</li>
+      <li>② <b>抽共用引擎</b>：兩點雲覆蓋分析獨立成函式，兩邊共用、行為一致。</li>
+      <li>③ <b>cross-link</b>：Compare 的 gap →「在覆蓋圖看/加入購物車」；覆蓋圖 →「用 Compare 量整體距離」。</li>
+      <li>④ Compare 維持 QA/指標工具，FID/LPIPS <b>不</b>進熱力圖。</li>
+    </ul>
+    <p><span class="who 老張">老張</span>：守住三條——量測/行動分離、誠實命名（②標「外部參照」與①自我參照分清）、DRY。</p>
+  </div>
+
+  <h2>7. 爭點與收斂</h2>
+  <table>
+    <tr><th>爭點</th><th>收斂</th></tr>
+    <tr><td>合併成一個工具？</td><td><b>不合併</b>：job 不同、屬性棋盤裝不進兩夾、像素指標會 bloat。</td></tr>
+    <tr><td>使用者的「兩資料夾」？</td><td><b>做成覆蓋圖的「參照資料夾 B」模式（②）</b>，不是搬 Compare 過來。</td></tr>
+    <tr><td>重複的部分？</td><td><b>抽共用引擎</b> <code>compute_coverage_gaps</code>，兩邊共用。</td></tr>
+    <tr><td>誠實命名風險？</td><td>②標「以 B 為外部參照」，與①並列不混淆——反而補上缺的外部真值。</td></tr>
+  </table>
+
+  <h2>8. 最終建議（要不要合併？）</h2>
+  <div class="card">
+    <p><b>不要合併工具；要合併引擎 + 互連，並把「兩資料夾」做成覆蓋圖的參照模式。</b></p>
+    <p><span class="pri p0">P0</span>覆蓋圖加「參照資料夾 B」模式（②，重用 compute_coverage_gaps）。</p>
+    <p><span class="pri p0">P0</span>抽共用引擎（兩點雲覆蓋分析），Compare 與覆蓋圖共用。</p>
+    <p><span class="pri p1">P1</span>Compare ↔ 覆蓋圖 cross-link。</p>
+    <p><span class="pri p1">P1</span>兩工具標題/說明各加定位句（「比兩堆」vs「看一堆內部」）。</p>
+    <p><span class="pri p2">P2</span>覆蓋圖①mine／②reference 用單選切換，講清差別。</p>
+  </div>
+
+  <h2>9. 不做 / 反範圍</h2>
+  <div class="card anti">
+    <ul>
+      <li>不把 FID/KID/LPIPS/SSIM/PSNR 搬進熱力圖（像素級感知指標不屬策展盲區分析）。</li>
+      <li>不把屬性棋盤強塞兩資料夾（本質單資料集）。</li>
+      <li>不把「量測」與「行動」混進同一頁。</li>
+      <li>不讓②外部參照稀疏與①自我參照稀疏共用一個沒標示的數字。</li>
+    </ul>
+  </div>
+
+  <h2>10. 一句話總結</h2>
+  <div class="card sumcard">
+    這兩個工具<b>同源（特徵空間兩點雲）但不同職</b>（Compare＝QA 量測、熱力圖＝策展行動），<b>不該合併成一個分頁</b>；該做的是把使用者要的「兩資料夾」做成覆蓋圖的<b>「外部參照（B）」模式</b>——正好補上覆蓋圖一直誠實承認自己缺的外部真值——再<b>抽共用引擎、用 cross-link 把「量測 ↔ 行動」一鍵串起來</b>。
+  </div>
+</div>
+</body>
+</html>
