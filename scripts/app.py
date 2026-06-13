@@ -192,7 +192,8 @@ def _build_viz_figure(
                 x=[coords[i, 0] for i in hs], y=[coords[i, 1] for i in hs], **ring))
 
     fig = go.Figure(data=traces)
-    layout = dict(title=f"{model_name} · {method_label}",
+    # 620px：layout 評審 R2 拍板的散點高度（填滿左欄、消死白）
+    layout = dict(title=f"{model_name} · {method_label}", height=620,
                   legend=dict(title="Class (Split)", groupclick="toggleitem"))
     if use_3d:
         layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
@@ -455,6 +456,8 @@ def _render_select_view(
     sim_target = focus if focus is not None else (sel_indices[0] if sel_indices else None)
     a2.button("🔎 找相似", key="viz_similar_btn", use_container_width=True,
               disabled=sim_target is None, on_click=_start_query, args=(sim_target,))
+    # 注意：label_visibility="collapsed" 會連 help 問號一起藏掉（實測抓到），
+    # 排序說明改掛在永遠可見的狀態行上。
     sort = a3.selectbox("排序", ["空間順序", "離群度", "標籤分歧", "檔名"],
                         key="viz_grid_sort", label_visibility="collapsed")
     a4.button("✕ 清除", key="viz_clear_btn", use_container_width=True,
@@ -501,7 +504,13 @@ def _render_select_view(
             order, shown = [], []
             status = "未選取"
     with st.container(key="viz_status_line"):
-        st.caption(status)
+        st.caption(
+            status,
+            help="排序說明：空間順序＝縮圖位置模仿散點圖；離群度＝到鄰居的平均距離，"
+                 "越高越「孤立」；標籤分歧＝k 近鄰中標籤不同的比例，越高越值得複查標註"
+                 "（後兩者僅供排序參考，非品質判定）。卡片上的「第n」是目前排序的名次，"
+                 "#n 是資料點編號。",
+        )
 
     _render_viewer_slot(records, shown)
     _render_grid(records, shown, show_rank)
@@ -800,27 +809,89 @@ def _render_right_panel(
         _render_export_view()
 
 
-def _visualize_embeddings_ui() -> None:
-    st.header("Visualize Embeddings")
+_MODE_CLEAR_KEYS = (
+    "viz_records", "viz_embeddings", "viz_raw_embeddings",
+    "viz_data_token", "viz_nn_index", "viz_class_names",
+    "viz_selection", "viz_active_image", "viz_viewer_ctx",
+    "viz_query_chain", "viz_outlier_scores", "viz_grid_limit",
+    "viz_export_list", "viz_panel_view", "viz_manifest",
+    "viz_phashes", "viz_label_disagreement", "viz_dup_result",
+)
 
+_DEMO_DIR = Path(__file__).parent.parent / "demo" / "coco8"
+
+
+def _load_demo() -> None:
+    """快速開始：一鍵載入 coco8 範例並自動執行（detector 模式，零下載）。"""
+    st.session_state["viz_mode"] = "Object Detector"
+    st.session_state["_viz_mode_prev"] = "Object Detector"
+    st.session_state["viz_folder_list"] = [
+        str(_DEMO_DIR / "train"), str(_DEMO_DIR / "val")]
+    st.session_state["_viz_autorun"] = True
+    _log_usage("demo_load")
+
+
+def _restore_mode_snapshot() -> None:
+    """切模式誤觸的後悔藥：還原上一個模式的全部結果（可逆優於攔截）。"""
+    snap = st.session_state.pop("_viz_mode_snapshot", None)
+    if not snap:
+        return
+    st.session_state["viz_mode"] = snap["mode"]
+    st.session_state["_viz_mode_prev"] = snap["mode"]
+    for k, v in snap["state"].items():
+        if v is None:
+            st.session_state.pop(k, None)
+        else:
+            st.session_state[k] = v
+    st.session_state["viz_folder_list"] = snap["folders"]
+
+
+def _render_quick_start() -> None:
+    """冷啟動空狀態：三步教學卡 + 一鍵 demo（取代一行英文提示的死白）。"""
+    st.markdown("##### 快速開始")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1, st.container(border=True):
+        st.markdown("**① 選資料**")
+        st.caption("在左側貼上圖片資料夾路徑，或先用下方範例試跑。")
+    with c2, st.container(border=True):
+        st.markdown("**② 跑分析**")
+        st.caption("按 ▶ Run，自動萃取特徵並降維成散點圖。")
+    with c3, st.container(border=True):
+        st.markdown("**③ 探索**")
+        st.caption("在散點圖框選任一群點，右欄立即顯示對應縮圖。")
+    mid = st.columns([2, 1.6, 2])[1]
+    mid.button("▶ 一鍵體驗（coco8 範例）", key="viz_demo_btn", type="primary",
+               use_container_width=True, on_click=_load_demo,
+               disabled=not (_DEMO_DIR / "train").exists())
+
+
+def _visualize_embeddings_ui() -> None:
     with st.sidebar:
+        st.markdown("**① 資料**")
         mode = st.radio(
             "模式", ["Object Detector", "Image Classifier"],
             key="viz_mode", horizontal=True,
+            captions=["YOLO 格式（images/ + labels/）", "依類別分子資料夾"],
         )
-        # 切換模式時清除舊結果與資料夾列表
+        # 切換模式時清除舊結果（先快照，留一鍵復原）
         if st.session_state.get("_viz_mode_prev") != mode:
+            prev = st.session_state.get("_viz_mode_prev")
             st.session_state["_viz_mode_prev"] = mode
-            for k in ("viz_records", "viz_embeddings", "viz_raw_embeddings",
-                      "viz_data_token", "viz_nn_index", "viz_class_names",
-                      "viz_selection", "viz_active_image", "viz_viewer_ctx",
-                      "viz_query_chain", "viz_outlier_scores", "viz_grid_limit",
-                      "viz_export_list", "viz_panel_view", "viz_manifest",
-                      "viz_phashes", "viz_label_disagreement", "viz_dup_result"):
+            if prev is not None and st.session_state.get("viz_records") is not None:
+                st.session_state["_viz_mode_snapshot"] = {
+                    "mode": prev,
+                    "state": {k: st.session_state.get(k) for k in _MODE_CLEAR_KEYS},
+                    "folders": list(st.session_state.get("viz_folder_list", [])),
+                }
+            for k in _MODE_CLEAR_KEYS:
                 st.session_state.pop(k, None)
             st.session_state["viz_folder_list"] = []
 
-        st.divider()
+        snap = st.session_state.get("_viz_mode_snapshot")
+        if snap:
+            st.warning(f"已切換模式，{snap['mode']} 的結果已清空。")
+            st.button("↩ 復原上個模式的結果", key="viz_mode_undo",
+                      use_container_width=True, on_click=_restore_mode_snapshot)
 
         if "viz_folder_list" not in st.session_state:
             st.session_state["viz_folder_list"] = []
@@ -843,45 +914,77 @@ def _visualize_embeddings_ui() -> None:
         st.text_area(
             "或貼上資料夾路徑（每行一個）",
             key="viz_folder_text",
-            placeholder="demo/imagenette/train",
+            placeholder="例：C:\\data\\coco8\\train",
             height=68,
+            help="與上方清單合併。Detector 模式貼含 images/ 與 labels/ 的資料夾；Classifier 模式貼含類別子資料夾的資料夾。",
         )
-        st.caption("與上方清單合併；適用於無檔案對話框的環境。")
 
         if mode == "Object Detector":
-            st.divider()
-            cc1, cc2 = st.columns([4, 1])
-            classes_path = st.session_state.get("viz_classes_file", "")
-            cc1.caption("classes.txt")
-            cc1.text(Path(classes_path).name if classes_path else "（自動偵測或手動輸入）")
-            if cc2.button("📄", key="browse_classes", use_container_width=True,
-                          help="選擇 classes.txt"):
-                _pick_file("viz_classes_file", title="選擇 classes.txt",
-                           filetypes=[("Text", "*.txt"), ("All files", "*.*")])
-                st.rerun()
-            if classes_path:
-                if st.button("✕ 清除", key="clear_classes", use_container_width=True):
-                    del st.session_state["viz_classes_file"]
+            # 類別來源屬進階設定（預設自動偵測 classes.txt），收進 expander（G4）
+            with st.expander("類別來源（預設自動偵測 classes.txt）"):
+                cc1, cc2 = st.columns([4, 1])
+                classes_path = st.session_state.get("viz_classes_file", "")
+                cc1.caption("classes.txt")
+                cc1.text(Path(classes_path).name if classes_path else "（自動偵測或手動輸入）")
+                if cc2.button("📄", key="browse_classes", use_container_width=True,
+                              help="選擇 classes.txt"):
+                    _pick_file("viz_classes_file", title="選擇 classes.txt",
+                               filetypes=[("Text", "*.txt"), ("All files", "*.*")])
                     st.rerun()
+                if classes_path:
+                    if st.button("✕ 清除", key="clear_classes", use_container_width=True):
+                        del st.session_state["viz_classes_file"]
+                        st.rerun()
 
-            class_input = st.text_input(
-                "Class names — 手動輸入（classes.txt 未選擇時使用）",
-                value="apple,banana,orange",
-            )
+                class_input = st.text_input(
+                    "Class names — 手動輸入（classes.txt 未選擇時使用）",
+                    value="apple,banana,orange",
+                )
         else:
             class_input = ""
 
+        st.markdown("**② 模型**")
         all_models = available_models()
         if not all_models:
-            st.error("No .pth models found in ./models/. Add a model file and restart.")
+            st.error("models/ 內找不到模型檔，請放入 .pth 模型後重啟。")
             return
-        selected_models = st.multiselect("Models", all_models, default=all_models)
+        selected_models = st.multiselect(
+            "模型", all_models, default=all_models, label_visibility="collapsed",
+            help="每個模型各算一份 embedding；chinese-clip 同時解鎖「以文搜圖」。",
+        )
+
+        st.markdown("**③ 投影方法**")
         selected_method_labels = st.multiselect(
             "投影方法", list(_METHOD_KEY), default=list(_METHOD_KEY),
-            key="viz_methods", help="只勾選需要的投影可大幅縮短計算時間。",
+            key="viz_methods", label_visibility="collapsed",
+            help="只勾選需要的投影可大幅縮短計算時間。",
         )
-        run = st.button("▶ Run", use_container_width=True, key="run_viz")
 
+        st.markdown("**④ 執行**")
+        n_folders = len(st.session_state.get("viz_folder_list", [])) + len(
+            parse_folder_paths(st.session_state.get("viz_folder_text", "")))
+        missing = []
+        if n_folders == 0:
+            missing.append("①資料夾")
+        if not selected_models:
+            missing.append("②模型")
+        if not selected_method_labels:
+            missing.append("③投影")
+        st.caption(f"{n_folders} 資料夾 · {len(selected_models)} 模型 · "
+                   f"{len(selected_method_labels)} 投影")
+        if missing:
+            st.caption(f":red[⚠ 缺：{'、'.join(missing)}]")
+        # 注意：資料夾欄是 text_area，值要「失焦」才提交——若用它 gate
+        # disabled，填完直接點 Run 會點到還沒解鎖的按鈕（點擊被吞）。
+        # 所以只有即時提交的 multiselect 缺件才真正鎖按鈕；缺資料夾僅紅字
+        # 提示，按下去由 Run 內的驗證錯誤接手。
+        hard_missing = not selected_models or not selected_method_labels
+        run = st.button("▶ Run", use_container_width=True, key="run_viz",
+                        disabled=hard_missing,
+                        type="secondary" if missing else "primary")
+
+    if st.session_state.pop("_viz_autorun", False):
+        run = True
     if run:
         folders = [Path(f) for f in st.session_state.get("viz_folder_list", [])]
         for p in parse_folder_paths(st.session_state.get("viz_folder_text", "")):
@@ -1079,11 +1182,12 @@ def _visualize_embeddings_ui() -> None:
         st.session_state["viz_viewer_ctx"] = []
         st.session_state["viz_query_chain"] = []
         st.session_state["viz_grid_limit"] = _GRID_BATCH
+        st.session_state.pop("_viz_mode_snapshot", None)
         # 匯出清單以 image path 為鍵，跨 Run 仍有效 — 刻意不清
         st.toast(f"完成：{len(records)} 張影像 × {len(selected_models)} 模型", icon="✅")
 
     if "viz_records" not in st.session_state:
-        st.info("Configure inputs in the sidebar and click ▶ Run.")
+        _render_quick_start()
         return
 
     records = st.session_state["viz_records"]
@@ -1093,9 +1197,12 @@ def _visualize_embeddings_ui() -> None:
     model_names = list(embeddings_per_model.keys())
     unique_splits = sorted({r["split"] for r in records})
 
-    col_plot, col_panel = st.columns([3, 2], gap="medium")
+    col_plot, col_panel = st.columns([5, 3], gap="medium")
 
     with col_plot:
+        # 常駐資料規模摘要（G6）：不靠 Run 當下的 banner/toast，rerun 後仍可見
+        st.caption(f"{len(records)} 張影像 · {len(model_names)} 模型 · "
+                   f"{len(unique_splits)} 個 split")
         c1, c2, c3, c4 = st.columns([2, 2, 2, 1.4])
         selected_model = c1.selectbox("Model", model_names, key="viz_model_select")
         method_labels = [lbl for lbl, key in _METHOD_KEY.items()
@@ -1132,6 +1239,8 @@ def _visualize_embeddings_ui() -> None:
         fig = _build_viz_figure(records, coords, indices, selected_model, selected_method,
                                 dim=dim, highlight=highlight)
 
+        if not sel_state["indices"] and dim == 2:
+            st.caption("💡 在圖上拖曳框選或套索圈點，右欄會立即顯示對應縮圖。")
         with st.container(key="viz_scatter_wrap"):
             if dim == 2:
                 event = st.plotly_chart(
@@ -1170,8 +1279,6 @@ def _visualize_embeddings_ui() -> None:
 
 
 def _compare_distributions_ui() -> None:
-    st.header("Compare Distributions")
-
     with st.sidebar:
         st.caption("Folder A（直接圖片資料夾）")
         col_a, col_btn_a = st.columns([4, 1])
@@ -1319,7 +1426,7 @@ def _compare_distributions_ui() -> None:
         st.session_state["cmp_coverage_gaps"] = coverage_gaps
 
     if "cmp_projections" not in st.session_state:
-        st.info("Configure inputs in the sidebar and click ▶ Run.")
+        st.info("在左側設定 Folder A／Folder B 與模型後，按 ▶ Run 比較兩個分布。")
         return
 
     projections = st.session_state["cmp_projections"]
@@ -1452,18 +1559,22 @@ def _compare_distributions_ui() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Dataset Analysis", layout="wide")
-    st.title("Dataset Analysis Tools")
+    # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
+    st.set_page_config(page_title="Dataset Analysis", layout="wide",
+                       initial_sidebar_state=400)
     if not st.session_state.get("_usage_session_logged"):
         st.session_state["_usage_session_logged"] = True
         _log_usage("session_start")
 
-    tool = st.sidebar.radio(
-        "Tool",
-        ["Visualize Embeddings", "Compare Distributions"],
-        label_visibility="collapsed",
-    )
-    st.sidebar.divider()
+    # 單行工具列取代舊的 st.title + sidebar Tool radio——把首屏高度還給工作區
+    brand_col, switch_col = st.columns([2, 3], gap="medium")
+    brand_col.markdown("#### Dataset Analysis Tools")
+    st.session_state.setdefault("tool_switch", "Visualize Embeddings")
+    with switch_col:
+        tool = st.segmented_control(
+            "Tool", ["Visualize Embeddings", "Compare Distributions"],
+            key="tool_switch", label_visibility="collapsed",
+        ) or "Visualize Embeddings"
 
     if tool == "Visualize Embeddings":
         _visualize_embeddings_ui()

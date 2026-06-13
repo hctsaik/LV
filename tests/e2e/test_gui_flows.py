@@ -603,3 +603,25 @@ def test_q_text_to_image_search(flow_page):
     expect(panel.locator('button:has-text("#")').first).to_be_visible()
     expect(page.locator('.st-key-viz_text_query input')).to_have_value("")
     _no_exception(page)
+
+
+# ── (r) layout review: quick-start cards + one-click demo (coco8) ───────
+
+def test_r_quick_start_demo(app_page):
+    page = app_page
+    # cold start: three step cards + the demo button replace the dead white
+    expect(page.get_by_text("快速開始")).to_be_visible()
+    for step in ("① 選資料", "② 跑分析", "③ 探索"):
+        expect(page.get_by_text(step)).to_be_visible()
+    demo_btn = page.locator('.st-key-viz_demo_btn button')
+    expect(demo_btn).to_be_visible()
+    # brand line survives the title removal (toolbar row)
+    expect(page.get_by_text("Dataset Analysis Tools")).to_be_visible()
+
+    demo_btn.click()
+    page.wait_for_selector('.st-key-viz_scatter_wrap g.points path', timeout=600000)
+    wait_idle(page, timeout=300000)
+    # the demo run lands in the normal linked view with the default grid
+    assert "未選取" in _status_text(page)
+    expect(_grid_imgs(page).first).to_be_visible()
+    _no_exception(page)
