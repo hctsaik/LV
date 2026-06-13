@@ -1119,8 +1119,21 @@ def _visualize_embeddings_ui() -> None:
 
                 n_samples = len(embeddings)
                 n_comps = min(3, max(1, n_samples - 2))
+
+                def _pad2d(a: np.ndarray) -> np.ndarray:
+                    # n≤3 時投影只有 1 維 — 補零軸，散點圖永遠拿得到 y
+                    return a if a.shape[1] >= 2 else np.hstack(
+                        [a, np.zeros((len(a), 1))])
+
                 proj: dict[str, np.ndarray] = {}
                 for mkey, mlabel in method_pairs:
+                    # t-SNE/UMAP 對極小樣本無定義（perplexity / n_neighbors
+                    # 必須 < n）——誠實跳過，別讓整個 Run 帶著 traceback 倒地
+                    if mkey != "pca" and n_samples < 4:
+                        _step += 1
+                        _bar.progress(_step / _n_steps,
+                                      text=f"[{model_name}] {mlabel} 已跳過（樣本 < 4）")
+                        continue
                     if mkey == "pca":
                         arr = PCA(n_components=n_comps, random_state=42).fit_transform(embeddings)
                     elif mkey == "tsne":
@@ -1131,10 +1144,13 @@ def _visualize_embeddings_ui() -> None:
                         n_neighbors = min(15, max(2, n_samples - 1))
                         arr = umap.UMAP(n_components=n_comps, n_neighbors=n_neighbors,
                                         random_state=42).fit_transform(embeddings)
-                    proj[mkey] = arr
+                    proj[mkey] = _pad2d(arr)
                     _step += 1
                     _bar.progress(_step / _n_steps, text=f"[{model_name}] {mlabel} 完成")
 
+                if not proj:  # 極小樣本且未勾 PCA → 以 PCA 保底，不留空結果
+                    proj["pca"] = _pad2d(
+                        PCA(n_components=n_comps, random_state=42).fit_transform(embeddings))
                 embeddings_per_model[model_name] = proj
 
             # embedding_refs 填完才落盤 — manifest 是後續策展功能的唯一入口
