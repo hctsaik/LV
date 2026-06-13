@@ -1369,21 +1369,22 @@ def _visualize_embeddings_ui() -> None:
             help="只勾選需要的投影可大幅縮短計算時間。",
         )
         if "UMAP" in selected_method_labels:
-            uc1, uc2 = st.columns([3, 1])
-            uc1.toggle(
+            st.toggle(
                 "固定 UMAP 參考系", key="viz_umap_ref",
                 help="首跑擬合並凍結 UMAP 空間（存於 embeddings_<model>/umap_ref.pkl）；"
                      "之後新增的影像以 transform 投入同一座標系，舊點完全不動，"
                      "跨 Run 佈局可比較。注意：transform 的擺位是近似值，"
-                     "資料大幅改變後請按「↻」重建參考系。",
+                     "資料大幅改變後按下方「↻ 重建參考系」再 Run。",
             )
             if st.session_state.get("viz_umap_ref"):
-                uc2.button("↻", key="viz_umap_rebuild_btn", use_container_width=True,
-                           help="下次 Run 重新擬合並覆寫參考系",
-                           on_click=lambda: st.session_state.__setitem__(
-                               "_viz_umap_rebuild", True))
+                st.button("↻ 重建參考系（下次 Run 重新擬合）",
+                          key="viz_umap_rebuild_btn", use_container_width=True,
+                          help="丟掉現有參考系，下次 Run 以目前全部資料重新擬合並覆寫。"
+                               "資料大幅改變後才需要。",
+                          on_click=lambda: st.session_state.__setitem__(
+                              "_viz_umap_rebuild", True))
                 if st.session_state.get("_viz_umap_rebuild"):
-                    st.caption(":orange[↻ 下次 Run 將重建 UMAP 參考系]")
+                    st.caption(":orange[↻ 已標記：下次 Run 將重建 UMAP 參考系]")
 
         st.markdown("**④ 執行**")
         n_folders = len(st.session_state.get("viz_folder_list", [])) + len(
