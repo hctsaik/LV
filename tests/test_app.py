@@ -1,7 +1,37 @@
 from pathlib import Path
 import numpy as np
 import pytest
-from app import _build_cmp_figure, _build_viz_figure, parse_folder_paths, read_classes_txt
+from PIL import Image
+from app import (
+    _build_cmp_figure,
+    _build_viz_figure,
+    _cmp_resolve_images,
+    parse_folder_paths,
+    read_classes_txt,
+)
+
+
+def test_cmp_resolve_images_flat_recurse_empty(tmp_path):
+    # flat folder with images → returned as-is, no note (the tool's正解)
+    flat = tmp_path / "flat"; flat.mkdir()
+    Image.new("RGB", (8, 8)).save(flat / "a.jpg")
+    Image.new("RGB", (8, 8)).save(flat / "b.png")
+    paths, note = _cmp_resolve_images(flat)
+    assert len(paths) == 2 and note is None
+    # class-subfolder layout (no direct images) → recurse + 容錯 note
+    root = tmp_path / "ds"
+    (root / "cat").mkdir(parents=True); (root / "dog").mkdir()
+    Image.new("RGB", (8, 8)).save(root / "cat" / "c.jpg")
+    Image.new("RGB", (8, 8)).save(root / "dog" / "d.jpg")
+    paths2, note2 = _cmp_resolve_images(root)
+    assert len(paths2) == 2 and note2 is not None
+    # cache dirs (embeddings_*/.thumbs) are skipped by the recursive fallback
+    cache = tmp_path / "ds2" / "embeddings_x"; cache.mkdir(parents=True)
+    Image.new("RGB", (8, 8)).save(cache / "thumb.jpg")
+    assert _cmp_resolve_images(tmp_path / "ds2") == ([], None)
+    # genuinely empty → nothing, no note
+    empty = tmp_path / "empty"; empty.mkdir()
+    assert _cmp_resolve_images(empty) == ([], None)
 
 
 def test_read_classes_txt_found(tmp_path):

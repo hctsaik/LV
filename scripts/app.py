@@ -2075,6 +2075,39 @@ def _render_cmp_panel(cmp_paths: list[Path], cmp_groups: list[str]) -> None:
                           on_click=_set_cmp_active, args=(i, list(shown)))
 
 
+_CMP_DEMO_A = Path(__file__).parent.parent / "demo" / "imagenette" / "train" / "cassette_player"
+_CMP_DEMO_B = Path(__file__).parent.parent / "demo" / "imagenette" / "train" / "chainsaw"
+_CMP_CACHE_DIRS = ("embeddings_", "object_crops", ".thumbs")
+
+
+def _load_cmp_demo() -> None:
+    """一鍵填入兩個範例『直接含圖片』資料夾並自動跑（對齊其他工具的 demo）。"""
+    st.session_state["cmp_folder_a"] = str(_CMP_DEMO_A)
+    st.session_state["cmp_folder_b"] = str(_CMP_DEMO_B)
+    st.session_state["_cmp_autorun"] = True
+    _log_usage("cmp_demo_load")
+
+
+def _cmp_resolve_images(folder: Path) -> tuple[list[Path], str | None]:
+    """抓資料夾的圖片。先抓『直接』圖片（這工具的正解）；若一張都沒有但底下
+    是類別子資料夾，就往下層遞迴找並回傳提示（容錯）。略過 embeddings_/縮圖/
+    crop 等快取夾。回傳 (paths, note)。"""
+    flat = get_image_paths(folder)
+    if flat:
+        return flat, None
+    rec: list[Path] = []
+    for ext in ("*.jpg", "*.jpeg", "*.png"):
+        for p in folder.rglob(ext):
+            if any(part.startswith(_CMP_CACHE_DIRS) for part in p.parts):
+                continue
+            rec.append(p)
+    rec = sorted(set(rec))
+    if rec:
+        return rec, (f"偵測到類別子資料夾，已自動往下層找到 {len(rec)} 張圖"
+                     "（這工具其實要『直接含圖片』的資料夾）。")
+    return [], None
+
+
 def _compare_distributions_ui() -> None:
     with st.sidebar:
         st.caption("Folder A（直接圖片資料夾）")
@@ -2111,29 +2144,39 @@ def _compare_distributions_ui() -> None:
         )
         run = st.button("▶ Run", use_container_width=True, key="run_cmp")
 
+    if st.session_state.pop("_cmp_autorun", False):
+        run = True
+
     if run:
         path_a = Path(folder_a.strip()) if folder_a.strip() else None
         path_b = Path(folder_b.strip()) if folder_b.strip() else None
 
         if not path_a or not path_b:
-            st.error("Enter both Folder A and Folder B paths.")
+            st.error("請在左側填入 Folder A 與 Folder B 兩個資料夾路徑"
+                     "（或按下方「✨ 用範例資料試跑」）。")
             return
         if not path_a.exists():
-            st.error(f"Folder A not found: {path_a}")
+            st.error(f"找不到 Folder A：{path_a}")
             return
         if not path_b.exists():
-            st.error(f"Folder B not found: {path_b}")
+            st.error(f"找不到 Folder B：{path_b}")
             return
 
-        paths_a = get_image_paths(path_a)
-        paths_b = get_image_paths(path_b)
+        paths_a, note_a = _cmp_resolve_images(path_a)
+        paths_b, note_b = _cmp_resolve_images(path_b)
 
+        _no_img = ("Folder {f} 找不到影像：{p}\n"
+                   "這工具比較的是「兩堆影像的分布」，要選**直接含圖片**的資料夾"
+                   "（例如 …/images 或某個類別夾），不是含類別子資料夾的上層。"
+                   "想比 train vs val 嗎？分別指到各自的 images 夾。")
         if not paths_a:
-            st.error(f"No images found in Folder A: {path_a}")
-            return
+            st.error(_no_img.format(f="A", p=path_a)); return
         if not paths_b:
-            st.error(f"No images found in Folder B: {path_b}")
-            return
+            st.error(_no_img.format(f="B", p=path_b)); return
+        if note_a:
+            st.info(f"Folder A：{note_a}")
+        if note_b:
+            st.info(f"Folder B：{note_b}")
 
         _CMP_STEPS = 6 if viz_only else 13
         _prog = st.progress(0, text="載入模型…")
@@ -2227,7 +2270,25 @@ def _compare_distributions_ui() -> None:
         st.session_state["cmp_viewer_ctx"] = []
 
     if "cmp_projections" not in st.session_state:
-        st.info("在左側設定 Folder A／Folder B 與模型後，按 ▶ Run 比較兩個分布。")
+        st.markdown("##### 快速開始")
+        st.caption("比較**兩堆影像的分布**（真實 vs 生成、train vs val、資料 v1 vs v2…）。"
+                   "和「完整度熱力圖」不同：熱力圖看單一資料集**內部**哪裡缺，"
+                   "這裡看 A、B **兩堆之間**像不像、B 漏了 A 的哪些區域。")
+        c1, c2, c3 = st.columns(3, gap="medium")
+        with c1, st.container(border=True):
+            st.markdown("**① 選 Folder A／B**")
+            st.caption("左側各填一個**直接含圖片**的資料夾（不是含類別子夾的上層）。")
+        with c2, st.container(border=True):
+            st.markdown("**② 選模型**")
+            st.caption("算兩堆的 embedding 與分布距離（FID/KID/LPIPS…）。")
+        with c3, st.container(border=True):
+            st.markdown("**③ Run**")
+            st.caption("出投影疊圖、分布指標、coverage gap。")
+        mid = st.columns([2, 1.6, 2])[1]
+        mid.button("✨ 用範例資料試跑（cassette_player vs chainsaw）",
+                   key="cmp_demo_btn", type="primary", use_container_width=True,
+                   on_click=_load_cmp_demo,
+                   disabled=not (_CMP_DEMO_A.exists() and _CMP_DEMO_B.exists()))
         return
 
     projections = st.session_state["cmp_projections"]
