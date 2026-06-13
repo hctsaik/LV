@@ -53,6 +53,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     nearest_anchor,
     nearest_labels,
     rank_gap_fillers,
+    reference_coverage,
     select_gray_zone,
     make_thumbnail,
     neighbor_hit_density,
@@ -3047,26 +3048,62 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                   disabled=not st.session_state.get("cov_cand_text", "").strip(),
                   on_click=_cov_embed_candidates, args=(model,))
         if not has_cand:
-            st.info("投影候選後，這裡會列出『最能補洞』的候選並可送進組考卷。")
+            st.info("投影 B 後，這裡可選 B 的角色：『採礦池』挑 B 補你的洞，"
+                    "或『參照分佈』量你相對 B 缺多少。")
             return
 
-        st.markdown("**② 最能補洞的候選**")
-        st.caption("依『離既有資料多遠（落在稀疏區）』排序，越前越能補你缺的區域。")
+        # ── B 的角色：採礦池(①) vs 參照分佈(②，補上覆蓋圖缺的外部真值)──
+        b_role = st.radio(
+            "B 的角色", ["採礦池", "參照分佈"], horizontal=True, key="cov_b_role",
+            captions=["B＝待挑池：挑 B 裡最能補我稀疏洞的影像",
+                      "B＝外部參照/真值：量我相對 B 覆蓋多少、缺哪些區域"])
+        is_ref = b_role == "參照分佈"
+
+        if is_ref:
+            radius_b = _cov_radius(emb, active_token)
+            uncovered, recall, d_b2a = reference_coverage(emb, cand_emb, radius_b)
+            rc1, rc2 = st.columns(2)
+            rc1.metric("覆蓋參照 B", f"{recall * 100:.0f}%",
+                       help="B 的點有多少落在你資料的半徑內＝你覆蓋了參照分佈的多少。"
+                            "這是覆蓋圖第一次有的『外部真值』——自我參照稀疏量不到。")
+            rc2.metric("未覆蓋點", len(uncovered),
+                       help="B 有、你半徑內沒覆蓋到的點＝你相對外部參照缺的區域。")
+            st.caption(":gray[參照模式：B 當外部真值，量你相對 B 缺哪裡（補上"
+                       "『稀疏＝自我參照、未校正真實分佈』的洞）。]")
+            work_idx = uncovered
+            work_score = {i: float(d_b2a[i]) for i in uncovered}
+            head, csv_name, send_key, cart_src = (
+                "你相對參照 B 缺的區域（B 有、你沒覆蓋）",
+                "reference_gaps.csv", "cov_to_quiz_ref", "reference")
+            if not work_idx:
+                st.success("你已覆蓋參照 B 的全部區域（半徑內）。")
+                return
+        else:
+            work_idx = ranked_idx
+            work_score = dict(zip(ranked_idx, ranked_scores))
+            head, csv_name, send_key, cart_src = (
+                "最能補洞的候選", "gap_fillers.csv", "cov_to_quiz", "gap_filler")
+            st.caption("依『離既有資料多遠（落在稀疏區）』排序，越前越能補你缺的區域。")
+
+        st.markdown(f"**② {head}**")
         send_n = int(st.number_input(
-            "送前 N 名進組考卷標註", min_value=1, max_value=len(ranked_idx),
-            value=min(12, len(ranked_idx)), key="cov_send_n"))
-        picks = ranked_idx[:send_n]
+            "送前 N 名進組考卷標註", min_value=1, max_value=len(work_idx),
+            value=min(12, len(work_idx)), key="cov_send_n"))
+        picks = work_idx[:send_n]
         chosen = [cand_records[i] for i in picks]
         chosen_labels = [provisional[i] for i in picks]
-        chosen_scores = ranked_scores[:send_n]
+        chosen_scores = [work_score[i] for i in picks]
         quiz_records = candidates_to_quiz_records(chosen, chosen_labels, chosen_scores)
-        st.button(f"📝 送前 {len(picks)} 名進組考卷 →", key="cov_to_quiz",
-                  type="primary", use_container_width=True,
-                  on_click=_cov_send_to_quiz,
-                  args=(quiz_records, chosen_scores, class_opts))
+        bq1, bq2 = st.columns(2)
+        bq1.button(f"📝 送前 {len(picks)} 名進組考卷 →", key=send_key,
+                   type="primary", use_container_width=True,
+                   on_click=_cov_send_to_quiz,
+                   args=(quiz_records, chosen_scores, class_opts))
+        bq2.button("🛒 加入策展購物車", key="cov_cand_cart", use_container_width=True,
+                   on_click=_batch_add,
+                   args=(cand_records, list(picks), cart_src, dict(work_score)))
         st.caption(":gray[候選無標籤——暫定類別取自最近鄰，送考卷後盲標即為新標籤。]")
-        score_by_idx = dict(zip(ranked_idx, ranked_scores))
-        with st.container(height=300):
+        with st.container(height=280):
             cols = st.columns(3)
             for j, i in enumerate(picks):
                 with cols[j % 3]:
@@ -3074,15 +3111,15 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                     thumb = _thumb_or_none(p)
                     if thumb:
                         st.image(thumb, use_container_width=True,
-                                 caption=f"#{j + 1} d={score_by_idx[i]:.3f}"
+                                 caption=f"#{j + 1} d={work_score[i]:.3f}"
                                          f"→{provisional[i] or '?'}")
                     else:
                         st.warning("⚠ 缺檔")
-        csv = "rank,path,gap_score,provisional_label\n" + "\n".join(
-            f'{r + 1},"{cand_records[i]["path"]}",{score_by_idx[i]:.6f},{provisional[i]}'
+        csv = "rank,path,score,provisional_label\n" + "\n".join(
+            f'{r + 1},"{cand_records[i]["path"]}",{work_score[i]:.6f},{provisional[i]}'
             for r, i in enumerate(picks))
-        st.download_button("⬇ 匯出補洞候選 CSV", data=csv,
-                           file_name="gap_fillers.csv", mime="text/csv",
+        st.download_button("⬇ 匯出 CSV", data=csv,
+                           file_name=csv_name, mime="text/csv",
                            key="cov_gap_csv", use_container_width=True)
 
 

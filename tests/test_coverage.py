@@ -20,6 +20,7 @@ from interaction import (
     nearest_labels,
     parse_yolo_boxes,
     rank_gap_fillers,
+    reference_coverage,
     sparsity_scores,
 )
 
@@ -240,3 +241,29 @@ def test_cross_class_nn_pairs_deduped_capped_and_degenerate():
     assert all(i < j for i, j in pairs)            # unordered, deduped
     assert len(set(pairs)) == len(pairs)
     assert cross_class_nn_pairs(np.zeros((1, 4)), ["A"]) == []
+
+
+# ── reference_coverage (嵌入覆蓋圖 關係②：A 相對外部參照 B) ───────────────
+
+def test_reference_coverage_flags_uncovered_region():
+    # A = cluster around [1,0,0,0]; B has points near A (covered) + one far away
+    a = _two_clusters(n_per=10)[:10]                # one tight A cluster
+    covered = np.array([[1.0, 0.01, 0.0, 0.0]])     # sits on top of A
+    faraway = np.array([[0.0, 0.0, 1.0, 0.0]])      # a region A never covers
+    b = np.vstack([covered, faraway])
+    uncovered, recall, d = reference_coverage(a, b, radius=0.05)
+    assert uncovered == [1]                          # only the far B point
+    assert recall == pytest.approx(0.5)              # 1 of 2 B points covered
+    assert d.shape == (2,) and d[1] > d[0]
+
+
+def test_reference_coverage_full_and_empty():
+    a = _two_clusters(n_per=8)
+    # B identical to A → fully covered → recall 1.0, none uncovered
+    uncovered, recall, _ = reference_coverage(a, a, radius=0.2)
+    assert uncovered == [] and recall == pytest.approx(1.0)
+    # empty inputs are safe
+    unc0, rec0, _ = reference_coverage(np.zeros((0, 4)), a, 0.1)
+    assert unc0 == [] and rec0 == 1.0
+    unc1, rec1, d1 = reference_coverage(a, np.zeros((0, 4)), 0.1)
+    assert unc1 == [] and rec1 == 1.0 and len(d1) == 0

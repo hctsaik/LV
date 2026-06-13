@@ -1076,3 +1076,28 @@ def cross_class_nn_pairs(
             cand.append((key[0], key[1], float(dist[i, col])))
     cand.sort(key=lambda t: t[2])
     return [(i, j) for i, j, _ in cand[:max_pairs]]
+
+
+def reference_coverage(
+    emb_a: np.ndarray, emb_b: np.ndarray, radius: float,
+) -> tuple[list[int], float, np.ndarray]:
+    """A 相對『外部參照分佈 B』的覆蓋（嵌入覆蓋圖的關係②，與自我參照稀疏互補）。
+
+    對每個 B 點算到 A 的最近 cosine 距離 ``d_b_to_a``；超過 ``radius`` 視為
+    『A 沒覆蓋到的 B 區域』。回傳 ``(uncovered_b_indices, recall, d_b_to_a)``，
+    其中 ``recall`` = 落在半徑內的 B 比例（A 覆蓋了參照的多少；1.0＝全覆蓋）。
+    uncovered 依距離由遠到近排序（最該補的在前）。空輸入 → ([], 1.0, 空陣列)。
+
+    這是覆蓋圖第一次有「外部真值」：自我參照稀疏看不出「全資料集都缺的類型」，
+    而以 B 當參照就能誠實量出『相對 B 我缺哪裡』。
+    """
+    a = np.asarray(emb_a)
+    b = np.asarray(emb_b)
+    if len(a) == 0 or len(b) == 0:
+        return [], 1.0, np.zeros(len(b), dtype=float)
+    nn = NearestNeighbors(n_neighbors=1, metric="cosine").fit(a)
+    dist, _ = nn.kneighbors(b)
+    d_b_to_a = dist[:, 0]
+    uncovered = [int(i) for i in np.argsort(d_b_to_a)[::-1] if d_b_to_a[i] > radius]
+    recall = 1.0 - len(uncovered) / len(b)
+    return uncovered, float(recall), d_b_to_a
