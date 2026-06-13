@@ -47,6 +47,18 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
 )
 from manifest import rel_key, set_embedding_refs, update_manifest, write_manifest
 from umap_ref import ref_path_for, stable_umap
+from completeness import (
+    STATE_EMPTY,
+    STATE_FAKE,
+    STATE_HEALTHY,
+    STATE_LOW,
+    STATE_MISSING,
+    STATE_OVER,
+    build_completeness,
+    bucketize,
+    categorical_buckets,
+    image_stats,
+)
 from compare_distributions import (
     build_projection_figure,
     compute_fid,
@@ -1732,6 +1744,197 @@ def _compare_distributions_ui() -> None:
         )
 
 
+_STATE_COLOR = {
+    STATE_EMPTY: "#c0392b", STATE_MISSING: "#e74c3c", STATE_LOW: "#f39c12",
+    STATE_HEALTHY: "#2ecc71", STATE_FAKE: "#9b59b6", STATE_OVER: "#3498db",
+}
+_STATE_Z = {  # 離散色階用的整數編碼
+    STATE_EMPTY: 0, STATE_MISSING: 1, STATE_LOW: 2,
+    STATE_HEALTHY: 3, STATE_FAKE: 4, STATE_OVER: 5,
+}
+# 可當軸的「自動計算屬性」（從影像算，不需事先標註）
+_AUTO_AXES = ["brightness", "contrast", "sharpness", "aspect"]
+
+
+def _completeness_axis_values(records: list[dict], axis: str):
+    """回傳該軸的 (每筆 bucket index, bucket labels)。類別軸用 records 欄位，
+    數值軸用快取的影像統計分桶。"""
+    if axis in ("label", "split"):
+        return categorical_buckets([r.get(axis, "") for r in records])
+    stats = st.session_state.get("cmp_img_stats", [])
+    vals = [s.get(axis, 0.0) for s in stats]
+    n_bins = int(st.session_state.get("cov_bins", 3))
+    return bucketize(vals, n_bins, method="quantile")
+
+
+def _completeness_ui() -> None:
+    st.markdown("##### 模型收值完整性熱力圖")
+    st.caption("把資料依兩個屬性軸切成小格，看每格「不太多也不太少」。"
+               "綠＝健康、紫＝假完整（量夠但都是近重複）、紅/橘＝缺。"
+               "詳見 docs/defect_mechanisms_v2.md §5。")
+
+    with st.sidebar:
+        st.markdown("**① 資料**")
+        st.text_area("資料夾路徑（每行一個）", key="cov_folder_text",
+                     placeholder="例：demo/imagenette/train", height=68)
+        all_models = available_models()
+        if not all_models:
+            st.error("models/ 內找不到模型檔。")
+            return
+        st.markdown("**② 模型**")
+        model = st.selectbox("模型", all_models, label_visibility="collapsed",
+                             help="算每格內 embedding 多樣性（質量探針）用。")
+        st.markdown("**③ 屬性軸**")
+        axis_opts = ["label", "split", *_AUTO_AXES]
+        ax_x = st.selectbox("X 軸", axis_opts, index=0, key="cov_ax_x")
+        ax_y = st.selectbox("Y 軸", axis_opts, index=2, key="cov_ax_y")
+        st.number_input("數值軸分桶數", min_value=2, max_value=8, value=3,
+                        key="cov_bins", help="brightness 等連續屬性切幾檔。")
+        st.markdown("**④ 健康帶**")
+        t_abs = st.number_input("每格目標樣本數（地板）", min_value=1, value=10,
+                                key="cov_t_abs",
+                                help="未提供真實分佈時的均勻目標，標『未校正』。")
+        d_star = st.slider("多樣性門檻 d*", 0.0, 1.0, 0.6, 0.05, key="cov_dstar",
+                           help="格內多樣性低於此值＝假完整（近重複充數）。")
+        run = st.button("▶ Run", use_container_width=True, key="run_cov",
+                        type="primary")
+
+    if run:
+        folders = parse_folder_paths(st.session_state.get("cov_folder_text", ""))
+        missing = [str(p) for p in folders if not p.exists()]
+        if not folders:
+            st.error("請先輸入至少一個資料夾。"); return
+        if missing:
+            st.error(f"資料夾不存在：{', '.join(missing)}"); return
+        records = discover_images_classifier(folders)
+        if not records:
+            st.error("找不到影像（需 folder/類別/影像 結構）。"); return
+
+        embed_fn = load_model(model)
+        with st.status("計算中…", expanded=True) as _status:
+            bar = st.progress(0.0, text="特徵擷取…")
+            paths = [r["path"] for r in records]
+            cache = folders[0] / f"embeddings_{model}" / "embeddings.npz"
+
+            def _cb(done, total):
+                bar.progress(min(done / max(total, 1) * 0.6, 0.6),
+                             text=f"特徵擷取 {done}/{total}")
+            emb = extract_embeddings(paths, embed_fn, cache_path=cache, progress_cb=_cb)
+
+            stats = []
+            for i, p in enumerate(paths):
+                try:
+                    stats.append(image_stats(p))
+                except OSError:
+                    stats.append({a: 0.0 for a in _AUTO_AXES})
+                if i % 20 == 0:
+                    bar.progress(0.6 + 0.4 * (i + 1) / len(paths),
+                                 text=f"影像屬性 {i + 1}/{len(paths)}")
+            bar.progress(1.0, text="完成")
+            _status.update(label="完成", state="complete", expanded=False)
+
+        st.session_state["cov_records"] = records
+        st.session_state["cov_emb"] = emb
+        st.session_state["cmp_img_stats"] = stats
+        st.session_state["cov_token"] = uuid.uuid4().hex
+        st.session_state.pop("cov_active_cell", None)
+        st.toast(f"完成：{len(records)} 張影像", icon="✅")
+
+    if "cov_records" not in st.session_state:
+        st.info("在左側輸入資料夾、選兩個屬性軸後按 ▶ Run。"
+                "建議先用 demo/imagenette/train 試跑。")
+        return
+
+    records = st.session_state["cov_records"]
+    emb = st.session_state["cov_emb"]
+    bx, lx = _completeness_axis_values(records, ax_x)
+    by, ly = _completeness_axis_values(records, ax_y)
+    result = build_completeness(records, emb, bx, by, lx, ly,
+                                t_abs=int(t_abs), d_star=float(d_star))
+    cells = result["cells"]
+    health = result["health"]
+
+    col_map, col_side = st.columns([5, 3], gap="medium")
+    with col_map:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Coverage Health", f"{health['coverage_health']:.0f}%",
+                  help="達標格佔比（含假完整 0.7 折）。一眼看資料夠不夠。")
+        n_miss = health["counts"].get(STATE_EMPTY, 0) + health["counts"].get(STATE_MISSING, 0)
+        m2.metric("缺格數", f"{n_miss}/{len(cells)}")
+        m3.metric("不均度 Gini", f"{health['gini']:.2f}",
+                  help="0=每格平均；高=量集中在少數格（假完整風險）。")
+        m4.metric("假完整格", f"{health['fake_ratio'] * 100:.0f}%",
+                  help="量夠但近重複的格子比例。")
+        if not result["calibrated"]:
+            st.caption(":orange[⚠ 目標數為均勻假設（未校正真實分佈）——稀有格可能被誤判為缺。]")
+
+        # 熱力圖：屬性軸網格、五態離散色
+        nx, ny = len(lx), len(ly)
+        z = [[None] * nx for _ in range(ny)]
+        text = [[""] * nx for _ in range(ny)]
+        for c in cells:
+            z[c["y"]][c["x"]] = _STATE_Z[c["state"]]
+            text[c["y"]][c["x"]] = (f"{c['state']}<br>n={c['n']} / t={c['t']:.0f}"
+                                    f"<br>多樣性 d={c['d']:.2f}")
+        colorscale = [[_STATE_Z[s] / 5, _STATE_COLOR[s]] for s in
+                      (STATE_EMPTY, STATE_MISSING, STATE_LOW, STATE_HEALTHY,
+                       STATE_FAKE, STATE_OVER)]
+        fig = go.Figure(data=go.Heatmap(
+            z=z, x=lx, y=ly, text=text, hoverinfo="text",
+            colorscale=colorscale, zmin=0, zmax=5, showscale=False,
+            xgap=3, ygap=3,
+        ))
+        fig.update_layout(
+            height=560, margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_title=ax_x, yaxis_title=ax_y,
+            title=f"{ax_x} × {ax_y}　·　🟥缺 🟧偏缺 🟩健康 🟪假完整 🟦過多",
+        )
+        st.plotly_chart(fig, use_container_width=True, key="cov_heatmap")
+
+    with col_side:
+        st.markdown("**缺格清單（缺口大→小）**")
+        gaps = [g for g in health["top_gaps"]
+                if g["state"] in (STATE_EMPTY, STATE_MISSING, STATE_LOW)]
+        if not gaps:
+            st.success("沒有缺格——每格都達標。")
+        with st.container(height=200):
+            for g in gaps[:30]:
+                lab = f"{g['x_label']} × {g['y_label']}"
+                if st.button(f"🔴 {lab}　n={g['n']}/t={g['t']:.0f}（缺 {g['shortfall']:.0f}）",
+                             key=f"cov_gap_{g['x']}_{g['y']}", use_container_width=True):
+                    st.session_state["cov_active_cell"] = (g["x"], g["y"])
+                    st.rerun()
+        # 點任一格（含健康/假完整）看圖
+        st.markdown("**檢視格內影像**")
+        active = st.session_state.get("cov_active_cell")
+        cell = next((c for c in cells if (c["x"], c["y"]) == active), None)
+        if cell is None:
+            st.caption("點左方缺格、或下方挑一格，看格內影像。")
+            opts = {f"{c['x_label']} × {c['y_label']}（{c['state']} n={c['n']}）":
+                    (c["x"], c["y"]) for c in cells if c["n"] > 0}
+            pick = st.selectbox("挑一格", ["—"] + list(opts), key="cov_cell_pick")
+            if pick != "—":
+                st.session_state["cov_active_cell"] = opts[pick]
+                st.rerun()
+        else:
+            st.caption(f"**{cell['x_label']} × {cell['y_label']}** · {cell['state']} · "
+                       f"n={cell['n']} / t={cell['t']:.0f} · 多樣性 d={cell['d']:.2f}")
+            if cell["state"] == STATE_FAKE:
+                st.caption(":violet[假完整：量夠但多樣性低，多為近重複——建議去重而非再補。]")
+            with st.container(height=300):
+                cols = st.columns(3)
+                for j, i in enumerate(cell["indices"][:30]):
+                    with cols[j % 3]:
+                        p = Path(records[i]["path"])
+                        thumb = _thumb_or_none(p)
+                        if thumb:
+                            st.image(thumb, use_container_width=True)
+                        else:
+                            st.warning("⚠ 缺檔")
+            st.button("✕ 關閉", key="cov_cell_close",
+                      on_click=lambda: st.session_state.pop("cov_active_cell", None))
+
+
 def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
@@ -1746,7 +1949,7 @@ def main() -> None:
     st.session_state.setdefault("tool_switch", "Visualize Embeddings")
     with switch_col:
         tool = st.segmented_control(
-            "Tool", ["Visualize Embeddings", "Compare Distributions"],
+            "Tool", ["Visualize Embeddings", "Compare Distributions", "完整度熱力圖"],
             key="tool_switch", label_visibility="collapsed",
         ) or "Visualize Embeddings"
     with help_col, st.popover("✨ 功能地圖", use_container_width=True):
@@ -1761,14 +1964,18 @@ def main() -> None:
             "- **固定 UMAP 參考系**：③ 投影方法下的開關——跨 Run 佈局可比較\n"
             "- **比較兩資料夾**：Compare Distributions——FID/KID 等指標＋"
             "點選散點看對應影像\n"
+            "- **完整度熱力圖**：把資料依兩屬性軸切格，看每格『不太多不太少』、"
+            "整體 Coverage Health、缺格清單（紫＝假完整近重複）\n"
             "- **資料合約 manifest.jsonl**：每次 Run 自動寫入各資料夾"
             "（sha256／phash／embedding refs），供去重、回溯與下游工具使用"
         )
 
     if tool == "Visualize Embeddings":
         _visualize_embeddings_ui()
-    else:
+    elif tool == "Compare Distributions":
         _compare_distributions_ui()
+    else:
+        _completeness_ui()
 
 
 if __name__ == "__main__":

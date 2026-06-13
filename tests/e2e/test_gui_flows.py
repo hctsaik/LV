@@ -723,3 +723,44 @@ def test_t_umap_reference_frame(app_page, tmp_path):
     wait_idle(page, timeout=120000)
     _no_exception(page)
     assert list(train.glob("embeddings_*/umap_ref.pkl")), "frame must survive re-Run"
+
+
+# ── (u) completeness heatmap tool (defect-mechanisms v2 §5) ─────────────
+
+def test_u_completeness_heatmap(app_page, tmp_path):
+    import numpy as np
+    from PIL import Image
+    page = app_page
+    # 3 classes, each split bright vs dark → an interpretable label×brightness grid
+    root = tmp_path / "concept" / "train"
+    for ci, cls in enumerate(("alpha", "beta", "gamma")):
+        d = root / cls
+        d.mkdir(parents=True)
+        for i in range(8):
+            base = 210 if i < 4 else 40       # bright half / dark half
+            arr = np.full((64, 64, 3), base, "uint8")
+            arr[:, :, ci] = (arr[:, :, ci].astype(int) + 30).clip(0, 255)
+            Image.fromarray(arr).save(d / f"{cls}_{i}.jpg", quality=90)
+
+    page.locator('.st-key-tool_switch').get_by_text("完整度熱力圖").click()
+    wait_idle(page)
+    page.locator('.st-key-cov_folder_text textarea').fill(str(root))
+    # X = label, Y = brightness (default index 2 already = brightness)
+    page.locator('.st-key-run_cov button').click()
+    page.wait_for_selector('.st-key-cov_heatmap', timeout=300000)
+    wait_idle(page, timeout=120000)
+    _no_exception(page)
+
+    # the headline number + missing-cell stats render
+    expect(page.get_by_text("Coverage Health", exact=True)).to_be_visible()
+    expect(page.get_by_text("缺格數", exact=True)).to_be_visible()
+    expect(page.get_by_text("假完整格", exact=True)).to_be_visible()
+    # the heatmap has cells (one trace, label×brightness)
+    assert page.locator('.st-key-cov_heatmap').count() == 1
+
+    # pick a populated cell → its images render in the side panel
+    page.locator('.st-key-cov_cell_pick [data-baseweb="select"]').click()
+    page.get_by_role("option").nth(1).click()  # first real cell
+    wait_idle(page)
+    expect(page.locator('.st-key-cov_cell_close')).to_be_visible()
+    _no_exception(page)
