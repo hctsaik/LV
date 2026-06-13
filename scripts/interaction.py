@@ -374,6 +374,70 @@ def attribute_escape(
     return {"class": ESCAPE_REVIEW, "confidence": 0.3, "reasons": reasons}
 
 
+# ── three-orthogonal-signal root-cause diagnosis (H1–H5) ────────────────
+# (vision-judgment-boundary framework §3 / defect-mechanisms decision tree)
+CAUSE_H1 = "H1 覆蓋缺口"
+CAUSE_H2 = "H2 定義歧義"
+CAUSE_H3 = "H3 標籤雜訊"
+CAUSE_H4 = "H4 容量/特徵限制"
+CAUSE_H5 = "H5 分布外 OOD"
+
+_CAUSE_ACTION = {
+    CAUSE_H1: "補這一格的資料——『本該判對只是資料太少』，補了大概率有效。",
+    CAUSE_H2: "定義問題，非資料問題：凍結為灰帶、送仲裁人、更新定義書（補資料不會收斂，標籤互相矛盾）。",
+    CAUSE_H3: "稽核這一帶的訓練標籤、查混淆變數——模型可能其實是對的、GT 錯了。",
+    CAUSE_H4: "換架構 / 加特徵 / 上專家模型——落在密集格仍學不會，是容量天花板，補資料幫助有限。",
+    CAUSE_H5: "看似 in-distribution 實則新樣態：收新樣態資料，並檢查 embedding 分不分得開。",
+}
+_CAUSE_ADD_DATA = {
+    CAUSE_H1: "有效（補這格）",
+    CAUSE_H2: "無效（是定義問題，補資料不收斂）",
+    CAUSE_H3: "先別補（先稽核標籤，GT 可能才錯）",
+    CAUSE_H4: "幫助有限（要換架構）",
+    CAUSE_H5: "需收『新樣態』資料",
+}
+
+
+def diagnose_root_cause(
+    s1_consistency: float,
+    s2_density: float,
+    s3_entropy: float,
+    *,
+    consistency_thr: float = 0.75,
+    density_thr: float = 3,
+    entropy_thr: float = 0.5,
+) -> dict:
+    """Cross-locate why a misjudged sample failed, from three ORTHOGONAL
+    signals (none alone is enough):
+
+      S1 ``s1_consistency`` — concept ambiguity (HUMAN consistency, e.g.
+        the quiz / gauge-R&R score). Low = experts themselves disagree.
+      S2 ``s2_density`` — local data coverage (embedding neighbour count
+        within the N2 radius). Sparse = a coverage gap.
+      S3 ``s3_entropy`` — model uncertainty (softmax entropy / 1−margin).
+        High = the model itself hesitates; low = confidently wrong.
+
+    Returns {cause, action, add_data, s1_low, s2_sparse, s3_high}. The
+    headline ``add_data`` answers the founding question — does adding data
+    actually help — which only H1 (and H5, for new regimes) does.
+    """
+    s1_low = s1_consistency < consistency_thr
+    s2_sparse = s2_density <= density_thr
+    s3_high = s3_entropy >= entropy_thr
+    if s1_low:                       # humans disagree → it's a spec problem
+        cause = CAUSE_H2
+    elif s3_high:                    # model hesitates
+        cause = CAUSE_H1 if s2_sparse else CAUSE_H4
+    else:                            # confidently wrong
+        cause = CAUSE_H5 if s2_sparse else CAUSE_H3
+    return {
+        "cause": cause,
+        "action": _CAUSE_ACTION[cause],
+        "add_data": _CAUSE_ADD_DATA[cause],
+        "s1_low": s1_low, "s2_sparse": s2_sparse, "s3_high": s3_high,
+    }
+
+
 def compute_label_disagreement(
     embeddings: np.ndarray,
     labels: Sequence[str],

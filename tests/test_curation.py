@@ -266,3 +266,53 @@ def test_gray_decision_csv_contract():
     assert "邊緣有微小凹陷" in lines[1] and lines[1].endswith("approved")
     assert gray_decision_csv([]).strip() == \
         "path,soft_label,confidence,anchor,reason,proposer,approver,status"
+
+
+# ── three-signal root-cause diagnosis (H1–H5) — BDD scenarios as tests ──
+
+from interaction import (  # noqa: E402
+    CAUSE_H1, CAUSE_H2, CAUSE_H3, CAUSE_H4, CAUSE_H5, diagnose_root_cause,
+)
+
+
+def test_diag_h1_sparse_consistent_high_entropy_is_coverage_gap():
+    # 稀疏 + 人類一致 + 高熵 → H1 覆蓋缺口, 補資料有效
+    r = diagnose_root_cause(s1_consistency=0.95, s2_density=1, s3_entropy=0.8)
+    assert r["cause"] == CAUSE_H1
+    assert r["add_data"].startswith("有效")
+    assert r["s2_sparse"] and r["s3_high"] and not r["s1_low"]
+
+
+def test_diag_h4_dense_consistent_high_entropy_is_capacity_limit():
+    # 密集 + 人類一致 + 高熵 → H4 容量限制, 補資料無效（換架構）
+    r = diagnose_root_cause(s1_consistency=0.95, s2_density=30, s3_entropy=0.8)
+    assert r["cause"] == CAUSE_H4 and "有限" in r["add_data"]
+
+
+def test_diag_h3_dense_confident_wrong_is_label_noise():
+    # 密集 + 篤定卻錯（低熵）→ H3 標籤雜訊
+    r = diagnose_root_cause(s1_consistency=0.95, s2_density=30, s3_entropy=0.1)
+    assert r["cause"] == CAUSE_H3
+
+
+def test_diag_h5_sparse_confident_wrong_is_ood():
+    # 稀疏 + 篤定卻錯 → H5 OOD, 需收新樣態
+    r = diagnose_root_cause(s1_consistency=0.95, s2_density=0, s3_entropy=0.1)
+    assert r["cause"] == CAUSE_H5 and "新樣態" in r["add_data"]
+
+
+def test_diag_h2_human_inconsistent_overrides_everything():
+    # 人類不一致 → H2 定義歧義（不論 S2/S3）, 補資料不收斂
+    for d, e in [(0, 0.9), (30, 0.1), (5, 0.5)]:
+        r = diagnose_root_cause(s1_consistency=0.4, s2_density=d, s3_entropy=e)
+        assert r["cause"] == CAUSE_H2 and r["s1_low"]
+        assert "無效" in r["add_data"]
+
+
+def test_diag_threshold_boundaries_configurable():
+    # at exactly the thresholds: density==thr is "sparse", entropy==thr is "high"
+    r = diagnose_root_cause(0.95, 3, 0.5, density_thr=3, entropy_thr=0.5)
+    assert r["s2_sparse"] and r["s3_high"] and r["cause"] == CAUSE_H1
+    # raise the consistency bar so a 0.8 score now counts as inconsistent
+    r2 = diagnose_root_cause(0.8, 1, 0.8, consistency_thr=0.9)
+    assert r2["cause"] == CAUSE_H2

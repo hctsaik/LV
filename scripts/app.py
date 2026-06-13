@@ -29,6 +29,7 @@ from _utils import (
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
     attribute_escape,
     build_nn_index,
+    diagnose_root_cause,
     compute_label_disagreement,
     compute_outlier_scores,
     draw_yolo_boxes,
@@ -905,40 +906,51 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
             radius = float(np.percentile(dist[:, 1], 75))
             st.session_state["_viz_card_radius"] = radius
 
-        density = neighbor_hit_density(raw, idx, radius)
-        entropy = neighbor_label_entropy(raw, labels, idx, k=20)
-        if outlier is not None:
-            outlier_pct = float((outlier <= outlier[idx]).mean())
-        else:
-            outlier_pct = 0.5
+        density = neighbor_hit_density(raw, idx, radius)          # S2 覆蓋度
+        label_entropy = neighbor_label_entropy(raw, labels, idx, k=20)
 
         scores = _scores_for(p)
         sc = scores.get(p.name)
         score_v = sc[0] if sc else None
         thr_v = sc[1] if sc else None
 
-        attr = attribute_escape(density, entropy, outlier_pct,
-                                score=score_v, threshold=thr_v)
+        # S3 模型不確定度：有 scores.csv 用分數 margin（真模型不確定度），
+        # 否則退回鄰域標籤熵當代理（誠實標示）。
+        if score_v is not None and thr_v is not None:
+            margin = abs(score_v - thr_v) / (abs(thr_v) + 1e-9)
+            s3 = float(max(0.0, 1.0 - min(margin, 1.0)))
+            s3_src = "模型分數 margin"
+        else:
+            s3 = float(label_entropy)
+            s3_src = "鄰域標籤熵（代理，未提供 scores.csv）"
 
         st.subheader(f"🩺 體檢卡 · {p.name}")
         st.caption(f"{r['label']}（{r['split']}）· #{idx}")
-        # 歸因
-        st.markdown(f"**歸因：{attr['class']}**　信心 {attr['confidence']:.0%}")
-        for reason in attr["reasons"]:
-            st.caption(f"· {reason}")
-        # 訊號
+
+        # S1 概念歧義度：人類一致性（來自組考卷 / gauge R&R），由使用者提供
+        s1_default = float(st.session_state.get("quiz_last_consistency", 0.9))
+        s1 = st.slider("S1 此概念的人類一致性（來自組考卷 / gauge study）",
+                       0.0, 1.0, s1_default, 0.01, key="viz_card_s1",
+                       help="量『人』——專家對這類樣本判定有多一致。"
+                            "低於門檻才會判 H2 定義歧義（補資料不收斂）。"
+                            "跑過組考卷會自動帶入其自我一致率。")
+
+        diag = diagnose_root_cause(s1, density, s3)
+        st.markdown(f"### 根因：{diag['cause']}")
+        st.markdown(f"**補資料有效性：{diag['add_data']}**")
+        st.caption(diag["action"])
+
+        # 三正交訊號
         c1, c2, c3 = st.columns(3)
-        c1.metric("N2 命中密度", density, help=f"半徑 {radius:.3f} 內訓練集相似鄰居數。")
-        c2.metric("N3 標籤分歧熵", f"{entropy:.2f}", help="鄰居標籤的歸一化熵；高＝標準漂移。")
-        c3.metric("離群度百分位", f"{outlier_pct * 100:.0f}%",
-                  help="此圖離群度在資料集中的位置。")
-        if score_v is not None:
-            st.caption(f"模型分數 {score_v:.3f}" +
-                       (f" · 閾值 {thr_v:.3f}（N4 已啟用）" if thr_v is not None
-                        else "（無閾值，N4 僅供參考）"))
-        else:
-            st.caption(":gray[未找到 scores.csv（filename,score[,threshold]）——"
-                       "N4 分數閘停用，僅以 embedding 訊號歸因。]")
+        c1.metric("S1 人類一致性", f"{s1 * 100:.0f}%",
+                  "歧義" if diag["s1_low"] else "清楚",
+                  help="量人：低＝專家也喬不定＝定義問題。")
+        c2.metric("S2 命中密度", density, "稀疏" if diag["s2_sparse"] else "密集",
+                  help=f"量資料：半徑 {radius:.3f} 內訓練集相似鄰居數。")
+        c3.metric("S3 模型不確定度", f"{s3:.2f}", "猶豫" if diag["s3_high"] else "篤定",
+                  help=f"量模型：來源＝{s3_src}。")
+        st.caption(f":gray[S3 來源：{s3_src}。三訊號需彼此獨立——"
+                   "缺 S1（沒跑組考卷）時 H2 無法觸發，請補測人類一致性。]")
 
         # kNN 鄰居縮圖牆
         st.markdown("**最近鄰（它長得像誰）**")
@@ -953,25 +965,23 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
                         st.image(thumb, use_container_width=True,
                                  caption=f"{records[ni]['label']} d={nd:.3f}")
         # 匯出
-        report = _health_card_report(p, r, idx, attr, density, entropy,
-                                     outlier_pct, score_v, thr_v, radius,
-                                     nbr_idx, nbr_d, records)
+        report = _health_card_report(p, r, idx, diag, s1, density, s3, s3_src,
+                                     score_v, thr_v, radius, nbr_idx, nbr_d, records)
         st.download_button("⬇ 匯出體檢卡 HTML", data=report,
                            file_name=f"healthcard_{p.stem}.html",
                            mime="text/html", key="viz_card_export",
                            use_container_width=True)
 
 
-def _health_card_report(p, r, idx, attr, density, entropy, outlier_pct,
+def _health_card_report(p, r, idx, diag, s1, density, s3, s3_src,
                         score_v, thr_v, radius, nbr_idx, nbr_d, records) -> str:
     rows = "".join(
         f"<tr><td>#{ni}</td><td>{records[ni]['label']}</td>"
         f"<td>{records[ni]['split']}</td><td>{nd:.4f}</td></tr>"
         for ni, nd in zip(nbr_idx, nbr_d))
     score_line = (f"模型分數 {score_v:.3f}" +
-                  (f"，閾值 {thr_v:.3f}（N4 啟用）" if thr_v is not None else "（無閾值）")
-                  ) if score_v is not None else "未提供 scores.csv，N4 停用"
-    reasons = "".join(f"<li>{x}</li>" for x in attr["reasons"])
+                  (f"，閾值 {thr_v:.3f}" if thr_v is not None else "（無閾值）")
+                  ) if score_v is not None else "未提供 scores.csv"
     return f"""<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8">
 <title>體檢卡 {p.name}</title><style>
 body{{font-family:"Noto Sans TC",sans-serif;max-width:720px;margin:24px auto;color:#1a2433}}
@@ -980,10 +990,12 @@ td,th{{border:1px solid #e3e8ef;padding:6px 10px;font-size:14px}}
 .attr{{background:#eef2f7;border-radius:8px;padding:12px 16px;margin:12px 0}}</style></head><body>
 <h1>🩺 Escape 體檢卡 · {p.name}</h1>
 <p class="k">{r['label']}（{r['split']}）· #{idx} · {p}</p>
-<div class="attr"><b>歸因：{attr['class']}</b>　信心 {attr['confidence']:.0%}
-<ul>{reasons}</ul></div>
-<p>N2 命中密度 <b>{density}</b>（半徑 {radius:.3f}）　·　N3 標籤分歧熵 <b>{entropy:.2f}</b>
-　·　離群度百分位 <b>{outlier_pct*100:.0f}%</b></p>
+<div class="attr"><b>根因：{diag['cause']}</b><br>補資料有效性：<b>{diag['add_data']}</b>
+<p>{diag['action']}</p></div>
+<p>三正交訊號 —
+S1 人類一致性 <b>{s1*100:.0f}%</b>（{'歧義' if diag['s1_low'] else '清楚'}）　·
+S2 命中密度 <b>{density}</b>（半徑 {radius:.3f}，{'稀疏' if diag['s2_sparse'] else '密集'}）　·
+S3 模型不確定度 <b>{s3:.2f}</b>（{'猶豫' if diag['s3_high'] else '篤定'}，來源 {s3_src}）</p>
 <p>{score_line}</p>
 <h3>最近鄰</h3><table><tr><th>#</th><th>label</th><th>split</th><th>cosine 距離</th></tr>
 {rows}</table>
@@ -2475,6 +2487,8 @@ def _quiz_ui() -> None:
 
     # ── 評分 ──
     report = score_quiz(answers, quiz)
+    # 把自我一致率留給體檢卡當 S1（概念歧義度）預填值
+    st.session_state["quiz_last_consistency"] = report["self_consistency"]
     st.markdown("**作答完成 · 成績**")
     m1, m2, m3 = st.columns(3)
     sc, vg = report["self_consistency"], report["vs_golden"]
@@ -2740,8 +2754,9 @@ def main() -> None:
             "勾「僅跨 split」＝train/val 洩漏）\n"
             "- **離群度・標籤分歧**：Run 完自動計算，右欄排序選單切換\n"
             "- **多樣性選樣／主動學習**：右欄「選樣」tab，farthest-point 挑最該優先標的 N 張\n"
-            "- **體檢卡**：選一張圖 → 右欄「體檢卡」tab，看 N2 命中密度/N3 標籤熵/"
-            "歸因（放 scores.csv 可加 N4 分數閘），可匯出 HTML\n"
+            "- **體檢卡 · 三訊號根因診斷**：選一張圖 → 右欄「體檢卡」tab，"
+            "用 S1 人類一致性（組考卷）× S2 覆蓋密度 × S3 模型不確定度 交叉定位 "
+            "H1–H5 根因，直接回答『補資料有沒有用』，可匯出 HTML\n"
             "- **匯出清單**：跨視圖累積選取，匯出 CSV（含 sha256）／ZIP\n"
             "- **固定 UMAP 參考系**：③ 投影方法下的開關——跨 Run 佈局可比較\n"
             "- **比較兩資料夾**：Compare Distributions——FID/KID 等指標＋"

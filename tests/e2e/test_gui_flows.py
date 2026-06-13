@@ -780,11 +780,14 @@ def test_v_health_card(flow_page):
     page.locator('.st-key-viz_panel_view').get_by_text("體檢卡", exact=True).click()
     wait_idle(page)
     panel = page.locator('.st-key-viz_card_panel')
-    expect(panel.get_by_text(re.compile("歸因："))).to_be_visible()
-    expect(panel.get_by_text("N2 命中密度", exact=True)).to_be_visible()
-    expect(panel.get_by_text("N3 標籤分歧熵", exact=True)).to_be_visible()
-    # no scores.csv in the synthetic dataset → N4 disabled, stated honestly
-    expect(panel.get_by_text(re.compile("未找到 scores.csv"))).to_be_visible()
+    # three-orthogonal-signal H1–H5 diagnosis
+    expect(panel.get_by_text(re.compile("根因："))).to_be_visible()
+    expect(panel.get_by_text(re.compile("補資料有效性"))).to_be_visible()
+    expect(panel.get_by_text("S1 人類一致性", exact=True)).to_be_visible()
+    expect(panel.get_by_text("S2 命中密度", exact=True)).to_be_visible()
+    expect(panel.get_by_text("S3 模型不確定度", exact=True)).to_be_visible()
+    # no scores.csv → S3 falls back to the labeled proxy, stated honestly
+    expect(panel.get_by_text(re.compile("代理"))).to_be_visible()
     expect(page.locator('.st-key-viz_card_export')).to_be_visible()
     page.locator('.st-key-viz_panel_view').get_by_text("選取", exact=True).click()
     wait_idle(page)
