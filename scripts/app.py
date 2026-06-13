@@ -27,13 +27,20 @@ from _utils import (
     supports_text_query,
 )
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
+    CAUSE_H1,
+    CAUSE_H5,
     attribute_escape,
     build_nn_index,
+    candidates_to_quiz_records,
+    crop_bbox,
     curation_log_csv,
     diagnose_root_cause,
+    diagnose_sparse_points,
+    discover_yolo_objects,
     match_shas_to_indices,
     compute_label_disagreement,
     compute_outlier_scores,
+    cross_class_nn_pairs,
     draw_yolo_boxes,
     ensure_thumbnails,
     find_duplicate_pairs_embedding,
@@ -44,11 +51,14 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     gray_decision_csv,
     load_scores_csv,
     nearest_anchor,
+    nearest_labels,
+    rank_gap_fillers,
     select_gray_zone,
     make_thumbnail,
     neighbor_hit_density,
     neighbor_label_entropy,
     parse_folder_paths,
+    sparsity_scores,
     records_to_csv,
     selection_points_to_indices,
     snapshots_to_csv,
@@ -191,6 +201,52 @@ def read_classes_txt(folder: Path) -> list[str] | None:
 
 
 
+_DISAGREE_SCALE = [[0.0, "#cfd8dc"], [0.5, "#ff9800"], [1.0, "#d32f2f"]]
+
+
+def _viz_cross_pairs(model: str, token: str, records: list[dict]) -> list[tuple[int, int]]:
+    """『最近鄰卻異類』點對（在原始高維 cosine 空間，與分歧度同源），以
+    (token, model) 快取避免每次 rerun 重算。"""
+    key = f"{token}|{model}"
+    cache = st.session_state.get("_viz_pairs")
+    if cache and cache.get("key") == key:
+        return cache["pairs"]
+    raw = st.session_state.get("viz_raw_embeddings", {}).get(model)
+    pairs = ([] if raw is None
+             else cross_class_nn_pairs(raw, [r["label"] for r in records],
+                                       k=1, max_pairs=300))
+    st.session_state["_viz_pairs"] = {"key": key, "pairs": pairs}
+    return pairs
+
+
+def _viz_send_to_gray(indices: list[int], model: str) -> None:
+    """把散點框選的爭議點直接送進『灰帶覆核』佇列（與 _cov_send_to_quiz 對稱的
+    handoff）：寫入灰帶 session keys、依分歧度排序、每類取最明確者當錨例，切頁。"""
+    records = st.session_state.get("viz_records")
+    raw = st.session_state.get("viz_raw_embeddings", {}).get(model)
+    if not records or raw is None or not indices:
+        return
+    labels = [r["label"] for r in records]
+    dis = st.session_state.get("viz_label_disagreement", {}).get(model)
+
+    def _d(i):
+        return float(dis[i]) if dis is not None else 0.0
+    queue = sorted(dict.fromkeys(int(i) for i in indices), key=_d, reverse=True)
+    anchors: dict[str, int | None] = {}
+    for c in sorted(set(labels)):
+        cand = [i for i in range(len(records)) if labels[i] == c]
+        anchors[c] = (min(cand, key=_d) if cand else None)
+    st.session_state["gray_records"] = records
+    st.session_state["gray_emb"] = raw
+    st.session_state["gray_queue"] = queue
+    st.session_state["gray_anchors"] = anchors
+    st.session_state["gray_state"] = {}
+    st.session_state["gray_pos"] = 0
+    st.session_state["gray_inbound"] = True
+    st.session_state["tool_switch"] = "灰帶覆核"
+    _log_usage("viz_send_to_gray", n=len(queue))
+
+
 def _build_viz_figure(
     records: list[dict],
     coords: np.ndarray,
@@ -199,54 +255,107 @@ def _build_viz_figure(
     method_label: str,
     dim: int = 2,
     highlight: list[int] | None = None,
+    color_by: str = "class",
+    disagreement: np.ndarray | None = None,
+    pairs: list[tuple[int, int]] | None = None,
 ) -> go.Figure:
     """Simple scatter for the selected model/method/split combination.
 
     Each point carries its GLOBAL record index in customdata so box/lasso
     selections map back to records regardless of trace/split filtering.
+
+    ``color_by="disagreement"`` recolours points by k-NN label disagreement
+    (gray→red) instead of class, and draws thin lines between "closest
+    neighbour but different class" ``pairs`` — the conflicts the eye catches.
+    The disagreement spec stays selection-independent, so box/lasso never
+    resets.
     """
-    labels = sorted({records[i]["label"] for i in indices})
-    splits = sorted({records[i]["split"] for i in indices})
-    color_map = {lbl: _VIZ_COLORS[j % len(_VIZ_COLORS)] for j, lbl in enumerate(labels)}
     use_3d = dim == 3 and coords.shape[1] >= 3
     # render 體質（重評 #2）：SVG Scatter 約 5千–1萬點就卡。點數過門檻才換
     # WebGL Scattergl（撐到十萬級）；小資料集維持 SVG 保留逐點點擊互動。
     scatter2d = go.Scattergl if len(indices) > _SCATTERGL_THRESHOLD else go.Scatter
-
+    show_disagree = color_by == "disagreement" and disagreement is not None
     traces = []
-    for label in labels:
-        for split in splits:
-            idx = [i for i in indices if records[i]["label"] == label and records[i]["split"] == split]
-            if not idx:
-                continue
-            common = dict(
-                mode="markers",
-                name=f"{label} ({split})",
-                legendgroup=label,
-                marker=dict(
-                    color=color_map[label],
-                    symbol=_VIZ_SYMBOLS.get(split, "circle"),
-                    size=4 if use_3d else 7,
-                    opacity=0.8,
-                ),
-                text=[records[i]["path"].name for i in idx],
-                customdata=[[i] for i in idx],
-                hovertemplate="%{text}<br>Label: " + label + "<br>Split: " + split
-                              + "<br>#%{customdata[0]}<extra></extra>",
-            )
-            if use_3d:
-                traces.append(go.Scatter3d(
-                    x=[coords[i, 0] for i in idx],
-                    y=[coords[i, 1] for i in idx],
-                    z=[coords[i, 2] for i in idx],
-                    **common,
-                ))
-            else:
-                traces.append(scatter2d(
-                    x=[coords[i, 0] for i in idx],
-                    y=[coords[i, 1] for i in idx],
-                    **common,
-                ))
+
+    if show_disagree:
+        # ① 相鄰異類連線（靜態，不依賴選取）
+        if pairs:
+            lx: list[float | None] = []
+            ly: list[float | None] = []
+            lz: list[float | None] = []
+            iset = set(indices)
+            for i, j in pairs:
+                if i not in iset or j not in iset:
+                    continue
+                lx += [coords[i, 0], coords[j, 0], None]
+                ly += [coords[i, 1], coords[j, 1], None]
+                lz += [coords[i, 2] if use_3d else 0,
+                       coords[j, 2] if use_3d else 0, None]
+            if lx:
+                line = dict(mode="lines", name="相鄰異類", legendgroup="pairs",
+                            line=dict(width=1, color="rgba(214,39,40,0.35)"),
+                            hoverinfo="skip")
+                traces.append(go.Scatter3d(x=lx, y=ly, z=lz, **line) if use_3d
+                              else go.Scatter(x=lx, y=ly, **line))
+        # ② 點以分歧度著色（紅＝鄰居都異類）
+        vals = [float(disagreement[i]) for i in indices]
+        common = dict(
+            mode="markers", name="標籤分歧", showlegend=False,
+            marker=dict(color=vals, colorscale=_DISAGREE_SCALE, cmin=0.0, cmax=1.0,
+                        showscale=True, colorbar=dict(title="分歧"),
+                        size=4 if use_3d else 7, opacity=0.85),
+            text=[records[i]["path"].name for i in indices],
+            customdata=[[i] for i in indices],
+            hovertemplate="%{text}<br>分歧=%{marker.color:.2f}"
+                          "<br>#%{customdata[0]}<extra></extra>",
+        )
+        if use_3d:
+            traces.append(go.Scatter3d(
+                x=[coords[i, 0] for i in indices], y=[coords[i, 1] for i in indices],
+                z=[coords[i, 2] for i in indices], **common))
+        else:
+            traces.append(scatter2d(
+                x=[coords[i, 0] for i in indices],
+                y=[coords[i, 1] for i in indices], **common))
+    else:
+        labels = sorted({records[i]["label"] for i in indices})
+        splits = sorted({records[i]["split"] for i in indices})
+        color_map = {lbl: _VIZ_COLORS[j % len(_VIZ_COLORS)]
+                     for j, lbl in enumerate(labels)}
+        for label in labels:
+            for split in splits:
+                idx = [i for i in indices if records[i]["label"] == label
+                       and records[i]["split"] == split]
+                if not idx:
+                    continue
+                common = dict(
+                    mode="markers",
+                    name=f"{label} ({split})",
+                    legendgroup=label,
+                    marker=dict(
+                        color=color_map[label],
+                        symbol=_VIZ_SYMBOLS.get(split, "circle"),
+                        size=4 if use_3d else 7,
+                        opacity=0.8,
+                    ),
+                    text=[records[i]["path"].name for i in idx],
+                    customdata=[[i] for i in idx],
+                    hovertemplate="%{text}<br>Label: " + label + "<br>Split: " + split
+                                  + "<br>#%{customdata[0]}<extra></extra>",
+                )
+                if use_3d:
+                    traces.append(go.Scatter3d(
+                        x=[coords[i, 0] for i in idx],
+                        y=[coords[i, 1] for i in idx],
+                        z=[coords[i, 2] for i in idx],
+                        **common,
+                    ))
+                else:
+                    traces.append(scatter2d(
+                        x=[coords[i, 0] for i in idx],
+                        y=[coords[i, 1] for i in idx],
+                        **common,
+                    ))
 
     # ring overlay marking the active/highlighted record(s)
     hs = [i for i in (highlight or []) if i in set(indices)]
@@ -266,11 +375,17 @@ def _build_viz_figure(
 
     fig = go.Figure(data=traces)
     # 620px：layout 評審 R2 拍板的散點高度（填滿左欄、消死白）；
-    # plotly 預設邊距很肥，壓到貼齊容器。t 留 52 給 全選/全不選 按鈕。
-    layout = dict(title=f"{model_name} · {method_label}", height=620,
-                  margin=dict(l=10, r=10, t=52, b=10),
-                  updatemenus=_legend_toggle_buttons(),
+    # plotly 預設邊距很肥，壓到貼齊容器。t 留 40 給 全選/全不選 按鈕。
+    # 不放圖內標題：model · method 已在正上方 Model/Method 下拉重複顯示，
+    # 圖內置中長標題會壓到左上的 全選/全不選 按鈕（排版重疊）。
+    layout = dict(height=620,
+                  margin=dict(l=10, r=10, t=40, b=10),
                   legend=dict(title="Class (Split)", groupclick="toggleitem"))
+    if show_disagree:
+        layout["legend"] = dict(title="", orientation="h", y=1.02, yanchor="bottom")
+        layout["dragmode"] = "select"  # 分歧檢視＝拖曳即框選紅點，方便整群送覆核
+    else:  # 全選/全不選 只在類別圖例下有意義
+        layout["updatemenus"] = _legend_toggle_buttons()
     if use_3d:
         layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
     else:
@@ -1671,6 +1786,18 @@ def _visualize_embeddings_ui() -> None:
         selected_split = c3.selectbox("Split", ["All"] + unique_splits, key="viz_split_select")
         dim = 3 if c4.radio("維度", ["2D", "3D"], horizontal=True, key="viz_dim_radio") == "3D" else 2
 
+        # ── 著色依據：類別（預設）/ 標籤分歧（紅＝鄰居都異類＋相鄰異類連線）──
+        disagreement = st.session_state.get("viz_label_disagreement", {}).get(selected_model)
+        color_by, pairs = "class", None
+        if disagreement is not None:
+            if st.radio("著色依據", ["類別", "標籤分歧"], horizontal=True,
+                        key="viz_color_by",
+                        help="標籤分歧＝點以 k 近鄰中異類比例著色（紅＝鄰居都異類），"
+                             "並把『最近鄰卻異類』的點對連線——你眼睛看到的爭議，"
+                             "工具直接幫你標出；框選後可一鍵送灰帶覆核。") == "標籤分歧":
+                color_by = "disagreement"
+                pairs = _viz_cross_pairs(selected_model, data_token, records)
+
         method_key = _METHOD_KEY[selected_method]
         coords = embeddings_per_model[selected_model][method_key]
 
@@ -1687,8 +1814,9 @@ def _visualize_embeddings_ui() -> None:
             sel_state = {"token": data_token, "indices": []}
 
         # scatter widget key 帶 view 資訊：舊視圖的 widget 事件不可能滲入新視圖
+        # （含 color_by：切換著色模式＝乾淨重掛，避免跨模式殘留選取狀態）
         scatter_key = (f"viz_scatter_{data_token[:8]}_{selected_model}"
-                       f"_{method_key}_{selected_split}")
+                       f"_{method_key}_{selected_split}_{color_by}")
 
         # NOTE: the 2D interactive chart must keep a STABLE figure spec across
         # reruns — mutating it (e.g. adding a highlight trace) makes Streamlit
@@ -1705,8 +1833,12 @@ def _visualize_embeddings_ui() -> None:
         else:
             highlight = []
         fig = _build_viz_figure(records, coords, indices, selected_model, selected_method,
-                                dim=dim, highlight=highlight)
+                                dim=dim, highlight=highlight,
+                                color_by=color_by, disagreement=disagreement, pairs=pairs)
 
+        if color_by == "disagreement":
+            st.caption(":gray[🔴 紅＝k 近鄰多為異類（最該複查標註）；紅線＝最近鄰卻異類的點對。"
+                       "框選爭議點 → 下方一鍵送灰帶覆核。]")
         if dim == 2 and len(indices) > _SCATTERGL_THRESHOLD:
             st.caption(f"⚡ {len(indices)} 點：已切換 WebGL 加速渲染；框選/套索照常可用，"
                        "單點 hover 精度略降。")
@@ -1740,6 +1872,16 @@ def _visualize_embeddings_ui() -> None:
                 else:
                     st.caption("ℹ 3D 模式不支援框選；切回 2D 框選後，轉來 3D 會高亮那批點。")
         st.session_state["viz_selection"] = sel_state
+
+        # 探索→治理 handoff：框選的爭議點一鍵送進灰帶覆核（與覆蓋圖→組考卷對稱）
+        if sel_state["indices"]:
+            st.button(
+                f"🌫 送選取的 {len(sel_state['indices'])} 張進灰帶覆核 →",
+                key="viz_to_gray", use_container_width=True,
+                help="把這批爭議樣本送進有紀錄的裁決流程（對照錨例→提議→品保雙簽→匯出）；"
+                     "散點只負責探索，改標籤這種決定留在灰帶覆核做。",
+                on_click=_viz_send_to_gray,
+                args=(list(sel_state["indices"]), selected_model))
 
         dl_fig = build_plotly_figure(records, embeddings_per_model)
         st.download_button(
@@ -2247,6 +2389,509 @@ def _render_cov_quick_start() -> None:
                disabled=not _COV_DEMO_DIR.exists())
 
 
+# ── 嵌入覆蓋圖（embedding-space coverage / gap-filling）─────────────────────
+# 與屬性棋盤互補：密度一律在「原始高維 cosine 空間」用 kNN 距離算，2-D/3-D
+# 投影只拿來「畫」高維找出的稀疏區，絕不拿來數密度（正是 completeness.py
+# docstring 拒絕 UMAP 網格的理由）。
+_COV_PROJ_LABELS = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap"}
+_COV_SPARSE_PCT = 80   # 自參照百分位門檻：稀疏度落在前 (100-pct)% 視為盲區候選
+
+
+def _pad_cols(arr: np.ndarray, d: int) -> np.ndarray:
+    """確保投影至少有 d 欄（補零軸），2D/3D 散點永遠拿得到對應座標。"""
+    arr = np.asarray(arr)
+    if arr.shape[1] >= d:
+        return arr
+    return np.hstack([arr, np.zeros((len(arr), d - arr.shape[1]))])
+
+
+def _cov_projection(dataset_emb, cand_emb, method, dim, token, cand_token):
+    """資料集（+ 候選）合併擬合到同一座標系，兩者位置完全一致（不用近似
+    transform）。以 (token, 候選 token, 投影法, 維度) 快取——token 由呼叫端
+    依「整圖／物件級」傳入，避免兩種粒度互撞。稀疏度永遠不從這些座標讀——
+    只拿來畫圖。回傳 (coords_dataset, coords_candidates|None)。
+    """
+    has_cand = cand_emb is not None and len(cand_emb) > 0
+    key = "|".join([
+        token,
+        cand_token if has_cand else "-",
+        method, str(dim),
+    ])
+    cache = st.session_state.get("_cov_proj_cache")
+    if cache and cache.get("key") == key:
+        return cache["coords_d"], cache["coords_c"]
+    n_d = len(dataset_emb)
+    combined = np.vstack([dataset_emb, cand_emb]) if has_cand else np.asarray(dataset_emb)
+    n = len(combined)
+    n_comps = min(dim, max(1, n - 1))
+    if method == "tsne" and n >= 4:
+        arr = TSNE(n_components=n_comps, random_state=42,
+                   perplexity=min(30, max(1, n - 1))).fit_transform(combined)
+    elif method == "umap" and n >= 4:
+        arr = umap.UMAP(n_components=n_comps, n_neighbors=min(15, max(2, n - 1)),
+                        random_state=42).fit_transform(combined)
+    else:  # PCA，或極小樣本保底
+        arr = PCA(n_components=n_comps, random_state=42).fit_transform(combined)
+    arr = _pad_cols(np.asarray(arr), dim)
+    coords_d, coords_c = arr[:n_d], (arr[n_d:] if has_cand else None)
+    st.session_state["_cov_proj_cache"] = {
+        "key": key, "coords_d": coords_d, "coords_c": coords_c}
+    return coords_d, coords_c
+
+
+def _cov_sparsity(emb, k, token):
+    """高維稀疏度（到 k 近鄰平均 cosine 距離），以 (token, k) 快取。"""
+    key = f"{token}|{k}"
+    cache = st.session_state.get("_cov_sparsity")
+    if cache and cache.get("key") == key:
+        return cache["scores"]
+    scores = sparsity_scores(emb, k=int(k))
+    st.session_state["_cov_sparsity"] = {"key": key, "scores": scores}
+    return scores
+
+
+def _cov_radius(emb, token):
+    """N2 命中密度用的半徑＝資料集 1-NN cosine 距離 P75（與體檢卡一致）。"""
+    key = token
+    cache = st.session_state.get("_cov_radius")
+    if cache and cache.get("key") == key:
+        return cache["radius"]
+    from sklearn.neighbors import NearestNeighbors
+    emb = np.asarray(emb)
+    if len(emb) < 2:
+        radius = 0.0
+    else:
+        nn = NearestNeighbors(metric="cosine", n_neighbors=2).fit(emb)
+        dist, _ = nn.kneighbors(emb)
+        radius = float(np.percentile(dist[:, 1], 75))
+    st.session_state["_cov_radius"] = {"key": key, "radius": radius}
+    return radius
+
+
+def _cov_candidate_image_records(folders: list[Path]) -> list[dict]:
+    """候選資料夾的影像清單：先試 類別子資料夾，否則平鋪掃描。"""
+    recs = discover_images_classifier(folders)
+    if not recs:
+        paths: list[Path] = []
+        for f in folders:
+            paths += [p for ext in ("*.jpg", "*.jpeg", "*.png") for p in f.rglob(ext)]
+        recs = [{"path": p, "split": p.parent.name, "label": ""}
+                for p in sorted(set(paths))]
+    return recs
+
+
+def _cov_embed_candidates(model: str) -> None:
+    """投影新候選資料夾進此空間：擷取（快取）特徵，存進 session。粒度跟隨
+    目前『分析單位』——物件級時改裁候選資料夾的 YOLO 物件再各自算特徵。"""
+    folders = [p for p in parse_folder_paths(
+        st.session_state.get("cov_cand_text", "")) if p.exists()]
+    if not folders:
+        st.warning("候選資料夾不存在。"); return
+    cand_records = _cov_candidate_image_records(folders)
+    if not cand_records:
+        st.warning("候選資料夾中找不到影像。"); return
+    is_obj = st.session_state.get("cov_granularity") == "物件級（YOLO）"
+    if is_obj:
+        pad = float(st.session_state.get("cov_obj_pad", 0.12))
+        cnames = (read_classes_txt(_cov_object_root(cand_records))
+                  or st.session_state.get("cov_obj_class_names"))
+        obj_records, cand_emb, _ = _crop_and_embed_objects(
+            cand_records, model, cnames, pad,
+            base_token="cand|" + repr(sorted(str(f) for f in folders)),
+            session_key="_cov_obj_cand", spinner="裁切候選物件")
+        if not obj_records:
+            st.warning("候選資料夾的 labels/ 找不到 bbox；請改『整張影像』或先補標註。")
+            return
+        cand_records = obj_records
+    else:
+        with st.spinner(f"擷取候選特徵（{len(cand_records)} 張）…"):
+            embed_fn = load_model(model)
+            cache = folders[0] / f"embeddings_{model}" / "embeddings.npz"
+            cand_emb = extract_embeddings(
+                [r["path"] for r in cand_records], embed_fn, cache_path=cache)
+    st.session_state["cov_cand_records"] = cand_records
+    st.session_state["cov_cand_emb"] = cand_emb
+    st.session_state["cov_cand_token"] = uuid.uuid4().hex
+    st.session_state.pop("_cov_proj_cache", None)
+    unit = "物件" if is_obj else "張"
+    st.toast(f"已投影 {len(cand_records)} {unit}候選進此空間", icon="🧭")
+    _log_usage("cov_project_candidates", n=len(cand_records))
+
+
+def _cov_send_to_quiz(quiz_records, scores, class_opts) -> None:
+    """送補洞候選進組考卷：寫入 quiz 的 inbound session keys 並切到考卷頁。"""
+    st.session_state["quiz_records"] = quiz_records
+    st.session_state["quiz_disagreement"] = np.asarray(scores, dtype=float)
+    st.session_state["quiz_class_opts"] = class_opts
+    st.session_state["quiz_inbound"] = True
+    for k in ("quiz_spec", "quiz_answers", "quiz_pos"):
+        st.session_state.pop(k, None)
+    st.session_state["tool_switch"] = "組考卷"
+    _log_usage("cov_send_to_quiz", n=len(quiz_records))
+
+
+def _build_cov_scatter(coords_d, sparsity, records, dim,
+                       coords_c, cand_records, ranked_idx, ranked_scores):
+    """流形散點：資料集點以高維稀疏度著色（亮＝稀疏盲區），候選以深色菱形
+    疊上、大小隨補洞分數。"""
+    use_3d = dim == 3 and coords_d.shape[1] >= 3
+    scatter = go.Scatter3d if use_3d else (
+        go.Scattergl if len(coords_d) > _SCATTERGL_THRESHOLD else go.Scatter)
+
+    def _xyz(coords):
+        d = {"x": coords[:, 0].tolist(), "y": coords[:, 1].tolist()}
+        if use_3d:
+            d["z"] = coords[:, 2].tolist()
+        return d
+
+    data = [scatter(
+        **_xyz(coords_d), mode="markers", name="資料集",
+        marker=dict(size=4 if use_3d else 7,
+                    color=np.asarray(sparsity, dtype=float).tolist(),
+                    colorscale="Turbo", showscale=True,
+                    colorbar=dict(title="稀疏度"), opacity=0.85),
+        customdata=[[i] for i in range(len(records))],  # 框選→record index→縮圖
+        text=[f"{Path(r['path']).name}<br>{r.get('label', '')}（{r.get('split', '')}）"
+              for r in records],
+        hovertemplate="%{text}<br>稀疏度=%{marker.color:.3f}<extra></extra>",
+    )]
+    if coords_c is not None and cand_records:
+        score_by_idx = dict(zip(ranked_idx, ranked_scores))
+        cs = np.asarray([score_by_idx.get(i, 0.0) for i in range(len(cand_records))])
+        rng = cs.max() - cs.min()
+        norm = (cs - cs.min()) / rng if rng > 1e-12 else np.zeros_like(cs)
+        base, span = (4, 8) if use_3d else (8, 14)
+        data.append(scatter(
+            **_xyz(coords_c), mode="markers", name="候選（新資料夾）",
+            marker=dict(size=(base + span * norm).tolist(), symbol="diamond",
+                        color="#111111", line=dict(width=1, color="#ffffff"),
+                        opacity=0.9),
+            text=[f"{Path(r['path']).name}<br>補洞分數 {score_by_idx.get(i, 0.0):.3f}"
+                  for i, r in enumerate(cand_records)],
+            hovertemplate="%{text}<extra></extra>",
+        ))
+    fig = go.Figure(data=data)
+    layout = dict(height=560, margin=dict(l=10, r=10, t=34, b=10),
+                  title="嵌入特徵空間 · 顏色＝高維稀疏度（亮＝稀疏盲區）",
+                  legend=dict(orientation="h", y=1.02, yanchor="bottom"))
+    if use_3d:
+        layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
+    else:
+        # 預設拖曳＝框選（不是縮放），讓「拉一群點看縮圖」一拖就中
+        layout.update(xaxis_title="Component 1", yaxis_title="Component 2",
+                      dragmode="select")
+    fig.update_layout(**layout)
+    return fig
+
+
+def _cov_object_root(records: list[dict]) -> Path:
+    """資料集根目錄（YOLO 為 <root>/images/x.jpg → <root>），物件 crop 寫這底下。"""
+    img0 = Path(records[0]["path"])
+    return img0.parent.parent if img0.parent.parent != img0.parent else img0.parent
+
+
+def _cov_class_names(records: list[dict]) -> list[str] | None:
+    """從 classes.txt 解析 YOLO 類別名（試資料集根與其上層）。"""
+    if not records:
+        return None
+    root = _cov_object_root(records)
+    for folder in (root, root.parent):
+        names = read_classes_txt(folder)
+        if names:
+            return names
+    return None
+
+
+def _is_detection_dataset(records: list[dict], probe: int = 25) -> bool:
+    """目前載入的影像是否帶 YOLO 標註檔（偵測格式）→ 可做物件級覆蓋。"""
+    return any(yolo_label_path_for(Path(r["path"])).exists()
+               for r in records[:probe])
+
+
+def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
+                            session_key="_cov_obj", crops_subdir="object_crops",
+                            spinner="裁切物件"):
+    """把 records 裡每個 YOLO bbox 裁成 crop 存檔、各自算 embedding（一個物件
+    一個點）。以 (base_token, model, pad, n) 在 session 快取；crop 檔與 npz
+    皆落地，第二次極快。回傳 (object_records, object_emb, token)；object_records
+    的 path＝crop 檔、另帶 image_path / bbox / label(類別) / class_id。"""
+    seed = repr((base_token, model, round(pad, 3), len(records)))
+    cached = st.session_state.get(session_key)
+    if cached and cached.get("seed") == seed:
+        return cached["records"], cached["emb"], cached["token"]
+    image_paths = [Path(r["path"]) for r in records]
+    split_by = {str(Path(r["path"])): r.get("split", "") for r in records}
+    meta = discover_yolo_objects(image_paths, class_names)
+    if not meta:
+        empty = {"seed": seed, "records": [], "emb": np.zeros((0, 1)), "token": ""}
+        st.session_state[session_key] = empty
+        return [], np.zeros((0, 1)), ""
+    crops_dir = (_cov_object_root(records) / crops_subdir
+                 / f"pad{int(round(pad * 100))}")
+    crops_dir.mkdir(parents=True, exist_ok=True)
+    obj_records: list[dict] = []
+    crop_paths: list[Path] = []
+    last_ip, last_img = None, None
+    with st.spinner(f"{spinner}（{len(meta)} 個物件）…"):
+        for o in meta:
+            ip = o["image_path"]
+            out = crops_dir / f"{ip.stem}__obj{o['obj_index']}.jpg"
+            if not out.exists():
+                if str(ip) != last_ip:
+                    try:
+                        last_img = Image.open(ip).convert("RGB")
+                    except OSError:
+                        last_img = None
+                    last_ip = str(ip)
+                if last_img is None:
+                    continue
+                try:
+                    crop_bbox(last_img, *o["bbox"], pad=pad).save(out, quality=88)
+                except (OSError, ValueError):
+                    continue
+            crop_paths.append(out)
+            obj_records.append({
+                "path": out, "image_path": ip, "split": split_by.get(str(ip), ""),
+                "label": o["label"], "class_id": o["class_id"],
+                "bbox": o["bbox"], "obj_index": o["obj_index"],
+            })
+        embed_fn = load_model(model)
+        cache = crops_dir / f"embeddings_{model}.npz"
+        emb = extract_embeddings(crop_paths, embed_fn, cache_path=cache)
+    token = uuid.uuid4().hex
+    st.session_state[session_key] = {
+        "seed": seed, "records": obj_records, "emb": emb, "token": token}
+    return obj_records, emb, token
+
+
+def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> None:
+    """嵌入覆蓋圖：在特徵空間找稀疏盲區 → 投影新資料夾 → 排補洞候選 → 送考卷。"""
+    # ── 分析單位：整張影像 vs 物件級（偵測資料集才有「物件級」可選）──
+    is_det = _is_detection_dataset(records)
+    granularity = "整張影像"
+    class_names: list[str] | None = None
+    pad = 0.0
+    if is_det:
+        gc1, gc2, gc3 = st.columns([1.5, 0.9, 1.8])
+        granularity = gc1.radio(
+            "分析單位", ["整張影像", "物件級（YOLO）"], horizontal=True,
+            key="cov_granularity",
+            help="偵測資料集一張圖含多個物件。整張圖＝場景級稀疏；物件級＝裁出"
+                 "每個 bbox 各算一點，稀疏才對應到『某類物件的某種樣態收太少』。")
+        pad = float(gc2.number_input("物件外擴", 0.0, 0.5, 0.12, 0.02,
+                                     key="cov_obj_pad",
+                                     help="裁切時把框往外擴幾成留背景脈絡（0＝貼框）。"))
+        gc3.caption(":gray[物件級：讀 labels/*.txt 每個框→裁出物件→各自算 "
+                    "embedding，顏色＝物件級稀疏；點/框選看的是裁切後的物件縮圖。]")
+    is_obj = is_det and granularity == "物件級（YOLO）"
+
+    # 切換粒度＝丟掉另一種粒度殘留的候選/選取/快取
+    if st.session_state.get("_cov_gran_prev") not in (None, granularity):
+        for kk in ("cov_cand_emb", "cov_cand_records", "cov_cand_token",
+                   "_cov_proj_cache", "cov_sel"):
+            st.session_state.pop(kk, None)
+    st.session_state["_cov_gran_prev"] = granularity
+
+    active_token = st.session_state.get("cov_token", "")
+    if is_obj:
+        class_names = _cov_class_names(records)
+        st.session_state["cov_obj_class_names"] = class_names
+        obj_records, obj_emb, obj_token = _crop_and_embed_objects(
+            records, model, class_names, pad,
+            base_token=st.session_state.get("cov_token", ""))
+        if not obj_records:
+            st.warning("這個資料集的 labels/ 裡找不到任何 bbox；已切回『整張影像』。")
+            is_obj = False
+        else:
+            records, emb, active_token = obj_records, obj_emb, obj_token
+
+    n = len(emb)
+    labels = [r.get("label", "") for r in records]
+    class_opts = sorted({r.get("label", "") for r in records})
+
+    c1, c2, c3 = st.columns([1.6, 1, 1.2])
+    method_lbl = c1.selectbox(
+        "投影", list(_COV_PROJ_LABELS), index=0, key="cov_proj_method",
+        help="只用來『畫』流形；稀疏度一律在原始高維算，不受投影扭曲影響。")
+    dim = 3 if c2.radio("維度", ["2D", "3D"], horizontal=True,
+                        key="cov_proj_dim") == "3D" else 2
+    k = c3.number_input("稀疏度 k", min_value=1, max_value=max(1, n - 1),
+                        value=min(10, max(1, n - 1)), key="cov_sparsity_k",
+                        help="到 k 個最近鄰的平均 cosine 距離＝稀疏度（高維算）。")
+    method = _COV_PROJ_LABELS[method_lbl]
+
+    sparsity = _cov_sparsity(emb, int(k), active_token)
+    cand_emb = st.session_state.get("cov_cand_emb")
+    cand_records = st.session_state.get("cov_cand_records")
+    has_cand = cand_emb is not None and len(cand_emb) > 0
+    cand_token = st.session_state.get("cov_cand_token", "")
+    coords_d, coords_c = _cov_projection(emb, cand_emb, method, dim,
+                                         active_token, cand_token)
+
+    ranked_idx: list[int] = []
+    ranked_scores: list[float] = []
+    provisional: list[str] = []
+    if has_cand:
+        ranked_idx, ranked_scores = rank_gap_fillers(cand_emb, emb, k=int(k))
+        provisional = nearest_labels(cand_emb, emb, labels)
+
+    thr = float(np.percentile(sparsity, _COV_SPARSE_PCT)) if len(sparsity) else 0.0
+    n_sparse = int(np.sum(np.asarray(sparsity) >= thr)) if len(sparsity) else 0
+
+    col_map, col_side = st.columns([5, 3], gap="medium")
+    with col_map:
+        mm1, mm2, mm3 = st.columns(3)
+        mm1.metric("物件數" if is_obj else "樣本數", n)
+        mm2.metric(f"稀疏點（前 {100 - _COV_SPARSE_PCT}%）", n_sparse,
+                   help="稀疏度在自參照百分位門檻以上的點＝覆蓋盲區候選。")
+        mm3.metric("候選", len(cand_records) if cand_records else 0)
+        st.caption(":orange[⚠ 稀疏＝相對你自己資料的密度（未校正真實分佈）；"
+                   "全資料集都缺的類型不會顯示為稀疏。稀疏是『該補的嫌疑』，"
+                   "不等於模型一定弱——下方根因會判斷補資料是否真有效。]")
+        fig = _build_cov_scatter(coords_d, sparsity, records, dim,
+                                 coords_c, cand_records, ranked_idx, ranked_scores)
+        unit = "物件" if is_obj else "張"
+        cov_sel = st.session_state.get("cov_sel", {})
+        if cov_sel.get("token") != active_token:
+            cov_sel = {"token": active_token, "indices": []}
+        if dim == 2:
+            event = st.plotly_chart(
+                fig, use_container_width=True, key="cov_emb_scatter",
+                on_select="rerun", selection_mode=("points", "box", "lasso"))
+            sel_pts: list[dict] = []
+            if event is not None:
+                so = event.get("selection") if hasattr(event, "get") else None
+                if so:
+                    sel_pts = list(so.get("points", []))
+            picked = selection_points_to_indices(sel_pts)
+            if picked and picked != cov_sel["indices"]:
+                cov_sel = {"token": active_token, "indices": picked}
+                st.toast(f"已框選 {len(picked)} {unit}，下方顯示縮圖", icon="🖼")
+        else:
+            st.plotly_chart(fig, use_container_width=True, key="cov_emb_scatter_3d")
+        st.session_state["cov_sel"] = cov_sel
+        sel_idx = cov_sel["indices"]
+        st.caption(":gray[ℹ 2-D/3-D 佈局僅供定位、非密度量尺；換投影法或載入候選"
+                   "位置會變，但稀疏度數字不變（一律高維算）。"
+                   "在 2D 圖上拖曳框選／套索／點一群點 → 下方看縮圖＋標籤。]")
+
+        # ── 看影像：散點不只是圖——框選的那群、或預設最稀疏的盲區影像 ──
+        noun = "物件" if is_obj else "影像"
+        gh1, gh2, gh3 = st.columns([2.4, 1, 1])
+        if sel_idx:
+            gh1.markdown(f"**🖼 {noun} · 你框選的 {len(sel_idx)} {unit}**")
+            gh3.button("✕ 清除框選", key="cov_sel_clear", use_container_width=True,
+                       on_click=lambda: st.session_state.update(
+                           cov_sel={"token": "", "indices": []}))
+            base_idx = sel_idx
+        else:
+            gh1.markdown(f"**🖼 {noun} · 最稀疏盲區（由稀到密）**")
+            base_idx = [int(i) for i in np.argsort(sparsity)[::-1]]
+        gal_n = int(gh2.number_input("張數", 3, 60, 12, key="cov_gal_n",
+                                     label_visibility="collapsed"))
+        full_ctx = is_obj and st.checkbox(
+            "縮圖改顯示原圖(含框)", key="cov_gal_fullimg",
+            help="看物件在整張圖的位置脈絡（紅框為該圖所有標註）。")
+        view_idx = base_idx[:gal_n]
+        if not view_idx:
+            st.caption("目前沒有可顯示的影像。")
+        else:
+            with st.container(height=330):
+                gcols = st.columns(4)
+                for j, i in enumerate(view_idx):
+                    with gcols[j % 4]:
+                        rec = records[i]
+                        cap = (f"{rec.get('label', '') or '?'} · "
+                               f"稀疏{float(sparsity[i]):.3f}")
+                        if full_ctx:
+                            ip = Path(rec["image_path"])
+                            img = draw_yolo_boxes(ip, yolo_label_path_for(ip),
+                                                  class_names)
+                            img.thumbnail((240, 240))
+                            st.image(img, use_container_width=True, caption=cap)
+                            continue
+                        thumb = _thumb_or_none(Path(rec["path"]))
+                        if thumb:
+                            st.image(thumb, use_container_width=True, caption=cap)
+                        else:
+                            st.warning(f"⚠ 缺檔 · {cap}")
+
+        # Phase B：H1–H5 根因——這些稀疏區補資料到底有沒有用
+        with st.expander("🧭 根因：這些稀疏區補資料有沒有用？（H1–H5 誠實閘）"):
+            s1 = st.slider(
+                "S1 此概念的人類一致性（來自組考卷 / gauge study）", 0.0, 1.0,
+                float(st.session_state.get("quiz_last_consistency", 0.9)), 0.01,
+                key="cov_s1",
+                help="量『人』：低於門檻＝定義歧義（H2），補資料不會收斂。"
+                     "跑過組考卷會自動帶入其自我一致率。")
+            radius = _cov_radius(emb, active_token)
+            sparse_idx = [int(i) for i in np.argsort(sparsity)[::-1][:min(50, n)]
+                          if sparsity[i] >= thr]
+            if not sparse_idx:
+                st.caption("目前沒有稀疏點。")
+            else:
+                diags = diagnose_sparse_points(emb, labels, sparse_idx,
+                                               s1_consistency=s1, radius=radius)
+                from collections import Counter
+                cnt = Counter(d["cause"] for d in diags)
+                helps = sum(v for c, v in cnt.items() if c in (CAUSE_H1, CAUSE_H5))
+                st.caption(f"稀疏點 {len(sparse_idx)} 個 · "
+                           f":green[補資料有效（H1/H5）：{helps}] · "
+                           f"其餘為定義/標籤/容量問題（補資料幫助有限）")
+                for c, v in cnt.most_common():
+                    st.write(f"- {c}：{v} 點")
+
+    with col_side:
+        st.markdown("**① 指定新候選資料夾**")
+        st.button("📁 選擇候選資料夾", key="cov_cand_pick", use_container_width=True,
+                  on_click=_pick_folder_into_text, args=("cov_cand_text",))
+        st.text_area("候選資料夾（每行一個，可未標註）", key="cov_cand_text", height=58,
+                     placeholder="例：尚未標註的新產線影像資料夾",
+                     label_visibility="collapsed")
+        st.button("🧭 投影候選進此空間", key="cov_cand_btn", use_container_width=True,
+                  type="primary",
+                  disabled=not st.session_state.get("cov_cand_text", "").strip(),
+                  on_click=_cov_embed_candidates, args=(model,))
+        if not has_cand:
+            st.info("投影候選後，這裡會列出『最能補洞』的候選並可送進組考卷。")
+            return
+
+        st.markdown("**② 最能補洞的候選**")
+        st.caption("依『離既有資料多遠（落在稀疏區）』排序，越前越能補你缺的區域。")
+        send_n = int(st.number_input(
+            "送前 N 名進組考卷標註", min_value=1, max_value=len(ranked_idx),
+            value=min(12, len(ranked_idx)), key="cov_send_n"))
+        picks = ranked_idx[:send_n]
+        chosen = [cand_records[i] for i in picks]
+        chosen_labels = [provisional[i] for i in picks]
+        chosen_scores = ranked_scores[:send_n]
+        quiz_records = candidates_to_quiz_records(chosen, chosen_labels, chosen_scores)
+        st.button(f"📝 送前 {len(picks)} 名進組考卷 →", key="cov_to_quiz",
+                  type="primary", use_container_width=True,
+                  on_click=_cov_send_to_quiz,
+                  args=(quiz_records, chosen_scores, class_opts))
+        st.caption(":gray[候選無標籤——暫定類別取自最近鄰，送考卷後盲標即為新標籤。]")
+        score_by_idx = dict(zip(ranked_idx, ranked_scores))
+        with st.container(height=300):
+            cols = st.columns(3)
+            for j, i in enumerate(picks):
+                with cols[j % 3]:
+                    p = Path(cand_records[i]["path"])
+                    thumb = _thumb_or_none(p)
+                    if thumb:
+                        st.image(thumb, use_container_width=True,
+                                 caption=f"#{j + 1} d={score_by_idx[i]:.3f}"
+                                         f"→{provisional[i] or '?'}")
+                    else:
+                        st.warning("⚠ 缺檔")
+        csv = "rank,path,gap_score,provisional_label\n" + "\n".join(
+            f'{r + 1},"{cand_records[i]["path"]}",{score_by_idx[i]:.6f},{provisional[i]}'
+            for r, i in enumerate(picks))
+        st.download_button("⬇ 匯出補洞候選 CSV", data=csv,
+                           file_name="gap_fillers.csv", mime="text/csv",
+                           key="cov_gap_csv", use_container_width=True)
+
+
 def _completeness_ui() -> None:
     st.markdown("##### 模型收值完整性熱力圖")
     st.caption("把資料切成小棋盤格，看每格「不太多也不太少」。"
@@ -2320,6 +2965,15 @@ def _completeness_ui() -> None:
 
     records = st.session_state["cov_records"]
     emb = st.session_state["cov_emb"]
+
+    view_mode = st.radio(
+        "檢視方式", ["屬性棋盤", "嵌入覆蓋圖"], horizontal=True, key="cov_view_mode",
+        captions=["可解讀屬性軸切格（量化每格夠不夠）",
+                  "特徵空間真實形狀（找稀疏盲區＋投影新資料夾補洞＋送考卷）"],
+    )
+    if view_mode == "嵌入覆蓋圖":
+        _render_coverage_view(records, emb, model)
+        return
 
     # ── tuning 列（在熱力圖正上方即時調，免重跑）──
     axis_opts = ["label", "split", *_AUTO_AXES]
@@ -2589,6 +3243,9 @@ def _quiz_ui() -> None:
         st.session_state["quiz_records"] = records
         st.session_state["quiz_disagreement"] = dis
         _quiz_reset()
+        # 從資料夾載入＝放棄任何「嵌入覆蓋圖」送來的候選 inbound 狀態
+        st.session_state.pop("quiz_inbound", None)
+        st.session_state.pop("quiz_class_opts", None)
         st.toast(f"已載入 {len(records)} 張影像", icon="✅")
 
     if "quiz_records" not in st.session_state:
@@ -2597,7 +3254,12 @@ def _quiz_ui() -> None:
 
     records = st.session_state["quiz_records"]
     dis = st.session_state["quiz_disagreement"]
-    class_opts = sorted({r["label"] for r in records})
+    # 補洞候選送來時用完整資料集類別當作答選項（暫定標籤只涵蓋部分類別）
+    class_opts = (st.session_state.get("quiz_class_opts")
+                  or sorted({r["label"] for r in records}))
+    if st.session_state.get("quiz_inbound"):
+        st.info("ℹ 這些是『嵌入覆蓋圖』送來的未標註補洞候選；暫定類別取自最近鄰"
+                "（非標準答案）。逐題盲標即可，最後匯出作答 CSV 作為新標籤。")
 
     # ── 出題（尚無考卷）──
     if "quiz_spec" not in st.session_state:
@@ -2796,11 +3458,16 @@ def _gray_zone_ui() -> None:
         st.session_state["gray_anchors"] = anchors
         st.session_state["gray_state"] = {}
         st.session_state["gray_pos"] = 0
+        st.session_state.pop("gray_inbound", None)  # 從資料夾建立＝非散點送來
         st.toast(f"佇列建立：{len(queue)} 筆灰帶候選", icon="🌫")
 
     if "gray_records" not in st.session_state:
         _render_gray_quick_start()
         return
+
+    if st.session_state.get("gray_inbound"):
+        st.info("ℹ 這批佇列是『Visualize Embeddings』框選的爭議點送來的（依標籤分歧度排序）。"
+                "對照錨例逐筆裁決即可——不直接寫回資料集，雙簽通過後匯出決策。")
 
     records = st.session_state["gray_records"]
     emb = st.session_state["gray_emb"]
@@ -2923,7 +3590,9 @@ def main() -> None:
             "- **比較兩資料夾**：Compare Distributions——FID/KID 等指標＋"
             "點選散點看對應影像\n"
             "- **完整度熱力圖**：把資料依兩屬性軸切格，看每格『不太多不太少』、"
-            "整體 Coverage Health、缺格清單（紫＝假完整近重複）\n"
+            "整體 Coverage Health、缺格清單（紫＝假完整近重複）。可切「嵌入覆蓋圖」"
+            "模式：在原始高維空間找稀疏盲區、投影新資料夾排補洞候選、H1–H5 判斷"
+            "補資料有沒有用、一鍵送進組考卷盲標\n"
             "- **組考卷**：把爭議樣本變盲測考卷，量標註者自我一致率／vs golden／"
             "多人 Fleiss kappa\n"
             "- **灰帶覆核**：爭議樣本進覆核佇列，對照錨例 → 提議+品保覆核（雙簽）"

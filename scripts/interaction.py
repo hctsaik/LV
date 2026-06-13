@@ -802,3 +802,274 @@ def draw_yolo_boxes(
         )
         draw.text((x0 + 2, max(0, y0 - 12)), name, fill="#e74c3c")
     return img
+
+
+# ── embedding-space coverage / gap-filling (defect-mechanisms 嵌入覆蓋圖) ──
+# The honest counterpart to the attribute-axis completeness grid: density is
+# measured HERE, in raw cosine embedding space (k-NN distance), and a 2-D
+# projection is only ever used to *draw* the regions found in high-D — never
+# to count them (which is what completeness.py's docstring rightly refuses).
+
+def sparsity_scores(embeddings: np.ndarray, k: int = 10) -> np.ndarray:
+    """Per-row data sparsity in raw embedding space: mean cosine distance to
+    each row's k nearest OTHER rows. High = the model was shown few similar
+    examples near here → a coverage blind-spot candidate.
+
+    A thin, self-referential wrapper over compute_outlier_scores (drop-self),
+    so the manifold scatter can be coloured by sparsity computed in full
+    dimensionality, not off the distorted 2-D layout. <2 rows → all zeros.
+    """
+    emb = np.asarray(embeddings)
+    if len(emb) < 2:
+        return np.zeros(len(emb), dtype=float)
+    return compute_outlier_scores(emb, emb, k=k, candidates_in_reference=True)
+
+
+def rank_gap_fillers(
+    candidate_embeddings: np.ndarray,
+    dataset_embeddings: np.ndarray,
+    k: int = 10,
+    top: int | None = None,
+    min_distance: float | None = None,
+) -> tuple[list[int], list[float]]:
+    """Rank a NEW folder's images by how much each fills a SPARSE region of
+    the existing dataset, in raw cosine space (the new-folder gap-filling
+    score for the 嵌入覆蓋圖 view).
+
+    Score = mean cosine distance from a candidate to its k nearest DATASET
+    neighbours (large = lands where the dataset is thin = better gap-filler).
+    Returns (candidate indices, scores) sorted DESCENDING. ``min_distance``
+    drops candidates closer than the threshold (already covered, not a gap);
+    ``top`` caps the list. Honest by construction: a high score means "your
+    data is thin here", NOT "the model is proven weak here" — the H1–H5 gate
+    (diagnose_sparse_points) decides whether collecting actually helps.
+    """
+    cand = np.asarray(candidate_embeddings)
+    data = np.asarray(dataset_embeddings)
+    if len(cand) == 0 or len(data) == 0:
+        return [], []
+    scores = compute_outlier_scores(cand, data, k=k)
+    order = np.argsort(scores)[::-1]
+    out_idx: list[int] = []
+    out_score: list[float] = []
+    for i in order:
+        s = float(scores[i])
+        if min_distance is not None and s < min_distance:
+            continue
+        out_idx.append(int(i))
+        out_score.append(s)
+    if top is not None:
+        out_idx, out_score = out_idx[:top], out_score[:top]
+    return out_idx, out_score
+
+
+def nearest_labels(
+    query_embeddings: np.ndarray,
+    reference_embeddings: np.ndarray,
+    reference_labels: Sequence[str],
+) -> list[str]:
+    """1-NN label transfer: each query row gets its nearest reference row's
+    label (cosine). Seeds PROVISIONAL labels for unlabeled gap-filling
+    candidates so the blind quiz has a class to render — never a ground-truth
+    claim. Empty reference (or labels) → "" for every query.
+    """
+    q = np.asarray(query_embeddings)
+    ref = np.asarray(reference_embeddings)
+    labels = list(reference_labels)
+    if len(q) == 0:
+        return []
+    if len(ref) == 0 or not labels:
+        return [""] * len(q)
+    nn = NearestNeighbors(n_neighbors=1, metric="cosine").fit(ref)
+    _, idx = nn.kneighbors(q)
+    return [labels[int(row[0])] for row in idx]
+
+
+def candidates_to_quiz_records(
+    candidate_records: Sequence[dict],
+    provisional_labels: Sequence[str],
+    gap_scores: Sequence[float] | None = None,
+) -> list[dict]:
+    """Wrap gap-filling candidates as quiz-ready records (the send-to-quiz
+    handoff contract).
+
+    Each output carries a PROVISIONAL ``label`` (from nearest_labels) so the
+    blind quiz can render answer buttons, plus provenance — ``source``,
+    ``provisional=True``, ``gap_score`` — so the quiz UI can flag these as
+    unlabeled candidates rather than graded golden cases. ``split`` defaults
+    to "candidate".
+    """
+    out: list[dict] = []
+    for i, r in enumerate(candidate_records):
+        score = (float(gap_scores[i])
+                 if gap_scores is not None and i < len(gap_scores) else None)
+        out.append({
+            "path": r["path"],
+            "split": r.get("split", "candidate"),
+            "label": provisional_labels[i] if i < len(provisional_labels) else "",
+            "source": "gap_filler",
+            "provisional": True,
+            "gap_score": score,
+        })
+    return out
+
+
+def diagnose_sparse_points(
+    embeddings: np.ndarray,
+    labels: Sequence[str],
+    indices: Sequence[int],
+    *,
+    s1_consistency: float,
+    radius: float,
+    k: int = 20,
+) -> list[dict]:
+    """Run the H1–H5 root-cause gate over a set of sparse-region points so
+    the coverage map never bare-claims "sparse → go collect".
+
+    Per point, three orthogonal signals feed diagnose_root_cause:
+      S2 = neighbor_hit_density(radius) — this point's local data coverage,
+      S3 = neighbor_label_entropy(k)    — proxy model uncertainty,
+      S1 = s1_consistency               — human consistency (supplied; from
+           the quiz / gauge-R&R, shared across the region).
+    Returns [{idx, cause, add_data, s2_density, s3_entropy}] so the UI can
+    report how many sparse points are H1/H5 (collecting helps) vs H2/H3/H4
+    (collecting won't). Reuses diagnose_root_cause unchanged.
+    """
+    out: list[dict] = []
+    for i in indices:
+        i = int(i)
+        dens = neighbor_hit_density(embeddings, i, radius)
+        ent = neighbor_label_entropy(embeddings, labels, i, k=k)
+        diag = diagnose_root_cause(s1_consistency, dens, ent)
+        out.append({
+            "idx": i, "cause": diag["cause"], "add_data": diag["add_data"],
+            "s2_density": dens, "s3_entropy": round(float(ent), 3),
+        })
+    return out
+
+
+# ── object-level coverage (crop each YOLO bbox → one point per OBJECT) ─────
+# The whole-image embedding collapses a multi-object detection scene into a
+# single point, so "sparse" means "unusual scene", not "unusual object". For
+# detection data the actionable unit is the object: crop each bbox, embed the
+# crop, and measure sparsity per object. These helpers stay pure (geometry +
+# label parsing); the app does the disk crop/cache around them.
+
+def parse_yolo_boxes(
+    label_path: Path,
+) -> list[tuple[int, float, float, float, float]]:
+    """Parse a YOLO label file → ``[(class_id, cx, cy, w, h), …]`` with
+    normalized (0–1) box coords. Missing file, short lines, non-numeric
+    fields, and non-positive boxes are skipped (never raises)."""
+    label_path = Path(label_path)
+    if not label_path.exists():
+        return []
+    out: list[tuple[int, float, float, float, float]] = []
+    for line in label_path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            cid = int(float(parts[0]))
+            cx, cy, w, h = (float(v) for v in parts[1:5])
+        except ValueError:
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        out.append((cid, cx, cy, w, h))
+    return out
+
+
+def bbox_to_pixels(
+    cx: float, cy: float, w: float, h: float,
+    img_w: int, img_h: int, pad: float = 0.0,
+) -> tuple[int, int, int, int]:
+    """Normalized YOLO bbox → integer pixel box ``(x0, y0, x1, y1)``, grown by
+    ``pad`` (fraction of each side) for context and clamped to the image. The
+    returned box always has positive area (≥1px) even for degenerate input."""
+    gw, gh = w * (1.0 + 2.0 * pad), h * (1.0 + 2.0 * pad)
+    x0 = max(0, int(round((cx - gw / 2.0) * img_w)))
+    y0 = max(0, int(round((cy - gh / 2.0) * img_h)))
+    x1 = min(img_w, int(round((cx + gw / 2.0) * img_w)))
+    y1 = min(img_h, int(round((cy + gh / 2.0) * img_h)))
+    if x1 <= x0:
+        x1 = min(img_w, x0 + 1)
+    if y1 <= y0:
+        y1 = min(img_h, y0 + 1)
+    return x0, y0, x1, y1
+
+
+def crop_bbox(
+    img: Image.Image, cx: float, cy: float, w: float, h: float, pad: float = 0.0,
+) -> Image.Image:
+    """Crop a normalized YOLO bbox out of a PIL image (padded, clamped)."""
+    iw, ih = img.size
+    box = bbox_to_pixels(cx, cy, w, h, iw, ih, pad=pad)
+    return img.crop(box)
+
+
+def discover_yolo_objects(
+    image_paths: Sequence[Path],
+    class_names: Sequence[str] | None = None,
+    label_for: Callable[[Path], Path] | None = None,
+) -> list[dict]:
+    """Expand detection images into one record PER OBJECT by reading each
+    image's YOLO label file.
+
+    Returns ``[{image_path, label, class_id, bbox=(cx,cy,w,h), obj_index}, …]``
+    in image-then-box order. Images with no label file / no boxes contribute
+    nothing. ``label_for`` resolves an image path to its label file (default
+    :func:`yolo_label_path_for`); ``class_names`` maps class_id → name
+    (fallback ``"class_<id>"``).
+    """
+    resolve = label_for or yolo_label_path_for
+    names = list(class_names) if class_names else None
+    out: list[dict] = []
+    for ip in image_paths:
+        ip = Path(ip)
+        for k, (cid, cx, cy, w, h) in enumerate(parse_yolo_boxes(resolve(ip))):
+            label = (names[cid] if names and 0 <= cid < len(names)
+                     else f"class_{cid}")
+            out.append({
+                "image_path": ip, "label": label, "class_id": cid,
+                "bbox": (cx, cy, w, h), "obj_index": k,
+            })
+    return out
+
+
+def cross_class_nn_pairs(
+    embeddings: np.ndarray,
+    labels: Sequence[str],
+    k: int = 1,
+    max_pairs: int = 200,
+) -> list[tuple[int, int]]:
+    """Pairs ``(i, j)`` where j is among i's k nearest neighbours in cosine
+    space but carries a DIFFERENT label — the "close but different class"
+    conflicts the eye catches on the embedding plot (the label-disagreement
+    signal, drawn as connecting lines).
+
+    Deduped as unordered pairs and capped at ``max_pairs``, closest first
+    (the most blatant conflicts). <2 rows → empty.
+    """
+    emb = np.asarray(embeddings)
+    labels = list(labels)
+    n = len(emb)
+    if n < 2:
+        return []
+    kk = min(k, n - 1)
+    nn = NearestNeighbors(n_neighbors=kk + 1, metric="cosine").fit(emb)
+    dist, idx = nn.kneighbors(emb)
+    seen: set[tuple[int, int]] = set()
+    cand: list[tuple[int, int, float]] = []
+    for i in range(n):
+        for col in range(1, kk + 1):       # col 0 is the point itself
+            j = int(idx[i, col])
+            if labels[j] == labels[i]:
+                continue
+            key = (i, j) if i < j else (j, i)
+            if key in seen:
+                continue
+            seen.add(key)
+            cand.append((key[0], key[1], float(dist[i, col])))
+    cand.sort(key=lambda t: t[2])
+    return [(i, j) for i, j, _ in cand[:max_pairs]]
