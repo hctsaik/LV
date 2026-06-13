@@ -160,6 +160,27 @@ def _fmt_classes(names: list[str], max_show: int = 10) -> str:
     return shown
 
 
+def _legend_toggle_buttons() -> list[dict]:
+    """Plotly client-side 全選/全不選 buttons for the legend.
+
+    These restyle trace visibility in the browser WITHOUT a Streamlit
+    rerun, so they never reset the chart's box/lasso selection (a
+    Streamlit-side button would re-send the figure and drop the selection
+    — the figure-reset trap). "全不選" sets every trace to "legendonly"
+    (hidden but still clickable in the legend); "全選類別" brings them back.
+    """
+    return [dict(
+        type="buttons", direction="right",
+        x=0.0, y=1.06, xanchor="left", yanchor="bottom",
+        pad=dict(t=0, r=0), showactive=False,
+        bgcolor="#f0f0f0", bordercolor="#ccc", font=dict(size=11),
+        buttons=[
+            dict(label="全選類別", method="restyle", args=[{"visible": True}]),
+            dict(label="全不選", method="restyle", args=[{"visible": "legendonly"}]),
+        ],
+    )]
+
+
 def read_classes_txt(folder: Path) -> list[str] | None:
     """Return class names from <folder-parent>/classes.txt, or None if absent/empty."""
     classes_file = folder.parent / "classes.txt"
@@ -245,9 +266,10 @@ def _build_viz_figure(
 
     fig = go.Figure(data=traces)
     # 620px：layout 評審 R2 拍板的散點高度（填滿左欄、消死白）；
-    # plotly 預設邊距很肥，壓到貼齊容器
+    # plotly 預設邊距很肥，壓到貼齊容器。t 留 52 給 全選/全不選 按鈕。
     layout = dict(title=f"{model_name} · {method_label}", height=620,
-                  margin=dict(l=10, r=10, t=40, b=10),
+                  margin=dict(l=10, r=10, t=52, b=10),
+                  updatemenus=_legend_toggle_buttons(),
                   legend=dict(title="Class (Split)", groupclick="toggleitem"))
     if use_3d:
         layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
@@ -288,7 +310,8 @@ def _build_cmp_figure(
         _trace(proj[n_a:], [p.name for p in paths_b], "#e74c3c", name_b, n_a),
     ])
     layout = dict(legend=dict(title="Group"), height=560,
-                  margin=dict(l=10, r=10, t=20, b=10))
+                  margin=dict(l=10, r=10, t=44, b=10),
+                  updatemenus=_legend_toggle_buttons())
     if use_3d:
         layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
     else:

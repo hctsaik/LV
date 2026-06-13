@@ -1005,3 +1005,19 @@ def test_aa_curation_log(flow_page):
     wait_idle(page)
     assert _selected_count(page) == n, "re-select from the log restores the batch"
     _no_exception(page)
+
+
+# ── (ab) legend select-all / deselect-all buttons (client-side) ─────────
+
+def test_ab_legend_toggle_buttons(flow_page):
+    page = flow_page
+    _switch_panel(page, "選取")
+    wrap = page.locator('.st-key-viz_scatter_wrap')
+    # plotly updatemenus render the two buttons inside the chart svg
+    expect(wrap.get_by_text("全選類別").first).to_be_visible()
+    expect(wrap.get_by_text("全不選").first).to_be_visible()
+    # clicking them is a client-side restyle (no Streamlit rerun, no
+    # selection reset) — just prove it does not raise
+    wrap.get_by_text("全不選").first.click()
+    wrap.get_by_text("全選類別").first.click()
+    _no_exception(page)
