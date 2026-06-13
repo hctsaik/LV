@@ -144,6 +144,7 @@ _METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap"}
 _GRID_BATCH = 60          # cards appended per「載入更多」click
 _GRID_CAP = 240           # DOM ceiling agreed in the UX review
 _DEFAULT_TOP_OUTLIERS = 50
+_SCATTERGL_THRESHOLD = 2000   # 點數超過此值，2D 散點改 WebGL（render 體質 #2）
 
 _USAGE_LOG = Path(__file__).parent.parent / "output" / "usage_log.jsonl"
 
@@ -185,6 +186,9 @@ def _build_viz_figure(
     splits = sorted({records[i]["split"] for i in indices})
     color_map = {lbl: _VIZ_COLORS[j % len(_VIZ_COLORS)] for j, lbl in enumerate(labels)}
     use_3d = dim == 3 and coords.shape[1] >= 3
+    # render 體質（重評 #2）：SVG Scatter 約 5千–1萬點就卡。點數過門檻才換
+    # WebGL Scattergl（撐到十萬級）；小資料集維持 SVG 保留逐點點擊互動。
+    scatter2d = go.Scattergl if len(indices) > _SCATTERGL_THRESHOLD else go.Scatter
 
     traces = []
     for label in labels:
@@ -215,7 +219,7 @@ def _build_viz_figure(
                     **common,
                 ))
             else:
-                traces.append(go.Scatter(
+                traces.append(scatter2d(
                     x=[coords[i, 0] for i in idx],
                     y=[coords[i, 1] for i in idx],
                     **common,
@@ -234,7 +238,7 @@ def _build_viz_figure(
                 x=[coords[i, 0] for i in hs], y=[coords[i, 1] for i in hs],
                 z=[coords[i, 2] for i in hs], **ring))
         else:
-            traces.append(go.Scatter(
+            traces.append(scatter2d(
                 x=[coords[i, 0] for i in hs], y=[coords[i, 1] for i in hs], **ring))
 
     fig = go.Figure(data=traces)
@@ -1574,11 +1578,22 @@ def _visualize_embeddings_ui() -> None:
         # reruns — mutating it (e.g. adding a highlight trace) makes Streamlit
         # reset the chart's selection state, silently dropping the user's
         # box/lasso selection. Highlight rings are therefore 3D-only.
+        # 3D doesn't carry a box/lasso selection to protect, so it can safely
+        # highlight the WHOLE current 2D selection (重評 #3：2D 選、3D 看) —
+        # ring the selected batch plus the active image.
         active_idx = st.session_state.get("viz_active_image")
-        highlight = [active_idx] if (dim == 3 and active_idx is not None) else []
+        if dim == 3:
+            highlight = list(sel_state["indices"])
+            if active_idx is not None and active_idx not in highlight:
+                highlight.append(active_idx)
+        else:
+            highlight = []
         fig = _build_viz_figure(records, coords, indices, selected_model, selected_method,
                                 dim=dim, highlight=highlight)
 
+        if dim == 2 and len(indices) > _SCATTERGL_THRESHOLD:
+            st.caption(f"⚡ {len(indices)} 點：已切換 WebGL 加速渲染；框選/套索照常可用，"
+                       "單點 hover 精度略降。")
         if not sel_state["indices"] and dim == 2:
             st.caption("💡 在圖上拖曳框選或套索圈點，右欄會立即顯示對應縮圖。")
         with st.container(key="viz_scatter_wrap"):
@@ -1603,7 +1618,11 @@ def _visualize_embeddings_ui() -> None:
                     st.toast(f"已選取 {len(new_indices)} 個點", icon="🎯")
             else:
                 st.plotly_chart(fig, use_container_width=True, key="viz_scatter_3d")
-                st.caption("ℹ 3D 模式不支援框選；切回 2D 後選取仍會保留。")
+                if sel_state["indices"]:
+                    st.caption(f"ℹ 3D 看：黑圈為目前選取的 {len(sel_state['indices'])} 點"
+                               "（在 2D 框選、轉到 3D 看它們的空間分布）；3D 不支援框選。")
+                else:
+                    st.caption("ℹ 3D 模式不支援框選；切回 2D 框選後，轉來 3D 會高亮那批點。")
         st.session_state["viz_selection"] = sel_state
 
         dl_fig = build_plotly_figure(records, embeddings_per_model)

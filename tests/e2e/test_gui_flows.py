@@ -337,7 +337,9 @@ def test_j_3d_mode_preserves_selection(flow_page):
     assert n >= 1
     page.locator('.st-key-viz_dim_radio').get_by_text("3D").click()
     wait_idle(page, timeout=30000)
-    expect(page.get_by_text(re.compile("切回 2D 後選取仍會保留"))).to_be_visible()
+    # 3D now highlights the current 2D selection (重評 #3): the caption names
+    # the highlighted count
+    expect(page.get_by_text(re.compile(rf"3D 看：黑圈為目前選取的 {n} 點"))).to_be_visible()
     _no_exception(page)
     page.locator('.st-key-viz_dim_radio').get_by_text("2D").click()
     wait_idle(page, timeout=30000)
