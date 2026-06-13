@@ -690,18 +690,29 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
             "以 phash（位元近似）或 embedding（語意近似）找出疑似重複的影像對；"
             "勾「僅跨 split」即 train/val 洩漏候選。僅供人工複核，非自動判決。"
         )
-        c1, c2, c3, c4 = st.columns([1.7, 1.3, 1.1, 1])
-        method = c1.selectbox("方法", ["phash（嚴格重複）", "embedding（語意重複）"],
-                              key="viz_dup_method", label_visibility="collapsed")
-        c2.toggle("僅跨 split", key="viz_dup_cross", help="只列出跨資料夾的重複＝洩漏候選")
+        # 兩列排版：同列混用「有標籤」與「無標籤」控件會高度錯位
+        r1a, r1b, r1c = st.columns([2.1, 1.2, 1])
+        method = r1a.selectbox("方法", ["phash（嚴格重複）", "embedding（語意重複）"],
+                               key="viz_dup_method", label_visibility="collapsed")
+        r1b.toggle("僅跨 split", key="viz_dup_cross",
+                   help="只列出跨資料夾的重複＝train/val 洩漏候選")
+        r1c.button("🔍 掃描", key="viz_dup_scan", use_container_width=True,
+                   on_click=_scan_duplicates, args=(records, model_name))
         if method.startswith("phash"):
-            c3.number_input("漢明 ≤", min_value=0, max_value=16, value=4,
-                            key="viz_dup_thr_ph")
+            st.number_input(
+                "指紋差異門檻（漢明距離 ≤）", min_value=0, max_value=16, value=4,
+                key="viz_dup_thr_ph",
+                help="每張圖會壓成 64 位元的感知指紋（dHash）；此值＝允許兩張圖指紋"
+                     "不同的位元數。0＝幾乎位元級相同；預設 4 抓近似重複；"
+                     "越大越寬鬆、誤報越多。",
+            )
         else:
-            c3.number_input("cosine ≤", min_value=0.0, max_value=0.5, value=0.05,
-                            step=0.01, format="%.2f", key="viz_dup_thr_emb")
-        c4.button("🔍 掃描", key="viz_dup_scan", use_container_width=True,
-                  on_click=_scan_duplicates, args=(records, model_name))
+            st.number_input(
+                "語意距離門檻（cosine ≤）", min_value=0.0, max_value=0.5, value=0.05,
+                step=0.01, format="%.2f", key="viz_dup_thr_emb",
+                help="兩張圖 embedding 的 cosine 距離上限；預設 0.05 抓改尺寸／"
+                     "重新壓縮後內容仍相同的圖；越大越寬鬆。",
+            )
 
         res = st.session_state.get("viz_dup_result")
         if (not res or res.get("token") != st.session_state.get("viz_data_token")
