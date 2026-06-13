@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from PIL import Image
 import umap
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
@@ -63,6 +64,12 @@ from completeness import (
     bucketize,
     categorical_buckets,
     image_stats,
+)
+from quiz import (
+    build_quiz,
+    fleiss_kappa,
+    geometric_skin,
+    score_quiz,
 )
 from compare_distributions import (
     build_projection_figure,
@@ -2303,6 +2310,216 @@ def _completeness_ui() -> None:
                       on_click=lambda: st.session_state.pop("cov_active_cell", None))
 
 
+_QUIZ_DEMO_DIR = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
+
+
+def _load_quiz_demo() -> None:
+    st.session_state["quiz_folder_text"] = str(_QUIZ_DEMO_DIR)
+    st.session_state["_quiz_autorun"] = True
+    _log_usage("quiz_demo_load")
+
+
+def _quiz_answer(qid: int, label: str) -> None:
+    st.session_state.setdefault("quiz_answers", {})[qid] = label
+    st.session_state["quiz_pos"] = st.session_state.get("quiz_pos", 0) + 1
+
+
+def _quiz_reset() -> None:
+    for k in ("quiz_spec", "quiz_answers", "quiz_pos"):
+        st.session_state.pop(k, None)
+
+
+def _quiz_generate(records: list[dict], dis, n_q: int) -> None:
+    st.session_state["quiz_spec"] = build_quiz(records, dis, n_questions=int(n_q))
+    st.session_state["quiz_answers"] = {}
+    st.session_state["quiz_pos"] = 0
+
+
+def _quiz_skip(pos: int) -> None:
+    st.session_state["quiz_pos"] = pos + 1
+
+
+def _fleiss_from_csvs(answer_maps: list[dict[int, str]]) -> tuple[float, int]:
+    """Fleiss kappa across raters' {qid: answer} maps on their common qids."""
+    if len(answer_maps) < 2:
+        return 0.0, 0
+    common = set(answer_maps[0])
+    for m in answer_maps[1:]:
+        common &= set(m)
+    common = sorted(common)
+    if not common:
+        return 0.0, 0
+    cats = sorted({a for m in answer_maps for a in m.values()})
+    cat_idx = {c: i for i, c in enumerate(cats)}
+    mat = np.zeros((len(common), len(cats)))
+    for r, qid in enumerate(common):
+        for m in answer_maps:
+            mat[r, cat_idx[m[qid]]] += 1
+    return fleiss_kappa(mat), len(common)
+
+
+def _render_quiz_quick_start() -> None:
+    st.markdown("##### 快速開始")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1, st.container(border=True):
+        st.markdown("**① 貼資料夾**")
+        st.caption("含類別子資料夾的影像資料夾——考卷會從爭議樣本出題。")
+    with c2, st.container(border=True):
+        st.markdown("**② 產生考卷**")
+        st.caption("自動挑爭議題＋對照題＋換皮重測＋golden 定錨。")
+    with c3, st.container(border=True):
+        st.markdown("**③ 盲測作答**")
+        st.caption("逐題盲答，算自我一致率與 vs golden；多人可算 Fleiss kappa。")
+    mid = st.columns([2, 1.6, 2])[1]
+    mid.button("✨ 用範例資料試跑（imagenette）", key="quiz_demo_btn",
+               type="primary", use_container_width=True, on_click=_load_quiz_demo,
+               disabled=not _QUIZ_DEMO_DIR.exists())
+
+
+def _quiz_ui() -> None:
+    st.markdown("##### 組考卷 · 標註者一致性盲測")
+    st.caption("把爭議樣本變成盲測考卷，量「同一人會不會自打嘴巴」與「跨人是否一致」。"
+               "只量對既有案例的判定穩定性，量不到庫外新型或 golden 本身對錯。")
+
+    with st.sidebar:
+        st.markdown("**① 資料夾**")
+        st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="quiz_folder_text",
+                     placeholder="例：demo/imagenette/train", height=68,
+                     label_visibility="collapsed")
+        all_models = available_models()
+        if not all_models:
+            st.error("models/ 內找不到模型檔。"); return
+        st.markdown("**② 模型**")
+        model = st.selectbox("模型", all_models, label_visibility="collapsed",
+                             help="用來找爭議樣本（kNN 標籤分歧）與對照題（以圖搜圖）。")
+        run = st.button("▶ 載入資料", use_container_width=True, key="run_quiz",
+                        type="primary")
+
+    if st.session_state.pop("_quiz_autorun", False):
+        run = True
+    if run:
+        folders = parse_folder_paths(st.session_state.get("quiz_folder_text", ""))
+        missing = [str(p) for p in folders if not p.exists()]
+        if not folders:
+            st.error("請先輸入資料夾。"); return
+        if missing:
+            st.error(f"資料夾不存在：{', '.join(missing)}"); return
+        records = discover_images_classifier(folders)
+        if not records or len({r["label"] for r in records}) < 2:
+            st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
+        embed_fn = load_model(model)
+        with st.status("計算中…", expanded=True):
+            paths = [r["path"] for r in records]
+            cache = folders[0] / f"embeddings_{model}" / "embeddings.npz"
+            emb = extract_embeddings(paths, embed_fn, cache_path=cache)
+            k = min(10, len(records) - 1)
+            dis = compute_label_disagreement(emb, [r["label"] for r in records], k=k)
+        st.session_state["quiz_records"] = records
+        st.session_state["quiz_disagreement"] = dis
+        _quiz_reset()
+        st.toast(f"已載入 {len(records)} 張影像", icon="✅")
+
+    if "quiz_records" not in st.session_state:
+        _render_quiz_quick_start()
+        return
+
+    records = st.session_state["quiz_records"]
+    dis = st.session_state["quiz_disagreement"]
+    class_opts = sorted({r["label"] for r in records})
+
+    # ── 出題（尚無考卷）──
+    if "quiz_spec" not in st.session_state:
+        st.markdown("**產生考卷**")
+        c1, c2 = st.columns([1, 3])
+        n_q = c1.number_input("題數", min_value=4, max_value=min(40, len(records)),
+                              value=min(16, len(records)), key="quiz_n")
+        c2.caption("配比：爭議題 / 對照題(distractor) / 換皮重測 / golden 定錨。"
+                   "換皮只用幾何變換（裁切/旋轉/翻轉），不動對比亮度。")
+        st.button("📝 產生考卷", key="quiz_gen", type="primary",
+                  on_click=_quiz_generate, args=(records, dis, int(n_q)))
+        _render_quiz_multirater()
+        return
+
+    quiz = st.session_state["quiz_spec"]
+    questions = quiz["questions"]
+    answers = st.session_state.setdefault("quiz_answers", {})
+    pos = st.session_state.get("quiz_pos", 0)
+
+    # ── 作答中 ──
+    if pos < len(questions):
+        q = questions[pos]
+        st.progress((pos) / len(questions), text=f"第 {pos + 1} / {len(questions)} 題")
+        col_img, col_ans = st.columns([3, 2], gap="medium")
+        with col_img:
+            p = Path(records[q["record_idx"]]["path"])
+            try:
+                img = Image.open(p).convert("RGB")
+                if q["skin"]:
+                    img = geometric_skin(img, q["skin"])
+                st.image(img, use_container_width=True)
+            except OSError:
+                st.warning(f"無法讀取：{p}")
+        with col_ans:
+            st.markdown("**這張屬於哪一類？**")
+            st.caption("（盲測：不顯示原標籤；憑你的判斷選。）")
+            for c in class_opts:
+                st.button(c, key=f"quiz_ans_{q['qid']}_{c}", use_container_width=True,
+                          on_click=_quiz_answer, args=(q["qid"], c))
+            st.button("跳過", key=f"quiz_skip_{q['qid']}", use_container_width=True,
+                      on_click=_quiz_skip, args=(pos,))
+            st.button("✕ 放棄此卷", key="quiz_abandon", on_click=_quiz_reset)
+        return
+
+    # ── 評分 ──
+    report = score_quiz(answers, quiz)
+    st.markdown("**作答完成 · 成績**")
+    m1, m2, m3 = st.columns(3)
+    sc, vg = report["self_consistency"], report["vs_golden"]
+    m1.metric("自我一致率", f"{sc * 100:.0f}%",
+              "✅ 達標(≥90%)" if report["self_pass"] else "⚠ 未達標",
+              help="同一題換皮重測你答得一不一致；量你會不會自打嘴巴。")
+    m2.metric("vs golden 一致", f"{vg * 100:.0f}%",
+              "✅ 達標(≥85%)" if report["golden_pass"] else "⚠ 未達標",
+              help="golden / 對照題你和標準答案一致率。")
+    m3.metric("作答題數", f"{report['n_answered']}/{report['n_questions']}")
+    if report["n_repeat_pairs"] == 0:
+        st.caption(":gray[（本卷無換皮重測對，自我一致率以 0 計——增加題數可納入重測。）]")
+    csv = "qid,answer\n" + "\n".join(f"{q},{a}" for q, a in sorted(answers.items()))
+    st.download_button("⬇ 匯出作答 CSV（給多人一致性用）", data=csv,
+                       file_name="quiz_answers.csv", mime="text/csv",
+                       key="quiz_answers_csv")
+    st.button("🔁 再出一卷", key="quiz_again", on_click=_quiz_reset)
+    st.divider()
+    _render_quiz_multirater()
+
+
+def _render_quiz_multirater() -> None:
+    """跨人一致性：上傳 ≥2 份作答 CSV → Fleiss kappa（共同題上計算）。"""
+    with st.expander("👥 多人一致性（Fleiss kappa）"):
+        st.caption("上傳 2 份以上不同標註者的作答 CSV（qid,answer），"
+                   "在共同題上算 Fleiss kappa（≥0.75 為及格）。")
+        files = st.file_uploader("作答 CSV（可多選）", type="csv",
+                                 accept_multiple_files=True, key="quiz_multi_files")
+        if files and len(files) >= 2:
+            maps = []
+            for f in files:
+                m = {}
+                for line in f.getvalue().decode("utf-8").splitlines()[1:]:
+                    parts = line.split(",")
+                    if len(parts) >= 2 and parts[0].strip().isdigit():
+                        m[int(parts[0])] = parts[1].strip()
+                maps.append(m)
+            kappa, n_common = _fleiss_from_csvs(maps)
+            c1, c2 = st.columns(2)
+            c1.metric("Fleiss kappa", f"{kappa:.3f}",
+                      "✅ 達標(≥0.75)" if kappa >= 0.75 else "⚠ 未達標")
+            c2.metric("共同題數", n_common)
+            if n_common == 0:
+                st.warning("這些作答檔沒有共同題（qid 不重疊）。")
+        elif files:
+            st.info("至少需要 2 份作答 CSV。")
+
+
 def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
@@ -2317,7 +2534,8 @@ def main() -> None:
     st.session_state.setdefault("tool_switch", "Visualize Embeddings")
     with switch_col:
         tool = st.segmented_control(
-            "Tool", ["Visualize Embeddings", "Compare Distributions", "完整度熱力圖"],
+            "Tool", ["Visualize Embeddings", "Compare Distributions",
+                     "完整度熱力圖", "組考卷"],
             key="tool_switch", label_visibility="collapsed",
         ) or "Visualize Embeddings"
     with help_col, st.popover("✨ 功能地圖", use_container_width=True):
@@ -2337,6 +2555,8 @@ def main() -> None:
             "點選散點看對應影像\n"
             "- **完整度熱力圖**：把資料依兩屬性軸切格，看每格『不太多不太少』、"
             "整體 Coverage Health、缺格清單（紫＝假完整近重複）\n"
+            "- **組考卷**：把爭議樣本變盲測考卷，量標註者自我一致率／vs golden／"
+            "多人 Fleiss kappa\n"
             "- **資料合約 manifest.jsonl**：每次 Run 自動寫入各資料夾"
             "（sha256／phash／embedding refs），供去重、回溯與下游工具使用"
         )
@@ -2345,8 +2565,10 @@ def main() -> None:
         _visualize_embeddings_ui()
     elif tool == "Compare Distributions":
         _compare_distributions_ui()
-    else:
+    elif tool == "完整度熱力圖":
         _completeness_ui()
+    else:
+        _quiz_ui()
 
 
 if __name__ == "__main__":

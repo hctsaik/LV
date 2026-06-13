@@ -874,3 +874,44 @@ def test_x_diversity_sampling(flow_page):
     page.locator('.st-key-viz_panel_view').get_by_text("選取", exact=True).click()
     wait_idle(page)
     _no_exception(page)
+
+
+# ── (y) §1 annotator-agreement quiz tool ────────────────────────────────
+
+def test_y_quiz_tool(app_page, tmp_path):
+    import numpy as np
+    from PIL import Image
+    page = app_page
+    root = tmp_path / "quizds" / "train"
+    for ci, cls in enumerate(("alpha", "beta")):
+        d = root / cls
+        d.mkdir(parents=True)
+        for i in range(10):
+            arr = np.random.default_rng(ci * 50 + i).integers(0, 255, (64, 64, 3)).astype("uint8")
+            arr[:, :, ci] = 220
+            Image.fromarray(arr).save(d / f"{cls}_{i}.jpg", quality=90)
+
+    page.locator('.st-key-tool_switch').get_by_text("組考卷", exact=True).click()
+    wait_idle(page)
+    page.locator('.st-key-quiz_folder_text textarea').fill(str(root))
+    page.locator('.st-key-run_quiz button').click()
+    wait_idle(page, timeout=300000)
+    _no_exception(page)
+
+    # generate a quiz, then answer every question blind
+    page.locator('.st-key-quiz_gen button').click()
+    page.wait_for_selector('[class*="st-key-quiz_ans_"] button', timeout=30000)
+    done = page.get_by_text(re.compile("作答完成"))
+    for _ in range(60):  # bounded; answer until the report appears
+        if done.count():
+            break
+        btns = page.locator('[class*="st-key-quiz_ans_"] button')
+        if btns.count() == 0:
+            break
+        btns.first.click()
+        wait_idle(page)
+    expect(done).to_be_visible()
+    expect(page.get_by_text("自我一致率", exact=True)).to_be_visible()
+    expect(page.get_by_text("vs golden 一致", exact=True)).to_be_visible()
+    expect(page.locator('.st-key-quiz_answers_csv')).to_be_visible()
+    _no_exception(page)
