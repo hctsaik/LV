@@ -680,3 +680,42 @@ def test_s_compare_linked_view(app_page, tmp_path):
     assert page.evaluate("el => el.naturalWidth", img.element_handle()) > 0
     expect(viewer.get_by_text(re.compile("setA|setB"))).to_be_visible()
     _no_exception(page)
+
+
+# ── (t) persistent UMAP reference frame (固定參考系) ─────────────────────
+
+def test_t_umap_reference_frame(app_page, tmp_path):
+    import numpy as np
+    from PIL import Image
+    page = app_page
+    train = tmp_path / "ds" / "train"
+    for ci, cls in enumerate(("a", "b")):
+        d = train / cls
+        d.mkdir(parents=True)
+        for i in range(3):
+            arr = np.random.default_rng(ci * 10 + i).integers(0, 255, (64, 64, 3)).astype("uint8")
+            arr[:, :, ci] = 255
+            Image.fromarray(arr).save(d / f"{cls}{i}.jpg", quality=90)
+
+    page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
+    wait_idle(page)
+    page.locator('.st-key-viz_folder_text textarea').fill(str(train))
+    page.locator('.st-key-viz_umap_ref label').first.click()
+    wait_idle(page)
+    page.locator('.st-key-run_viz button').click()
+    page.wait_for_selector('.st-key-viz_scatter_wrap g.points path', timeout=300000)
+    wait_idle(page, timeout=120000)
+    _no_exception(page)
+    refs = list(train.glob("embeddings_*/umap_ref.pkl"))
+    assert refs, "the fitted UMAP reference frame must be persisted to disk"
+
+    # second Run reuses the frozen frame without refitting or crashing
+    page.locator('.st-key-run_viz button').click()
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('.st-key-viz_status_line');
+            return el && el.innerText.includes('未選取');
+        }""", timeout=300000)
+    wait_idle(page, timeout=120000)
+    _no_exception(page)
+    assert list(train.glob("embeddings_*/umap_ref.pkl")), "frame must survive re-Run"

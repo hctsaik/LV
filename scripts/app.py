@@ -46,6 +46,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     zip_selected_images,
 )
 from manifest import rel_key, set_embedding_refs, update_manifest, write_manifest
+from umap_ref import ref_path_for, stable_umap
 from compare_distributions import (
     build_projection_figure,
     compute_fid,
@@ -966,6 +967,22 @@ def _visualize_embeddings_ui() -> None:
             key="viz_methods", label_visibility="collapsed",
             help="只勾選需要的投影可大幅縮短計算時間。",
         )
+        if "UMAP" in selected_method_labels:
+            uc1, uc2 = st.columns([3, 1])
+            uc1.toggle(
+                "固定 UMAP 參考系", key="viz_umap_ref",
+                help="首跑擬合並凍結 UMAP 空間（存於 embeddings_<model>/umap_ref.pkl）；"
+                     "之後新增的影像以 transform 投入同一座標系，舊點完全不動，"
+                     "跨 Run 佈局可比較。注意：transform 的擺位是近似值，"
+                     "資料大幅改變後請按「↻」重建參考系。",
+            )
+            if st.session_state.get("viz_umap_ref"):
+                uc2.button("↻", key="viz_umap_rebuild_btn", use_container_width=True,
+                           help="下次 Run 重新擬合並覆寫參考系",
+                           on_click=lambda: st.session_state.__setitem__(
+                               "_viz_umap_rebuild", True))
+                if st.session_state.get("_viz_umap_rebuild"):
+                    st.caption(":orange[↻ 下次 Run 將重建 UMAP 參考系]")
 
         st.markdown("**④ 執行**")
         n_folders = len(st.session_state.get("viz_folder_list", [])) + len(
@@ -1097,6 +1114,13 @@ def _visualize_embeddings_ui() -> None:
             _step += 1
             _bar.progress(_step / _n_steps, text="Manifest 更新完成")
 
+            # 影像內容雜湊（combined 順序）— 固定 UMAP 參考系的點身分證
+            all_keys: list[str] = []
+            for folder in folders:
+                m_entries = manifest_by_folder.get(folder, {})
+                all_keys += [m_entries[rel_key(folder, r["path"])]["sha256"]
+                             for r in records if r["split"] == folder.name]
+
             for model_name in selected_models:
                 embed_fn = load_model(model_name)
                 all_embs = []
@@ -1149,8 +1173,18 @@ def _visualize_embeddings_ui() -> None:
                                    perplexity=perplexity).fit_transform(embeddings)
                     else:
                         n_neighbors = min(15, max(2, n_samples - 1))
-                        arr = umap.UMAP(n_components=n_comps, n_neighbors=n_neighbors,
-                                        random_state=42).fit_transform(embeddings)
+                        if st.session_state.get("viz_umap_ref"):
+                            arr, n_new, refitted = stable_umap(
+                                embeddings, all_keys,
+                                ref_path_for(folders[0], model_name),
+                                n_comps, n_neighbors,
+                                rebuild=bool(st.session_state.get("_viz_umap_rebuild")),
+                            )
+                            mlabel = (f"{mlabel}（重擬合參考系）" if refitted
+                                      else f"{mlabel}（參考系沿用，+{n_new} 新點）")
+                        else:
+                            arr = umap.UMAP(n_components=n_comps, n_neighbors=n_neighbors,
+                                            random_state=42).fit_transform(embeddings)
                     proj[mkey] = _pad2d(arr)
                     _step += 1
                     _bar.progress(_step / _n_steps, text=f"[{model_name}] {mlabel} 完成")
@@ -1206,6 +1240,7 @@ def _visualize_embeddings_ui() -> None:
         st.session_state["viz_query_chain"] = []
         st.session_state["viz_grid_limit"] = _GRID_BATCH
         st.session_state.pop("_viz_mode_snapshot", None)
+        st.session_state.pop("_viz_umap_rebuild", None)
         # 匯出清單以 image path 為鍵，跨 Run 仍有效 — 刻意不清
         st.toast(f"完成：{len(records)} 張影像 × {len(selected_models)} 模型", icon="✅")
 
@@ -1700,8 +1735,11 @@ def main() -> None:
             "勾「僅跨 split」＝train/val 洩漏）\n"
             "- **離群度・標籤分歧**：Run 完自動計算，右欄排序選單切換\n"
             "- **匯出清單**：跨視圖累積選取，匯出 CSV（含 sha256）／ZIP\n"
+            "- **固定 UMAP 參考系**：③ 投影方法下的開關——跨 Run 佈局可比較\n"
             "- **比較兩資料夾**：Compare Distributions——FID/KID 等指標＋"
-            "點選散點看對應影像"
+            "點選散點看對應影像\n"
+            "- **資料合約 manifest.jsonl**：每次 Run 自動寫入各資料夾"
+            "（sha256／phash／embedding refs），供去重、回溯與下游工具使用"
         )
 
     if tool == "Visualize Embeddings":
