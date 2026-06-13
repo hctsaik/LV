@@ -1,0 +1,943 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>模型判斷邊界診斷與資料完整性框架</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F4F6F7;
+    --paper-2:#FFFFFF;
+    --ink:#14181B;
+    --ink-soft:#4A535A;
+    --ink-faint:#8A949B;
+    --line:#D7DEE1;
+    --line-strong:#BCC6CB;
+    --accent:#0E7C86;
+    --accent-deep:#0A5A62;
+    --accent-tint:#0E7C861a;
+    --under:#C2402F;
+    --under-tint:#C2402F1f;
+    --inband:#2E7D5B;
+    --inband-tint:#2E7D5B1f;
+    --over:#B07A1E;
+    --over-tint:#B07A1E22;
+    --na:#AAB4B9;
+    --na-tint:#AAB4B915;
+    --maxw:1180px;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto;}}
+  body{
+    margin:0;
+    background-color:var(--paper);
+    background-image:
+      linear-gradient(var(--line) 1px,transparent 1px),
+      linear-gradient(90deg,var(--line) 1px,transparent 1px);
+    background-size:32px 32px;
+    background-position:-1px -1px;
+    color:var(--ink);
+    font-family:"Noto Sans TC",system-ui,-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif;
+    font-size:16px;
+    line-height:1.78;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;}
+
+  .shell{
+    max-width:var(--maxw);
+    margin:0 auto;
+    padding:0 24px 96px;
+    display:grid;
+    grid-template-columns:228px 1fr;
+    gap:48px;
+    align-items:start;
+  }
+
+  /* ---------- masthead ---------- */
+  .masthead{
+    grid-column:1 / -1;
+    background:var(--paper-2);
+    border:1px solid var(--line-strong);
+    margin-top:32px;
+    padding:36px 40px 28px;
+    position:relative;
+  }
+  .masthead::before{
+    content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:var(--accent);
+  }
+  .doc-tag{
+    font-family:"IBM Plex Mono",monospace;
+    font-size:11.5px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--accent-deep);
+    display:flex;gap:14px;flex-wrap:wrap;align-items:center;
+    margin-bottom:18px;
+  }
+  .doc-tag .dot{width:5px;height:5px;background:var(--accent);border-radius:50%;}
+  h1.doc-title{
+    font-size:clamp(26px,4.4vw,40px);
+    line-height:1.18;
+    font-weight:700;
+    letter-spacing:-.01em;
+    margin:0 0 10px;
+  }
+  .doc-sub{
+    font-size:15px;color:var(--ink-soft);margin:0 0 24px;max-width:62ch;
+  }
+  .meta-grid{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+    border-top:1px solid var(--line);
+  }
+  .meta-cell{
+    padding:14px 0 4px;border-right:1px solid var(--line);padding-right:20px;margin-right:20px;
+  }
+  .meta-cell:last-child{border-right:none;}
+  .meta-k{
+    font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--ink-faint);margin-bottom:3px;
+  }
+  .meta-v{font-size:13.5px;color:var(--ink);font-weight:500;line-height:1.5;}
+
+  /* ---------- toc ---------- */
+  .toc{
+    position:sticky;top:24px;
+    font-size:13.5px;
+    border-left:1px solid var(--line-strong);
+    padding-left:18px;
+  }
+  .toc-h{
+    font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--ink-faint);margin-bottom:14px;
+  }
+  .toc a{
+    display:block;color:var(--ink-soft);text-decoration:none;padding:5px 0;
+    border-left:2px solid transparent;margin-left:-20px;padding-left:18px;
+    transition:color .15s,border-color .15s;
+    line-height:1.4;
+  }
+  .toc a .n{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-faint);margin-right:8px;}
+  .toc a:hover{color:var(--ink);}
+  .toc a.active{color:var(--accent-deep);border-left-color:var(--accent);font-weight:500;}
+  .toc a.active .n{color:var(--accent);}
+
+  /* ---------- main flow ---------- */
+  main{min-width:0;}
+  section.block{
+    scroll-margin-top:24px;
+    padding:40px 0;
+    border-bottom:1px solid var(--line);
+  }
+  section.block:last-of-type{border-bottom:none;}
+  .eyebrow{
+    font-family:"IBM Plex Mono",monospace;font-size:11.5px;letter-spacing:.2em;
+    text-transform:uppercase;color:var(--accent-deep);
+    display:flex;align-items:center;gap:12px;margin-bottom:14px;
+  }
+  .eyebrow .sn{
+    color:var(--paper-2);background:var(--accent);
+    padding:2px 9px;font-weight:600;letter-spacing:.1em;
+  }
+  h2{font-size:clamp(20px,2.6vw,27px);font-weight:700;line-height:1.25;margin:0 0 8px;letter-spacing:-.01em;}
+  h3{font-size:17.5px;font-weight:700;margin:30px 0 8px;}
+  h4{font-size:15px;font-weight:700;margin:22px 0 6px;color:var(--ink);}
+  p{margin:12px 0;}
+  strong{font-weight:700;color:var(--ink);}
+  a{color:var(--accent-deep);}
+  ul,ol{margin:12px 0;padding-left:22px;}
+  li{margin:7px 0;}
+  code:not(pre code){
+    font-family:"IBM Plex Mono",monospace;font-size:.86em;
+    background:var(--accent-tint);color:var(--accent-deep);
+    padding:1px 6px;border-radius:3px;
+  }
+
+  .lede{
+    font-size:18px;line-height:1.7;color:var(--ink);
+    border-left:3px solid var(--accent);padding:4px 0 4px 20px;margin:18px 0;
+  }
+
+  /* callout */
+  .note{
+    background:var(--paper-2);border:1px solid var(--line-strong);
+    border-left:4px solid var(--accent);
+    padding:18px 22px;margin:20px 0;font-size:14.5px;
+  }
+  .note .lbl{
+    font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--accent-deep);display:block;margin-bottom:6px;
+  }
+  .note.warn{border-left-color:var(--under);}
+  .note.warn .lbl{color:var(--under);}
+
+  /* tables */
+  .tbl-wrap{overflow-x:auto;margin:20px 0;border:1px solid var(--line-strong);}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:560px;background:var(--paper-2);}
+  th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{
+    font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--ink-faint);background:var(--paper);
+    border-bottom:1px solid var(--line-strong);font-weight:500;white-space:nowrap;
+  }
+  tbody tr:last-child td{border-bottom:none;}
+  td.c{text-align:center;white-space:nowrap;}
+  .pill{
+    font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:500;
+    padding:2px 8px;border-radius:3px;display:inline-block;white-space:nowrap;
+  }
+  .p-hi{background:var(--inband-tint);color:var(--inband);}
+  .p-lo{background:var(--under-tint);color:var(--under);}
+  .p-mid{background:var(--over-tint);color:var(--over);}
+  .p-any{background:var(--na-tint);color:var(--ink-faint);}
+  .rootcode{font-family:"IBM Plex Mono",monospace;font-weight:600;color:var(--accent-deep);}
+
+  /* three-signal gauges */
+  .gauges{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:24px 0;}
+  .gauge{
+    background:var(--paper-2);border:1px solid var(--line-strong);padding:18px 18px 16px;position:relative;
+  }
+  .gauge .gk{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.14em;color:var(--accent-deep);font-weight:600;}
+  .gauge .gt{font-weight:700;font-size:15px;margin:6px 0 2px;}
+  .gauge .gm{font-size:12.5px;color:var(--ink-soft);line-height:1.5;}
+  .gauge .scale{
+    margin-top:12px;height:6px;border-radius:3px;
+    background:linear-gradient(90deg,var(--line) 0%,var(--accent) 100%);
+    position:relative;
+  }
+  .gauge .scale::after{content:"";position:absolute;right:18%;top:-3px;width:2px;height:12px;background:var(--ink);}
+  .gauge .stk{display:flex;justify-content:space-between;font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--ink-faint);margin-top:5px;letter-spacing:.08em;}
+
+  /* ---------- HEATMAP signature ---------- */
+  .heat-panel{
+    background:var(--paper-2);border:1px solid var(--line-strong);
+    margin:26px 0;padding:26px 28px 22px;
+  }
+  .heat-head{
+    display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap;
+    border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:20px;
+  }
+  .heat-head .ttl{font-weight:700;font-size:16px;}
+  .heat-head .cap{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-faint);letter-spacing:.08em;}
+  .heat-layout{display:grid;grid-template-columns:1fr 240px;gap:32px;align-items:start;}
+  .grid-frame{display:flex;gap:10px;}
+  .yaxis{display:flex;flex-direction:column;justify-content:flex-end;}
+  .ylab{
+    font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.14em;
+    color:var(--accent-deep);writing-mode:vertical-rl;transform:rotate(180deg);
+    text-transform:uppercase;align-self:center;padding-bottom:24px;
+  }
+  .grid-body{flex:1;}
+  .ycells{display:flex;align-items:stretch;gap:8px;}
+  .yticks{display:flex;flex-direction:column;gap:8px;justify-content:center;}
+  .ytick{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);height:62px;display:flex;align-items:center;justify-content:flex-end;width:30px;}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(3,62px);gap:8px;flex:1;}
+  .cell{
+    border:1px solid var(--line-strong);border-radius:3px;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    font-family:"IBM Plex Mono",monospace;position:relative;cursor:default;
+  }
+  .cell .ct{font-size:16px;font-weight:600;line-height:1;}
+  .cell .cs{font-size:8.5px;letter-spacing:.1em;margin-top:3px;text-transform:uppercase;opacity:.85;}
+  .cell .star{position:absolute;top:4px;right:5px;font-size:9px;color:var(--accent-deep);}
+  .c-under{background:var(--under-tint);border-color:var(--under);color:var(--under);}
+  .c-in{background:var(--inband-tint);border-color:var(--inband);color:var(--inband);}
+  .c-over{background:var(--over-tint);border-color:var(--over);color:var(--over);}
+  .c-na{background:var(--na-tint);border-color:var(--line);color:var(--na);}
+  .xticks{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px;margin-left:38px;}
+  .xtick{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-soft);text-align:center;}
+  .xlab{
+    font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.14em;
+    color:var(--accent-deep);text-transform:uppercase;text-align:center;
+    margin-top:6px;margin-left:38px;
+  }
+  /* readout side */
+  .readout{display:flex;flex-direction:column;gap:14px;}
+  .ro-card{border:1px solid var(--line);padding:12px 14px;}
+  .ro-k{font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);}
+  .ro-v{font-family:"IBM Plex Mono",monospace;font-size:24px;font-weight:600;line-height:1.1;margin-top:4px;}
+  .ro-v small{font-size:13px;color:var(--ink-faint);}
+  .ro-v.warnv{color:var(--under);}
+  .ro-v.okv{color:var(--inband);}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin-top:18px;border-top:1px solid var(--line);padding-top:14px;}
+  .lg{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--ink-soft);}
+  .sw{width:13px;height:13px;border-radius:3px;border:1px solid;}
+  .sw.under{background:var(--under-tint);border-color:var(--under);}
+  .sw.in{background:var(--inband-tint);border-color:var(--inband);}
+  .sw.over{background:var(--over-tint);border-color:var(--over);}
+  .sw.na{background:var(--na-tint);border-color:var(--line);}
+
+  /* tolerance band motif */
+  .band{display:flex;height:34px;margin:16px 0 6px;border:1px solid var(--line-strong);font-family:"IBM Plex Mono",monospace;font-size:11px;}
+  .band div{display:flex;align-items:center;justify-content:center;color:#fff;letter-spacing:.05em;}
+  .band .b-lo{background:var(--under);flex:1;}
+  .band .b-in{background:var(--inband);flex:2.4;}
+  .band .b-hi{background:var(--over);flex:1;}
+  .band-ax{display:flex;justify-content:space-between;font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--ink-faint);}
+
+  /* ---------- agent transcript ---------- */
+  .round-h{
+    font-family:"IBM Plex Mono",monospace;font-size:12px;letter-spacing:.1em;
+    color:var(--accent-deep);font-weight:600;margin:30px 0 4px;
+    display:flex;align-items:center;gap:10px;
+  }
+  .round-h .rn{background:var(--accent);color:#fff;padding:2px 8px;font-size:11px;}
+  .round-topic{font-size:14px;color:var(--ink-soft);margin:0 0 14px;font-weight:500;}
+  .turn{
+    display:grid;grid-template-columns:74px 1fr;gap:0;
+    border-left:2px solid var(--line);margin:0 0 2px;
+  }
+  .turn .who{
+    font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600;
+    padding:11px 12px 11px 14px;letter-spacing:.04em;color:var(--ink-soft);
+    border-right:1px solid var(--line);
+  }
+  .turn .say{padding:10px 0 10px 18px;font-size:14px;line-height:1.65;}
+  .turn.a1{border-left-color:#0E7C86;} .turn.a1 .who{color:#0E7C86;}
+  .turn.a2{border-left-color:#7A5BA8;} .turn.a2 .who{color:#7A5BA8;}
+  .turn.a3{border-left-color:#B07A1E;} .turn.a3 .who{color:#B07A1E;}
+  .turn.a4{border-left-color:#C2402F;} .turn.a4 .who{color:#C2402F;}
+  .turn.a5{border-left-color:#2E7D5B;} .turn.a5 .who{color:#2E7D5B;}
+  .turn.arb{border-left-color:var(--ink);background:var(--paper-2);} .turn.arb .who{color:var(--ink);}
+  .consensus{
+    background:var(--accent-tint);border:1px solid var(--accent);
+    border-left:4px solid var(--accent);
+    padding:12px 18px;margin:12px 0 8px;font-size:13.5px;
+  }
+  .consensus .lbl{font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--accent-deep);font-weight:600;}
+
+  .roster{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:20px 0;}
+  .rc{border:1px solid var(--line-strong);background:var(--paper-2);padding:12px 14px;border-top:3px solid var(--accent);}
+  .rc .rk{font-family:"IBM Plex Mono",monospace;font-weight:600;font-size:12px;}
+  .rc .rt{font-weight:700;font-size:13.5px;margin:3px 0;}
+  .rc .rd{font-size:12px;color:var(--ink-soft);line-height:1.45;}
+  .rc.r1{border-top-color:#0E7C86;} .rc.r2{border-top-color:#7A5BA8;}
+  .rc.r3{border-top-color:#B07A1E;} .rc.r4{border-top-color:#C2402F;}
+  .rc.r5{border-top-color:#2E7D5B;} .rc.rarb{border-top-color:var(--ink);}
+
+  /* code / gherkin */
+  .gherkin{
+    background:#10171A;color:#D6E2E4;
+    font-family:"IBM Plex Mono",monospace;font-size:12.5px;line-height:1.65;
+    padding:20px 22px;overflow-x:auto;margin:16px 0;border-radius:4px;
+    border:1px solid #1f2b2f;
+  }
+  .gherkin .gk-feat{color:#6FD3C4;font-weight:600;}
+  .gherkin .gk-scn{color:#E0B85A;}
+  .gherkin .gk-step{color:#9FC2E0;}
+  .gherkin .gk-cm{color:#5E6E72;font-style:italic;}
+  .gherkin .gk-txt{color:#D6E2E4;}
+
+  footer{
+    grid-column:1 / -1;margin-top:8px;padding-top:24px;border-top:1px solid var(--line-strong);
+    font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--ink-faint);
+    letter-spacing:.06em;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;
+  }
+
+  /* mobile */
+  @media (max-width:880px){
+    .shell{grid-template-columns:1fr;gap:0;padding:0 16px 64px;}
+    .toc{display:none;}
+    .masthead{padding:26px 22px 22px;margin-top:18px;}
+    .meta-cell{border-right:none;margin-right:0;padding-right:0;border-bottom:1px solid var(--line);}
+    .gauges{grid-template-columns:1fr;}
+    .heat-layout{grid-template-columns:1fr;gap:22px;}
+    .turn{grid-template-columns:60px 1fr;}
+    .turn .who{font-size:10px;padding:9px 8px;}
+    .turn .say{padding-left:12px;font-size:13.5px;}
+    body{font-size:15px;}
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <header class="masthead">
+    <div class="doc-tag">
+      <span>VISION&nbsp;AI&nbsp;/&nbsp;MLOPS</span><span class="dot"></span>
+      <span>診斷框架 &amp; BDD 設計</span><span class="dot"></span>
+      <span>討論用工作文件</span>
+    </div>
+    <h1 class="doc-title">模型判斷邊界診斷<br>與資料完整性框架</h1>
+    <p class="doc-sub">當模型判錯時,如何用三個正交訊號說清楚「為什麼錯」,以及「補資料到底有沒有用」。內含多代理圓桌討論、根因診斷矩陣、完整度熱力圖設計、BDD 情境與仲裁待裁清單。</p>
+    <div class="meta-grid">
+      <div class="meta-cell"><div class="meta-k">文件性質</div><div class="meta-v">持續討論用 · 非定版規格</div></div>
+      <div class="meta-cell"><div class="meta-k">仲裁人 Arbiter</div><div class="meta-v">客戶端(你)</div></div>
+      <div class="meta-cell"><div class="meta-k">共識規則</div><div class="meta-v">框架收斂為止;參數落點以「建議值 + 待裁」交付</div></div>
+      <div class="meta-cell"><div class="meta-k">核心結論</div><div class="meta-v">三訊號交叉定位根因,缺一誤判</div></div>
+    </div>
+  </header>
+
+  <aside class="toc" aria-label="目錄">
+    <div class="toc-h">目錄 / Contents</div>
+    <nav>
+      <a href="#s0"><span class="n">00</span>導讀:收斂到同一核心</a>
+      <a href="#s1"><span class="n">01</span>問題重述</a>
+      <a href="#s2"><span class="n">02</span>多代理圓桌討論</a>
+      <a href="#s3"><span class="n">03</span>核心框架:根因診斷</a>
+      <a href="#s4"><span class="n">04</span>完整度熱力圖設計</a>
+      <a href="#s5"><span class="n">05</span>逐項決策回覆</a>
+      <a href="#s6"><span class="n">06</span>BDD 測試情境</a>
+      <a href="#s7"><span class="n">07</span>仲裁人決策清單</a>
+      <a href="#s8"><span class="n">08</span>下一步與待續</a>
+    </nav>
+  </aside>
+
+  <main>
+
+    <!-- 00 -->
+    <section class="block" id="s0">
+      <div class="eyebrow"><span class="sn">00</span>導讀</div>
+      <h2>這些需求其實收斂到同一核心</h2>
+      <p>你提的東西看起來分散——BDD、根因判斷、N2/N3 門檻、灰帶分類、定義書、escape 體檢卡、完整度指標——但它們是同一條軸上的不同切面:</p>
+      <p class="lede">當模型判錯時,我能不能說清楚「為什麼錯」,以及「補資料到底有沒有用」?</p>
+      <p>整份文件圍繞這個問題展開。核心結論先講:<strong>判斷失敗的根因,要靠三個彼此獨立的訊號交叉定位</strong>,單看任何一個都會誤判。後面所有機制(熱力圖、考卷盲測、門檻校準、體檢卡)都是在量測或運用這三個訊號。</p>
+    </section>
+
+    <!-- 01 -->
+    <section class="block" id="s1">
+      <div class="eyebrow"><span class="sn">01</span>Problem</div>
+      <h2>問題重述</h2>
+
+      <h3>核心問題 A — 判錯了,但我不確定該怎麼解讀</h3>
+      <p>當模型對某筆資料沒判對,你無法明確判定屬於哪一種:</p>
+      <ul>
+        <li><strong>假設 H1(資料不足)</strong>:這筆我本來就「應該」判對,只是過去同類資料太少;<strong>補資料就能判對</strong>。這是覆蓋率問題。</li>
+        <li><strong>假設 H2(邊界該擴展)</strong>:這其實是該擴展判斷邊界的案例——「正確答案」本身可爭議,或現行定義沒涵蓋它。這是定義問題,不是資料量問題。</li>
+      </ul>
+      <p>你的需求:<strong>設計一套分析機制,把這兩種(及其他可能)區分開來</strong>,讓「要不要補資料 / 要不要改定義」變成有依據的決策。</p>
+
+      <h3>核心問題 B — 模型收值完整性指標</h3>
+      <p>把某個 concept 切成很多小格,檢查<strong>每格資料是否完整——不太多、也不太少</strong>;用熱力圖呈現,最後能輕鬆統計出<strong>還有多少格缺資料</strong>,以及<strong>整體 concept 完整度是否足夠</strong>。</p>
+
+      <h3>你已表態 / 待我建議的決策點</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>#</th><th>議題</th><th>你的傾向 / 提問</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">D1</td><td>N3 熵閾值、N2 命中密度半徑 r 的初始值與重校頻率</td><td><strong>提問</strong>:從資料產生,還是設成 config?</td></tr>
+            <tr><td class="mono">D2</td><td>灰帶樣本要不要進「低閾值警示通道」?誤報成本誰吸收?</td><td><strong>要額外分一類</strong>,讓 User 在 LV 疊圖比較,確認後再進資料集</td></tr>
+            <tr><td class="mono">D3</td><td>多影像類型之間,定義書與 gauge study 要不要分開做?</td><td><strong>直接做完整版</strong></td></tr>
+            <tr><td class="mono">D4</td><td>escape 體檢卡要不要做成 app 內一鍵報告?</td><td><strong>要一鍵報告</strong>(本輪僅討論設計)</td></tr>
+            <tr><td class="mono">D5</td><td>考卷式機制</td><td>對爭議資料多次盲測同一/相似筆看一致性;仲裁人由客戶端出</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 02 -->
+    <section class="block" id="s2">
+      <div class="eyebrow"><span class="sn">02</span>Roundtable</div>
+      <h2>多代理圓桌討論</h2>
+      <p>多代理多輪辯論,直到對「框架結構」收斂。對「參數落點」不強求共識,改以建議值交付仲裁人。</p>
+
+      <div class="roster">
+        <div class="rc r1"><div class="rk">A1</div><div class="rt">視覺 / ML</div><div class="rd">決策理論、embedding、模型不確定度</div></div>
+        <div class="rc r2"><div class="rk">A2</div><div class="rt">資料 / MLOps</div><div class="rd">manifest、版本、完整度、門檻校準</div></div>
+        <div class="rc r3"><div class="rk">A3</div><div class="rt">品質 / MSA</div><div class="rd">Gauge R&amp;R、定義書、escape、DOE</div></div>
+        <div class="rc r4"><div class="rk">A4</div><div class="rt">產線 / 維運</div><div class="rd">誤報成本、停線風險、警示通道</div></div>
+        <div class="rc r5"><div class="rk">A5</div><div class="rt">LV / 工具</div><div class="rd">疊圖審查、一鍵報告、操作流</div></div>
+        <div class="rc rarb"><div class="rk">ARB</div><div class="rt">仲裁人(你)</div><div class="rd">價值判斷、門檻落點、最終裁定</div></div>
+      </div>
+
+      <!-- round 1 -->
+      <div class="round-h"><span class="rn">R1</span>怎麼框定「判錯的根因」</div>
+      <div class="turn a1"><div class="who">A1</div><div class="say">最直接:兩個訊號就好——embedding 鄰域密度(稀疏=沒看過)+ 模型輸出的熵(高熵=模型自己也不確定)。稀疏 + 高熵 = 補資料。</div></div>
+      <div class="turn a3"><div class="who">A3</div><div class="say">反對簡化成這樣。你這兩個訊號都長在「模型這一側」,完全沒量到「概念本身有多模糊」。連專家自己都喬不定的筆,是定義問題,不是資料問題,補再多模型也學不出穩定邊界——標籤本身在打架。這在量測學就是 Gauge R&amp;R。</div></div>
+      <div class="turn a2"><div class="who">A2</div><div class="say">A3 講到重點。而且 A1 的「鄰域密度」跟漢章要的完整度熱力圖是同一件事,只是粒度不同。應該共用同一層 embedding 與 manifest,別做兩套。</div></div>
+      <div class="turn a1"><div class="who">A1</div><div class="say">接受。訊號從兩個變三個:概念歧義度、局部覆蓋度、模型不確定度。前者量人,後兩者量模型與資料。</div></div>
+      <div class="consensus"><span class="lbl">R1 共識</span> 根因診斷需要三個彼此正交的訊號,缺一不可。</div>
+
+      <!-- round 2 -->
+      <div class="round-h"><span class="rn">R2</span>完整度熱力圖的「格子」怎麼定義</div>
+      <div class="turn a1"><div class="who">A1</div><div class="say">最省事:全庫 embedding 用 UMAP 壓到 2D,平面打格數點。自動,不用人工定維度。</div></div>
+      <div class="turn a3"><div class="who">A3</div><div class="say">不行。UMAP 格子沒物理意義,你跟產線說「第 7 格缺資料」沒人懂那是什麼缺陷。而且 UMAP 不穩定,換 seed 格子就跑掉,無法當長期基準。主張用領域因子切格:尺寸×對比×位置×變體×影像類型,看得懂也補得了。</div></div>
+      <div class="turn a1"><div class="who">A1</div><div class="say">領域因子會讓格子數爆炸,而且很多格不會同時出現,大半是空的,完整度分數會被「不可能組合」拉低失真。</div></div>
+      <div class="turn a2"><div class="who">A2</div><div class="say">折衷——主軸用領域因子(可行動),格內再做 embedding 密度副檢(抓格內結塊)。爆炸用兩招:只實體化實際觀察到的組合;沒出現的標 N/A 不計分。再加關鍵性加權——近邊界、高 escape 成本的格下限拉高、權重也高。完整度因此是風險加權,不是齊頭覆蓋。</div></div>
+      <div class="turn a3"><div class="who">A3</div><div class="say">同意,這跟 DOE 分層抽樣天然對齊。</div></div>
+      <div class="consensus"><span class="lbl">R2 共識</span> 混合座標:領域因子為主軸、embedding 密度為格內副檢,加關鍵性加權與 N/A 排除。</div>
+
+      <!-- round 3 -->
+      <div class="round-h"><span class="rn">R3</span>N2/N3 門檻:config 還是從資料產生(D1)</div>
+      <div class="turn a2"><div class="who">A2</div><div class="say">不是二選一,是分層——介面是 config,來源是資料。門檻一律以 config 存在(明確、可版控、可覆寫、可稽核),絕不寫死;但初始值與週期重校由一支校準工作從資料導出,不憑空填數字。</div></div>
+      <div class="turn a1"><div class="who">A1</div><div class="say">同意,但警告:校準集太小,門檻會 overfit 到那一小撮。對門檻估信賴區間,寧可取保守端。</div></div>
+      <div class="turn a3"><div class="who">A3</div><div class="say">重校頻率別綁日曆,綁事件——模型改版、embedding 改版、偵測到漂移才重校;另掛月度漂移巡檢當安全網。這跟 gauge study 再鑑定時機同邏輯。</div></div>
+      <div class="turn a2"><div class="who">A2</div><div class="say">而且門檻要連同 model + embedding + dataset 三版本一起版控(寫進 manifest)。沒有 lineage 的門檻是無效的。</div></div>
+      <div class="consensus"><span class="lbl">R3 共識</span> config 為介面、資料為來源、事件驅動重校、與三版本一起版控。</div>
+
+      <!-- round 4 -->
+      <div class="round-h"><span class="rn">R4</span>灰帶樣本與誤報成本(D2)</div>
+      <div class="turn a4"><div class="who">A4</div><div class="say">先把成本攤開。灰帶直接擋產線,誤報吃產能;直接放行,escape 風險上升。這個取捨不能由演算法默默決定。</div></div>
+      <div class="turn a5"><div class="who">A5</div><div class="say">所以別讓灰帶做「擋/放」二元決策。走獨立的低閾值警示通道,不停線,只標記;同時落成獨立生命週期狀態 pending_review,進暫存區不進 train/val。User 在 LV 疊圖逐筆比對,確認後才晉升。誤報成本從「產能」轉到「審查預算」,可控可調,旋鈕是 N3。</div></div>
+      <div class="turn a1"><div class="who">A1</div><div class="say">澄清:這「額外一類」不是模型輸出類別,是路由/暫存標籤。模型照常輸出判斷與熵;是熵落在灰帶,才把它路由到警示通道與 pending_review。別污染模型的類別定義。</div></div>
+      <div class="turn arb"><div class="who">ARB</div><div class="say">成本落點與通道鬆緊保留給我裁定。我要的是:演算法把灰帶清楚分出來、給我疊圖工具、給我考卷盲測判它是「漏判清楚案例」還是「真歧義」;放不放進資料集我拍板。</div></div>
+      <div class="consensus"><span class="lbl">R4 共識</span> 灰帶 = 獨立路由/暫存類別 + 低閾值警示通道(不停線)+ LV 疊圖審查 + pending_review;成本與門檻由仲裁人裁定,考卷盲測為裁決工具。</div>
+
+      <!-- round 5 -->
+      <div class="round-h"><span class="rn">R5</span>定義書/gauge study 範圍 與 體檢卡(D3、D4)</div>
+      <div class="turn a3"><div class="who">A3</div><div class="say">做完整版我贊成,但結構要清楚:每種影像類型各一份定義書、各一份 gauge study(缺陷外觀與模糊地帶因類型而異),但共用同一份範本,往上彙整成跨類型一致性看板。</div></div>
+      <div class="turn a3"><div class="who">A3</div><div class="say">觀念對齊:這裡 gauge study 量的是「判斷系統」的再現性(不同人是否一致)與重複性(同一人不同時間是否一致)。漢章要的考卷盲測,本質就是人側的 Gauge R&amp;R——不是另做一套,是把它正式定義成判斷系統的 R&amp;R。</div></div>
+      <div class="turn a5"><div class="who">A5</div><div class="say">體檢卡內容我定(本輪只設計):一鍵跑出一頁——近期 escape 清單、每筆三訊號特徵與根因分類、落在熱力圖哪些格、escape 的人類一致性、趨勢、排序好的建議動作。等於把整套框架自動跑在近期 escape 上。</div></div>
+      <div class="turn a2"><div class="who">A2</div><div class="say">體檢卡每個數字都要能點回 lineage——點一筆 escape,追到影像 hash、當時 manifest 版本、當時門檻。</div></div>
+      <div class="consensus"><span class="lbl">R5 共識</span> 定義書/gauge study 逐類型各做、共用範本、跨類型彙整;考卷盲測 = 人側 Gauge R&amp;R;體檢卡內容如上,實作列下一階段。</div>
+
+      <div class="note">
+        <span class="lbl">收斂後的統一模型</span>
+        判斷失敗的根因,由三個正交訊號交叉定位:<strong>(1) 概念固有歧義度</strong>(量人,考卷式 Gauge R&amp;R,定義準確度天花板)、<strong>(2) 局部資料覆蓋度</strong>(量資料,N2 半徑 + 熱力圖)、<strong>(3) 模型不確定度</strong>(量模型,N3 熵)。人類一致性把「概念真的歧義」與「模型有缺陷」解耦;密度/熱力圖判斷「補資料有沒有用」。這就是回答核心問題 A 的鑰匙。
+      </div>
+    </section>
+
+    <!-- 03 -->
+    <section class="block" id="s3">
+      <div class="eyebrow"><span class="sn">03</span>Core Framework</div>
+      <h2>核心框架:判斷失敗的根因診斷</h2>
+
+      <h3>三個正交訊號</h3>
+      <div class="gauges">
+        <div class="gauge">
+          <div class="gk">S1 · 量「人」</div>
+          <div class="gt">概念歧義度</div>
+          <div class="gm">概念本身清不清楚。用考卷式盲測一致性(人側 Gauge R&amp;R)。一致性高=概念清楚;低=定義在打架。</div>
+          <div class="scale"></div>
+          <div class="stk"><span>歧義</span><span>清楚</span></div>
+        </div>
+        <div class="gauge">
+          <div class="gk">S2 · 量「資料」</div>
+          <div class="gt">局部覆蓋度</div>
+          <div class="gm">這一帶資料夠不夠。用 N2 密度半徑 r 內鄰點數 / 熱力圖格子狀態。密集=看過很多;稀疏=覆蓋缺口。</div>
+          <div class="scale"></div>
+          <div class="stk"><span>稀疏</span><span>密集</span></div>
+        </div>
+        <div class="gauge">
+          <div class="gk">S3 · 量「模型」</div>
+          <div class="gt">模型不確定度</div>
+          <div class="gm">模型自己確不確定。用 N3 熵 / softmax margin。高熵=模型猶豫;低熵=模型很篤定。</div>
+          <div class="scale"></div>
+          <div class="stk"><span>篤定</span><span>猶豫</span></div>
+        </div>
+      </div>
+      <p>關鍵:<strong>這三者必須分開量</strong>。把它們混在一起(例如只用熵)是最常見的誤判來源——模型篤定地判錯,跟模型猶豫地判錯,根因完全不同。</p>
+
+      <h3>根因診斷矩陣(對象:模型判錯的樣本)</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr>
+            <th>S1 人類一致性</th><th>S2 覆蓋度</th><th>S3 模型熵</th><th>根因</th><th>建議動作</th>
+          </tr></thead>
+          <tbody>
+            <tr>
+              <td class="c"><span class="pill p-hi">高</span></td><td class="c"><span class="pill p-lo">稀疏</span></td><td class="c"><span class="pill p-mid">高</span></td>
+              <td><span class="rootcode">H1 覆蓋缺口</span></td>
+              <td><strong>補這一格的資料</strong>。正是「我本該判對,只是資料太少」</td>
+            </tr>
+            <tr>
+              <td class="c"><span class="pill p-hi">高</span></td><td class="c"><span class="pill p-hi">密集</span></td><td class="c"><span class="pill p-mid">高</span></td>
+              <td><span class="rootcode">H4 容量/特徵限制</span></td>
+              <td>換架構 / 加特徵 / 上專家模型;<strong>補資料幫助有限</strong></td>
+            </tr>
+            <tr>
+              <td class="c"><span class="pill p-hi">高</span></td><td class="c"><span class="pill p-hi">密集</span></td><td class="c"><span class="pill p-any">低·篤定卻錯</span></td>
+              <td><span class="rootcode">H3 標籤雜訊</span></td>
+              <td>稽核這一帶訓練標籤;查混淆變數;<strong>模型可能其實是對的、GT 錯了</strong></td>
+            </tr>
+            <tr>
+              <td class="c"><span class="pill p-hi">高</span></td><td class="c"><span class="pill p-lo">稀疏</span></td><td class="c"><span class="pill p-any">低·篤定卻錯</span></td>
+              <td><span class="rootcode">H5 分布外 OOD</span></td>
+              <td>看似 in-distribution 實則新樣態;收新樣態資料、檢查 embedding 分不分得開</td>
+            </tr>
+            <tr>
+              <td class="c"><span class="pill p-lo">低·都喬不定</span></td><td class="c"><span class="pill p-any">任意</span></td><td class="c"><span class="pill p-any">任意</span></td>
+              <td><span class="rootcode">H2 定義歧義</span></td>
+              <td><strong>定義問題,非資料問題</strong>;凍結為灰帶、送仲裁人、更新定義書;<strong>補資料不會收斂</strong></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>這如何直接回答你的核心問題 A</h3>
+      <ul>
+        <li><strong>「只是資料太少,補了就好」= H1</strong>。判定法:人類對這筆高度一致(S1 高)+ 它落在稀疏格(S2 稀疏)。兩條件同時成立,補資料才大概率有效;熱力圖直接告訴你補哪一格。</li>
+        <li><strong>「該擴展判斷邊界」要拆成兩種</strong>:
+          <ul>
+            <li>擴展「定義」<strong>= H2</strong>:人類自己都不一致(S1 低)。答案本身在爭議,<strong>這是規格決策,由仲裁人裁定</strong>,凍結為灰帶。補資料無用,標籤互相矛盾。</li>
+            <li>擴展「覆蓋到新樣態」<strong>= H5</strong>:人類一致、但是模型沒見過的新 regime(篤定卻錯且稀疏)。要補的是「新樣態」資料,並檢查 embedding 分不分得開。</li>
+          </ul>
+        </li>
+        <li><strong>最容易忽略的陷阱 = H4</strong>:你補了一堆資料卻沒改善——因為它落在密集格,模型早看夠還是學不會,代表是架構/特徵的天花板,不是資料量。沒有 S2,你會一直無效地補資料。</li>
+      </ul>
+      <div class="note">
+        <span class="lbl">一句話</span>
+        S1 決定「值不值得追求準確」(天花板),S2 決定「補資料有沒有用」,S3 決定「模型現在離天花板多遠」。
+      </div>
+    </section>
+
+    <!-- 04 -->
+    <section class="block" id="s4">
+      <div class="eyebrow"><span class="sn">04</span>Completeness</div>
+      <h2>完整度熱力圖設計</h2>
+      <p>回應核心問題 B。這也是整套框架的視覺中心——它同時是 S2 訊號的來源,也是 H1 診斷的證據。</p>
+
+      <div class="heat-panel">
+        <div class="heat-head">
+          <div class="ttl">完整度熱力圖(示意)· concept = 焊點缺陷</div>
+          <div class="cap">facet: 影像類型 A&nbsp;&nbsp;|&nbsp;&nbsp;cell = 樣本數</div>
+        </div>
+        <div class="heat-layout">
+          <div>
+            <div class="grid-frame">
+              <div class="ylab">對比 contrast</div>
+              <div class="grid-body">
+                <div class="ycells">
+                  <div class="yticks">
+                    <div class="ytick">高</div><div class="ytick">中</div><div class="ytick">低</div>
+                  </div>
+                  <div class="grid">
+                    <!-- row 高 -->
+                    <div class="cell c-in"><span class="ct">214</span><span class="cs">in</span></div>
+                    <div class="cell c-over"><span class="ct">very 高</span><span class="cs" style="font-size:8px">over · 412</span></div>
+                    <div class="cell c-in"><span class="ct">156</span><span class="cs">in</span></div>
+                    <!-- row 中 -->
+                    <div class="cell c-in"><span class="ct">98</span><span class="cs">in</span></div>
+                    <div class="cell c-in"><span class="ct">187</span><span class="cs">in</span></div>
+                    <div class="cell c-under"><span class="star">★</span><span class="ct">12</span><span class="cs">under</span></div>
+                    <!-- row 低 -->
+                    <div class="cell c-under"><span class="star">★</span><span class="ct">7</span><span class="cs">under</span></div>
+                    <div class="cell c-under"><span class="ct">23</span><span class="cs">under</span></div>
+                    <div class="cell c-na"><span class="ct">N/A</span><span class="cs">未觀察</span></div>
+                  </div>
+                </div>
+                <div class="xticks"><div class="xtick">小</div><div class="xtick">中</div><div class="xtick">大</div></div>
+                <div class="xlab">缺陷尺寸 size</div>
+              </div>
+            </div>
+            <div class="legend">
+              <span class="lg"><span class="sw under"></span>低於下限 · 補資料</span>
+              <span class="lg"><span class="sw in"></span>帶內 · 健康</span>
+              <span class="lg"><span class="sw over"></span>高於上限 · 不平衡</span>
+              <span class="lg"><span class="sw na"></span>N/A · 不計分</span>
+              <span class="lg" style="color:var(--accent-deep)">★ 關鍵格(近邊界 / 高 escape 成本)</span>
+            </div>
+          </div>
+          <div class="readout">
+            <div class="ro-card"><div class="ro-k">缺資料格數</div><div class="ro-v warnv">3<small> / 8 有效格</small></div></div>
+            <div class="ro-card"><div class="ro-k">其中關鍵紅格</div><div class="ro-v warnv">2</div></div>
+            <div class="ro-card"><div class="ro-k">整體完整度</div><div class="ro-v">62<small>%</small></div></div>
+            <div class="ro-card"><div class="ro-k">關鍵完整度</div><div class="ro-v warnv">33<small>%</small></div></div>
+          </div>
+        </div>
+      </div>
+      <p style="font-size:13px;color:var(--ink-faint)" class="mono">※ 示意為單一 facet 的 尺寸×對比 2D 切面;真實空間為高維(再乘上位置區、產品變體、影像類型),以階層展開呈現。</p>
+
+      <h3>4.1 概念空間怎麼切格(混合座標)</h3>
+      <ul>
+        <li><strong>主軸——領域因子(看得懂、可行動)</strong>:沿若干領域維度分箱,如 <code>缺陷尺寸 × 對比 × 位置區 × 產品變體 × 影像類型</code>。每格 = 一組因子組合,等同 DOE 分層,與定義書/gauge study 維度一致。</li>
+        <li><strong>副檢——格內 embedding 密度</strong>:每個領域格內再用 embedding 看點是否結塊,避免「格內 100 筆但其實是同一種重複」的假完整。</li>
+        <li><strong>防爆炸</strong>:只實體化實際觀察到的組合;未出現的標 N/A 不計分;用階層展開,需要時才往下鑽。</li>
+      </ul>
+
+      <h3>4.2 每格目標帶 [下限, 上限] — 「不太多、不太少」</h3>
+      <div class="band"><div class="b-lo">低於下限 · 補</div><div class="b-in">帶內 · 健康</div><div class="b-hi">高於上限 · 不平衡</div></div>
+      <div class="band-ax"><span>min(硬)</span><span>樣本數 →</span><span>max(軟)</span></div>
+      <ul>
+        <li><strong>下限 min(硬的)</strong>:讓模型在這格學出穩定決策、並能用可接受信賴區間估計局部表現所需的最少筆數。關鍵格的下限要拉高。不足就是真風險。</li>
+        <li><strong>上限 max(軟的)</strong>:避免過度代表造成不平衡、偏置 loss、浪費標註預算。超出只是黃色提醒,危害遠小於不足;關鍵格甚至可不設上限。</li>
+        <li>具體數字列入<strong>仲裁待裁</strong>(§7),這裡只給原則。</li>
+      </ul>
+
+      <h3>4.3 關鍵性加權 — 完整度要「風險加權」,不要齊頭</h3>
+      <p>靠近<strong>決策邊界</strong>的格(結構上 S3 熵就高)、<strong>escape 成本高</strong>的格 → 下限拉高、在總分權重也高。深處「一看就 OK」的格 → 低權重,不需塞滿。因此「完整」= 該密的地方密,不重要的地方不強求。</p>
+
+      <h3>4.4 輸出指標</h3>
+      <ul>
+        <li>每格:筆數 + 狀態 + 是否關鍵格。</li>
+        <li><strong>缺資料格數</strong>:紅格總數,並標出其中哪些是關鍵紅格。</li>
+        <li><strong>整體完整度</strong> = 加權的「在帶內格數佔比」。</li>
+        <li><strong>關鍵完整度</strong>(分開報):只看關鍵格——「整體 95% 但關鍵格只有 50%」會被平均藏起來,必須單獨盯。</li>
+        <li><strong>自動產出補資料任務</strong>:關鍵紅格 → 直接生成標註佇列任務(接回 manifest 與 labeling 流程)。</li>
+      </ul>
+
+      <div class="note warn">
+        <span class="lbl">重要警語</span>
+        <strong>完整 ≠ 已解決</strong>。完整度是必要非充分——塞滿的綠格仍可能判錯(那是 H4,要換架構)。熱力圖告訴你「資料夠不夠」,不保證「模型學不學得會」。另:主軸務必用領域因子,別讓 embedding 軸當主軸(不穩、不可解釋);embedding 只做格內副檢。格子定義一旦定版就要版控,否則無法做長期趨勢追蹤。
+      </div>
+    </section>
+
+    <!-- 05 -->
+    <section class="block" id="s5">
+      <div class="eyebrow"><span class="sn">05</span>Decisions</div>
+      <h2>逐項決策回覆</h2>
+
+      <h3>D1 — N2/N3:config 還是從資料產生?</h3>
+      <p class="lede">介面是 config,來源是資料,事件驅動重校,與三版本一起版控。</p>
+      <ul>
+        <li><strong>N3 熵閾值初始值</strong>:在已標註校準集上掃 entropy,選出達到目標 escape/誤報取捨的操作點(PR sweep)。落點本身是價值判斷 → 待裁(§7)。</li>
+        <li><strong>N2 半徑 r 初始值</strong>:r 取決於 embedding 空間尺度,建議從訓練集 embedding 的 k 近鄰距離分布取某百分位(中位數起步)。</li>
+        <li><strong>重校頻率(綁事件)</strong>:模型改版 / embedding 改版 / 偵測到漂移 → 重校;另掛月度漂移巡檢當安全網。</li>
+        <li><strong>版控</strong>:N2/N3 連同 <code>model + embedding + dataset</code> 版本一起寫進 manifest。沒有 lineage 的門檻等於無效。</li>
+        <li><strong>警告</strong>:校準集小 → 門檻會 overfit;對門檻估信賴區間,取保守端。</li>
+      </ul>
+
+      <h3>D2 — 灰帶樣本、警示通道、誤報成本</h3>
+      <p class="lede">額外分一個「路由/暫存」類別,走不停線的低閾值警示通道,LV 疊圖審查,pending_review 暫存,仲裁人拍板。</p>
+      <ul>
+        <li>這「額外一類」<strong>不是模型輸出類別</strong>,是路由/暫存標籤:熵落在灰帶 → 路由到警示通道 + 進 pending_review。模型類別定義不受污染。</li>
+        <li><strong>警示通道不停線</strong>,只標記;誤報成本從「產能」轉到「審查預算」,旋鈕是 N3。</li>
+        <li><strong>pending_review 是獨立生命週期狀態</strong>(對應 manifest 獨立 split),不進 train/val。</li>
+        <li>User 在 LV 用疊圖逐筆比對 → 確認後晉升進正式資料集。</li>
+        <li><strong>晉升前先跑考卷盲測</strong>:判它是「漏判清楚案例」(→ 進 train,H1)、「真歧義」(→ 定義更新或永久灰帶,H2)、「雜訊」(→ 丟棄,H3)。</li>
+        <li>成本落點與通道鬆緊 = <strong>仲裁人裁定</strong>(§7)。</li>
+      </ul>
+
+      <h3>D3 — 多影像類型:定義書與 gauge study(完整版)</h3>
+      <p class="lede">逐影像類型各做、共用範本、跨類型彙整。</p>
+      <ul>
+        <li>每種影像類型各一份定義書 + 各一份 gauge study(缺陷外觀與模糊地帶因類型而異)。</li>
+        <li>共用同一份範本,確保跨類型可比較、可彙整;往上彙整成跨類型一致性看板。</li>
+        <li><strong>觀念對齊</strong>:此處 gauge study = 量「判斷系統(人+模型)」的 reproducibility(不同人)與 repeatability(同一人不同時間)。<strong>考卷盲測就是人側 Gauge R&amp;R</strong>,不是另做一套。</li>
+      </ul>
+
+      <h3>D4 — escape 一鍵體檢卡(本輪設計,下一階段開發)</h3>
+      <p>一鍵跑出一頁診斷:</p>
+      <ol>
+        <li>近期 escape 清單(時間窗可選)。</li>
+        <li>每筆三訊號特徵(S1/S2/S3)+ 根因分類(套 §3 矩陣)。</li>
+        <li>熱力圖落點:這些 escape 集中在哪些格?是不是覆蓋缺口(關鍵紅格)?</li>
+        <li>escape 樣本的人類一致性:漏判清楚案例,還是本來就歧義?</li>
+        <li>趨勢:escape 率、根因分布隨時間變化。</li>
+        <li>排序好的建議動作:這幾格補資料 / 那條定義改 / 這類換架構。</li>
+        <li>可點回 lineage:每筆能追到影像 hash、當時 manifest 版本、當時門檻。</li>
+      </ol>
+
+      <h3>D5 — 考卷式盲測一致性(= 人側 Gauge R&amp;R)</h3>
+      <ul>
+        <li><strong>組考卷</strong>:對爭議資料,把同一筆(或語意相似的誘餌)多次、亂序、盲測丟給 User。</li>
+        <li><strong>誘餌的作用</strong>:混入相似但已知答案的樣本,用來區分「真實判斷一致」與「記憶效應/看圖猜答案」。</li>
+        <li><strong>一致性分數</strong>:同一人重測一致(repeatability)、不同人之間一致(reproducibility)。</li>
+        <li><strong>路由</strong>:一致性高 → 概念清楚 → 失敗在模型側(H1/H4/H5)依矩陣處理;一致性低 → 概念歧義(H2)→ 凍結為灰帶,送<strong>仲裁人</strong>裁定是否更新定義書。</li>
+        <li><strong>仲裁人由客戶端出</strong>:AI 只負責出考卷、算一致性、攤開證據;最終裁決是人的職權。</li>
+      </ul>
+    </section>
+
+    <!-- 06 -->
+    <section class="block" id="s6">
+      <div class="eyebrow"><span class="sn">06</span>BDD</div>
+      <h2>BDD 測試情境(Gherkin)</h2>
+      <p>中文 Gherkin,可直接餵給 behave / pytest-bdd / Cucumber(zh-TW)。關鍵字:功能=Feature,場景=Scenario,假設=Given,當=When,那麼=Then,而且=And。</p>
+
+      <div class="gherkin"><span class="gk-cm"># language: zh-TW</span>
+
+<span class="gk-feat">功能:</span> <span class="gk-txt">判斷失敗的根因診斷</span>
+  <span class="gk-txt">為了決定「補資料 / 改定義 / 換架構」哪一個才對</span>
+  <span class="gk-txt">身為模型維運者,我要系統用三個正交訊號交叉定位失敗根因</span>
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">稀疏區 + 人類一致 + 高熵 判為覆蓋缺口</span>
+    <span class="gk-step">假設</span> 一筆被模型判錯的樣本
+    <span class="gk-step">而且</span> 人類盲測一致性高於門檻
+    <span class="gk-step">而且</span> 該樣本落在熱力圖的稀疏格(S2 稀疏)
+    <span class="gk-step">而且</span> 模型輸出熵高於 N3 閾值
+    <span class="gk-step">當</span> 系統執行根因診斷
+    <span class="gk-step">那麼</span> 根因應分類為 "H1 覆蓋缺口"
+    <span class="gk-step">而且</span> 系統應對該格產生一筆補資料任務
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">密集區 + 人類一致 + 高熵 判為容量限制</span>
+    <span class="gk-step">假設</span> 一筆被模型判錯的樣本
+    <span class="gk-step">而且</span> 人類盲測一致性高於門檻
+    <span class="gk-step">而且</span> 該樣本落在熱力圖的密集格(S2 密集)
+    <span class="gk-step">而且</span> 模型輸出熵高於 N3 閾值
+    <span class="gk-step">當</span> 系統執行根因診斷
+    <span class="gk-step">那麼</span> 根因應分類為 "H4 容量/特徵限制"
+    <span class="gk-step">而且</span> 系統不應產生補資料任務
+    <span class="gk-step">而且</span> 系統應建議 "換架構或加特徵"
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">密集區 + 人類一致 + 低熵但判錯 判為標籤雜訊</span>
+    <span class="gk-step">假設</span> 一筆被模型篤定判錯的樣本(熵低於 N3 閾值)
+    <span class="gk-step">而且</span> 人類盲測一致性高於門檻
+    <span class="gk-step">而且</span> 該樣本落在熱力圖的密集格
+    <span class="gk-step">當</span> 系統執行根因診斷
+    <span class="gk-step">那麼</span> 根因應分類為 "H3 標籤雜訊"
+    <span class="gk-step">而且</span> 系統應將該區訓練標籤送入標籤稽核佇列
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">人類不一致 判為定義歧義</span>
+    <span class="gk-step">假設</span> 一筆被模型判錯的樣本
+    <span class="gk-step">而且</span> 人類盲測一致性低於門檻
+    <span class="gk-step">當</span> 系統執行根因診斷
+    <span class="gk-step">那麼</span> 根因應分類為 "H2 定義歧義"
+    <span class="gk-step">而且</span> 系統不應建議補資料
+    <span class="gk-step">而且</span> 系統應將該樣本凍結為灰帶並送交仲裁人</div>
+
+      <div class="gherkin"><span class="gk-feat">功能:</span> <span class="gk-txt">考卷式盲測一致性(人側 Gauge R&amp;R)</span>
+  <span class="gk-txt">為了區分「概念真的歧義」與「模型有缺陷」</span>
+  <span class="gk-txt">身為仲裁人,我要對爭議資料做可重複的盲測一致性量測</span>
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">同一筆爭議資料多次盲測</span>
+    <span class="gk-step">假設</span> 一筆被標記為爭議的樣本
+    <span class="gk-step">當</span> 系統以亂序、盲測方式對同一使用者重複呈現該樣本 N 次
+    <span class="gk-step">那麼</span> 系統應計算該使用者的重複性一致分數
+    <span class="gk-step">而且</span> 分數應附帶呈現次數與信賴區間
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">混入相似誘餌以偵測記憶效應</span>
+    <span class="gk-step">假設</span> 一份考卷包含爭議樣本與已知答案的相似誘餌
+    <span class="gk-step">當</span> 使用者完成盲測
+    <span class="gk-step">那麼</span> 系統應分別回報爭議樣本一致性與誘餌答對率
+    <span class="gk-step">而且</span> 若誘餌答對率異常低 系統應標記該次量測為不可信
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">一致性過低判為概念歧義</span>
+    <span class="gk-step">假設</span> 多位使用者完成同一份考卷
+    <span class="gk-step">當</span> 跨使用者再現性一致分數低於門檻
+    <span class="gk-step">那麼</span> 系統應將該概念標記為 "定義歧義"
+    <span class="gk-step">而且</span> 系統應通知仲裁人裁定是否更新定義書</div>
+
+      <div class="gherkin"><span class="gk-feat">功能:</span> <span class="gk-txt">灰帶暫存與疊圖審查</span>
+  <span class="gk-txt">為了在不影響產能下安全納入邊界資料</span>
+  <span class="gk-txt">身為產線維運者與仲裁人,我要灰帶樣本走獨立通道並經人工確認</span>
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">灰帶樣本進低閾值警示通道但不停線</span>
+    <span class="gk-step">假設</span> 一筆樣本的模型熵落在灰帶區間
+    <span class="gk-step">當</span> 推論流程處理該樣本
+    <span class="gk-step">那麼</span> 該樣本應被路由到低閾值警示通道
+    <span class="gk-step">而且</span> 產線不應因此停線
+    <span class="gk-step">而且</span> 該樣本應被標記為 pending_review
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">暫存樣本不得進入訓練或驗證集</span>
+    <span class="gk-step">假設</span> 一筆 pending_review 樣本
+    <span class="gk-step">當</span> 系統組裝訓練或驗證資料集
+    <span class="gk-step">那麼</span> 該樣本不應出現在 train 或 val split
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">仲裁人疊圖確認後才納入資料集</span>
+    <span class="gk-step">假設</span> 一筆 pending_review 樣本已在 LV 完成疊圖比對
+    <span class="gk-step">而且</span> 仲裁人確認其為清楚的漏判案例
+    <span class="gk-step">當</span> 仲裁人核准晉升
+    <span class="gk-step">那麼</span> 該樣本應被加入正式資料集並產生新版 manifest
+    <span class="gk-step">而且</span> manifest 版本應記錄此晉升的 lineage</div>
+
+      <div class="gherkin"><span class="gk-feat">功能:</span> <span class="gk-txt">模型收值完整度熱力圖</span>
+  <span class="gk-txt">為了知道「補哪一格、整體夠不夠」</span>
+  <span class="gk-txt">身為資料負責人,我要對 concept 切格並以色帶呈現每格完整度</span>
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">切格後統計每格筆數並標示色帶</span>
+    <span class="gk-step">假設</span> 一個已定義領域因子座標的 concept
+    <span class="gk-step">當</span> 系統統計每格樣本數
+    <span class="gk-step">那麼</span> 每格應依目標帶標為 紅/綠/黃
+    <span class="gk-step">而且</span> 未觀察到的因子組合應標為 N/A 且不計分
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">關鍵格低於下限觸發補資料任務</span>
+    <span class="gk-step">假設</span> 一個被標記為關鍵(近邊界或高 escape 成本)的格
+    <span class="gk-step">當</span> 該格筆數低於其下限
+    <span class="gk-step">那麼</span> 系統應將該格標為關鍵紅格
+    <span class="gk-step">而且</span> 系統應產生一筆高優先補資料任務
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">計算整體與關鍵完整度分數</span>
+    <span class="gk-step">假設</span> 所有格的狀態與關鍵性加權
+    <span class="gk-step">當</span> 系統計算完整度
+    <span class="gk-step">那麼</span> 系統應分別回報整體完整度與關鍵完整度
+    <span class="gk-step">而且</span> 關鍵完整度應獨立呈現 不被整體平均掩蓋</div>
+
+      <div class="gherkin"><span class="gk-feat">功能:</span> <span class="gk-txt">N2/N3 門檻校準與版本化</span>
+  <span class="gk-txt">為了讓門檻可重現、可回溯</span>
+  <span class="gk-txt">身為 MLOps 工程師,我要門檻從資料導出並與三版本一起版控</span>
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">校準工作從資料導出門檻</span>
+    <span class="gk-step">假設</span> 一份已標註校準集與一個 embedding 模型版本
+    <span class="gk-step">當</span> 執行門檻校準工作
+    <span class="gk-step">那麼</span> N2 半徑 r 應由 k 近鄰距離分布導出
+    <span class="gk-step">而且</span> N3 熵閾值應由達成目標取捨的操作點導出
+    <span class="gk-step">而且</span> 兩門檻應附帶信賴區間
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">模型或 embedding 改版觸發重校</span>
+    <span class="gk-step">假設</span> 已存在一組生效中的門檻
+    <span class="gk-step">當</span> 模型版本或 embedding 版本變更
+    <span class="gk-step">那麼</span> 系統應將現行門檻標記為過期
+    <span class="gk-step">而且</span> 系統應觸發一次重新校準
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">門檻與三版本一起版本化</span>
+    <span class="gk-step">假設</span> 一次門檻校準完成
+    <span class="gk-step">當</span> 系統寫入門檻
+    <span class="gk-step">那麼</span> 門檻應與 model 版本、embedding 版本、dataset 版本綁定寫入 manifest</div>
+
+      <div class="gherkin"><span class="gk-feat">功能:</span> <span class="gk-txt">escape 一鍵體檢卡</span>
+  <span class="gk-txt">為了快速回答「為什麼漏、該先做什麼」</span>
+  <span class="gk-txt">身為仲裁人,我要一鍵對近期 escape 產出根因與行動報告</span>
+
+  <span class="gk-scn">場景:</span> <span class="gk-txt">對近期 escape 產生根因分類與建議</span>
+    <span class="gk-step">假設</span> 一個選定的時間窗內的 escape 清單
+    <span class="gk-step">當</span> 使用者觸發 escape 體檢卡
+    <span class="gk-step">那麼</span> 報告應對每筆 escape 標出 S1/S2/S3 與根因分類
+    <span class="gk-step">而且</span> 報告應標出 escape 在熱力圖的落點
+    <span class="gk-step">而且</span> 報告應給出依優先序排列的建議動作
+    <span class="gk-step">而且</span> 每筆 escape 應可點回其 lineage</div>
+    </section>
+
+    <!-- 07 -->
+    <section class="block" id="s7">
+      <div class="eyebrow"><span class="sn">07</span>Arbiter</div>
+      <h2>仲裁人決策清單</h2>
+      <p>以下都是<strong>價值判斷</strong>,AI 給建議預設值,最終由仲裁人(你)拍板。</p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>#</th><th>決策</th><th>取捨本質</th><th>建議預設</th><th>裁定</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">AR1</td><td>N3 熵閾值操作點</td><td>escape 漏檢 ↔ 誤報吃產能</td><td>取保守端(寧可多警示)</td><td class="c"><span class="pill p-mid">待裁</span></td></tr>
+            <tr><td class="mono">AR2</td><td>N2 半徑 r 的百分位</td><td>太大→什麼都算密 / 太小→什麼都算稀疏</td><td>kNN 距離中位數起步</td><td class="c"><span class="pill p-mid">待裁</span></td></tr>
+            <tr><td class="mono">AR3</td><td>每格下限 / 上限</td><td>學得動所需 ↔ 標註預算</td><td>下限隨關鍵性分級;上限軟設</td><td class="c"><span class="pill p-mid">待裁</span></td></tr>
+            <tr><td class="mono">AR4</td><td>關鍵格的判定與權重</td><td>哪些格算「關鍵」</td><td>近邊界 + 高 escape 成本</td><td class="c"><span class="pill p-mid">待裁</span></td></tr>
+            <tr><td class="mono">AR5</td><td>誤報成本由誰吸收</td><td>產能 vs 審查預算</td><td>轉嫁審查預算(警示不停線)</td><td class="c"><span class="pill p-mid">待裁</span></td></tr>
+            <tr><td class="mono">AR6</td><td>「概念歧義」的一致性門檻</td><td>多低算歧義</td><td>先用試點資料估再定</td><td class="c"><span class="pill p-mid">待裁</span></td></tr>
+            <tr><td class="mono">AR7</td><td>各影像類型定義書簽核</td><td>—</td><td>逐類型簽核</td><td class="c"><span class="pill p-mid">待裁</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 08 -->
+    <section class="block" id="s8">
+      <div class="eyebrow"><span class="sn">08</span>Next</div>
+      <h2>下一步與待續討論</h2>
+      <ol>
+        <li><strong>先把熱力圖的領域因子座標定下來</strong>:列出每個影像類型要切哪幾個因子、各分幾箱。這是整個完整度與 H1 診斷的地基。</li>
+        <li><strong>跑一次門檻校準試點</strong>:用現有校準集導出 N2/N3 初始值與信賴區間,看落點合不合理。</li>
+        <li><strong>設計考卷盲測的 UI 與抽題策略</strong>:誘餌怎麼選、一筆重測幾次、跨幾位使用者。</li>
+        <li><strong>escape 體檢卡實作排程</strong>(本輪只設計)。</li>
+        <li><strong>仲裁待裁清單(§7)逐項拍板</strong>。</li>
+      </ol>
+      <div class="note">
+        <span class="lbl">需要你提供的關鍵變數</span>
+        會大幅影響落地細節:影像類型清單與各自缺陷定義輪廓、目前每類大致資料量、產線是否容許「警示不停線」、團隊規模與審查人力。給我這些,我可以把框架收斂成可執行的規格。
+      </div>
+    </section>
+
+    <footer>
+      <span>VISION AI · MLOPS DIAGNOSTIC FRAMEWORK</span>
+      <span>DISCUSSION DRAFT · ARBITER = CLIENT</span>
+    </footer>
+
+  </main>
+</div>
+
+<script>
+  // TOC active-section highlight
+  (function(){
+    var links = Array.prototype.slice.call(document.querySelectorAll('.toc a'));
+    var map = {};
+    links.forEach(function(a){
+      var id = a.getAttribute('href').slice(1);
+      var el = document.getElementById(id);
+      if(el) map[id] = a;
+    });
+    var sections = Object.keys(map).map(function(id){return document.getElementById(id);});
+    if(!('IntersectionObserver' in window) || !sections.length) return;
+    var obs = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){
+          links.forEach(function(l){l.classList.remove('active');});
+          var a = map[e.target.id];
+          if(a) a.classList.add('active');
+        }
+      });
+    },{rootMargin:'-15% 0px -70% 0px',threshold:0});
+    sections.forEach(function(s){obs.observe(s);});
+  })();
+</script>
+</body>
+</html>

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>瑕疵「漏逮」問題重定義 — 退一步，先把問題本身想清楚</title>
+<style>
+:root{--ink:#1f2933;--muted:#5c6b7a;--line:#e3e8ee;--bg:#f7f9fb;--card:#fff;
+--accent:#2c6fb5;--accent2:#9b59b6;--warn:#c0392b;--ok:#1e8449;--soft:#eef4fa;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font-family:-apple-system,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;
+line-height:1.75;font-size:16px;}
+.wrap{max-width:920px;margin:0 auto;padding:48px 24px 96px;}
+.hero{background:linear-gradient(135deg,#243b55,#141e30);color:#fff;border-radius:18px;
+padding:40px 36px;margin-bottom:36px;box-shadow:0 12px 30px rgba(20,30,48,.25);}
+.hero .tag{display:inline-block;font-size:12px;letter-spacing:.18em;opacity:.8;
+text-transform:uppercase;margin-bottom:14px;}
+.hero h1{margin:0 0 14px;font-size:28px;line-height:1.35;}
+.hero p{margin:6px 0 0;opacity:.9;font-size:14px;}
+.content{background:var(--card);border:1px solid var(--line);border-radius:18px;
+padding:18px 40px 44px;box-shadow:0 6px 22px rgba(31,41,51,.06);}
+h1,h2,h3,h4{line-height:1.4;}
+h2{font-size:23px;margin:42px 0 12px;padding-top:18px;border-top:2px solid var(--line);
+color:#16324f;}
+h2:first-of-type{border-top:none;padding-top:6px;}
+h3{font-size:18px;margin:28px 0 8px;color:#1d4e7a;}
+h4{font-size:15.5px;margin:20px 0 6px;color:var(--muted);}
+p{margin:12px 0;}
+a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(44,111,181,.35);}
+a:hover{border-bottom-color:var(--accent);}
+strong{color:#10243a;}
+code{background:var(--soft);padding:1px 6px;border-radius:5px;font-size:.9em;
+font-family:"SF Mono",Consolas,monospace;color:#0b3d62;}
+hr{border:none;border-top:1px dashed var(--line);margin:30px 0;}
+blockquote{margin:18px 0;padding:14px 20px;background:var(--soft);
+border-left:4px solid var(--accent);border-radius:0 10px 10px 0;color:#27425d;}
+ul,ol{margin:12px 0;padding-left:24px;}
+li{margin:6px 0;}
+table{width:100%;border-collapse:collapse;margin:18px 0;font-size:14.5px;
+box-shadow:0 1px 0 var(--line);}
+th,td{border:1px solid var(--line);padding:10px 12px;text-align:left;vertical-align:top;}
+th{background:#16324f;color:#fff;font-weight:600;}
+tbody tr:nth-child(even){background:#fafbfd;}
+tbody tr:hover{background:#f1f6fb;}
+.foot{margin-top:30px;text-align:center;color:var(--muted);font-size:12.5px;
+letter-spacing:.1em;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div class="tag">VISION AI · 問題定義（只談問題，不給解法）</div>
+    <h1>瑕疵「漏逮」問題重定義 — 退一步，先把問題本身想清楚</h1>
+    <p>多代理三輪討論收斂 · 2026-06-13 · 達成共識</p>
+    <p>本文是 escape 分析／機制 v2／判斷邊界框架 三份解法文件的<strong style="color:#fff">前置問題定義</strong></p>
+  </div>
+  <div class="content">
+<blockquote>2026-06-13 · 多代理三輪討論收斂（4 視角獨立框定 → 整合＋紅隊對撞 → 最終和解仲裁）<br>狀態：<strong>達成共識</strong>。本文件<strong>只定義問題、不提任何解法</strong>——這是刻意的。<br>關係：本文是 <a href="defect_escape_analysis.md">defect_escape_analysis.md</a>、<a href="defect_mechanisms_v2.md">defect_mechanisms_v2.md</a>、<a href="vision_judgment_boundary_framework.html">vision_judgment_boundary_framework.html</a> 的<strong>前置文件</strong>。那三份都很快跳進了解法（決策樹、gauge study、熱力圖、體檢卡、三訊號框架）；本文退回它們的上游，重新確認「我們到底在解什麼問題」。</blockquote>
+<hr>
+<h2>0. 為什麼需要這份文件</h2>
+<p>先前三份文件都是好的工程設計。但它們有一個共同特徵：<strong>在問題還沒被確認之前，就開始設計機制</strong>。</p>
+<ul>
+<li>三訊號框架（S1 概念歧義 / S2 覆蓋度 / S3 模型熵）預設了「問題可以被拆成這三個可量化的軸」。</li>
+<li>根因矩陣 H1–H5 宣稱「根因恰好就是這五種」。</li>
+<li>escape 決策樹、灰帶區、體檢卡、完整度熱力圖——每一個都<strong>默默假設了「真值存在、且一筆 miss 可以被歸因」</strong>。</li>
+</ul>
+<p>這些假設<strong>可能對，也可能錯</strong>。一個被預先填好答案的問題，是一個還沒被真正理解的問題。本文的工作，就是把這些假設攤開、把「漏逮」這個詞拆開，讓你在投入建造之前，先確認靶心在哪。</p>
+<hr>
+<h2>1. 使用者的原始問題（忠實重述）</h2>
+<p>影像瑕疵檢測專案，多種影像類型，客戶要求<strong>極高 precision 與 recall</strong>，已投入大量資料。瑕疵<strong>非常小、不明顯</strong>。痛點：</p>
+<ol>
+<li>客戶持續回報「漏逮」（escape，模型沒抓到的瑕疵）。把漏抓影像加進訓練集重訓，<strong>有時下一版抓到了，有時加了也沒用</strong>，無法事前說明。</li>
+<li>使用者自陳根因一：瑕疵太小太不明顯，<strong>客戶／標註者自己對判定沒有一致標準</strong>，不同人看法不同。</li>
+<li>使用者自陳根因二：工程端<strong>無法歸因</strong>一筆 miss 的性質——是「模型該擴張判斷邊界」（新型態），還是「本來就該抓到、只是該型態樣本太少」（資料不足、補了就好）。</li>
+</ol>
+<hr>
+<h2>2. 一句話核心問題（修正後共識）</h2>
+<blockquote><strong>你面對的不是「一個」問題，而是被「漏逮」這個詞綁在一起的「數個本質不同」的問題。在把它們分流之前，任何重訓的成敗都無法歸因，任何「變好了」都無法被你自己驗證。真正缺的不是更強的模型，而是一把不隨客戶情緒漂移、能讓你判斷自己進退的尺。</strong></blockquote>
+<p>這句話裡有兩個各自獨立的壞消息，必須同時看見：</p>
+<ul>
+<li><strong>分類問題</strong>：「漏逮」是一個分類待辦，不是一個 bug。把不同種類的 miss 用「再重訓一次」一起處理，正是「有時有效有時沒用」的來源。</li>
+<li><strong>量尺問題</strong>：當「什麼算瑕疵」由人判定、而人彼此不一致時，你量到的 precision／recall 不是「模型對不對」，而是「模型輸出 vs 某位標註者某一天的意見」有多吻合。</li>
+</ul>
+<hr>
+<h2>3. 最關鍵的重新框定：「漏逮」是一個分類待辦</h2>
+<p>如果你只能從這份文件帶走一張表，就是這張。<strong>先別修模型，先把手上的 escape 倒進這四個桶——比例本身就是答案的一半。</strong></p>
+<table>
+<thead><tr>
+<th>桶</th>
+<th>這筆 miss 的本質</th>
+<th>加資料會不會有用</th>
+<th>它是什麼性質的問題</th>
+</tr></thead>
+<tbody>
+<tr><td><strong>① 訊號未進資料</strong></td><td>瑕疵小到訊號逼近採集的物理底限（光學／感測解析、雜訊基底）</td><td>❌ 無用——資訊在源頭就遺失了</td><td><strong>物理／原理天花板</strong>（與定義、客戶、合約都無關）</td></tr>
+<tr><td><strong>② 清楚是瑕疵、訊號充足卻沒抓</strong></td><td>大家都同意這是瑕疵，只是該型態樣本太少／太稀有</td><td>✅ 大概率有用——這正是「補了就好」</td><td><strong>可動手的工程問題</strong>（覆蓋／稀有型態）</td></tr>
+<tr><td><strong>③ 連人都會吵、落在邊界帶</strong></td><td>同一張圖，A 說瑕疵、B 說沒事；標籤本身在打架</td><td>⚠️ 無用甚至有害——補進去的是互相矛盾的標籤</td><td><strong>不可逐筆判定</strong>（必須以群體、而非單筆看待）</td></tr>
+<tr><td><strong>④ 抓不抓取決於客戶最近喊什麼</strong></td><td>模型被回饋迴圈推著走，追的是「最近被大聲抱怨的東西」</td><td>看似有用，實則在追一個會回看你的目標</td><td><strong>需他人／權力的問題</strong>（合約、期望、回饋設計）</td></tr>
+</tbody>
+</table>
+<blockquote><strong>使用者原始的「兩個根因」，其實就是桶②（樣本太少）與桶③（該擴張定義邊界）。</strong> 紅隊的提醒成立：在很多實務情況下，這個樸素框架<strong>就是對的、也夠用</strong>——瑕疵型態固定、只是稀有型態沒補齊時，不需要任何形上學。本文要補的，是被原始框架<strong>漏掉的桶①與桶④</strong>，以及「在分清比例之前不要一視同仁」這個紀律。</blockquote>
+<hr>
+<h2>4. 問題的四層分解</h2>
+<p>把上面四個桶往上抽象，是四個層次的問題。關鍵欄位是最後一欄：<strong>對一個「想把模型做好、但不一定有合約權力」的工程師而言，哪些他碰得到、哪些碰不到。</strong> 把碰不到的事當成自己的失職，是這類專案最常見的內耗。</p>
+<table>
+<thead><tr>
+<th>層</th>
+<th>這一層真正的問題</th>
+<th>無合約權力的工程師能不能碰</th>
+</tr></thead>
+<tbody>
+<tr><td><strong>物理層</strong></td><td>瑕疵的訊號到底有沒有進到資料裡？這是成像條件下的可偵測性上限問題。</td><td>✅ <strong>能碰</strong>——可獨立查驗（看訊號強度、感測極限），與合約無關。<strong>而且該最先查</strong>：若訊號不在資料裡，其餘三層全是白工。</td></tr>
+<tr><td><strong>定義／量測層</strong></td><td>靶是否固定？你量到的數字是「模型能力」還是「某人某天的意見」？recall 的分母（「所有該抓的瑕疵總數」）是否存在？</td><td>🟡 <strong>部分能碰</strong>——他能盤點自己 escape 的歧義比例（能碰）；但「要客戶／標註者用統一標準重標」需要權力（多半不能碰）。</td></tr>
+<tr><td><strong>學習／覆蓋層</strong></td><td>稀有型態的樣本是否足夠？這筆 miss 落在特徵空間的稀疏處還是稠密處？</td><td>✅ <strong>能碰</strong>——這是最典型的工程問題。</td></tr>
+<tr><td><strong>承諾／營運層</strong></td><td>在客戶自己都不一致的前提下，「極高 precision &amp; recall」這個承諾如何兌現？回饋迴圈在獎勵什麼？</td><td>🔴 <strong>多半不能碰</strong>——屬合約與權力問題。<strong>該誠實標記為「非工程能解」</strong>，而不是用更多重訓去硬扛。</td></tr>
+</tbody>
+</table>
+<hr>
+<h2>5. 三個必須想清楚的觀念糾結</h2>
+<p>這些是「單一視角看不到、把多個視角扣起來才浮現」的結論。它們不是解法，是你思考時必須先校正的認知。</p>
+<h3>5.1 「逐筆歸因」是一個「無解問句」，不只是「還沒找到方法」</h3>
+<p>你想對<strong>單獨一筆</strong> miss 問「這是該擴張邊界，還是樣本太少？」——在桶③（邊界帶）裡，這個問題<strong>原理上沒有答案</strong>。原因：一筆樣本「可不可分」不是它自己的性質，而是它所在<strong>區域</strong>的群體性質。當該區域裡同一種輸入對應到兩種真值的機率都不可忽略（貝氏錯誤率 &gt; 0），不存在任何決策邊界能同時滿足高 precision 與高 recall——因為連「正確答案」都還沒被定義。</p>
+<p><strong>但這把刀只切到桶③那一小撮</strong>，不要拿它否定可動手的桶②。紅隊的修正成立：<strong>先別假設比例，要去測它</strong>。把全部 miss 當「都不可歸因」與當「都可歸因」一樣錯。</p>
+<h3>5.2 「補資料有時有效有時沒用」是必然，不是運氣</h3>
+<p>同一個表面現象（重訓結果不可預測），底下至少有五種本質不同的機制在運作。它們對應到不同的桶，所以你看不出規律：</p>
+<ul>
+<li><strong>填補空洞</strong>（桶②）：新樣本補上了稀疏覆蓋 → 有效。</li>
+<li><strong>加入矛盾</strong>（桶③）：新樣本落在真值重疊區，只是塞進更多互相打架的標籤 → 零效甚至負效。</li>
+<li><strong>目標漂移</strong>（桶④）：每次重訓你其實在擬合一個<strong>定義在變動</strong>的目標函數，所以結果與資料量無單調關係。</li>
+<li><strong>分布錯置</strong>：新樣本改善了別處，卻沒覆蓋客戶真正漏逮的那個分布。</li>
+<li><strong>邊界擾動</strong>：在高度重疊區，加少量樣本讓決策邊界此消彼長——這裡抓到了、那裡又漏了。</li>
+</ul>
+<p>「無法事前預測」之所以發生，是因為你在對五種不同的病，施加同一種藥。</p>
+<h3>5.3 因果順序：偵測可以先行，但「相信數字」不能先於定義</h3>
+<p>紅隊正確地指出「定義必須先於偵測」是假的——工程史上大量偵測是先做出來、定義後補的。所以<strong>你不必等定義完美才動手</strong>。</p>
+<p>但最終裁定是：<strong>偵測可先行；量測與驗證不能先於定義。</strong> 沒有一個穩定的靶，你無法判斷「這次變好了」是真的修好、還是碰巧這次中了。這就是「極高 recall」在尺校準前<strong>不可簽</strong>的真正含義——它不是說你不能做，而是說在尺固定之前，你簽下的不是一個性能門檻，而是一個「跟誰的意見、在哪一天比」的開放賭注。</p>
+<hr>
+<h2>6. 舊框架裡的隱藏假設（攤開檢查）</h2>
+<p>使用者原始問法與先前三份文件，隱含了以下假設。每一條都<strong>可能對</strong>，但都<strong>未經你用真實資料證實</strong>：</p>
+<ol>
+<li>所有「漏逮」是同質事件，可以一視同仁地丟回訓練集。（→ 第 3 節否定）</li>
+<li>客戶的回報＝真值。（但客戶正是那個「沒有一致標準」的量測者；它座標可能錯、但方向通常對：它指對了商業損失發生在哪。）</li>
+<li>「補資料」是唯一的調整旋鈕。</li>
+<li>存在一個穩定、與時間無關的「瑕疵」客觀事實，等著被學會。</li>
+<li>precision／recall 是對的目標函數。（在無穩定真值時，recall 的分母本身沒有定義。）</li>
+<li>「定義」與「可偵測性」可以先驗地切開。（訊號太弱時，「定義模糊」與「人眼看不清」會長成同一個樣子——標註者吵架。）</li>
+<li>使用者有能力／權力去校準客戶、重談期望、重新定義漏逮。（若沒有，第 4 層的問題不該記在工程帳上。）</li>
+</ol>
+<hr>
+<h2>7. 待你裁定的開放問題（問句形式）</h2>
+<p>這些是達不成代理共識、<strong>必須由你（最接近真實資料與客戶的人）回答</strong>的問題。它們的答案會決定上面整個框架的形狀：</p>
+<ol>
+<li><strong>尺壞了多少？</strong> 你的「瑕疵」核心是否其實穩定、只有邊緣灰帶在飄？還是真值從根本就很模糊？</li>
+<li><strong>四個桶的比例是多少？</strong> 你手上的 escape，大致幾成落在桶①（物理）、桶②（覆蓋）、桶③（邊界帶）、桶④（迴圈）？</li>
+<li><strong>歧義是真的存在，還是你的猜測？</strong> 「人沒有一致標準」是你親口說的，但你<strong>實測過</strong>標註者間的一致性嗎？</li>
+<li><strong>客戶回報該扮演什麼角色？</strong> 當成需要剔除的噪音，還是「座標錯、方向對」的商業損失指南針？</li>
+<li><strong>不同的 escape，商業後果是否天差地別？</strong>（有的漏了會退貨／賠償，有的只是客戶看了不爽。）把它們一視同仁，掩蓋了你到底在為哪些風險付錢。</li>
+<li><strong>你有多少權力？</strong> 第 4 層（承諾／合約／回饋設計）你碰得到嗎？碰不到的部分，誰碰得到？</li>
+</ol>
+<hr>
+<h2>8. 最危險的單一誤解</h2>
+<blockquote><strong>把四個桶當成同一個問題，用「再重訓一次」一起處理。</strong></blockquote>
+<p>這正是「有時有效、有時沒用、無法事前預測」的唯一來源：你在對<strong>物理不可見</strong>、<strong>人類不一致</strong>、<strong>覆蓋不足</strong>、<strong>迴圈漂移</strong>四件本質不同的事，施加同一種藥。</p>
+<p>如果只記一句話：<strong>「漏逮」不是一個 bug，是一個分類待辦。</strong></p>
+<hr>
+<h2>9. 誠實邊界：這份問題定義本身可能錯在哪</h2>
+<p>這份文件也是一個框架，它同樣可能過度複雜化。它最可能錯的地方：</p>
+<ol>
+<li><strong>它假設「四個桶的比例值得分」。</strong> 如果你的 escape 幾乎全落在桶②（覆蓋不足），那麼紅隊全對——你原本的「兩個根因」框架就夠了，本文是殺雞用牛刀。</li>
+<li><strong>它假設「歧義真實存在」。</strong> 這是你自陳的，但未經資料證實；若實測發現標註者其實高度一致，「定義／量測層」應該大幅縮小，問題就回到單純的工程覆蓋問題。</li>
+<li><strong>它可能高估了「量測問題」、低估了「物理難度」</strong>（反之亦然）。哪一個是主戲，只有真實資料能說。</li>
+</ol>
+<h3>在做任何建造之前，唯一最該先用真實資料驗證的一件事</h3>
+<blockquote><strong>拿一批真實的 escape，做兩件事：(a) 讓數位標註者背靠背、亂序、盲測重標；(b) 量這些瑕疵的訊號強度。</strong></blockquote>
+<p>這一步會同時定出<strong>物理層、定義層、覆蓋層的真實比例</strong>——也就是回答第 7 節的問題 1~3。在做這件事之前，包括本文在內的所有框架（三訊號、決策樹、熱力圖、體檢卡）都只是<strong>有根據的猜測</strong>，而不是事實。</p>
+<hr>
+<h2>附錄：多代理三輪討論歷程</h2>
+<table>
+<thead><tr>
+<th>輪次</th>
+<th>角色</th>
+<th>貢獻</th>
+</tr></thead>
+<tbody>
+<tr><td><strong>R1（獨立框定）</strong></td><td>問題框架懷疑者</td><td>「漏逮」混了 5 種事件；既有框架把解法當問題；核心是缺乏客觀真值來源。</td></tr>
+<tr><td></td><td>ML 不確定性科學家</td><td>兩根因 ↔ aleatoric／epistemic；可分性是區域而非單樣本性質；貝氏重疊區原理上不可判定。</td></tr>
+<tr><td></td><td>量測系統／統計</td><td>尺不準時 P/R 量到的是「模型 vs 某人某天意見」；recall 分母浮動、不可簽；三個變異源被歸錯帳。</td></tr>
+<tr><td></td><td>領域／營運／商業</td><td>真正卡住的是「無法向客戶與自己交代有沒有變好」；回饋迴圈獎勵大聲者；技術問題下藏著合約錯位。</td></tr>
+<tr><td><strong>R2（對撞）</strong></td><td>整合主持人</td><td>收斂出三層問題與「逐筆歸因為無解問句」。</td></tr>
+<tr><td></td><td>紅隊（反方）</td><td>四記反擊：①不可判定被過度放大；②原始兩根因常常就夠；③集體漏掉「物理偵測極限」；④偷偷假設使用者有重定義的權力。</td></tr>
+<tr><td><strong>R3（和解）</strong></td><td>最終仲裁者</td><td>逐條和解紅隊：物理層升為獨立一層；不可判定收斂到只在桶③；區分「能碰／不能碰」；定出「偵測可先行、驗證不能先於定義」。</td></tr>
+</tbody>
+</table>
+<blockquote><strong>共識規則</strong>：對「問題的結構」求共識（已達成）；對「四個桶的實際比例」不強求——那必須由使用者用真實資料測得，本文僅交付待驗證的假設與該問的問題。</blockquote>
+  </div>
+  <div class="foot">DEFECT ESCAPE · PROBLEM RE-DEFINITION · DISCUSSION DRAFT</div>
+</div>
+</body>
+</html>

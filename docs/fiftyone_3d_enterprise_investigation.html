@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FiftyOne 3D 視覺化與 Enterprise 功能調查 — 為什麼 3D 用不了、哪些值得自己重做</title>
+<style>
+:root{--ink:#1f2933;--muted:#5c6b7a;--line:#e3e8ee;--bg:#f7f9fb;--card:#fff;
+--accent:#2c6fb5;--soft:#eef4fa;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font-family:-apple-system,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;
+line-height:1.75;font-size:16px;}
+.wrap{max-width:920px;margin:0 auto;padding:48px 24px 96px;}
+.hero{background:linear-gradient(135deg,#2b5876,#1a2f44);color:#fff;border-radius:18px;
+padding:40px 36px;margin-bottom:36px;box-shadow:0 12px 30px rgba(20,30,48,.25);}
+.hero .tag{display:inline-block;font-size:12px;letter-spacing:.18em;opacity:.8;
+text-transform:uppercase;margin-bottom:14px;}
+.hero h1{margin:0 0 14px;font-size:27px;line-height:1.35;}
+.hero p{margin:6px 0 0;opacity:.9;font-size:14px;}
+.content{background:var(--card);border:1px solid var(--line);border-radius:18px;
+padding:18px 40px 44px;box-shadow:0 6px 22px rgba(31,41,51,.06);}
+h1,h2,h3,h4{line-height:1.4;}
+h2{font-size:22px;margin:42px 0 12px;padding-top:18px;border-top:2px solid var(--line);
+color:#16324f;}
+h2:first-of-type{border-top:none;padding-top:6px;}
+h3{font-size:17.5px;margin:26px 0 8px;color:#1d4e7a;}
+h4{font-size:15.5px;margin:18px 0 6px;color:var(--muted);}
+p{margin:12px 0;}
+a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(44,111,181,.35);}
+a:hover{border-bottom-color:var(--accent);}
+strong{color:#10243a;}
+code{background:var(--soft);padding:1px 6px;border-radius:5px;font-size:.88em;
+font-family:"SF Mono",Consolas,monospace;color:#0b3d62;}
+hr{border:none;border-top:1px dashed var(--line);margin:30px 0;}
+blockquote{margin:18px 0;padding:14px 20px;background:var(--soft);
+border-left:4px solid var(--accent);border-radius:0 10px 10px 0;color:#27425d;}
+ul,ol{margin:12px 0;padding-left:24px;}
+li{margin:6px 0;}
+table{width:100%;border-collapse:collapse;margin:18px 0;font-size:14px;}
+th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;vertical-align:top;}
+th{background:#16324f;color:#fff;font-weight:600;}
+tbody tr:nth-child(even){background:#fafbfd;}
+tbody tr:hover{background:#f1f6fb;}
+.foot{margin-top:30px;text-align:center;color:var(--muted);font-size:12.5px;
+letter-spacing:.1em;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <div class="tag">FIFTYONE · 3D & ENTERPRISE · 調查／討論（尚未開發）</div>
+    <h1>FiftyOne 3D 視覺化與 Enterprise 功能調查 — 為什麼 3D 用不了、哪些值得自己重做</h1>
+    <p>多代理調查 · FiftyOne 1.16 原始碼＋官方文件查證 · 2026-06-13</p>
+  </div>
+  <div class="content">
+<blockquote>2026-06-13 · 多代理調查（3 視角：架構考據 / 心智模型挑戰 / 工程取捨）＋ FiftyOne 1.16 原始碼與官方文件查證<br>狀態：<strong>調查與討論，尚未開發</strong>（依使用者要求「先不要實際的開發，而是先討論」）。<br>範圍：回答三個問題——(1) 為什麼 3D 用不了？(2) 能不能請你開發？(3) 我有哪些 Enterprise 功能不能用、值不值得重做？</blockquote>
+<hr>
+<h2>TL;DR — 三個直接答案</h2>
+<ol>
+<li><strong>為什麼 3D 用不了？</strong> 因為 <strong>plotly 的 3D 散點（WebGL <code>scatter3d</code>）原生不支援 box/lasso 區域選取</strong>——3D 場景的滑鼠拖曳被綁成「旋轉視角」。FiftyOne 在 <code>num_dims==3</code> 時只能 <code>warnings.warn(&quot;Interactive selection is only supported in 2D&quot;)</code> 並回傳一張<strong>不連動的靜態 3D 圖</strong>。這是<strong>繪圖函式庫的天花板，不是 Enterprise 的鎖</strong>。</li>
+</ol>
+<ol>
+<li><strong>「3D 沒有 App 內 lasso 是 Enterprise 功能」這個前提，是錯的。</strong> 我查遍 FiftyOne 官方的 OSS↔Enterprise 功能對照，<strong>沒有任何一項</strong>把「3D embeddings 選取」列為 Enterprise 功能。Enterprise 付費版<strong>同樣沒有</strong> 3D in-scene lasso，因為它沿用同一套 plotly 後端。你把一個<strong>技術限制</strong>誤讀成了<strong>商業限制</strong>，再用這個誤讀去推論「值得重做」——推論的前提就不成立。</li>
+</ol>
+<ol>
+<li><strong>「一個功能用 Enterprise，就代表它重要有價值」——這個心智模型站不住。</strong> FiftyOne 的真正切割線<strong>不是「價值高低」，而是「服務誰」</strong>：OSS = 單人分析者的完整能力（curation／evaluation／視覺化／Brain／embeddings／2D lasso 全在）；Enterprise = 多人／雲端／合規／規模的<strong>營運基礎設施</strong>（SSO、RBAC、版本治理、cloud media、orchestration、十億級規模、白手套支援）。對一個<strong>單人、離線</strong>的你，Enterprise 清單裡幾乎每一項的價值訊號都是失真的——它們服務的是「買單的企業 IT／合規部門」，不是「想把分析做好的個人」。</li>
+</ol>
+<blockquote><strong>最重要的一句</strong>：你其實已經把 FiftyOne 裡你覺得有價值的東西（2D 框選看圖）重做進了 visuallatent，而且<strong>已經撞到同一道 3D 牆</strong>（你的 <a href="../scripts/app.py">app.py</a> 裡就寫著「3D 模式不支援框選；切回 2D 後選取仍會保留」）。那道牆跟著你過來，是因為它是 plotly 的牆，不是 FiftyOne 的商業決策。</blockquote>
+<hr>
+<h2>§1 為什麼 3D 用不了（原始碼層級查證）</h2>
+<p>我直接讀了 VIX venv 裡安裝的 FiftyOne 1.16 原始碼，逐條驗證你的主張：</p>
+<table>
+<thead><tr>
+<th>你的主張</th>
+<th>查證結果</th>
+<th>出處</th>
+</tr></thead>
+<tbody>
+<tr><td><code>num_dims</code> 可設 3</td><td>✅ 對</td><td><code>core/plots/plotly.py</code> 接受 2D/3D</td></tr>
+<tr><td><code>points_field</code>+lasso 硬性要求 <code>num_dims==2</code></td><td>✅ <strong>完全屬實</strong></td><td><code>brain/visualization.py:79-80</code>：<code>raise ValueError(&quot;points_field is only supported when num_dims=2&quot;)</code></td></tr>
+<tr><td>3D 沒有 App 內 lasso/選取</td><td>✅ 對，但<strong>原因不是 Enterprise</strong></td><td><code>base.py:437-438</code>、<code>plotly.py:962-963</code>、<code>matplotlib.py:622-623</code> 全寫「interactive point selection is only available in 2D」</td></tr>
+<tr><td>3D 只能離線出靜態圖</td><td>✅ 對</td><td><code>plotly.py:1144-1147</code>：<code>num_dims==3</code> 且有 samples 時只 <code>warn</code>，回傳非連動圖</td></tr>
+</tbody>
+</table>
+<p><strong>真正的技術根因（三位 agent 一致）</strong>：</p>
+<ul>
+<li><strong>2D 散點</strong> 跑在 SVG/Canvas 上，plotly 提供 <code>lasso</code>／<code>box</code> 工具，會回傳「被框中的點索引」，FiftyOne（與你的 app）才能據此連動看圖。</li>
+<li><strong>3D 散點（<code>scatter3d</code>）</strong> 跑在 WebGL <code>scene</code> 上，<strong>plotly 根本沒有「在投影平面圈一塊區域」的選取工具</strong>——3D 的滑鼠拖曳被綁成旋轉相機。Streamlit 的 <code>st.plotly_chart(on_select=...)</code> 在 3D 同樣拿不到框選事件。</li>
+<li><code>points_field</code>（讓 lasso 高效查詢的空間索引）因此也只允許 2D。</li>
+</ul>
+<p>所以這不是「FiftyOne 把 3D 選取藏進付費版」，而是「<strong>上游繪圖函式庫到 3D 就沒有區域選取這個能力</strong>」。你的 app 與 FiftyOne 都同樣受限，正是獨立印證。</p>
+<hr>
+<h2>§2 我目前不能用的 Enterprise 功能有哪些（逐項對「單人離線」分類）</h2>
+<p>來源：FiftyOne 官方 <a href="https://voxel51.com/fiftyone/why-upgrade">why-upgrade</a> 與 <a href="https://docs.voxel51.com/enterprise/overview.html">Enterprise overview</a>。OSS 套件<strong>沒有</strong> <code>fiftyone/management</code> 模組（那是 Enterprise SDK）即一個旁證。</p>
+<table>
+<thead><tr>
+<th>Enterprise 獨有功能</th>
+<th>對「單人、離線」相關？</th>
+<th>OSS／自建等價物</th>
+</tr></thead>
+<tbody>
+<tr><td>多人協作／RBAC／SSO（OIDC/OAuth2/SAML）</td><td>❌ 否（單人無多人概念）</td><td>—</td></tr>
+<tr><td>雲端／地端／air-gapped 部署</td><td>❌ 否（本機跑就是 air-gapped）</td><td>本機執行</td></tr>
+<tr><td>Dataset versioning + 稽核</td><td>🟡 弱相關</td><td>git／parquet 快照＋內容雜湊</td></tr>
+<tr><td>Cloud-backed media（不需複製媒體）</td><td>❌ 否</td><td>直接讀本地檔</td></tr>
+<tr><td>Delegated operations／orchestration／scheduler</td><td>❌ 多半否</td><td>單機本地 job queue</td></tr>
+<tr><td>Management SDK</td><td>❌ 否（管理對象是團隊資源）</td><td>—</td></tr>
+<tr><td>Query performance／索引優化</td><td>🟡 視資料規模</td><td>faiss／hnswlib（你的 app 已用 hnswlib）</td></tr>
+<tr><td>Enterprise plugins／白手套支援</td><td>❌ 否</td><td>—</td></tr>
+<tr><td>十億級樣本規模、雲廠商整合</td><td>❌ 否（單人資料量遠低於此）</td><td>—</td></tr>
+<tr><td>Auto-labeling／quality scoring（foundation models）</td><td>✅ <strong>唯一真正可惜處</strong></td><td>OSS 可自接模型；自建 app 可自行整合</td></tr>
+<tr><td><strong>Curation／Evaluation／Visualization／Brain（embeddings、2D lasso）</strong></td><td>—</td><td>✅ <strong>全部 OSS 已有，無需 Enterprise</strong></td></tr>
+</tbody>
+</table>
+<p><strong>結論</strong>：Enterprise 清單裡，對單人離線者真正「有價值但用不到」的，幾乎只有 <strong>auto-labeling／quality scoring 的現成服務化</strong>——而連它的底層能力 OSS 都能自行拼裝（只是要花工）。其餘全是「組織治理／規模／合規」，與你的情境零相關。</p>
+<hr>
+<h2>§3 心智模型修正：「Enterprise = 有價值」站不站得住</h2>
+<p>這是這次調查最重要的部分，因為它會反覆影響你的決策。</p>
+<p><strong>判斷準則只有一條</strong>：這個 paywall 是因為「<strong>功能難做／稀缺</strong>」，還是因為「<strong>易於計費、且只在多人/組織情境才有意義</strong>」？</p>
+<ul>
+<li>前者（獨家演算法、難複製的模型）→ paywall 確實是價值訊號。</li>
+<li>後者（SSO、RBAC、版本治理、雲端規模）→ paywall 訊號的是「<strong>客戶是誰</strong>」，而非「東西多好」。</li>
+</ul>
+<p>功能被放進 Enterprise tier 的常見真實原因，以及它與「對單一使用者有價值」的相關性：</p>
+<table>
+<thead><tr>
+<th>放進 Enterprise 的原因</th>
+<th>與「對單人有價值」的相關性</th>
+</tr></thead>
+<tbody>
+<tr><td>協作才有意義（多人、共享、權限）</td><td>零</td></tr>
+<tr><td>合規剛需（SSO、稽核、RBAC）</td><td>零（是企業 IT／法務在買單）</td></tr>
+<tr><td>規模成本（雲端媒體、十億級、orchestration）</td><td>零（廠商替你扛基礎設施）</td></tr>
+<tr><td>支援成本（白手套、SLA）</td><td>零（賣的是「人」不是功能）</td></tr>
+<tr><td>價格歧視（企業掏得出錢）</td><td>零</td></tr>
+</tbody>
+</table>
+<p>五個原因，跟「功能本身對單人有價值」相關的<strong>接近零個</strong>。Enterprise tier 的設計目標，本來就是抓「為合規與規模付錢的買家」，不是「想做好分析的個人」。</p>
+<p><strong>這個心智模型如何傷害你</strong>：把「別人鎖起來」當「我需要」，會讓你把工程資源投向<strong>模仿一個不是為你設計的產品邊界</strong>——去重做治理、版本、權限這類單人用不到的殼，而不是去解你真正卡住的分析問題。而且這跟你在 <a href="defect_problem_redefinition.md">瑕疵問題重定義</a> 裡「用 Enterprise 的存在替代自己判斷需求」是<strong>同一個根</strong>：讓賣方的 SKU 結構替你思考「我需要什麼」。</p>
+<p><strong>該問的不是「別人收費的是哪一步」，而是「我這個工作流此刻卡在哪一步」。</strong></p>
+<p><strong>誠實的反例（別把話說死）</strong>：Enterprise 裡確實可能藏著對單人也有用、只是被搭售的東西——例如自動版本快照／媒體去重的底層機制，或當「十億級」不只是規模、而是讓某分析在你的資料量上「跑得動 vs 跑不動」時，它就跨過質變線變成真價值。準則是：<strong>逐項剝掉「多人/合規/規模」的外殼，問剩下什麼對單人還有用</strong>；剩很多 → 值得自建，剩空殼 → 那是別人的客戶的需求。</p>
+<hr>
+<h2>§4 能不能「重新做一版」？務實工程取捨</h2>
+<p>使用者說「先不要實際的開發，而是先討論」，所以這裡只談<strong>值不值得、難在哪、價值多少</strong>。</p>
+<h3>4.1 3D 內選取：四條技術途徑的取捨</h3>
+<table>
+<thead><tr>
+<th>途徑</th>
+<th>工程難度</th>
+<th>真實使用價值</th>
+<th>取捨</th>
+</tr></thead>
+<tbody>
+<tr><td>3D 僅 click 單選</td><td>極低（plotly 原生）</td><td>低：一次一點、無法群選</td><td>可順手保留，解決不了核心需求</td></tr>
+<tr><td><strong>2D 投影選、3D 看（雙視圖聯動）</strong></td><td>低-中</td><td><strong>高</strong>：框選在 2D、gestalt 看 3D</td><td>✅ <strong>唯一划算解</strong></td></tr>
+<tr><td>旋轉到某視角→投影成 2D 框選</td><td>中-高（自管相機矩陣＋投影）</td><td>中：前後遮擋，框到的是視覺重疊非空間鄰近</td><td>遮擋問題本質無解，不划算</td></tr>
+<tr><td>自建 WebGL 選取錐體（frustum 投回 3D）</td><td>高（離開 plotly，自寫 three.js 拾取＋橋接）</td><td>中-高（最完整）</td><td>對單人離線者<strong>嚴重過度工程</strong>，維護成本吞掉收益</td></tr>
+</tbody>
+</table>
+<h3>4.2 「3D 選取」其實多半是偽需求</h3>
+<p>降維到 2D 的整個目的，就是把高維結構壓到「能用平面互動操作」的維度——<strong>2D 是為了操作，第三維只買到一點額外的整體形狀感</strong>。而在 3D 投影下精確選取還會被前後遮擋污染，反而比 2D 差。「我要在 3D 裡框選」通常是把「我想要更好的整體感」誤譯成了選取需求。正解是<strong>分工：3D 負責看、2D 負責選</strong>。</p>
+<h3>4.3 真正值得自建的 Enterprise 等價物（單人離線排序）</h3>
+<table>
+<thead><tr>
+<th>功能</th>
+<th>價值</th>
+<th>工程成本</th>
+<th>判定</th>
+</tr></thead>
+<tbody>
+<tr><td>Query 索引／效能（大集合近鄰、過濾加速）</td><td>高（決定 10 萬+ 點還能不能互動）</td><td>中（你的 app 已用 hnswlib，可延伸）</td><td>該做（最優先，視資料規模）</td></tr>
+<tr><td>Dataset versioning（快照／diff 篩選結果）</td><td>中-高（單人也常需「回到上週的篩選」）</td><td>低-中（parquet 快照＋內容雜湊，你已有 manifest sha256）</td><td>該做（輕量版）</td></tr>
+<tr><td>Delegated／背景運算</td><td>中（嵌入／降維跑久時有用）</td><td>中（單機只需本地 job queue）</td><td>可做，用最小方案</td></tr>
+<tr><td>多人／雲端／SSO／RBAC</td><td>0</td><td>高</td><td>❌ 不該做</td></tr>
+</tbody>
+</table>
+<p>排序：<strong>Query 效能 &gt; 輕量 versioning &gt; 本地背景運算 &gt; 其餘忽略</strong>。</p>
+<hr>
+<h2>§5 結論與建議的下一步（討論層級，未開發）</h2>
+<ol>
+<li><strong>3D 框選不要做</strong>「真正的 3D 內 lasso」——它是 plotly 天花板、且多半是偽需求、Enterprise 也沒有。</li>
+<li><strong>若你真想要 3D 的價值</strong>，唯一划算解是「<strong>2D 選、3D 看</strong>」聯動——而你的 app 其實已經有 90% 的零件（2D 框選、selection state 跨 rerun 保存、右欄看圖）。把 3D 圖接成「唯讀的 gestalt 視圖 + 高亮目前 2D 選取」即可，零新技術風險。</li>
+<li><strong>不要再用「Enterprise 有沒有」當需求清單</strong>。改用「我的工作流卡在哪」當清單。</li>
+<li><strong>若要投入工程</strong>，CP 值排序是：query 效能（視規模）→ 輕量 versioning → 本地背景運算。3D 選取墊底。</li>
+</ol>
+<blockquote>你問「我能請你開發相關的功能就好嗎？」——能。但這次調查的誠實建議是：<strong>先別開發 3D lasso</strong>（投錯方向），如果你要，我可以做的是「2D 選 / 3D 看」這條低成本聯動，或上面 CP 值更高的 query/versioning。等你決定方向，再進開發。</blockquote>
+<hr>
+<h2>§6 誠實邊界（這份調查可能錯在哪）</h2>
+<ol>
+<li><strong>FiftyOne 版本演進快</strong>：OSS↔Enterprise 界線會移動（Teams→Enterprise 改名、部分功能曾下放）。本文以你環境裡的 <strong>1.16 原始碼</strong>與當前官網為準，未複查每個更新版。</li>
+<li><strong>plotly 的 3D 限制若未來改版新增區域選取</strong>，§1 的「技術天花板」結論會鬆動；以目前原始碼成立。</li>
+<li><strong>query 效能的痛點取決於你真實的資料規模</strong>——若只有幾千點，plotly/pandas 直接夠用，自建 ANN 是過度準備。這是我沒有的資訊。</li>
+<li><strong>「auto-labeling 底層 OSS 可自建」是能力判斷，不代表工程成本低</strong>，未量化。</li>
+<li>「2D 選、3D 看」聯動在 Streamlit rerun 模型下的狀態同步，可能比「低成本」更黏手一點（兩視圖 index 對齊、選取持久化）。</li>
+</ol>
+<hr>
+<h2>附錄：多代理調查歷程與來源</h2>
+<table>
+<thead><tr>
+<th>視角</th>
+<th>結論</th>
+</tr></thead>
+<tbody>
+<tr><td>架構考據者</td><td>「3D=Enterprise」是把技術限制誤讀成商業分層；逐項分類 Enterprise 功能對單人離線多半零相關；切割線是「服務個人 vs 服務組織」。</td></tr>
+<tr><td>心智模型挑戰者</td><td>paywall 是「客戶是誰」的訊號、非「東西多好」；五個分層原因與單人價值相關性接近零；與「用 Enterprise 存在替代自己判斷」同根。</td></tr>
+<tr><td>工程取捨者</td><td>真 3D 選取不值得做；唯一划算是「2D 選 3D 看」；3D 選取多為偽需求；自建排序 query 效能 &gt; 輕量 versioning &gt; 背景運算。</td></tr>
+</tbody>
+</table>
+<p><strong>來源（已查證）</strong>：</p>
+<ul>
+<li>FiftyOne 原始碼（1.16）：<code>fiftyone/brain/visualization.py:79-80</code>、<code>fiftyone/core/plots/plotly.py:1144-1147</code>、<code>fiftyone/core/plots/base.py:437-438</code>、<code>matplotlib.py:622-623</code>；OSS 無 <code>fiftyone/management</code> 模組。</li>
+<li><a href="https://voxel51.com/fiftyone/why-upgrade">When FiftyOne Enterprise is the right choice (why-upgrade)</a></li>
+<li><a href="https://docs.voxel51.com/enterprise/overview.html">FiftyOne Enterprise Overview — docs</a></li>
+<li><a href="https://docs.voxel51.com/user_guide/plots.html">Interactive Plots — FiftyOne docs</a></li>
+<li><a href="https://voxel51.com/blog/announcing-fiftyone-0-19">Announcing FiftyOne 0.19: In-App Embeddings Visualization</a></li>
+</ul>
+  </div>
+  <div class="foot">FIFTYONE 3D & ENTERPRISE INVESTIGATION · DISCUSSION DRAFT</div>
+</div>
+</body>
+</html>
