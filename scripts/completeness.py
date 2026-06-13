@@ -32,9 +32,13 @@ STATE_HEALTHY = "健康"      # n >= t and d >= d*
 STATE_FAKE = "假完整"       # n >= t and d < d*  (near-duplicates padding)
 STATE_OVER = "過多"         # n >= 1.5t and d >= d* (may subdivide)
 STATE_EMPTY = "空"          # n == 0 (a missing cell with literally nothing)
+STATE_NA = "不適用"          # 真實分佈中此組合不存在，排除於完整度分母外
 
 _STATE_ORDER = [STATE_EMPTY, STATE_MISSING, STATE_LOW, STATE_HEALTHY,
-                STATE_FAKE, STATE_OVER]
+                STATE_FAKE, STATE_OVER, STATE_NA]
+
+# 粗分級頻率先驗 → 目標數乘數（討論共識：高/中/低三檔即可起步）
+FREQ_MULT = {"高": 2.0, "中": 1.0, "低": 0.4}
 
 
 # ── per-image attribute statistics (for auto axes) ──────────────────────
@@ -209,25 +213,29 @@ def classify_cell(n: int, d: float, t: float, d_star: float = 0.6) -> str:
 def coverage_health(cells: list[dict], d_star: float = 0.6) -> dict:
     """Roll per-cell {n, d, t, state} up into the headline number + guards.
 
+    Cells flagged STATE_NA (real distribution says this combination does
+    not exist) are excluded from both numerator and denominator so they
+    never count as missing.
+
     Returns:
-      - ``coverage_health``: 0-100, Σ(min(n/t,1)·quality) / n_cells, where
+      - ``coverage_health``: 0-100, Σ(min(n/t,1)·quality) / n_scored, where
         quality = 0.7 when a filled cell is fake (low diversity)
       - ``counts``: per-state cell tally
       - ``gini``: inequality of cell counts (balance guard)
-      - ``fake_ratio``: share of cells flagged fake-complete
+      - ``fake_ratio``: share of scored cells flagged fake-complete
       - ``top_gaps``: cells sorted by shortfall (t - n), the worklist
     """
-    n_cells = len(cells)
-    if n_cells == 0:
-        return {"coverage_health": 0.0, "counts": {}, "gini": 0.0,
-                "fake_ratio": 0.0, "top_gaps": []}
-    score_sum = 0.0
     counts: dict[str, int] = {s: 0 for s in _STATE_ORDER}
+    score_sum = 0.0
+    n_scored = 0
     n_vals, gaps = [], []
     n_fake = 0
     for c in cells:
-        n, d, t = c["n"], c["d"], max(c["t"], 1e-9)
         counts[c["state"]] = counts.get(c["state"], 0) + 1
+        if c["state"] == STATE_NA:
+            continue
+        n, d, t = c["n"], c["d"], max(c["t"], 1e-9)
+        n_scored += 1
         quality = 0.7 if (n >= t and d < d_star) else 1.0
         score_sum += min(n / t, 1.0) * quality
         n_vals.append(n)
@@ -237,13 +245,55 @@ def coverage_health(cells: list[dict], d_star: float = 0.6) -> dict:
         if shortfall > 0:
             gaps.append({**c, "shortfall": round(shortfall, 1)})
     gaps.sort(key=lambda g: -g["shortfall"])
+    if n_scored == 0:
+        return {"coverage_health": 0.0, "counts": counts, "gini": 0.0,
+                "fake_ratio": 0.0, "top_gaps": gaps}
     return {
-        "coverage_health": round(100.0 * score_sum / n_cells, 1),
+        "coverage_health": round(100.0 * score_sum / n_scored, 1),
         "counts": counts,
         "gini": round(_gini(n_vals), 3),
-        "fake_ratio": round(n_fake / n_cells, 3),
+        "fake_ratio": round(n_fake / n_scored, 3),
         "top_gaps": gaps,
     }
+
+
+def cell_centroid(embeddings: np.ndarray, indices: Sequence[int]) -> np.ndarray | None:
+    """Mean embedding of a cell's members, or None for an empty cell."""
+    idx = list(indices)
+    if not idx:
+        return None
+    return np.asarray(embeddings)[idx].mean(axis=0)
+
+
+def mine_candidates(
+    pool_embeddings: np.ndarray,
+    query_vec: np.ndarray,
+    k: int = 12,
+    max_distance: float | None = None,
+) -> tuple[list[int], list[float]]:
+    """Rank candidate-pool rows by cosine proximity to ``query_vec`` (F4/F6:
+    fill a missing cell from an unlabeled pool).
+
+    Returns (pool row indices, cosine distances) sorted ascending, capped
+    at k; rows beyond ``max_distance`` (when given) are dropped so a cell
+    with no real match returns fewer/zero candidates rather than noise.
+    """
+    pool = np.asarray(pool_embeddings)
+    if len(pool) == 0 or query_vec is None:
+        return [], []
+    q = np.asarray(query_vec, dtype=float).reshape(-1)
+    qn = q / (np.linalg.norm(q) + 1e-12)
+    pn = pool / (np.linalg.norm(pool, axis=1, keepdims=True) + 1e-12)
+    dist = 1.0 - pn @ qn
+    order = np.argsort(dist)[: max(k, 0)]
+    out_idx, out_dist = [], []
+    for i in order:
+        d = float(dist[i])
+        if max_distance is not None and d > max_distance:
+            break
+        out_idx.append(int(i))
+        out_dist.append(d)
+    return out_idx, out_dist
 
 
 def _gini(values: Sequence[float]) -> float:
@@ -265,15 +315,20 @@ def build_completeness(
     labels_y: list[str],
     t_abs: int = 10,
     d_star: float = 0.6,
-    freq_weights: dict[tuple[int, int], float] | None = None,
+    freq_classes: dict[tuple[int, int], str] | None = None,
 ) -> dict:
     """Assemble the full completeness grid for two attribute axes.
 
     ``bucket_x``/``bucket_y`` are per-record bucket indices. Returns a
     dict with ``cells`` (one per (x,y) in the full grid, including empty
     cells so missing combinations show up), the ``health`` summary, and
-    the axis labels. ``freq_weights`` maps a cell to its real-world
-    expected proportion; when omitted every cell falls back to ``t_abs``.
+    the axis labels.
+
+    ``freq_classes`` maps a cell to a coarse real-world frequency prior —
+    "高"/"中"/"低" scale the target up/down, "不適用" excludes the cell
+    from the completeness denominator (a combination reality never
+    produces, so it must not count as missing). When omitted every cell
+    uses the uniform target ``t_abs`` (marked uncalibrated).
     """
     nx, ny = len(labels_x), len(labels_y)
     members: dict[tuple[int, int], list[int]] = {}
@@ -281,16 +336,21 @@ def build_completeness(
         members.setdefault((int(bx), int(by)), []).append(i)
 
     global_nn = global_mean_nn_distance(embeddings)
-    n_total = len(records)
-    n_cells = nx * ny
     cells: list[dict] = []
     for xi in range(nx):
         for yi in range(ny):
             idx = members.get((xi, yi), [])
             n = len(idx)
             d = cell_diversity(embeddings, idx, global_nn)
-            fw = freq_weights.get((xi, yi)) if freq_weights else None
-            t = compute_target(n_cells, t_abs, freq_weight=fw, n_total=n_total)
+            fclass = freq_classes.get((xi, yi)) if freq_classes else None
+            if fclass == STATE_NA:
+                cells.append({
+                    "x": xi, "y": yi, "x_label": labels_x[xi], "y_label": labels_y[yi],
+                    "n": n, "d": round(d, 3), "t": 0.0,
+                    "state": STATE_NA, "indices": idx,
+                })
+                continue
+            t = float(t_abs) * FREQ_MULT.get(fclass, 1.0)
             cells.append({
                 "x": xi, "y": yi, "x_label": labels_x[xi], "y_label": labels_y[yi],
                 "n": n, "d": round(d, 3), "t": round(t, 1),
@@ -298,8 +358,10 @@ def build_completeness(
                 "indices": idx,
             })
     health = coverage_health(cells, d_star=d_star)
+    calibrated = bool(freq_classes) and any(
+        v != "中" for v in freq_classes.values())
     return {
         "cells": cells, "health": health,
         "labels_x": labels_x, "labels_y": labels_y,
-        "calibrated": freq_weights is not None,
+        "calibrated": calibrated,
     }

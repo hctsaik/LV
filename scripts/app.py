@@ -26,6 +26,7 @@ from _utils import (
     supports_text_query,
 )
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
+    attribute_escape,
     build_nn_index,
     compute_label_disagreement,
     compute_outlier_scores,
@@ -35,7 +36,10 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     find_duplicate_pairs_phash,
     find_similar_indices,
     find_similar_to_vector,
+    load_scores_csv,
     make_thumbnail,
+    neighbor_hit_density,
+    neighbor_label_entropy,
     parse_folder_paths,
     records_to_csv,
     selection_points_to_indices,
@@ -777,6 +781,140 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
                               on_click=_add_one, args=(records, j))
 
 
+def _scores_for(path: Path) -> dict:
+    """Walk up from an image to find a scores.csv (≤3 levels), cached per
+    directory. Returns {filename: (score, threshold)} — empty if none."""
+    cache = st.session_state.setdefault("viz_scores_cache", {})
+    p = Path(path).parent
+    for _ in range(4):
+        if str(p) in cache:
+            return cache[str(p)]
+        csv_path = p / "scores.csv"
+        if csv_path.exists():
+            loaded = load_scores_csv(csv_path)
+            cache[str(p)] = loaded
+            return loaded
+        if p.parent == p:
+            break
+        p = p.parent
+    return {}
+
+
+def _render_health_card(records: list[dict], model_name: str) -> None:
+    """Escape report card (defect-mechanisms §4): embedding-side diagnostics
+    + decision-tree attribution for the active image. Reads an optional
+    scores.csv to add the N4 gate; degrades honestly without it."""
+    _render_viewer_slot(records, [])
+    with st.container(key="viz_card_panel"):
+        idx = st.session_state.get("viz_active_image")
+        if idx is None or not (0 <= idx < len(records)):
+            st.info("在「選取」面板點一張縮圖、或在散點上選一個點，"
+                    "再回此頁產生該影像的體檢卡。")
+            return
+        raw = st.session_state.get("viz_raw_embeddings", {}).get(model_name)
+        if raw is None or len(raw) < 2:
+            st.info("此模型沒有可用特徵向量。"); return
+        r = records[idx]
+        p = Path(r["path"])
+        labels = [rec["label"] for rec in records]
+        outlier = st.session_state.get("viz_outlier_scores", {}).get(model_name)
+
+        # 自動半徑 r = 訓練集 kNN 距離 P75（與 N2 閘一致；可調）
+        radius = st.session_state.get("_viz_card_radius")
+        if radius is None:
+            from interaction import build_nn_index as _bni  # noqa
+            from sklearn.neighbors import NearestNeighbors
+            nn = NearestNeighbors(metric="cosine", n_neighbors=2).fit(raw)
+            dist, _ = nn.kneighbors(raw)
+            radius = float(np.percentile(dist[:, 1], 75))
+            st.session_state["_viz_card_radius"] = radius
+
+        density = neighbor_hit_density(raw, idx, radius)
+        entropy = neighbor_label_entropy(raw, labels, idx, k=20)
+        if outlier is not None:
+            outlier_pct = float((outlier <= outlier[idx]).mean())
+        else:
+            outlier_pct = 0.5
+
+        scores = _scores_for(p)
+        sc = scores.get(p.name)
+        score_v = sc[0] if sc else None
+        thr_v = sc[1] if sc else None
+
+        attr = attribute_escape(density, entropy, outlier_pct,
+                                score=score_v, threshold=thr_v)
+
+        st.subheader(f"🩺 體檢卡 · {p.name}")
+        st.caption(f"{r['label']}（{r['split']}）· #{idx}")
+        # 歸因
+        st.markdown(f"**歸因：{attr['class']}**　信心 {attr['confidence']:.0%}")
+        for reason in attr["reasons"]:
+            st.caption(f"· {reason}")
+        # 訊號
+        c1, c2, c3 = st.columns(3)
+        c1.metric("N2 命中密度", density, help=f"半徑 {radius:.3f} 內訓練集相似鄰居數。")
+        c2.metric("N3 標籤分歧熵", f"{entropy:.2f}", help="鄰居標籤的歸一化熵；高＝標準漂移。")
+        c3.metric("離群度百分位", f"{outlier_pct * 100:.0f}%",
+                  help="此圖離群度在資料集中的位置。")
+        if score_v is not None:
+            st.caption(f"模型分數 {score_v:.3f}" +
+                       (f" · 閾值 {thr_v:.3f}（N4 已啟用）" if thr_v is not None
+                        else "（無閾值，N4 僅供參考）"))
+        else:
+            st.caption(":gray[未找到 scores.csv（filename,score[,threshold]）——"
+                       "N4 分數閘停用，僅以 embedding 訊號歸因。]")
+
+        # kNN 鄰居縮圖牆
+        st.markdown("**最近鄰（它長得像誰）**")
+        nbr_idx, nbr_d = find_similar_indices(raw, idx, k=6,
+                                              nn_index=_nn_index_for(model_name))
+        with st.container(height=170):
+            cols = st.columns(3)
+            for j, (ni, nd) in enumerate(zip(nbr_idx, nbr_d)):
+                with cols[j % 3]:
+                    thumb = _thumb_or_none(Path(records[ni]["path"]))
+                    if thumb:
+                        st.image(thumb, use_container_width=True,
+                                 caption=f"{records[ni]['label']} d={nd:.3f}")
+        # 匯出
+        report = _health_card_report(p, r, idx, attr, density, entropy,
+                                     outlier_pct, score_v, thr_v, radius,
+                                     nbr_idx, nbr_d, records)
+        st.download_button("⬇ 匯出體檢卡 HTML", data=report,
+                           file_name=f"healthcard_{p.stem}.html",
+                           mime="text/html", key="viz_card_export",
+                           use_container_width=True)
+
+
+def _health_card_report(p, r, idx, attr, density, entropy, outlier_pct,
+                        score_v, thr_v, radius, nbr_idx, nbr_d, records) -> str:
+    rows = "".join(
+        f"<tr><td>#{ni}</td><td>{records[ni]['label']}</td>"
+        f"<td>{records[ni]['split']}</td><td>{nd:.4f}</td></tr>"
+        for ni, nd in zip(nbr_idx, nbr_d))
+    score_line = (f"模型分數 {score_v:.3f}" +
+                  (f"，閾值 {thr_v:.3f}（N4 啟用）" if thr_v is not None else "（無閾值）")
+                  ) if score_v is not None else "未提供 scores.csv，N4 停用"
+    reasons = "".join(f"<li>{x}</li>" for x in attr["reasons"])
+    return f"""<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8">
+<title>體檢卡 {p.name}</title><style>
+body{{font-family:"Noto Sans TC",sans-serif;max-width:720px;margin:24px auto;color:#1a2433}}
+h1{{font-size:20px}} .k{{color:#5a6b80}} table{{border-collapse:collapse;width:100%}}
+td,th{{border:1px solid #e3e8ef;padding:6px 10px;font-size:14px}}
+.attr{{background:#eef2f7;border-radius:8px;padding:12px 16px;margin:12px 0}}</style></head><body>
+<h1>🩺 Escape 體檢卡 · {p.name}</h1>
+<p class="k">{r['label']}（{r['split']}）· #{idx} · {p}</p>
+<div class="attr"><b>歸因：{attr['class']}</b>　信心 {attr['confidence']:.0%}
+<ul>{reasons}</ul></div>
+<p>N2 命中密度 <b>{density}</b>（半徑 {radius:.3f}）　·　N3 標籤分歧熵 <b>{entropy:.2f}</b>
+　·　離群度百分位 <b>{outlier_pct*100:.0f}%</b></p>
+<p>{score_line}</p>
+<h3>最近鄰</h3><table><tr><th>#</th><th>label</th><th>split</th><th>cosine 距離</th></tr>
+{rows}</table>
+<p class="k">由 LV 產生。歸因僅含 N2/N3（與可選 N4）embedding 訊號；N0 品質、N1 定義仲裁需人工。</p>
+</body></html>"""
+
+
 def _render_export_view() -> None:
     elist = st.session_state.get("viz_export_list", {})
     st.caption(f"匯出清單 — 共 {len(elist)} 張（session 內有效；匯出後可清空，不寫回資料集）")
@@ -837,7 +975,7 @@ def _render_right_panel(
     """
     st.session_state.setdefault("viz_panel_view", "選取")
     view = st.segmented_control(
-        "面板", ["選取", "相似", "重複", "匯出清單"], key="viz_panel_view",
+        "面板", ["選取", "相似", "重複", "體檢卡", "匯出清單"], key="viz_panel_view",
         label_visibility="collapsed",
     ) or "選取"
 
@@ -847,6 +985,8 @@ def _render_right_panel(
         _render_similar_view(records, model_name)
     elif view == "重複":
         _render_dup_view(records, model_name)
+    elif view == "體檢卡":
+        _render_health_card(records, model_name)
     else:
         _render_export_view()
 
@@ -1767,6 +1907,74 @@ def _completeness_axis_values(records: list[dict], axis: str):
     return bucketize(vals, n_bins, method="quantile")
 
 
+def _mine_cell_candidates(cell: dict, records: list[dict], emb: np.ndarray,
+                          model: str) -> None:
+    """(b) Fill a cell from the candidate pool: embed the pool (cached),
+    query by the cell's centroid (or the cell's X-marginal for an empty
+    cell), and stash the nearest pool images for review."""
+    from completeness import cell_centroid, mine_candidates
+    pool_folders = parse_folder_paths(st.session_state.get("cov_pool_text", ""))
+    pool_folders = [p for p in pool_folders if p.exists()]
+    if not pool_folders:
+        st.warning("候選池資料夾不存在。"); return
+    pool_records = discover_images_classifier(pool_folders)
+    if not pool_records:  # 候選池常是未分類的平鋪資料夾
+        pool_paths = []
+        for f in pool_folders:
+            pool_paths += [p for ext in ("*.jpg", "*.jpeg", "*.png")
+                           for p in f.rglob(ext)]
+        pool_records = [{"path": p, "split": p.parent.name, "label": ""}
+                        for p in sorted(set(pool_paths))]
+    if not pool_records:
+        st.warning("候選池中找不到影像。"); return
+
+    with st.spinner(f"擷取候選池特徵（{len(pool_records)} 張）…"):
+        embed_fn = load_model(model)
+        pool_paths = [r["path"] for r in pool_records]
+        cache = pool_folders[0] / f"embeddings_{model}" / "embeddings.npz"
+        pool_emb = extract_embeddings(pool_paths, embed_fn, cache_path=cache)
+
+    # query：有樣本用格心；空格退回該 X 標籤（同類）的整體中心
+    q = cell_centroid(emb, cell["indices"])
+    if q is None:
+        q = cell_centroid(emb, [i for i, r in enumerate(records)
+                                if r.get("label") == cell["x_label"]])
+    if q is None:
+        st.warning("此格無可用查詢向量（空格且無同類樣本可當種子）。"); return
+    idxs, dists = mine_candidates(pool_emb, q, k=12)
+    st.session_state["cov_candidates"] = {
+        "cell": (cell["x"], cell["y"]),
+        "items": [{"path": str(pool_records[i]["path"]), "d": d}
+                  for i, d in zip(idxs, dists)],
+    }
+    _log_usage("cov_mine", n=len(idxs))
+
+
+def _render_cov_candidates(cell: dict, records: list[dict]) -> None:
+    res = st.session_state.get("cov_candidates")
+    if not res or res.get("cell") != (cell["x"], cell["y"]):
+        return
+    items = res["items"]
+    if not items:
+        st.info("候選池中沒有夠相似的候選。"); return
+    st.caption(f"候選池相似候選（{len(items)} 張，距離小→大）——人工挑選後再進標註/資料集：")
+    with st.container(height=240):
+        cols = st.columns(3)
+        for j, it in enumerate(items):
+            with cols[j % 3]:
+                thumb = _thumb_or_none(Path(it["path"]))
+                if thumb:
+                    st.image(thumb, use_container_width=True,
+                             caption=f"d={it['d']:.3f}")
+                else:
+                    st.warning("⚠ 缺檔")
+    csv = "path,distance\n" + "\n".join(
+        f'"{it["path"]}",{it["d"]:.6f}' for it in items)
+    st.download_button("⬇ 匯出候選清單 CSV", data=csv,
+                       file_name="cell_candidates.csv", mime="text/csv",
+                       key="cov_cand_csv", use_container_width=True)
+
+
 def _completeness_ui() -> None:
     st.markdown("##### 模型收值完整性熱力圖")
     st.caption("把資料依兩個屬性軸切成小格，看每格「不太多也不太少」。"
@@ -1796,6 +2004,10 @@ def _completeness_ui() -> None:
                                 help="未提供真實分佈時的均勻目標，標『未校正』。")
         d_star = st.slider("多樣性門檻 d*", 0.0, 1.0, 0.6, 0.05, key="cov_dstar",
                            help="格內多樣性低於此值＝假完整（近重複充數）。")
+        st.markdown("**⑤ 候選池（選用）**")
+        st.text_area("撈候選用的資料夾（每行一個）", key="cov_pool_text",
+                     placeholder="例：未標註的產線影像資料夾", height=58,
+                     help="缺格時從這裡以圖搜圖撈相似候選來補。留空則不啟用。")
         run = st.button("▶ Run", use_container_width=True, key="run_cov",
                         type="primary")
 
@@ -1849,8 +2061,17 @@ def _completeness_ui() -> None:
     emb = st.session_state["cov_emb"]
     bx, lx = _completeness_axis_values(records, ax_x)
     by, ly = _completeness_axis_values(records, ax_y)
+
+    # (a) 真實分佈校正：每格 高/中/低/不適用 先驗（粗分級即可起步）
+    grid_key = f"{st.session_state.get('cov_token', '')}|{ax_x}|{ax_y}|{st.session_state.get('cov_bins')}"
+    freq_classes = st.session_state.get("cov_freq_classes", {})
+    if st.session_state.get("cov_freq_grid_key") != grid_key:
+        freq_classes = {}
+        st.session_state["cov_freq_grid_key"] = grid_key
+        st.session_state["cov_freq_classes"] = freq_classes
     result = build_completeness(records, emb, bx, by, lx, ly,
-                                t_abs=int(t_abs), d_star=float(d_star))
+                                t_abs=int(t_abs), d_star=float(d_star),
+                                freq_classes=freq_classes or None)
     cells = result["cells"]
     health = result["health"]
 
@@ -1891,6 +2112,33 @@ def _completeness_ui() -> None:
         )
         st.plotly_chart(fig, use_container_width=True, key="cov_heatmap")
 
+        # (a) 真實分佈校正編輯器：每格設 高/中/低/不適用 先驗
+        with st.expander("🎚 真實分佈校正（每格頻率先驗：高/中/低/不適用）"):
+            st.caption("用粗分級先驗校正『每格該有多少』——稀有格設『低』就不會被誤判為缺，"
+                       "現實不存在的組合設『不適用』排除於分母外。空白＝中（用地板值）。")
+            df = pd.DataFrame([
+                {"格": f"{c['x_label']} × {c['y_label']}",
+                 "x": c["x"], "y": c["y"], "n": c["n"],
+                 "頻率先驗": freq_classes.get((c["x"], c["y"]), "中")}
+                for c in cells
+            ])
+            edited = st.data_editor(
+                df[["格", "n", "頻率先驗"]], key="cov_freq_editor",
+                hide_index=True, use_container_width=True, height=240,
+                column_config={"頻率先驗": st.column_config.SelectboxColumn(
+                    options=["高", "中", "低", "不適用"], required=True)},
+                disabled=["格", "n"],
+            )
+            if st.button("套用校正", key="cov_apply_freq", use_container_width=True):
+                new_fc = {}
+                for row, c in zip(edited.itertuples(), cells):
+                    v = row.頻率先驗
+                    if v != "中":
+                        new_fc[(c["x"], c["y"])] = v
+                st.session_state["cov_freq_classes"] = new_fc
+                st.toast("已套用真實分佈校正", icon="🎚")
+                st.rerun()
+
     with col_side:
         st.markdown("**缺格清單（缺口大→小）**")
         gaps = [g for g in health["top_gaps"]
@@ -1921,7 +2169,7 @@ def _completeness_ui() -> None:
                        f"n={cell['n']} / t={cell['t']:.0f} · 多樣性 d={cell['d']:.2f}")
             if cell["state"] == STATE_FAKE:
                 st.caption(":violet[假完整：量夠但多樣性低，多為近重複——建議去重而非再補。]")
-            with st.container(height=300):
+            with st.container(height=240):
                 cols = st.columns(3)
                 for j, i in enumerate(cell["indices"][:30]):
                     with cols[j % 3]:
@@ -1931,6 +2179,16 @@ def _completeness_ui() -> None:
                             st.image(thumb, use_container_width=True)
                         else:
                             st.warning("⚠ 缺檔")
+
+            # (b) 缺格一鍵撈候選：從候選池以圖搜圖補
+            pool_text = st.session_state.get("cov_pool_text", "")
+            if pool_text.strip():
+                if st.button("🔎 從候選池撈相似候選", key="cov_mine_btn",
+                             use_container_width=True):
+                    _mine_cell_candidates(cell, records, emb, model)
+                _render_cov_candidates(cell, records)
+            else:
+                st.caption("（在左側『⑤ 候選池』填入資料夾即可一鍵撈候選補此格）")
             st.button("✕ 關閉", key="cov_cell_close",
                       on_click=lambda: st.session_state.pop("cov_active_cell", None))
 
@@ -1960,6 +2218,8 @@ def main() -> None:
             "- **重複／洩漏掃描**：右欄「重複」tab（phash 嚴格、embedding 語意，"
             "勾「僅跨 split」＝train/val 洩漏）\n"
             "- **離群度・標籤分歧**：Run 完自動計算，右欄排序選單切換\n"
+            "- **體檢卡**：選一張圖 → 右欄「體檢卡」tab，看 N2 命中密度/N3 標籤熵/"
+            "歸因（放 scores.csv 可加 N4 分數閘），可匯出 HTML\n"
             "- **匯出清單**：跨視圖累積選取，匯出 CSV（含 sha256）／ZIP\n"
             "- **固定 UMAP 參考系**：③ 投影方法下的開關——跨 Run 佈局可比較\n"
             "- **比較兩資料夾**：Compare Distributions——FID/KID 等指標＋"

@@ -197,3 +197,66 @@ def test_image_stats_bright_vs_dark(tmp_path):
 def test_image_stats_missing_raises(tmp_path):
     with pytest.raises(OSError):
         image_stats(tmp_path / "nope.jpg")
+
+
+# ── (a) frequency-prior calibration ─────────────────────────────────────
+
+from completeness import STATE_NA, cell_centroid, mine_candidates  # noqa: E402
+
+
+def test_freq_class_na_excluded_from_health():
+    rng = np.random.default_rng(3)
+    records = [{"label": "a"}] * 10 + [{"label": "b"}] * 10
+    emb = rng.normal(size=(20, 8))
+    bx, lx = categorical_buckets([r["label"] for r in records])
+    by = [0] * 20  # single y bucket
+    # mark cell (b,0) as 不適用 → must not drag coverage even if empty-ish
+    fclasses = {(1, 0): STATE_NA}
+    out = build_completeness(records, emb, bx, by, lx, ["all"], t_abs=5,
+                             freq_classes=fclasses)
+    states = {(c["x"], c["y"]): c["state"] for c in out["cells"]}
+    assert states[(1, 0)] == STATE_NA
+    # health denominator excludes the NA cell (only cell a is scored)
+    assert out["health"]["counts"][STATE_NA] == 1
+    assert out["calibrated"] is True
+
+
+def test_freq_class_low_lowers_target_high_raises():
+    rng = np.random.default_rng(4)
+    records = [{"label": "a"}] * 6
+    emb = rng.normal(size=(6, 8))
+    bx, lx = categorical_buckets([r["label"] for r in records])
+    by = [0] * 6
+    low = build_completeness(records, emb, bx, by, lx, ["all"], t_abs=10,
+                             freq_classes={(0, 0): "低"})
+    high = build_completeness(records, emb, bx, by, lx, ["all"], t_abs=10,
+                              freq_classes={(0, 0): "高"})
+    assert low["cells"][0]["t"] == 4.0    # 10 * 0.4
+    assert high["cells"][0]["t"] == 20.0  # 10 * 2.0
+    # 6 samples: meets the 低 target (4) but misses the 高 target (20)
+    assert low["cells"][0]["state"] != STATE_MISSING
+    assert high["cells"][0]["n"] < high["cells"][0]["t"]
+
+
+# ── (b) candidate mining ────────────────────────────────────────────────
+
+def test_cell_centroid_and_empty():
+    emb = np.array([[1.0, 0.0], [3.0, 0.0]])
+    assert np.allclose(cell_centroid(emb, [0, 1]), [2.0, 0.0])
+    assert cell_centroid(emb, []) is None
+
+
+def test_mine_candidates_ranks_by_proximity():
+    pool = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [-1.0, 0.0]])
+    q = np.array([1.0, 0.0])
+    idx, dist = mine_candidates(pool, q, k=2)
+    assert idx[:2] == [0, 1]            # the two aligned with the query
+    assert dist == sorted(dist)
+
+def test_mine_candidates_max_distance_drops_far():
+    pool = np.array([[1.0, 0.0], [0.0, 1.0]])  # one near, one orthogonal
+    idx, _ = mine_candidates(pool, np.array([1.0, 0.0]), k=5, max_distance=0.1)
+    assert idx == [0]
+
+def test_mine_candidates_empty_pool():
+    assert mine_candidates(np.zeros((0, 4)), np.ones(4)) == ([], [])

@@ -764,3 +764,77 @@ def test_u_completeness_heatmap(app_page, tmp_path):
     wait_idle(page)
     expect(page.locator('.st-key-cov_cell_close')).to_be_visible()
     _no_exception(page)
+
+
+# ── (v) escape health card tab (defect-mechanisms §4) ───────────────────
+
+def test_v_health_card(flow_page):
+    page = flow_page
+    _switch_panel(page, "選取")  # status line + grid live on this panel
+    # ensure something is selected (chain off the shared session)
+    if _selected_count(page) == 0:
+        _click_marker(page, 0, 1)
+    # open a card subject by clicking a grid card → sets viz_active_image
+    page.locator('.st-key-viz_grid [class*="st-key-viz_card_"] button').first.click()
+    wait_idle(page)
+    page.locator('.st-key-viz_panel_view').get_by_text("體檢卡", exact=True).click()
+    wait_idle(page)
+    panel = page.locator('.st-key-viz_card_panel')
+    expect(panel.get_by_text(re.compile("歸因："))).to_be_visible()
+    expect(panel.get_by_text("N2 命中密度", exact=True)).to_be_visible()
+    expect(panel.get_by_text("N3 標籤分歧熵", exact=True)).to_be_visible()
+    # no scores.csv in the synthetic dataset → N4 disabled, stated honestly
+    expect(panel.get_by_text(re.compile("未找到 scores.csv"))).to_be_visible()
+    expect(page.locator('.st-key-viz_card_export')).to_be_visible()
+    page.locator('.st-key-viz_panel_view').get_by_text("選取", exact=True).click()
+    wait_idle(page)
+    _no_exception(page)
+
+
+# ── (w) completeness calibration + candidate mining ─────────────────────
+
+def test_w_completeness_calibration_and_mining(app_page, tmp_path):
+    import numpy as np
+    from PIL import Image
+    page = app_page
+    root = tmp_path / "cov2" / "train"
+    pool = tmp_path / "cov2" / "pool"
+    pool.mkdir(parents=True)
+    for ci, cls in enumerate(("p", "q")):
+        d = root / cls
+        d.mkdir(parents=True)
+        for i in range(6):
+            arr = np.full((64, 64, 3), 210 if i < 3 else 40, "uint8")
+            arr[:, :, ci] = 200
+            Image.fromarray(arr).save(d / f"{cls}_{i}.jpg", quality=90)
+    # candidate pool: a few extra images to mine from
+    for i in range(5):
+        arr = np.random.default_rng(i).integers(0, 255, (64, 64, 3)).astype("uint8")
+        Image.fromarray(arr).save(pool / f"cand_{i}.jpg", quality=90)
+
+    page.locator('.st-key-tool_switch').get_by_text("完整度熱力圖").click()
+    wait_idle(page)
+    page.locator('.st-key-cov_folder_text textarea').fill(str(root))
+    page.locator('.st-key-cov_pool_text textarea').fill(str(pool))
+    page.locator('.st-key-cov_t_abs input').fill("4")
+    page.keyboard.press("Tab")
+    page.locator('.st-key-run_cov button').click()
+    page.wait_for_selector('.st-key-cov_heatmap', timeout=300000)
+    wait_idle(page, timeout=120000)
+    _no_exception(page)
+
+    # (a) calibration editor is present (uncalibrated warning visible first)
+    expect(page.get_by_text(re.compile("未校正真實分佈"))).to_be_visible()
+    page.get_by_text(re.compile("真實分佈校正")).click()
+    wait_idle(page)
+    expect(page.locator('.st-key-cov_apply_freq')).to_be_visible()
+
+    # (b) pick a cell → candidate mining button appears, mining renders results
+    page.locator('.st-key-cov_cell_pick [data-baseweb="select"]').click()
+    page.get_by_role("option").nth(1).click()
+    wait_idle(page)
+    expect(page.locator('.st-key-cov_mine_btn')).to_be_visible()
+    page.locator('.st-key-cov_mine_btn button').click()
+    wait_idle(page, timeout=120000)
+    expect(page.locator('.st-key-cov_cand_csv')).to_be_visible()
+    _no_exception(page)

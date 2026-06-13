@@ -150,6 +150,134 @@ def compute_outlier_scores(
     return dist.mean(axis=1)
 
 
+def load_scores_csv(csv_path: Path) -> dict[str, tuple[float, float | None]]:
+    """Optional detection-score ingestion for the escape card (N4 gate).
+
+    Reads a ``scores.csv`` with columns ``filename,score[,threshold]`` →
+    ``{filename: (score, threshold|None)}``. This is how a detection model's
+    output enters LV without LV running the detector. Missing file or
+    unparseable rows yield an empty / partial map (the card degrades to
+    embedding-only attribution).
+    """
+    csv_path = Path(csv_path)
+    out: dict[str, tuple[float, float | None]] = {}
+    if not csv_path.exists():
+        return out
+    with csv_path.open(encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = (row.get("filename") or row.get("file") or "").strip()
+            if not name:
+                continue
+            try:
+                score = float(row["score"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            thr = row.get("threshold")
+            try:
+                thr_v = float(thr) if thr not in (None, "") else None
+            except ValueError:
+                thr_v = None
+            out[name] = (score, thr_v)
+    return out
+
+
+def neighbor_hit_density(
+    emb_matrix: np.ndarray,
+    query_idx: int,
+    radius: float,
+    nn_index=None,
+) -> int:
+    """N2 signal: how many OTHER rows fall within cosine ``radius`` of the
+    query (excluding itself). Low density = the model was shown few
+    similar examples → sample scarcity candidate."""
+    emb = np.asarray(emb_matrix)
+    n = len(emb)
+    if not 0 <= query_idx < n or n < 2:
+        return 0
+    q = emb[query_idx]
+    qn = q / (np.linalg.norm(q) + 1e-12)
+    en = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+    dist = 1.0 - en @ qn
+    return int(np.sum(dist <= radius)) - 1  # drop self (distance 0)
+
+
+def neighbor_label_entropy(
+    emb_matrix: np.ndarray,
+    labels: Sequence[str],
+    query_idx: int,
+    k: int = 20,
+) -> float:
+    """N3 signal: normalized Shannon entropy ∈ [0,1] of the k nearest
+    neighbours' labels (self excluded). High = neighbours disagree on the
+    label → standard-drift / labeling-dispute candidate."""
+    emb = np.asarray(emb_matrix)
+    n = len(emb)
+    if not 0 <= query_idx < n or n < 2:
+        return 0.0
+    k_eff = max(1, min(k, n - 1))
+    nn = NearestNeighbors(metric="cosine")
+    nn.fit(emb)
+    _, idx = nn.kneighbors(emb[query_idx:query_idx + 1], n_neighbors=min(k_eff + 1, n))
+    neigh = [int(j) for j in idx[0] if int(j) != query_idx][:k_eff]
+    if not neigh:
+        return 0.0
+    arr = np.asarray(labels, dtype=object)[neigh]
+    _, counts = np.unique(arr, return_counts=True)
+    p = counts / counts.sum()
+    ent = -float(np.sum(p * np.log(p)))
+    max_ent = np.log(len(counts)) if len(counts) > 1 else 1.0
+    return float(ent / max_ent) if max_ent > 0 else 0.0
+
+
+# escape attribution classes (defect-mechanisms decision tree A–E)
+ESCAPE_A = "A 標準漂移"        # neighbours disagree on label (N3 high)
+ESCAPE_B = "B 樣本稀缺"        # few similar training examples (N2 low)
+ESCAPE_C = "C 邊界擦邊"        # model score sits next to the threshold (N4)
+ESCAPE_D = "D 新型態"          # no neighbours + outlier (N2 zero, novelty high)
+ESCAPE_REVIEW = "需人工覆核"    # signals insufficient to attribute
+
+
+def attribute_escape(
+    hit_density: int,
+    label_entropy: float,
+    outlier_pct: float,
+    score: float | None = None,
+    threshold: float | None = None,
+    entropy_thr: float = 0.8,
+    density_thr: int = 3,
+) -> dict:
+    """Preliminary escape attribution from embedding signals (+ optional
+    model score). Honest by construction: N0/N1 need a human and N4 needs
+    a detection score, so without a score this only separates A/B/D and
+    otherwise defers to 需人工覆核.
+
+    Returns {class, confidence (0-1), reasons[list]}.
+    """
+    reasons: list[str] = []
+    if label_entropy >= entropy_thr:
+        reasons.append(f"鄰居標籤分歧高（熵 {label_entropy:.2f} ≥ {entropy_thr}）")
+        return {"class": ESCAPE_A, "confidence": round(min(label_entropy, 1.0), 2),
+                "reasons": reasons}
+    if hit_density == 0 and outlier_pct >= 0.9:
+        reasons.append(f"訓練集無相似鄰居，且離群度居前 {(1 - outlier_pct) * 100:.0f}%")
+        return {"class": ESCAPE_D, "confidence": round(outlier_pct, 2),
+                "reasons": reasons}
+    if score is not None and threshold is not None:
+        margin = abs(score - threshold)
+        rel = margin / (abs(threshold) + 1e-9)
+        if rel <= 0.1:
+            reasons.append(f"模型分數貼近閾值（|{score:.3f}−{threshold:.3f}| 相對 {rel*100:.0f}%）")
+            return {"class": ESCAPE_C, "confidence": round(1 - rel, 2), "reasons": reasons}
+    if hit_density <= density_thr:
+        reasons.append(f"訓練集相似鄰居稀少（{hit_density} ≤ {density_thr}）")
+        return {"class": ESCAPE_B, "confidence": round(1 - hit_density / (density_thr + 1), 2),
+                "reasons": reasons}
+    reasons.append("embedding 訊號不足以歸因（鄰居充足且標籤一致）；"
+                   "需 N0 品質/N1 定義/N4 分數判定")
+    return {"class": ESCAPE_REVIEW, "confidence": 0.3, "reasons": reasons}
+
+
 def compute_label_disagreement(
     embeddings: np.ndarray,
     labels: Sequence[str],
