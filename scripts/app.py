@@ -192,8 +192,10 @@ def _build_viz_figure(
                 x=[coords[i, 0] for i in hs], y=[coords[i, 1] for i in hs], **ring))
 
     fig = go.Figure(data=traces)
-    # 620px：layout 評審 R2 拍板的散點高度（填滿左欄、消死白）
+    # 620px：layout 評審 R2 拍板的散點高度（填滿左欄、消死白）；
+    # plotly 預設邊距很肥，壓到貼齊容器
     layout = dict(title=f"{model_name} · {method_label}", height=620,
+                  margin=dict(l=10, r=10, t=40, b=10),
                   legend=dict(title="Class (Split)", groupclick="toggleitem"))
     if use_3d:
         layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
@@ -233,7 +235,8 @@ def _build_cmp_figure(
         _trace(proj[:n_a], [p.name for p in paths_a], "#3498db", name_a, 0),
         _trace(proj[n_a:], [p.name for p in paths_b], "#e74c3c", name_b, n_a),
     ])
-    layout = dict(legend=dict(title="Group"), height=560)
+    layout = dict(legend=dict(title="Group"), height=560,
+                  margin=dict(l=10, r=10, t=20, b=10))
     if use_3d:
         layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
     else:
@@ -861,7 +864,8 @@ def _render_quick_start() -> None:
         st.caption("按 ▶ Run，自動萃取特徵並降維成散點圖。")
     with c3, st.container(border=True):
         st.markdown("**③ 探索**")
-        st.caption("在散點圖框選任一群點，右欄立即顯示對應縮圖。")
+        st.caption("在散點圖框選任一群點，右欄立即顯示對應縮圖。"
+                   "進階功能（以文搜圖、重複掃描…）見右上「✨ 功能地圖」。")
     mid = st.columns([2, 1.6, 2])[1]
     mid.button("▶ 一鍵體驗（coco8 範例）", key="viz_demo_btn", type="primary",
                use_container_width=True, on_click=_load_demo,
@@ -1679,7 +1683,7 @@ def main() -> None:
         _log_usage("session_start")
 
     # 單行工具列取代舊的 st.title + sidebar Tool radio——把首屏高度還給工作區
-    brand_col, switch_col = st.columns([2, 3], gap="medium")
+    brand_col, switch_col, help_col = st.columns([2, 3, 1], gap="medium")
     brand_col.markdown("#### Dataset Analysis Tools")
     st.session_state.setdefault("tool_switch", "Visualize Embeddings")
     with switch_col:
@@ -1687,6 +1691,18 @@ def main() -> None:
             "Tool", ["Visualize Embeddings", "Compare Distributions"],
             key="tool_switch", label_visibility="collapsed",
         ) or "Visualize Embeddings"
+    with help_col, st.popover("✨ 功能地圖", use_container_width=True):
+        st.markdown(
+            "- **框選看圖**：左圖拖曳框選／套索 → 右欄「選取」縮圖牆\n"
+            "- **以文搜圖**：Model 選 *chinese-clip* → 右欄「相似」tab 輸入中文查詢\n"
+            "- **以圖搜圖**：選取影像後按「🔎 找相似」，↻ 可連鎖跳查\n"
+            "- **重複／洩漏掃描**：右欄「重複」tab（phash 嚴格、embedding 語意，"
+            "勾「僅跨 split」＝train/val 洩漏）\n"
+            "- **離群度・標籤分歧**：Run 完自動計算，右欄排序選單切換\n"
+            "- **匯出清單**：跨視圖累積選取，匯出 CSV（含 sha256）／ZIP\n"
+            "- **比較兩資料夾**：Compare Distributions——FID/KID 等指標＋"
+            "點選散點看對應影像"
+        )
 
     if tool == "Visualize Embeddings":
         _visualize_embeddings_ui()

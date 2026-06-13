@@ -122,6 +122,12 @@ def _click_marker(page, group_idx: int, path_idx: int, shift: bool = False) -> N
 def test_a_cold_load(flow_page):
     expect(flow_page.get_by_text("Dataset Analysis Tools")).to_be_visible()
     expect(flow_page.locator('[data-testid="stSidebar"]')).to_be_visible()
+    # feature discoverability: the feature map popover is one click away
+    popover_btn = flow_page.get_by_test_id("stPopoverButton")
+    expect(popover_btn).to_be_visible()
+    popover_btn.click()
+    expect(flow_page.get_by_text("以文搜圖", exact=False).first).to_be_visible()
+    flow_page.keyboard.press("Escape")
     _no_exception(flow_page)
 
 
