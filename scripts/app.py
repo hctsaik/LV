@@ -120,6 +120,23 @@ def _pick_folder_append(list_key: str) -> None:
             st.session_state[list_key].append(path)
 
 
+def _pick_folder_into_text(text_key: str) -> None:
+    """Open the native folder dialog and append the chosen path (one per
+    line) to a text-area's value — for the tools that take a pasted path.
+    Runs as an on_click callback so the value is set before the rerun."""
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes("-topmost", 1)
+    path = filedialog.askdirectory(title="選擇資料夾")
+    root.destroy()
+    if path:
+        cur = st.session_state.get(text_key, "").rstrip()
+        lines = [ln.strip() for ln in cur.splitlines() if ln.strip()]
+        if path not in lines:
+            lines.append(path)
+        st.session_state[text_key] = "\n".join(lines)
+
+
 _VIZ_COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c", "#95a5a6"]
 _VIZ_SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
 _METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap"}
@@ -2102,10 +2119,13 @@ def _completeness_ui() -> None:
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
+        st.button("📁 選擇資料夾", key="cov_pick", use_container_width=True,
+                  on_click=_pick_folder_into_text, args=("cov_folder_text",))
         st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="cov_folder_text",
                      placeholder="例：demo/imagenette/train", height=68,
                      label_visibility="collapsed",
-                     help="結構需為 資料夾／類別／影像。或按主畫面的「✨ 用範例資料試跑」。")
+                     help="結構需為 資料夾／類別／影像。或按上方「📁 選擇資料夾」、"
+                          "或主畫面的「✨ 用範例資料試跑」。")
         all_models = available_models()
         if not all_models:
             st.error("models/ 內找不到模型檔。")
@@ -2398,6 +2418,8 @@ def _quiz_ui() -> None:
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
+        st.button("📁 選擇資料夾", key="quiz_pick", use_container_width=True,
+                  on_click=_pick_folder_into_text, args=("quiz_folder_text",))
         st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="quiz_folder_text",
                      placeholder="例：demo/imagenette/train", height=68,
                      label_visibility="collapsed")
@@ -2593,6 +2615,8 @@ def _gray_zone_ui() -> None:
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
+        st.button("📁 選擇資料夾", key="gray_pick", use_container_width=True,
+                  on_click=_pick_folder_into_text, args=("gray_folder_text",))
         st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="gray_folder_text",
                      placeholder="例：demo/imagenette/train", height=68,
                      label_visibility="collapsed")
