@@ -29,7 +29,9 @@ from _utils import (
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
     attribute_escape,
     build_nn_index,
+    curation_log_csv,
     diagnose_root_cause,
+    match_shas_to_indices,
     compute_label_disagreement,
     compute_outlier_scores,
     draw_yolo_boxes,
@@ -305,6 +307,66 @@ def _log_usage(event: str, **fields) -> None:
             f.write(json.dumps({"ts": time.time(), "event": event, **fields}) + "\n")
     except OSError:
         pass
+
+
+_CURATION_LOG = Path(__file__).parent.parent / "output" / "curation_log.jsonl"
+
+
+def _load_curation_log() -> list[dict]:
+    """Read the on-disk curation log (most recent first). Survives restart."""
+    if not _CURATION_LOG.exists():
+        return []
+    out = []
+    for line in _CURATION_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return list(reversed(out))
+
+
+def _append_curation_entry(records: list[dict], indices: list[int],
+                           reason: str) -> None:
+    """Append one selection + reason to the disk log (策展時間維度 #1)."""
+    man = st.session_state.get("viz_manifest", {})
+    items = []
+    for i in indices:
+        p = Path(records[i]["path"])
+        entry = man.get(str(p.resolve()), {})
+        items.append({"sha256": entry.get("sha256", ""), "filename": p.name,
+                      "label": records[i].get("label", ""),
+                      "split": records[i].get("split", "")})
+    rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "reason": reason.strip(),
+           "n": len(indices), "items": items}
+    try:
+        _CURATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _CURATION_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        st.toast(f"已記錄此選取（{len(indices)} 張）＋理由", icon="📝")
+        _log_usage("curation_log", n=len(indices))
+    except OSError as exc:
+        st.warning(f"寫入策展日誌失敗：{exc}")
+
+
+def _curation_reselect(records: list[dict], shas: list[str]) -> None:
+    """Re-select a logged selection by content hash（回到上週的選取）."""
+    man = st.session_state.get("viz_manifest", {})
+    sha_to_index = {}
+    for i, r in enumerate(records):
+        e = man.get(str(Path(r["path"]).resolve()))
+        if e and e.get("sha256"):
+            sha_to_index[e["sha256"]] = i
+    idxs = match_shas_to_indices(shas, sha_to_index)
+    if not idxs:
+        st.toast("此日誌的影像不在目前資料集中（可能是別的 Run）。", icon="⚠")
+        return
+    st.session_state["viz_selection"] = {
+        "token": st.session_state.get("viz_data_token"), "indices": idxs}
+    st.session_state["viz_grid_limit"] = _GRID_BATCH
+    st.session_state["viz_active_image"] = None
+    st.toast(f"已重選 {len(idxs)} 張（日誌回放）", icon="↩")
 
 
 def _set_active_image(idx: int | None, ctx: list[int] | None = None) -> None:
@@ -594,6 +656,36 @@ def _render_select_view(
         ])
         st.dataframe(df, key="viz_sel_table", hide_index=True,
                      use_container_width=True, height=220)
+
+    _render_curation_log(records, sel_indices)
+
+
+def _render_curation_log(records: list[dict], sel_indices: list[int]) -> None:
+    """策展時間維度（重評 #1）：把選取＋判斷理由落盤，跨重啟保存、可回看、
+    可一鍵重選、可匯出交接。回答『回到上週的選取＋為什麼這樣選』。"""
+    with st.expander("📝 策展日誌（記錄選取＋理由，跨重啟保存）"):
+        reason = st.text_input("這次選取的理由（為什麼選這批）", key="viz_cur_reason",
+                               placeholder="例：疑似標錯的灰帶，待覆核")
+        st.button(f"記錄目前選取（{len(sel_indices)} 張）＋理由", key="viz_cur_log",
+                  use_container_width=True,
+                  disabled=not sel_indices or not reason.strip(),
+                  on_click=_append_curation_entry, args=(records, sel_indices, reason))
+        entries = _load_curation_log()
+        if not entries:
+            st.caption("尚無紀錄。選取後填理由按上方按鈕即可留痕。")
+            return
+        st.caption(f"近期紀錄（共 {len(entries)} 筆，最新在上）：")
+        with st.container(height=200):
+            for k, e in enumerate(entries[:30]):
+                shas = [it.get("sha256", "") for it in e.get("items", [])]
+                c1, c2 = st.columns([4, 1])
+                c1.markdown(f"**{e.get('ts','')}** · {e.get('n',0)} 張 · "
+                            f"{e.get('reason','')}")
+                c2.button("↩ 重選", key=f"viz_cur_re_{k}", use_container_width=True,
+                          on_click=_curation_reselect, args=(records, shas))
+        st.download_button("⬇ 匯出策展日誌 CSV", data=curation_log_csv(entries),
+                           file_name="curation_log.csv", mime="text/csv",
+                           key="viz_cur_csv", use_container_width=True)
 
 
 def _pivot_to_image_query(idx: int) -> None:
@@ -2801,6 +2893,8 @@ def main() -> None:
             "用 S1 人類一致性（組考卷）× S2 覆蓋密度 × S3 模型不確定度 交叉定位 "
             "H1–H5 根因，直接回答『補資料有沒有用』，可匯出 HTML\n"
             "- **匯出清單**：跨視圖累積選取，匯出 CSV（含 sha256）／ZIP\n"
+            "- **策展日誌**：選取面板底部 → 記錄『選了哪批＋為什麼』，跨重啟保存、"
+            "可一鍵重選、可匯出交接（回到上週的選取）\n"
             "- **固定 UMAP 參考系**：③ 投影方法下的開關——跨 Run 佈局可比較\n"
             "- **比較兩資料夾**：Compare Distributions——FID/KID 等指標＋"
             "點選散點看對應影像\n"

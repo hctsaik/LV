@@ -963,3 +963,45 @@ def test_z_gray_zone_review(app_page, tmp_path):
     # approved decision lands in the export list
     expect(page.locator('.st-key-gray_decisions_csv')).to_be_visible()
     _no_exception(page)
+
+
+# ── (aa) curation log: record selection + reason, persist, re-select ────
+
+def test_aa_curation_log(flow_page):
+    page = flow_page
+    _switch_panel(page, "選取")
+    if _selected_count(page) == 0:
+        _click_marker(page, 0, 1)
+    n = _selected_count(page)
+    assert n >= 1
+
+    def _open_log():
+        # idempotent: only expand if collapsed (clicking an open expander
+        # toggles it closed, and clear keeps the widget's open state)
+        if not page.locator('.st-key-viz_cur_reason input').is_visible():
+            page.locator('[data-testid="stExpander"] summary'
+                         ).filter(has_text="策展日誌").first.click()
+            wait_idle(page)
+
+    _open_log()
+    page.locator('.st-key-viz_cur_reason input').fill("e2e：疑似灰帶一批")
+    page.keyboard.press("Tab")
+    wait_idle(page)
+    page.locator('.st-key-viz_cur_log button').click()
+    wait_idle(page)
+    # the entry is now logged (survives restart on disk) + listed with re-select
+    expect(page.get_by_text(re.compile("e2e：疑似灰帶一批")).first).to_be_visible()
+    expect(page.locator('.st-key-viz_cur_csv')).to_be_visible()
+    # clear, then re-select from the log → selection comes back by sha256
+    _click_wait_status(page, '.st-key-viz_clear_btn button')
+    assert "未選取" in _status_text(page)
+    _open_log()
+    re_btn = page.locator('[class*="st-key-viz_cur_re_"] button').first
+    re_btn.scroll_into_view_if_needed()
+    re_btn.click()
+    page.wait_for_function(
+        """() => { const el = document.querySelector('.st-key-viz_status_line');
+                   return el && el.innerText.includes('已選取'); }""", timeout=10000)
+    wait_idle(page)
+    assert _selected_count(page) == n, "re-select from the log restores the batch"
+    _no_exception(page)

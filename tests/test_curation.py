@@ -316,3 +316,32 @@ def test_diag_threshold_boundaries_configurable():
     # raise the consistency bar so a 0.8 score now counts as inconsistent
     r2 = diagnose_root_cause(0.8, 1, 0.8, consistency_thr=0.9)
     assert r2["cause"] == CAUSE_H2
+
+
+# ── curation log (time dimension: selection + reason) ───────────────────
+
+from interaction import curation_log_csv, match_shas_to_indices  # noqa: E402
+
+
+def test_curation_log_csv_contract():
+    entries = [
+        {"ts": "2026-06-13T10:00", "reason": "可疑灰帶一批", "n": 2,
+         "items": [{"filename": "a.jpg", "sha256": "aa"},
+                   {"filename": "b.jpg", "sha256": "bb"}]},
+    ]
+    lines = curation_log_csv(entries).splitlines()
+    assert lines[0] == "ts,reason,n,filenames,sha256s"
+    assert "可疑灰帶一批" in lines[1]
+    assert "a.jpg b.jpg" in lines[1] and "aa bb" in lines[1]
+    assert curation_log_csv([]).strip() == "ts,reason,n,filenames,sha256s"
+
+
+def test_match_shas_to_indices_reselect_and_degrade():
+    sha_to_index = {"aa": 0, "bb": 1, "cc": 2}
+    # all present → re-select in order
+    assert match_shas_to_indices(["bb", "aa"], sha_to_index) == [1, 0]
+    # a hash from another dataset is skipped, not an error
+    assert match_shas_to_indices(["aa", "zz", "cc"], sha_to_index) == [0, 2]
+    # de-duplicated
+    assert match_shas_to_indices(["aa", "aa"], sha_to_index) == [0]
+    assert match_shas_to_indices([], sha_to_index) == []

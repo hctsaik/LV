@@ -150,6 +150,45 @@ def compute_outlier_scores(
     return dist.mean(axis=1)
 
 
+_CURATION_HEADER = ["ts", "reason", "n", "filenames", "sha256s"]
+
+
+def curation_log_csv(entries: Sequence[dict]) -> str:
+    """Export the curation log (selection + free-text reason) to CSV.
+
+    One row per logged selection: timestamp, the curator's reason, how
+    many images, and the filenames / sha256s (content-addressed) so the
+    record is auditable and transferable to a teammate."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(_CURATION_HEADER)
+    for e in entries:
+        items = e.get("items", [])
+        w.writerow([
+            e.get("ts", ""), e.get("reason", ""), e.get("n", len(items)),
+            " ".join(it.get("filename", "") for it in items),
+            " ".join(it.get("sha256", "") for it in items),
+        ])
+    return buf.getvalue()
+
+
+def match_shas_to_indices(
+    shas: Sequence[str], sha_to_index: dict[str, int],
+) -> list[int]:
+    """Map a logged selection's content hashes back to current record
+    indices (re-select『回到上週的選取』). Hashes not present in the
+    current run are silently skipped, so a log made on one dataset
+    degrades gracefully on another. De-duplicated, order preserved."""
+    seen: set[int] = set()
+    out: list[int] = []
+    for s in shas:
+        i = sha_to_index.get(s)
+        if i is not None and i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
 def select_gray_zone(scores: np.ndarray, k: int) -> list[int]:
     """Gray-zone review queue (§3): the k most ambiguous items by score
     (e.g. kNN label-disagreement), highest first. ``k`` clamped to N."""
