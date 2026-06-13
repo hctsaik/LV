@@ -814,14 +814,18 @@ def test_w_completeness_calibration_and_mining(app_page, tmp_path):
 
     page.locator('.st-key-tool_switch').get_by_text("完整度熱力圖").click()
     wait_idle(page)
+    # Run-time sidebar is just folder + model + run; tuning lives post-Run
     page.locator('.st-key-cov_folder_text textarea').fill(str(root))
-    page.locator('.st-key-cov_pool_text textarea').fill(str(pool))
-    page.locator('.st-key-cov_t_abs input').fill("4")
-    page.keyboard.press("Tab")
     page.locator('.st-key-run_cov button').click()
     page.wait_for_selector('.st-key-cov_heatmap', timeout=300000)
     wait_idle(page, timeout=120000)
     _no_exception(page)
+
+    # tuning row is in the main area now: lower the per-cell floor live (no re-Run)
+    page.locator('.st-key-cov_t_abs input').fill("4")
+    page.keyboard.press("Tab")
+    wait_idle(page)
+    expect(page.locator('.st-key-cov_heatmap')).to_be_visible()  # re-rendered, no re-Run
 
     # (a) calibration editor is present (uncalibrated warning visible first)
     expect(page.get_by_text(re.compile("未校正真實分佈"))).to_be_visible()
@@ -829,12 +833,19 @@ def test_w_completeness_calibration_and_mining(app_page, tmp_path):
     wait_idle(page)
     expect(page.locator('.st-key-cov_apply_freq')).to_be_visible()
 
-    # (b) pick a cell → candidate mining button appears, mining renders results
+    # (b) pick a cell → set the candidate pool in the popover, mine, export
     page.locator('.st-key-cov_cell_pick [data-baseweb="select"]').click()
     page.get_by_role("option").nth(1).click()
     wait_idle(page)
-    expect(page.locator('.st-key-cov_mine_btn')).to_be_visible()
-    page.locator('.st-key-cov_mine_btn button').click()
+    page.get_by_text("🔎 撈候選補此格").click()  # open the pool popover
+    pool_box = page.locator('.st-key-cov_pool_text textarea')
+    expect(pool_box).to_be_visible()  # wait for the popover body to mount
+    pool_box.fill(str(pool))
+    page.keyboard.press("Tab")
+    wait_idle(page)
+    mine = page.locator('.st-key-cov_mine_btn button')
+    expect(mine).to_be_enabled()
+    mine.click()
     wait_idle(page, timeout=120000)
     expect(page.locator('.st-key-cov_cand_csv')).to_be_visible()
     _no_exception(page)

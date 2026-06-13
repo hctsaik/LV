@@ -1975,16 +1975,47 @@ def _render_cov_candidates(cell: dict, records: list[dict]) -> None:
                        key="cov_cand_csv", use_container_width=True)
 
 
+_COV_DEMO_DIR = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
+_D_STAR_PRESET = {"寬鬆": 0.45, "標準": 0.6, "嚴格": 0.75}
+
+
+def _load_cov_demo() -> None:
+    st.session_state["cov_folder_text"] = str(_COV_DEMO_DIR)
+    st.session_state["_cov_autorun"] = True
+    _log_usage("cov_demo_load")
+
+
+def _render_cov_quick_start() -> None:
+    """冷啟動空狀態：三步卡 + 一鍵 demo（對齊 Visualize 的引導模式）。"""
+    st.markdown("##### 快速開始")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1, st.container(border=True):
+        st.markdown("**① 貼資料夾**")
+        st.caption("在左側貼上含「類別子資料夾」的影像資料夾路徑。")
+    with c2, st.container(border=True):
+        st.markdown("**② 選模型**")
+        st.caption("用來算每格內影像的多樣性（偵測近重複充數）。")
+    with c3, st.container(border=True):
+        st.markdown("**③ 開始分析**")
+        st.caption("跑完出現熱力圖；切格方式與達標標準可在圖上方即時調，免重跑。")
+    mid = st.columns([2, 1.6, 2])[1]
+    mid.button("✨ 用範例資料試跑（imagenette）", key="cov_demo_btn",
+               type="primary", use_container_width=True,
+               on_click=_load_cov_demo,
+               disabled=not _COV_DEMO_DIR.exists())
+
+
 def _completeness_ui() -> None:
     st.markdown("##### 模型收值完整性熱力圖")
-    st.caption("把資料依兩個屬性軸切成小格，看每格「不太多也不太少」。"
-               "綠＝健康、紫＝假完整（量夠但都是近重複）、紅/橘＝缺。"
-               "詳見 docs/defect_mechanisms_v2.md §5。")
+    st.caption("把資料切成小棋盤格，看每格「不太多也不太少」。"
+               "🟩 健康、🟪 假完整（量夠但都是近重複）、🟥/🟧 缺。")
 
     with st.sidebar:
-        st.markdown("**① 資料**")
-        st.text_area("資料夾路徑（每行一個）", key="cov_folder_text",
-                     placeholder="例：demo/imagenette/train", height=68)
+        st.markdown("**① 資料夾**")
+        st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="cov_folder_text",
+                     placeholder="例：demo/imagenette/train", height=68,
+                     label_visibility="collapsed",
+                     help="結構需為 資料夾／類別／影像。或按主畫面的「✨ 用範例資料試跑」。")
         all_models = available_models()
         if not all_models:
             st.error("models/ 內找不到模型檔。")
@@ -1992,25 +2023,11 @@ def _completeness_ui() -> None:
         st.markdown("**② 模型**")
         model = st.selectbox("模型", all_models, label_visibility="collapsed",
                              help="算每格內 embedding 多樣性（質量探針）用。")
-        st.markdown("**③ 屬性軸**")
-        axis_opts = ["label", "split", *_AUTO_AXES]
-        ax_x = st.selectbox("X 軸", axis_opts, index=0, key="cov_ax_x")
-        ax_y = st.selectbox("Y 軸", axis_opts, index=2, key="cov_ax_y")
-        st.number_input("數值軸分桶數", min_value=2, max_value=8, value=3,
-                        key="cov_bins", help="brightness 等連續屬性切幾檔。")
-        st.markdown("**④ 健康帶**")
-        t_abs = st.number_input("每格目標樣本數（地板）", min_value=1, value=10,
-                                key="cov_t_abs",
-                                help="未提供真實分佈時的均勻目標，標『未校正』。")
-        d_star = st.slider("多樣性門檻 d*", 0.0, 1.0, 0.6, 0.05, key="cov_dstar",
-                           help="格內多樣性低於此值＝假完整（近重複充數）。")
-        st.markdown("**⑤ 候選池（選用）**")
-        st.text_area("撈候選用的資料夾（每行一個）", key="cov_pool_text",
-                     placeholder="例：未標註的產線影像資料夾", height=58,
-                     help="缺格時從這裡以圖搜圖撈相似候選來補。留空則不啟用。")
-        run = st.button("▶ Run", use_container_width=True, key="run_cov",
+        run = st.button("▶ 開始分析", use_container_width=True, key="run_cov",
                         type="primary")
 
+    if st.session_state.pop("_cov_autorun", False):
+        run = True
     if run:
         folders = parse_folder_paths(st.session_state.get("cov_folder_text", ""))
         missing = [str(p) for p in folders if not p.exists()]
@@ -2020,7 +2037,7 @@ def _completeness_ui() -> None:
             st.error(f"資料夾不存在：{', '.join(missing)}"); return
         records = discover_images_classifier(folders)
         if not records:
-            st.error("找不到影像（需 folder/類別/影像 結構）。"); return
+            st.error("找不到影像（需 資料夾／類別／影像 結構）。"); return
 
         embed_fn = load_model(model)
         with st.status("計算中…", expanded=True) as _status:
@@ -2053,17 +2070,40 @@ def _completeness_ui() -> None:
         st.toast(f"完成：{len(records)} 張影像", icon="✅")
 
     if "cov_records" not in st.session_state:
-        st.info("在左側輸入資料夾、選兩個屬性軸後按 ▶ Run。"
-                "建議先用 demo/imagenette/train 試跑。")
+        _render_cov_quick_start()
         return
 
     records = st.session_state["cov_records"]
     emb = st.session_state["cov_emb"]
+
+    # ── tuning 列（在熱力圖正上方即時調，免重跑）──
+    axis_opts = ["label", "split", *_AUTO_AXES]
+    _AXIS_LABEL = {"label": "類別", "split": "資料集(split)", "brightness": "亮度",
+                   "contrast": "對比", "sharpness": "銳利度", "aspect": "長寬比"}
+    tcol = st.columns([1.4, 1.4, 1, 1.3, 1.4])
+    ax_x = tcol[0].selectbox("橫看（X）", axis_opts, index=0, key="cov_ax_x",
+                             format_func=lambda a: _AXIS_LABEL.get(a, a),
+                             help="把資料依哪個特徵切成橫向格子。")
+    ax_y = tcol[1].selectbox("直看（Y）", axis_opts, index=2, key="cov_ax_y",
+                             format_func=lambda a: _AXIS_LABEL.get(a, a),
+                             help="把資料依哪個特徵切成縱向格子。")
+    bins = tcol[2].number_input("連續特徵分幾檔", min_value=2, max_value=8, value=3,
+                                key="cov_bins",
+                                help="亮度這類連續值切成幾段（暗/中/亮＝3）。"
+                                     "改這個會清掉已填的真實分佈校正。")
+    t_abs = tcol[3].number_input("每格至少幾張", min_value=1, value=10,
+                                 key="cov_t_abs",
+                                 help="低於此數視為樣本不足。未提供真實分佈時對每格一視同仁。")
+    preset = tcol[4].radio("近重複警戒", list(_D_STAR_PRESET), index=1, horizontal=True,
+                           key="cov_dstar_preset",
+                           help="一格裡的圖太像（疑似近重複充數）就標🟪假完整；越嚴格越容易被判為假完整。")
+    d_star = _D_STAR_PRESET[preset]
+
     bx, lx = _completeness_axis_values(records, ax_x)
     by, ly = _completeness_axis_values(records, ax_y)
 
     # (a) 真實分佈校正：每格 高/中/低/不適用 先驗（粗分級即可起步）
-    grid_key = f"{st.session_state.get('cov_token', '')}|{ax_x}|{ax_y}|{st.session_state.get('cov_bins')}"
+    grid_key = f"{st.session_state.get('cov_token', '')}|{ax_x}|{ax_y}|{bins}"
     freq_classes = st.session_state.get("cov_freq_classes", {})
     if st.session_state.get("cov_freq_grid_key") != grid_key:
         freq_classes = {}
@@ -2105,10 +2145,11 @@ def _completeness_ui() -> None:
             colorscale=colorscale, zmin=0, zmax=5, showscale=False,
             xgap=3, ygap=3,
         ))
+        lab_x, lab_y = _AXIS_LABEL.get(ax_x, ax_x), _AXIS_LABEL.get(ax_y, ax_y)
         fig.update_layout(
             height=560, margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_title=ax_x, yaxis_title=ax_y,
-            title=f"{ax_x} × {ax_y}　·　🟥缺 🟧偏缺 🟩健康 🟪假完整 🟦過多",
+            xaxis_title=lab_x, yaxis_title=lab_y,
+            title=f"{lab_x} × {lab_y}　·　🟥缺 🟧偏缺 🟩健康 🟪假完整 🟦過多",
         )
         st.plotly_chart(fig, use_container_width=True, key="cov_heatmap")
 
@@ -2180,15 +2221,16 @@ def _completeness_ui() -> None:
                         else:
                             st.warning("⚠ 缺檔")
 
-            # (b) 缺格一鍵撈候選：從候選池以圖搜圖補
-            pool_text = st.session_state.get("cov_pool_text", "")
-            if pool_text.strip():
-                if st.button("🔎 從候選池撈相似候選", key="cov_mine_btn",
-                             use_container_width=True):
+            # (b) 缺格一鍵撈候選：候選池就地設定（popover），免回 sidebar
+            with st.popover("🔎 撈候選補此格", use_container_width=True):
+                st.text_area("候選池資料夾（每行一個，通常是未標註的影像）",
+                             key="cov_pool_text", height=58,
+                             placeholder="例：未標註的產線影像資料夾")
+                if st.button("開始撈候選", key="cov_mine_btn",
+                             use_container_width=True,
+                             disabled=not st.session_state.get("cov_pool_text", "").strip()):
                     _mine_cell_candidates(cell, records, emb, model)
-                _render_cov_candidates(cell, records)
-            else:
-                st.caption("（在左側『⑤ 候選池』填入資料夾即可一鍵撈候選補此格）")
+            _render_cov_candidates(cell, records)
             st.button("✕ 關閉", key="cov_cell_close",
                       on_click=lambda: st.session_state.pop("cov_active_cell", None))
 
