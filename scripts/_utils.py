@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -14,7 +15,12 @@ from models import (
     ResNetExtractor,
 )
 
-_DEFAULT_MODELS_DIR = Path(__file__).parent.parent / "models"
+# Model weights live in ``models/`` by default; the host platform (CIM) points
+# this at a writable "model-house" via LV_MODELS_DIR so the vendored submodule
+# stays thin (weights are not committed). Unset → unchanged local behaviour.
+_DEFAULT_MODELS_DIR = Path(
+    os.environ.get("LV_MODELS_DIR") or (Path(__file__).parent.parent / "models")
+)
 
 
 def available_models(models_dir: Path = _DEFAULT_MODELS_DIR) -> list[str]:

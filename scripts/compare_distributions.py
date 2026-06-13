@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 
@@ -16,7 +17,12 @@ from sklearn.manifold import TSNE
 
 from _utils import available_models, extract_embeddings, load_model
 
-_MODEL_DIR = Path("model")
+# Inception (FID/KID) weights dir. LV_INCEPTION_DIR lets the host platform point
+# at a writable model-house; default resolves next to the package (not cwd, which
+# previously broke when launched from another working dir). Unset → local default.
+_MODEL_DIR = Path(
+    os.environ.get("LV_INCEPTION_DIR") or (Path(__file__).parent.parent / "model")
+)
 
 
 def _load_inception(device: torch.device):
