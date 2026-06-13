@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>瑕疵檢測「漏逮」分析機制設計 — 多 Agent 評審共識</title>
+<style>
+  :root { --ink:#1a2433; --mut:#5a6b80; --line:#e3e8ef; --acc:#c0392b; --ok:#1e8e5a; --warn:#b9770e; --bg:#f7f9fb; }
+  * { box-sizing:border-box; }
+  body { font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; color:var(--ink);
+         background:var(--bg); margin:0; line-height:1.75; }
+  .wrap { max-width:1080px; margin:0 auto; padding:40px 28px 80px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:44px 0 12px; border-left:4px solid var(--acc); padding-left:10px; }
+  h3 { font-size:16px; margin:24px 0 8px; }
+  .sub { color:var(--mut); font-size:13px; margin-bottom:24px; }
+  .badge { display:inline-block; background:var(--ok); color:#fff; border-radius:4px;
+           font-size:12px; padding:2px 10px; margin-left:8px; vertical-align:middle; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin:14px 0; }
+  .card h3 { margin-top:0; }
+  table { width:100%; border-collapse:collapse; background:#fff; font-size:14px; margin:10px 0 18px; }
+  th,td { border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top; }
+  th { background:#eef2f7; font-weight:600; white-space:nowrap; }
+  .pill { display:inline-block; border-radius:10px; padding:0 8px; font-size:12px; font-weight:600; }
+  .pA{background:#fdecea;color:#c0392b}.pB{background:#eafaf1;color:#1e8e5a}.pC{background:#fef9e7;color:#b9770e}
+  .pD{background:#ebf5fb;color:#2471a3}.pE{background:#f4ecf7;color:#7d3c98}
+  .quote { border-left:3px solid var(--warn); background:#fffaf0; padding:10px 14px; margin:12px 0;
+           font-size:14px; color:#6b5a2e; border-radius:0 8px 8px 0; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  ol,ul { padding-left:22px; } li { margin:4px 0; }
+  code { background:#eef2f7; border-radius:4px; padding:1px 6px; font-size:13px; }
+  .warnbox { background:#fdecea; border:1px solid #f5b7b1; border-radius:8px; padding:12px 16px; margin:10px 0; font-size:14px; }
+  .muted { color:var(--mut); font-size:13px; }
+  @media (max-width:760px){ .grid2{grid-template-columns:1fr} }
+</style>
+</head>
+<body><div class="wrap">
+
+<h1>瑕疵檢測「漏逮」分析機制設計<span class="badge">全員簽署</span></h1>
+<div class="sub">2026-06-13 · 四位 persona（演算法老周／標註品質美玲／統計 MSA Dr. 賴／品質營運 Kevin）三輪討論收斂 · 本文件為討論成果，尚未開發</div>
+
+<h2>一、題目與需求</h2>
+<div class="card">
+  影像瑕疵檢測專案，多種影像類型，客戶要求<b>極高 precision 與 recall</b>，已投入大量資料。瑕疵<b>非常小、不明顯</b>。
+  <ol>
+    <li>客戶持續回報「漏逮」（escape）。把漏抓影像加進訓練重訓，<b>有時有效、有時無效</b>，無法預先說明。</li>
+    <li>根因一：<b>客戶自己對微小瑕疵沒有一致判斷標準</b>，不同人看法不同 —— ground truth 本身在晃。</li>
+    <li>根因二：工程端<b>無法歸因</b>一筆 miss —— 是「該擴張模型邊界」（新型態）？還是「該抓到但樣本太少」（資料不足）？</li>
+  </ol>
+  需求：設計分析機制 —— 逐筆歸因、預判加資料有效性、把「人的不一致」變成可管理的東西。
+</div>
+
+<h2>二、核心診斷（四人一致）</h2>
+<div class="grid2">
+  <div class="card"><h3>🪜 問題一：尺不準</h3>
+    參考標準（人的判定）本身有變異。模型指標量到的是「模型對某幾位標註者口味的擬合度」；
+    <b>標註者間一致性（IAA）是模型表現的天花板</b>。對策：gauge study＋定義書＋判例集＋仲裁。</div>
+  <div class="card"><h3>🎯 問題二：不歸因</h3>
+    「加資料看看會不會好」＝對著霧開槍。標準不一致的樣本塞進訓練集是灌噪音，判斷邊界被拉來拉去 ——
+    <b>這正是「有時有效有時無效」的真正根因</b>。對策：統一決策樹＋重訓前預判。</div>
+</div>
+<div class="quote">四位評審在 R1 <b>各自獨立</b>打槍了同一個做法：「收到 escape 不歸因就直接塞回訓練集重訓」。</div>
+
+<h2>三、共識框架</h2>
+
+<h3>3.1 Escape 統一決策樹（每筆漏逮依序過閘）</h3>
+<table>
+<tr><th>閘</th><th>問題</th><th>量測訊號</th><th>判定 → 出口</th><th>對應 LV 現有工具</th></tr>
+<tr><td><b>N0</b> 品質閘</td><td>影像有問題嗎？重複收件嗎？</td><td>品質檢查；manifest sha256 查重；重複/洩漏掃描</td>
+    <td>異常 → <span class="pill pE">E 流程問題</span> 修 pipeline，不碰模型</td><td>manifest、重複掃描</td></tr>
+<tr><td><b>N1</b> 定義閘</td><td>照「現行定義書」算瑕疵嗎？</td><td>仲裁人限答「是／否／灰」，24h</td>
+    <td>否 → 非瑕疵結案；灰 → 掛起每週批次仲裁</td><td>判例集（匯出清單＋雜湊）</td></tr>
+<tr><td><b>N2</b> 覆蓋閘</td><td>訓練集有相似樣本嗎？</td><td>find-similar 命中密度；embedding 離群度</td>
+    <td>零命中且離群 &gt; P99 → <span class="pill pD">D 新型態</span> 批量收集、能力邊界評估</td><td>以圖搜圖、離群度排序</td></tr>
+<tr><td><b>N3</b> 一致閘</td><td>相似樣本標籤一致嗎？</td><td>kNN 前 20 鄰標籤熵 &gt; 0.8（首月重校）</td>
+    <td>高分歧 → <span class="pill pA">A 標準漂移</span> 送仲裁、凍結該型態重訓</td><td>kNN 標籤分歧排序</td></tr>
+<tr><td><b>N4</b> 分數閘</td><td>模型分數在哪裡？</td><td>分數與閾值距離 ＋ N2 命中密度</td>
+    <td>貼閾值 → <span class="pill pC">C 邊界擦邊</span> 調閾值/雙閾值；遠低＋低密度 → <span class="pill pB">B 樣本稀缺</span> 補樣快軌</td><td>模型分數紀錄</td></tr>
+</table>
+
+<h3>3.2 雙軌制</h3>
+<div class="card">
+  <b>快軌</b>（<span class="pill pB">B</span><span class="pill pC">C</span>，kNN 零分歧、仲裁無爭議）：probe 預演 → 補樣 → per-type holdout 驗證 → 放行。<b>不必等 kappa</b> —— kappa 卡的是人，B 類缺的是樣本。<br>
+  <b>凍結軌</b>（<span class="pill pA">A</span><span class="pill pD">D</span>）：凍結重訓，走定義書修訂與批量收集，等標準收斂。
+</div>
+
+<h3>3.3 量測（gauge study，與 escape 處理並行、不停線）</h3>
+<table>
+<tr><th></th><th>設計</th><th>產出</th><th>放行門檻</th></tr>
+<tr><td><b>最小版</b>（3 工作天）</td><td>2 評審 × 30 張（邊界例 ≥10、分層）× 1 輪盲評</td><td>% agreement、vs-golden 一致率</td><td>agreement ≥ 85% → 放行無爭議型態快軌</td></tr>
+<tr><td><b>完整版</b>（2 週）</td><td>3 人 × 50 張（≥20 借邊）× 2 輪、間隔一週</td><td>分桶 Fleiss' kappa</td><td>kappa ≥ 0.75 且 vs golden ≥ 90% → 放行全量重訓＋對客報表</td></tr>
+</table>
+<div class="card"><b>kappa 到不了 0.75 的決策規則</b>：先「去灰重算」—— 剔除灰帶後 ≥0.75 → 灰區定義太窄，擴大灰區、規格不降；仍 &lt;0.75 → 該尺寸段核心例都歧義，<b>規格降級為輔助警示</b>、不入 recall 承諾、凍結該段加標投資。</div>
+
+<h3>3.4 灰帶標籤（工程規則）</h3>
+<div class="card">loss 權重 0.3 起跳（A/B 後調）；soft label＝仲裁票數比（2/3 判瑕疵 → 0.67）；
+<b>recall 分母一律剔除灰帶</b>，只含雙方確認的硬正例；灰帶另立「灰帶攔截率」併報但<b>不入合約</b>（簽署頁粗體寫明）。</div>
+
+<h3>3.5 修復驗證（放棄前瞻對照組）</h3>
+<div class="card"><ol>
+<li><b>歷史回測</b>：新模型跑凍結的歷史 escape 集＋正常品集，與舊版做 McNemar 檢定</li>
+<li><b>per-type holdout</b>：補樣切 20% 不入訓練，驗該型態 recall 的 95% CI 下限</li>
+<li><b>影子模式</b>：新版產線並行一週、不接管，收真實分佈</li></ol></div>
+
+<h3>3.6 重訓前預判（probe 對帳制）</h3>
+<div class="card">few-shot linear probe：凍結 backbone、embedding 上訓線性頭，把候選資料加入後看 escape 分數會不會動 —— 十分鐘，比重訓便宜百倍。<br>
+<b>對帳制</b>：每次預演先寫下預測 → 重訓後實測對帳 → 命中率公開於 dashboard，<b>連三次失準停用</b>。<br>
+適用邊界：只服務 B/C。D 類（backbone 沒覆蓋）與 A 類（標籤髒）不適用；樣本 &lt;20 張只給區間。</div>
+
+<h3>3.7 冷啟動</h3>
+<div class="grid2">
+<div class="card"><h3>定義書 v0（三天）</h3>escape 庫挑 20 張核心例 → 每張 find-similar top-50 → 人工切「明顯是／明顯不是／說不清」三堆 →「說不清」整理成<b>邊界判例頁</b>（一圖一句裁決理由）→ 客戶 QA 主管簽字。先求可裁決、不求完備。</div>
+<div class="card"><h3>學習曲線冷啟動</h3>回溯聚類（find-similar 對既有訓練集粗分型態，只補 escape 相關型態）＋ 25/50/75/100% 下採樣 bootstrap（借 probe 省算力）。足以判「曲線平了＝邊界問題 vs 仍陡＝樣本不足」。</div>
+</div>
+
+<h3>3.8 營運（SLA／校準／儀表板）</h3>
+<table>
+<tr><th>類別</th><th>SLA 與處置</th></tr>
+<tr><td><span class="pill pE">E 流程</span></td><td>72h 修流程，不碰模型</td></tr>
+<tr><td><span class="pill pC">C 擦邊</span></td><td>7 天內調產線閾值／雙閾值複檢</td></tr>
+<tr><td><span class="pill pB">B 稀缺</span></td><td>收圖標註立即起跑；重訓依快軌門檻放行</td></tr>
+<tr><td><span class="pill pD">D 新型態</span></td><td>14 天新類別判定＋臨時規則攔截；模型側比照 B</td></tr>
+<tr><td><span class="pill pA">A 標準漂移</span></td><td>凍結，只走定義書修訂線；不承諾時程、只承諾進校準會</td></tr>
+</table>
+<div class="card">流程：單一窗口 <b>2h 建單</b>（manifest 雜湊防重複；夜班放寬至交班後 2h）→ <b>24h 初判</b> → <b>72h 處置</b>。<br>
+<b>月度校準會（30 分鐘）</b>：三張表（SLA 結案率＋逾期清單／A–E 歸因分布趨勢／kappa 趨勢＋灰帶占比）＋兩個決定（灰帶判例晉升或剔除／下一輪重訓放行與否）。<br>
+<b>Dashboard 三數字</b>：SLA 內結案率、修復承諾兌現率、客戶標註一致率（去灰逐張 %；內部加權 kappa 同批樣本並列，避免兩套真相）。</div>
+
+<h3>3.9 規格改簽</h3>
+<div class="quote">把「極高 precision &amp; recall」改成可簽字的規格：<b>「尺寸 ≥ S、對比度 ≥ C 之瑕疵，recall ≥ 99%（95% 信賴下限），配抽樣檢驗計畫；以下灰區另議」</b>。量不出一致性的東西，不能簽進規格。</div>
+
+<h3>3.10 manifest 欄位擴充</h3>
+<div class="card"><code>型態</code> <code>尺寸</code> <code>對比度</code> <code>來源批次</code> <code>標註者</code> <code>仲裁結果</code> <code>加入時間</code> <code>模型版本</code> <code>kNN 分歧度</code> —— 為了學習曲線與歸因可追溯。</div>
+
+<h2>四、評審歷程</h2>
+<div class="card">
+<b>R1 獨立提案</b>：老周（五分類＋probe 預演）／美玲（IAA＝天花板、定義書/判例集/灰帶）／Dr. 賴（gauge study、學習曲線、規格改簽）／Kevin（SLA 流程、四類結論、三數字）。四人不約而同打槍「不歸因就重訓」。<br>
+<b>R2 交叉質詢</b>：統一決策樹 N0–N4；雙軌制（「kappa 卡人不卡樣本」）；Dr. 賴收回前瞻對照組改回測三件套；probe 對帳制與適用邊界；定義書 v0 三天生成法；灰帶工程規則；kappa 不達標決策規則；逐類 SLA 與雙指標對齊。<br>
+<b>R3 簽署</b>：全員簽署。保留意見：夜班 SLA 附註／N3 熵閾值首月重校並列入月會／manifest 與匯出自動接進建單流程需排程（約兩週）。
+</div>
+
+<h2>五、落地警告（風險登錄）</h2>
+<div class="warnbox">⚠ <b>N1 仲裁人是單點瓶頸</b> —— 休假或單量爆增時整棵樹堵死。需指定代理人。</div>
+<div class="warnbox">⚠ <b>客戶簽 v0 會在邊界判例頁打太極</b> —— 簽總則拒簽判例。判例頁是 v0 的本體，不簽不啟動。</div>
+<div class="warnbox">⚠ <b>B 類 per-type holdout 常湊不滿最低樣本數</b>，95% CI 下限算不出 —— 快軌放行需樣本數下限 fallback（點估計＋風險註記）。</div>
+<div class="warnbox">⚠ <b>find-similar 索引批次更新</b>時，當天新進 escape 查不到鄰居 → 零命中誤判成 D 新型態。建單需即時插索引或標注「索引未含本批」。</div>
+
+<h2>六、建議落地順序</h2>
+<div class="card"><ol>
+<li><b>第一週</b>：定義書 v0（三天）＋ gauge study 最小版（三天，並行）＋ escape 體檢卡（用現有 LV 工具手動跑通一筆）。</li>
+<li><b>第一個月</b>：決策樹進建單流程；A–E 逐類 SLA 生效；manifest 擴欄；probe 對帳制試行；第一次月校準會。</li>
+<li><b>持續</b>：完整版 gauge study → kappa 門檻放行；學習曲線隨新欄位累積；規格改簽談判。</li>
+</ol></div>
+
+<h2>七、開放問題（留給後續討論）</h2>
+<div class="card"><ol>
+<li>仲裁人由客戶端出，還是雙方共組？代理人機制怎麼設計？</li>
+<li>N3 熵閾值、N2 命中密度半徑 r 的初始值與重校頻率。</li>
+<li>灰帶樣本要不要進產線「低閾值警示通道」？誤報成本誰吸收？</li>
+<li>多影像類型之間，定義書與 gauge study 要不要分開做？</li>
+<li>LV 工具側：escape 體檢卡要不要做成 app 內一鍵報告？（本輪僅討論，未開發）</li>
+</ol></div>
+
+<div class="muted" style="margin-top:36px">同內容 Markdown 版：<code>docs/defect_escape_analysis.md</code> · 由多 agent 三輪評審（R1 獨立提案 → R2 交叉質詢 → R3 簽署）收斂</div>
+</div></body></html>
