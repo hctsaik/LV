@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>瑕疵分析機制 第二輪設計 — 組考卷／閾值／灰帶／體檢卡／完整度熱力圖</title>
+<style>
+  :root { --ink:#1a2433; --mut:#5a6b80; --line:#e3e8ef; --acc:#2471a3; --ok:#1e8e5a; --warn:#b9770e; --bg:#f7f9fb; }
+  * { box-sizing:border-box; }
+  body { font-family:"Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; color:var(--ink);
+         background:var(--bg); margin:0; line-height:1.75; }
+  .wrap { max-width:1100px; margin:0 auto; padding:40px 28px 80px; }
+  h1 { font-size:25px; margin:0 0 4px; }
+  h2 { font-size:20px; margin:42px 0 12px; border-left:4px solid var(--acc); padding-left:10px; }
+  h3 { font-size:16px; margin:22px 0 8px; }
+  .sub { color:var(--mut); font-size:13px; margin-bottom:22px; }
+  .badge { display:inline-block; background:var(--ok); color:#fff; border-radius:4px;
+           font-size:12px; padding:2px 10px; margin-left:8px; vertical-align:middle; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px 20px; margin:12px 0; }
+  table { width:100%; border-collapse:collapse; background:#fff; font-size:13.5px; margin:10px 0 16px; }
+  th,td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:#eef2f7; font-weight:600; }
+  .yes { color:var(--ok); font-weight:700; } .no { color:#c0392b; font-weight:700; }
+  .quote { border-left:3px solid var(--warn); background:#fffaf0; padding:10px 14px; margin:12px 0;
+           font-size:14px; color:#6b5a2e; border-radius:0 8px 8px 0; }
+  code,pre { background:#eef2f7; border-radius:4px; font-size:13px; }
+  code { padding:1px 6px; } pre { padding:12px 14px; overflow:auto; line-height:1.5; }
+  .flow { background:#0f2233; color:#d7e3ee; border-radius:10px; padding:16px 18px; font-size:13.5px; line-height:1.9; }
+  .flow b { color:#7fc8f0; }
+  .state { display:inline-block; border-radius:10px; padding:0 9px; font-size:12.5px; font-weight:600; }
+  .s-miss{background:#fdecea;color:#c0392b}.s-low{background:#fef5e7;color:#b9770e}.s-ok{background:#eafaf1;color:#1e8e5a}
+  .s-fake{background:#f4ecf7;color:#7d3c98}.s-over{background:#ebf5fb;color:#2471a3}
+  .warnbox { background:#fdecea; border:1px solid #f5b7b1; border-radius:8px; padding:10px 16px; margin:8px 0; font-size:13.5px; }
+  .muted { color:var(--mut); font-size:13px; }
+  ol,ul{padding-left:22px} li{margin:3px 0}
+</style>
+</head>
+<body><div class="wrap">
+
+<h1>瑕疵分析機制 — 第二輪設計<span class="badge">全員簽署</span></h1>
+<div class="sub">2026-06-13 · 承接 <code>defect_escape_analysis.md</code> 的開放問題 · 五位 persona（演算法／統計／標註品質／coverage／營運）三輪收斂 · 純討論，尚未開發</div>
+
+<div class="card">
+<b>本輪處理的客戶決定：</b>
+① 仲裁人客戶端出 +「組考卷」一致性盲測（§1）｜② N2/N3 閾值 自動 or config（§2）｜③ 灰帶獨立一類 + 疊圖 + 確認後才進資料集（§3）｜④ 多影像類型直接做完整版（§1.5）｜⑤ Escape 體檢卡一鍵報告（§4）｜⑥ <b>【全新】模型收值完整性熱力圖</b>（§5）
+</div>
+
+<h2>§1 組考卷：標註者一致性盲測</h2>
+<p>把「組考卷」正式設計成 <b>attribute agreement study 的儀器</b>——能拆出三個變異源、算得出統計量。</p>
+
+<h3>1.1 單卷結構（短卷多輪：化解疲勞 vs 統計力）</h3>
+<div class="card"><b>單卷 16 題封頂</b>（疲勞上限），<b>4 輪累積才結算 kappa</b>（16×4=64 題樣本）。</div>
+<table>
+<tr><th>題型</th><th>題數</th><th>占比</th><th>量什麼</th></tr>
+<tr><td>原始爭議題</td><td>7</td><td>44%</td><td>escape/爭議庫本體</td></tr>
+<tr><td>對照題 distractor（相似但答案已知）</td><td>4</td><td>25%</td><td>判準漂移 vs 題本身難</td></tr>
+<tr><td>同筆換皮重測</td><td>3</td><td>19%</td><td>自我一致性 intra-rater</td></tr>
+<tr><td>golden 定錨</td><td>2</td><td>12%</td><td>vs 標準 Cohen kappa</td></tr>
+</table>
+
+<h3>1.2 換皮允許／禁止清單</h3>
+<div class="quote"><b>總原則：只擾動「認圖記憶」（位置/構圖），不得改變「瑕疵的物理證據與灰帶判定」。</b></div>
+<table>
+<tr><th>變換</th><th>允許?</th><th>理由</th></tr>
+<tr><td>裁切（保留完整瑕疵+足夠背景）</td><td class="yes">✅</td><td>換位置不換證據</td></tr>
+<tr><td>旋轉 90/180/270、水平/垂直翻轉</td><td class="yes">✅</td><td>剛體變換</td></tr>
+<tr><td>平移、輕微縮放（瑕疵尺度仍可判）</td><td class="yes">✅</td><td>不改可見性</td></tr>
+<tr><td>對比 / 亮度 / Gamma</td><td class="no">❌</td><td>會把灰帶推過界，測到別的東西</td></tr>
+<tr><td>銳化 / 去噪 / 壓縮再編碼</td><td class="no">❌</td><td>製造或抹除瑕疵</td></tr>
+<tr><td>任意角度旋轉（插值模糊）</td><td class="no">❌</td><td>模糊改變微小瑕疵可見性</td></tr>
+</table>
+<div class="warnbox">⚠ MVP 前置：augment 白名單需寫進 CI 攔截，否則手滑套到對比調整就破功。</div>
+
+<h3>1.3 三個統計量與及格線</h3>
+<table>
+<tr><th>統計量</th><th>計算對象</th><th>門檻</th><th>不及格處置</th></tr>
+<tr><td>自我一致率</td><td>同筆換皮重測</td><td>≥ 90%</td><td>該員當輪作廢、重訓校準</td></tr>
+<tr><td>跨人 kappa（Fleiss/Cohen）</td><td>重疊題（4 題×4 輪=16）</td><td>≥ 0.75</td><td>開灰帶共識會、修手冊後重考</td></tr>
+<tr><td>相似題一致率</td><td>distractor vs 原型答案</td><td>≥ 85%</td><td>該類別禁判、回爐</td></tr>
+</table>
+
+<h3>1.4 自動生成 / 重考 / 防洩題</h3>
+<div class="card">生成：爭議題抽 escape 庫 → <code>find-similar</code> 撈 distractor → 白名單幾何變換做換皮 → golden 仲裁團鎖定。重考：每 2 週一卷。防洩題：題庫分池輪替、答案僅系統持有、<b>同一影像 6 個月內不重複進同一人卷面</b>。</div>
+
+<h3>1.5 多影像類型（直接做完整版）</h3>
+<div class="card">各型態各自做完整 gauge study，排序按「型態×出貨風險×目前 IAA 最低」，IAA 最爛先做。題庫共用「跨型態通用灰帶判準題」約 60%、型態專屬約 40%。</div>
+
+<h3>1.6 誠實邊界</h3>
+<div class="quote"><b>量到</b>：標註者對「既有 escape 案例」的判定穩定性與一致性。<br><b>量不到</b>：對「庫外新型瑕疵」的真實檢出率；「金標本身」是否正確。</div>
+
+<h2>§2 N2/N3 閾值：自動初值 + 可覆寫 config</h2>
+<p>客戶問「資料產生 or config」——<b>答案：兩者都要。自動算初值寫進 config 當 default，留覆寫 + 改簽紀錄。</b></p>
+<table>
+<tr><th>閾值</th><th>自動初值</th><th>為什麼留覆寫</th></tr>
+<tr><td>N2 命中密度半徑 r</td><td><code>r0 = percentile(訓練集 kNN 距離, 75)</code></td><td>牽動漏逮/誤殺的商業權衡，產線分佈會漂</td></tr>
+<tr><td>N3 鄰域熵閾值</td><td><code>H_thr = argmax(TPR − FPR)</code>（乾淨區 vs 爭議區 Youden-J）</td><td>同上</td></tr>
+<tr><td>N4 灰帶送審配額</td><td>純 config（不自動）</td><td>流程容量，與資料無關</td></tr>
+</table>
+<div class="quote"><b>老周底線</b>：閾值可自動給初值，但決定漏逮容忍度的那個數，永遠是客戶簽字的 config，不是模型偷偷算的。<br><span class="muted">保留：P75 初值隨訓練集漂移，重訓後必須重算。</span></div>
+
+<h2>§3 灰帶煉獄：獨立一類 + 疊圖 + 雙簽</h2>
+<div class="card">
+<b>疊圖三層對照</b>：灰帶圖 vs 判例集「明確是/明確否」<b>雙錨</b>（最有裁決力）；模型熱區當參考、非裁決依據。<br>
+<b>進資料集記四欄</b>：誰確認 · 比對了哪張判例(ID) · 最終 soft label(含信賴度) · 改判理由一句 → 判例集增量來源。<br>
+<b>雙簽 + 時限</b>：標註初判 → 品保覆核（<b>人員不可重疊</b>）→ 進資料集；每週清、>14 天告警、>30 天強制裁決。
+</div>
+<div class="warnbox">⚠ >30 天強制裁決遇客戶不回應會卡死，需設預設裁決 + 升級路徑。</div>
+
+<h2>§4 Escape 體檢卡：app 內一鍵報告</h2>
+<table>
+<tr><th>區塊</th><th>必放?</th><th>內容</th></tr>
+<tr><td>歸因 A–E + 信心</td><td class="yes">✅</td><td>決策樹落點</td></tr>
+<tr><td>kNN 鄰居縮圖牆</td><td class="yes">✅</td><td>「它長得像誰」</td></tr>
+<tr><td>訓練集命中密度</td><td class="yes">✅</td><td>「有沒有教過它」</td></tr>
+<tr><td>模型分數距閾值</td><td class="yes">✅</td><td>「差一點還差很遠」</td></tr>
+<tr><td>建議處置 + SLA</td><td class="yes">✅</td><td>誰做、何時做完</td></tr>
+<tr><td>熱力圖座標</td><td class="yes">✅</td><td>「本筆=熱力圖第 R3C5 格｜該格缺 47 筆、覆蓋 38%」</td></tr>
+<tr><td>離群度 / 相似歷史 escape / probe 預判</td><td>選配（摺疊）</td><td>工程深挖</td></tr>
+</table>
+<div class="card"><b>兩種讀者、一份檔依角色 render</b>：客戶版 PDF 封面只放結論+SLA+<b>漏逮容忍度簽核欄</b>，不露技術細節；工程版 HTML 附錄全開、可點進 LV。<br><b>操作</b>：散點選點右鍵「產體檢卡」，支援批次框選。</div>
+
+<h2>§5 模型收值完整性熱力圖（全新）</h2>
+
+<h3>5.1 核心決策：小格切在哪個空間</h3>
+<table>
+<tr><th>方案</th><th>密度可信</th><th>可解釋</th><th>可操作</th><th>裁決</th></tr>
+<tr><td>2D UMAP 鋪格</td><td class="no">零（不保密度）</td><td>中</td><td>高</td><td class="no">淘汰（當分母=自欺）</td></tr>
+<tr><td><b>屬性軸網格</b>（型態×尺寸×對比×來源）</td><td class="yes">高</td><td class="yes">最高</td><td class="yes">最高</td><td class="yes"><b>骨幹</b></td></tr>
+<tr><td>embedding 分群當 cell</td><td class="yes">高</td><td class="no">差</td><td>中</td><td>格內質量探針</td></tr>
+</table>
+<div class="quote"><b>屬性軸定位置、embedding 驗質量</b>：主熱力圖用 manifest 結構化欄位的屬性軸（看得懂、可下指令）；embedding 不切格，拿來算<b>格內多樣性 d</b>，抓「屬性軸沒切到、但其實是兩坨」的隱性缺口。UMAP 全程只當看圖入口、絕不計數。<br><b>小林死守</b>：分母一律產線真實頻率，幾何均勻只是無資訊退路且必標「未校正」——稀有即稀有，不得被幾何格數攤平成假缺口。</div>
+
+<h3>5.2 每格判定樹（量 n + 質 d + 目標 t）</h3>
+<div class="card"><b>d</b>＝格內 embedding「平均最近鄰距離(正規化)」與「有效秩(95% 能量維數)」幾何平均 ∈[0,1]；<b>d*</b> 預設 0.6。</div>
+<table>
+<tr><th>條件</th><th>狀態</th><th>行動</th></tr>
+<tr><td>n &lt; 0.5t</td><td><span class="state s-miss">🔴 缺</span></td><td>補資料</td></tr>
+<tr><td>0.5t ≤ n &lt; t</td><td><span class="state s-low">🟠 偏缺</span></td><td>補資料</td></tr>
+<tr><td>n ≥ t 且 d ≥ d*</td><td><span class="state s-ok">🟢 健康</span></td><td>—</td></tr>
+<tr><td>n ≥ t 且 d &lt; d*</td><td><span class="state s-fake">🟣 假完整</span></td><td>撈近重複充數，需細分/去重</td></tr>
+<tr><td>n ≥ 1.5t（d 仍高）</td><td><span class="state s-over">🔵 過多/可細分</span></td><td>近重複裁剪 / 拆子格</td></tr>
+</table>
+<div class="quote">關鍵聯合判讀：<b>n 高 d 高 = 該細分</b>（藏多個子概念）；<b>n 高 d 低 = 假完整</b>（同機同角度近重複）。多樣性決定「補」還是「拆」。</div>
+
+<h3>5.3 整體完整度（一個主數字 + 三佐證）</h3>
+<div class="card">
+<b>主數字 Coverage Health（0–100%）</b> = Σ(健康格 min(n/t,1)·質量因子) / Σ(期望非空格)；質量因子 d&lt;d* 時打 0.7 折（防假完整灌水）。<br>
+<b>三佐證</b>：① 覆蓋熵/Gini（防「總量達標但集中少數格」）｜② 最缺前 k 格缺口清單（防致命空洞被掩蓋、直接變工單）｜③ 假完整格佔比（防 d 低被平均吃掉）。
+</div>
+
+<h3>5.4 目標數 t 的設定法（混合）</h3>
+<pre>t_g = max(t_abs, p · f_g · N_target) · w_g
+  f_g  = 該格真實分佈佔比（分母）
+  t_abs= 最低絕對地板（每格 ≥30，保統計力）
+  w_g  = 邊界加權（決策灰帶 1.3，遠離 1.0，只當微調）</pre>
+<div class="card"><b>分母來源優先序</b>：產線抽樣統計 ＞ 客戶領域先驗（<b>高/中/低頻三檔即可起步</b>）＞ 退均勻並標「未校正」浮水印。客戶常給不出精確分佈 → 接受粗分級先驗，實收回填校準。</div>
+
+<h3>5.5 視覺 + 缺格接行動</h3>
+<div class="card">
+<b>顏色</b>：五態離散（🔴缺/🟠偏缺/🟢健康/🟣假完整/🔵過多）——離散優於連續，客戶要「還剩幾格」不是漸層。<br>
+<b>缺格一鍵</b>：以圖搜圖/文搜撈候選 → 去重 → 標註待辦 → 主動學習清單；<b>過載/假完整反向</b>：近重複裁剪、保留多樣代表。
+</div>
+<div class="warnbox">⚠ 屬性軸網格若 manifest 欄位缺漏，整格會直接消失而非顯示「缺」——盲區看不見，需顯式標「欄位未填」。</div>
+
+<h3>5.6 與既有 Coverage Gap 的關係</h3>
+<div class="card">本規格是 Coverage Gap 的「加質量維 d + 真實頻率分母」升級版；舊 gap 是其特例（d、f 設常數即退化）。缺格清單可調用 Coverage Gap 當補洞偵測引擎。</div>
+
+<h2>§6 三者整合：營運閉環</h2>
+<div class="flow">
+escape 發生<br>
+&nbsp;&nbsp;→ 演算法產【體檢卡】（自動歸因 A-E + 信心）<br>
+&nbsp;&nbsp;→ 若 B 類（樣本稀疏）/ D 類（邊界漂移）缺樣<br>
+&nbsp;&nbsp;→ 卡上自動帶出【熱力圖座標】→ 一鍵點亮該缺格<br>
+&nbsp;&nbsp;→ 品保按「撈候選」拉同類樣本<br>
+&nbsp;&nbsp;→ 進【灰帶煉獄】：標註初判疊圖 → 品保覆核（雙簽）<br>
+&nbsp;&nbsp;→ 入資料集 → 重訓 → 修復驗證（同類 escape 是否消滅）<br>
+&nbsp;&nbsp;→ 回填原體檢卡【結案】，熱力圖該格 🔴 轉 🟢
+</div>
+<div class="quote">最高槓桿連結：體檢卡顯示「本筆落在哪格、那格缺多少」→ 工程一眼判斷「<b>補這格 = 順手解一批同類 escape</b>」，把單點救火變成成批治理。</div>
+
+<h2>§7 MVP 與優先序</h2>
+<table>
+<tr><th>階段</th><th>內容</th></tr>
+<tr><td><b>MVP</b></td><td>(1) 體檢卡五塊核心 + 客戶/工程雙視圖；(2) 體檢卡 ↔ 熱力圖座標連結</td></tr>
+<tr><td>P2</td><td>灰帶雙簽自動化、缺格自動撈候選、月校準會熱力圖趨勢頁、組考卷自動出題</td></tr>
+<tr><td>dashboard</td><td>完整度<b>不進</b>主三數字，留熱力圖頁；月校準會新增「熱力圖趨勢」頁（資料健康領先指標）</td></tr>
+</table>
+
+<h2>§8 R3 簽署與落地警告</h2>
+<table>
+<tr><th>Persona</th><th>保留意見</th><th>第一個會壞的點</th></tr>
+<tr><td>老周（演算法）</td><td>換皮白名單進 CI 擋</td><td>N2 的 P75 初值隨訓練集漂移，重訓沒重算就失準</td></tr>
+<tr><td>Dr. 賴（統計）</td><td>類別不均時 Fleiss kappa 虛高</td><td>四輪累積每輪 n 太小，CI 寬到無法判定</td></tr>
+<tr><td>美玲（標註品質）</td><td>灰帶雙簽人員須不重疊</td><td>「假完整需細分」全靠主觀，無錨點會被亂塞成健康</td></tr>
+<tr><td>小林（coverage）</td><td>「未校正」分母須顯著標色、不混進主數字</td><td>manifest 欄位缺漏時整格消失，盲區看不見</td></tr>
+<tr><td>Kevin（營運）</td><td>客戶 PDF 留「漏逮容忍度」簽核欄</td><td>灰帶 >30 天遇客戶不回應卡死，需預設裁決+升級</td></tr>
+</table>
+<div class="warnbox"><b>MVP 上線前置（共同）</b>：補齊「augment 白名單 CI 攔截」與「kappa 信賴區間顯示」兩項，否則三及格線與換皮約束落地首日即失效。</div>
+
+<h2>§9 仍開放（下一輪）</h2>
+<div class="card"><ol>
+<li>真實分佈分母：客戶端能否提供產線抽樣統計？拿不到時粗分級先驗由誰定、多久回填？</li>
+<li>屬性軸由誰定義、定幾條軸、軸粒度（尺寸/對比切幾檔）？</li>
+<li><code>d*</code> 多樣性門檻與 <code>w_g</code> 邊界加權的初值校準資料從哪來？</li>
+<li>組考卷 golden 答案由誰最終鎖定（仲裁團組成、唯一裁決者 vs 共識）？</li>
+<li>LV 工具側落地範圍：體檢卡與熱力圖要做進 app 到什麼程度（本輪仍僅討論，未開發）。</li>
+</ol></div>
+
+<div class="muted" style="margin-top:32px">同內容 Markdown：<code>docs/defect_mechanisms_v2.md</code> · 前一份：<code>docs/defect_escape_analysis.md</code></div>
+</div></body></html>
