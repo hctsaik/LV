@@ -38,7 +38,10 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     farthest_point_sampling,
     find_similar_indices,
     find_similar_to_vector,
+    gray_decision_csv,
     load_scores_csv,
+    nearest_anchor,
+    select_gray_zone,
     make_thumbnail,
     neighbor_hit_density,
     neighbor_label_entropy,
@@ -2520,6 +2523,190 @@ def _render_quiz_multirater() -> None:
             st.info("至少需要 2 份作答 CSV。")
 
 
+_GRAY_DEMO_DIR = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
+
+
+def _load_gray_demo() -> None:
+    st.session_state["gray_folder_text"] = str(_GRAY_DEMO_DIR)
+    st.session_state["_gray_autorun"] = True
+    _log_usage("gray_demo_load")
+
+
+def _gray_propose(idx: int, label: str, conf: float, reason: str, anchor: str) -> None:
+    st.session_state.setdefault("gray_state", {})[idx] = {
+        "status": "proposed", "soft_label": label, "confidence": f"{conf:.2f}",
+        "reason": reason, "anchor": anchor, "proposer": "標註者", "approver": "",
+    }
+
+
+def _gray_approve(idx: int) -> None:
+    s = st.session_state.get("gray_state", {}).get(idx)
+    if s and s["status"] == "proposed":
+        s["status"], s["approver"] = "approved", "品保QA"
+
+
+def _gray_reject(idx: int) -> None:
+    st.session_state.get("gray_state", {}).pop(idx, None)
+
+
+def _render_gray_quick_start() -> None:
+    st.markdown("##### 快速開始")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1, st.container(border=True):
+        st.markdown("**① 貼資料夾**")
+        st.caption("含類別子資料夾的影像——佇列自動撈出最爭議（灰帶）的樣本。")
+    with c2, st.container(border=True):
+        st.markdown("**② 對照雙錨**")
+        st.caption("每筆灰帶旁顯示最近的『明確』錨例，幫你裁決離哪個近。")
+    with c3, st.container(border=True):
+        st.markdown("**③ 提議→覆核（雙簽）**")
+        st.caption("標註者提議 soft label＋理由，品保覆核通過才進決策清單匯出。")
+    mid = st.columns([2, 1.6, 2])[1]
+    mid.button("✨ 用範例資料試跑（imagenette）", key="gray_demo_btn",
+               type="primary", use_container_width=True, on_click=_load_gray_demo,
+               disabled=not _GRAY_DEMO_DIR.exists())
+
+
+def _gray_thumb(records, i):
+    t = _thumb_or_none(Path(records[i]["path"]))
+    return t
+
+
+def _gray_zone_ui() -> None:
+    st.markdown("##### 灰帶覆核 · 暫存煉獄")
+    st.caption("把判定爭議的『灰帶』樣本攔在這裡：對照明確錨例裁決、標註者提議＋"
+               "品保覆核（雙簽）後才進決策清單——不直接寫回資料集，確認後匯出。")
+
+    with st.sidebar:
+        st.markdown("**① 資料夾**")
+        st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="gray_folder_text",
+                     placeholder="例：demo/imagenette/train", height=68,
+                     label_visibility="collapsed")
+        all_models = available_models()
+        if not all_models:
+            st.error("models/ 內找不到模型檔。"); return
+        st.markdown("**② 模型**")
+        model = st.selectbox("模型", all_models, label_visibility="collapsed")
+        n_q = st.number_input("佇列張數（最爭議的前 N）", min_value=1, max_value=200,
+                              value=20, key="gray_n")
+        run = st.button("▶ 建立覆核佇列", use_container_width=True, key="run_gray",
+                        type="primary")
+
+    if st.session_state.pop("_gray_autorun", False):
+        run = True
+    if run:
+        folders = parse_folder_paths(st.session_state.get("gray_folder_text", ""))
+        missing = [str(p) for p in folders if not p.exists()]
+        if not folders:
+            st.error("請先輸入資料夾。"); return
+        if missing:
+            st.error(f"資料夾不存在：{', '.join(missing)}"); return
+        records = discover_images_classifier(folders)
+        if not records or len({r["label"] for r in records}) < 2:
+            st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
+        embed_fn = load_model(model)
+        with st.status("計算中…", expanded=True):
+            paths = [r["path"] for r in records]
+            cache = folders[0] / f"embeddings_{model}" / "embeddings.npz"
+            emb = extract_embeddings(paths, embed_fn, cache_path=cache)
+            labels = [r["label"] for r in records]
+            dis = compute_label_disagreement(emb, labels, k=min(10, len(records) - 1))
+        queue = select_gray_zone(dis, int(n_q))
+        # 錨例：每類最不爭議（最明確）的一張
+        anchors = {}
+        for c in sorted(set(labels)):
+            cand = [i for i in range(len(records)) if labels[i] == c]
+            anchors[c] = min(cand, key=lambda i: dis[i]) if cand else None
+        st.session_state["gray_records"] = records
+        st.session_state["gray_emb"] = emb
+        st.session_state["gray_queue"] = queue
+        st.session_state["gray_anchors"] = anchors
+        st.session_state["gray_state"] = {}
+        st.session_state["gray_pos"] = 0
+        st.toast(f"佇列建立：{len(queue)} 筆灰帶候選", icon="🌫")
+
+    if "gray_records" not in st.session_state:
+        _render_gray_quick_start()
+        return
+
+    records = st.session_state["gray_records"]
+    emb = st.session_state["gray_emb"]
+    queue = st.session_state["gray_queue"]
+    anchors = st.session_state["gray_anchors"]
+    gstate = st.session_state.setdefault("gray_state", {})
+    class_opts = sorted({r["label"] for r in records})
+    anchor_indices = [a for a in anchors.values() if a is not None]
+
+    pending = [i for i in queue if gstate.get(i, {}).get("status") != "approved"]
+    approved = [i for i in queue if gstate.get(i, {}).get("status") == "approved"]
+
+    col_rev, col_done = st.columns([5, 3], gap="medium")
+    with col_rev:
+        st.markdown(f"**覆核佇列**（待處理 {len(pending)} · 已通過 {len(approved)}）")
+        if not pending:
+            st.success("佇列清空——所有灰帶都已雙簽通過或退回。")
+        else:
+            i = pending[0]
+            r = records[i]
+            a_idx, a_d = nearest_anchor(emb, i, anchor_indices)
+            cc = st.columns(2)
+            with cc[0]:
+                st.caption(f"🌫 灰帶 #{i}（原標 {r['label']}）")
+                t = _gray_thumb(records, i)
+                st.image(t, use_container_width=True) if t else st.warning("⚠ 缺檔")
+            with cc[1]:
+                if a_idx is not None:
+                    st.caption(f"⚓ 最近錨例：{records[a_idx]['label']}（cosine {a_d:.3f}）")
+                    ta = _gray_thumb(records, a_idx)
+                    st.image(ta, use_container_width=True) if ta else st.warning("⚠ 缺檔")
+                else:
+                    st.caption("（無可用錨例）")
+
+            cur = gstate.get(i)
+            if not cur or cur.get("status") != "proposed":
+                # 階段一：標註者提議
+                st.markdown("**① 標註者提議**")
+                p1, p2 = st.columns([2, 1])
+                label = p1.selectbox("soft label（屬於哪類）", class_opts,
+                                     key=f"gray_lbl_{i}")
+                conf = p2.slider("信賴度", 0.0, 1.0, 0.67, 0.01, key=f"gray_conf_{i}")
+                reason = st.text_input("一句理由（必填）", key=f"gray_reason_{i}")
+                anchor_tag = (f"{records[a_idx]['label']}#{a_idx}"
+                              if a_idx is not None else "—")
+                st.button("提議", key=f"gray_propose_{i}", type="primary",
+                          disabled=not reason.strip(),
+                          on_click=_gray_propose,
+                          args=(i, label, conf, reason.strip(), anchor_tag))
+            else:
+                # 階段二：品保覆核（雙簽，人員不可重疊——此處以兩個顯式步驟表達）
+                st.markdown("**② 品保覆核**")
+                st.info(f"提議：soft label = **{cur['soft_label']}**（信賴 {cur['confidence']}）"
+                        f"· 對照錨例 {cur['anchor']}\n\n理由：{cur['reason']}")
+                q1, q2 = st.columns(2)
+                q1.button("✅ 覆核通過（進決策清單）", key=f"gray_ok_{i}",
+                          type="primary", use_container_width=True,
+                          on_click=_gray_approve, args=(i,))
+                q2.button("↩ 退回（重議）", key=f"gray_no_{i}",
+                          use_container_width=True, on_click=_gray_reject, args=(i,))
+
+    with col_done:
+        st.markdown("**決策清單（已雙簽通過）**")
+        if not approved:
+            st.caption("通過的決策會列在這裡，可匯出 CSV（含 4 欄：誰確認/錨例/soft label/理由）。")
+        else:
+            with st.container(height=300):
+                for i in approved:
+                    s = gstate[i]
+                    st.caption(f"#{i} → **{s['soft_label']}** · {s['anchor']} · "
+                               f"{s['reason']}")
+            decisions = [{**gstate[i], "path": str(records[i]["path"])}
+                         for i in approved]
+            st.download_button("⬇ 匯出決策 CSV", data=gray_decision_csv(decisions),
+                               file_name="gray_zone_decisions.csv", mime="text/csv",
+                               key="gray_decisions_csv", use_container_width=True)
+        st.caption(":gray[註：灰帶不直接寫回資料集；確認後匯出決策，由下游流程併入。]")
+
+
 def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
@@ -2535,7 +2722,7 @@ def main() -> None:
     with switch_col:
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "組考卷"],
+                     "完整度熱力圖", "組考卷", "灰帶覆核"],
             key="tool_switch", label_visibility="collapsed",
         ) or "Visualize Embeddings"
     with help_col, st.popover("✨ 功能地圖", use_container_width=True):
@@ -2557,6 +2744,8 @@ def main() -> None:
             "整體 Coverage Health、缺格清單（紫＝假完整近重複）\n"
             "- **組考卷**：把爭議樣本變盲測考卷，量標註者自我一致率／vs golden／"
             "多人 Fleiss kappa\n"
+            "- **灰帶覆核**：爭議樣本進覆核佇列，對照錨例 → 提議+品保覆核（雙簽）"
+            "→ 匯出決策（不直接寫回資料集）\n"
             "- **資料合約 manifest.jsonl**：每次 Run 自動寫入各資料夾"
             "（sha256／phash／embedding refs），供去重、回溯與下游工具使用"
         )
@@ -2567,8 +2756,10 @@ def main() -> None:
         _compare_distributions_ui()
     elif tool == "完整度熱力圖":
         _completeness_ui()
-    else:
+    elif tool == "組考卷":
         _quiz_ui()
+    else:
+        _gray_zone_ui()
 
 
 if __name__ == "__main__":

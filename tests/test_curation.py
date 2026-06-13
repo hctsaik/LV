@@ -229,3 +229,40 @@ def test_fps_clamps_and_degenerate():
 def test_fps_deterministic():
     emb = _two_clusters(8, seed=3)
     assert farthest_point_sampling(emb, 4) == farthest_point_sampling(emb, 4)
+
+
+# ── §3 gray-zone purgatory helpers ──────────────────────────────────────
+
+from interaction import gray_decision_csv, nearest_anchor, select_gray_zone  # noqa: E402
+
+
+def test_select_gray_zone_most_ambiguous_first():
+    scores = np.array([0.1, 0.9, 0.5, 0.8, 0.0])
+    assert select_gray_zone(scores, 3) == [1, 3, 2]  # highest disagreement first
+    assert select_gray_zone(scores, 99) == [1, 3, 2, 0, 4]  # clamped
+    assert select_gray_zone(np.zeros(0), 3) == []
+    assert select_gray_zone(scores, 0) == []
+
+
+def test_nearest_anchor_picks_closest():
+    emb = np.array([[1.0, 0.0], [0.95, 0.05], [0.0, 1.0]])
+    # item 0 is closest to anchor 1 (aligned), not anchor 2 (orthogonal)
+    a, d = nearest_anchor(emb, 0, [1, 2])
+    assert a == 1 and d < 0.05
+    # self is excluded from anchors
+    a2, _ = nearest_anchor(emb, 0, [0, 2])
+    assert a2 == 2
+    assert nearest_anchor(emb, 0, []) == (None, float("inf"))
+
+
+def test_gray_decision_csv_contract():
+    csv_text = gray_decision_csv([
+        {"path": "x.jpg", "soft_label": "瑕疵", "confidence": "0.67",
+         "anchor": "明確是#3", "reason": "邊緣有微小凹陷",
+         "proposer": "標註A", "approver": "QA", "status": "approved"},
+    ])
+    lines = csv_text.splitlines()
+    assert lines[0] == "path,soft_label,confidence,anchor,reason,proposer,approver,status"
+    assert "邊緣有微小凹陷" in lines[1] and lines[1].endswith("approved")
+    assert gray_decision_csv([]).strip() == \
+        "path,soft_label,confidence,anchor,reason,proposer,approver,status"

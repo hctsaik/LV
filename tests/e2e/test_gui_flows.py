@@ -829,7 +829,10 @@ def test_w_completeness_calibration_and_mining(app_page, tmp_path):
 
     # (a) calibration editor is present (uncalibrated warning visible first)
     expect(page.get_by_text(re.compile("未校正真實分佈"))).to_be_visible()
-    page.get_by_text(re.compile("真實分佈校正")).click()
+    # open the calibration expander via its summary (avoid matching the
+    # same words in the feature-map popover)
+    page.locator('[data-testid="stExpander"] summary'
+                 ).filter(has_text="真實分佈校正").first.click()
     wait_idle(page)
     expect(page.locator('.st-key-cov_apply_freq')).to_be_visible()
 
@@ -914,4 +917,44 @@ def test_y_quiz_tool(app_page, tmp_path):
     expect(page.get_by_text("自我一致率", exact=True)).to_be_visible()
     expect(page.get_by_text("vs golden 一致", exact=True)).to_be_visible()
     expect(page.locator('.st-key-quiz_answers_csv')).to_be_visible()
+    _no_exception(page)
+
+
+# ── (z) §3 gray-zone review (propose → approve double sign-off) ─────────
+
+def test_z_gray_zone_review(app_page, tmp_path):
+    import numpy as np
+    from PIL import Image
+    page = app_page
+    root = tmp_path / "grayds" / "train"
+    for ci, cls in enumerate(("p", "q")):
+        d = root / cls
+        d.mkdir(parents=True)
+        for i in range(10):
+            arr = np.random.default_rng(ci * 30 + i).integers(0, 255, (64, 64, 3)).astype("uint8")
+            arr[:, :, ci] = 200
+            Image.fromarray(arr).save(d / f"{cls}_{i}.jpg", quality=90)
+
+    page.locator('.st-key-tool_switch').get_by_text("灰帶覆核", exact=True).click()
+    wait_idle(page)
+    page.locator('.st-key-gray_folder_text textarea').fill(str(root))
+    page.locator('.st-key-run_gray button').click()
+    wait_idle(page, timeout=300000)
+    _no_exception(page)
+    # the review item shows the gray sample next to its nearest anchor
+    expect(page.get_by_text(re.compile("待處理")).first).to_be_visible()
+    expect(page.get_by_text(re.compile("最近錨例")).first).to_be_visible()
+
+    # stage 1: propose requires a reason, then enables the propose button
+    reason = page.locator('[class*="st-key-gray_reason_"] input')
+    reason.fill("邊界樣本，偏向 p")
+    page.keyboard.press("Tab")
+    wait_idle(page)
+    page.locator('[class*="st-key-gray_propose_"] button').click()
+    # stage 2: QA approval button appears (double sign-off); approve it
+    page.wait_for_selector('[class*="st-key-gray_ok_"] button', timeout=15000)
+    page.locator('[class*="st-key-gray_ok_"] button').click()
+    wait_idle(page)
+    # approved decision lands in the export list
+    expect(page.locator('.st-key-gray_decisions_csv')).to_be_visible()
     _no_exception(page)

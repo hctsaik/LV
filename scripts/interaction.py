@@ -150,6 +150,53 @@ def compute_outlier_scores(
     return dist.mean(axis=1)
 
 
+def select_gray_zone(scores: np.ndarray, k: int) -> list[int]:
+    """Gray-zone review queue (§3): the k most ambiguous items by score
+    (e.g. kNN label-disagreement), highest first. ``k`` clamped to N."""
+    s = np.asarray(scores)
+    if len(s) == 0 or k <= 0:
+        return []
+    return [int(i) for i in np.argsort(s)[::-1][:min(k, len(s))]]
+
+
+def nearest_anchor(
+    embeddings: np.ndarray, idx: int, anchor_indices: Sequence[int],
+) -> tuple[int | None, float]:
+    """Closest anchor to ``idx`` by cosine distance (which 明確是/明確否
+    example this gray-zone item sits nearest to). Returns (anchor_idx, d);
+    (None, inf) when there are no anchors."""
+    anchors = [a for a in anchor_indices if a != idx]
+    if not anchors:
+        return None, float("inf")
+    emb = np.asarray(embeddings, dtype=float)
+    q = emb[idx] / (np.linalg.norm(emb[idx]) + 1e-12)
+    best, best_d = None, float("inf")
+    for a in anchors:
+        v = emb[a] / (np.linalg.norm(emb[a]) + 1e-12)
+        d = float(1.0 - q @ v)
+        if d < best_d:
+            best, best_d = a, d
+    return best, best_d
+
+
+_GRAY_DECISION_HEADER = [
+    "path", "soft_label", "confidence", "anchor", "reason",
+    "proposer", "approver", "status",
+]
+
+
+def gray_decision_csv(decisions: Sequence[dict]) -> str:
+    """Serialize confirmed gray-zone decisions to CSV — the four required
+    provenance fields (who confirmed, anchor compared, soft label, reason)
+    plus status, so an approved decision is auditable downstream."""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(_GRAY_DECISION_HEADER)
+    for d in decisions:
+        w.writerow([d.get(k, "") for k in _GRAY_DECISION_HEADER])
+    return buf.getvalue()
+
+
 def farthest_point_sampling(
     embeddings: np.ndarray,
     n: int,
