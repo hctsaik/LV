@@ -215,22 +215,25 @@ def _build_cmp_figure(
     n_a = len(paths_a)
     use_3d = dim == 3 and proj.shape[1] >= 3
 
-    def _trace(data, names, color, label):
+    def _trace(data, names, color, label, base_idx):
         common = dict(
             mode="markers", name=label,
             marker=dict(color=color, size=4 if use_3d else 6, opacity=0.7),
             text=names,
-            hovertemplate="%{text}<br>Group: " + label + "<extra></extra>",
+            # global index over paths_a + paths_b → click/lasso 可對回影像
+            customdata=[[base_idx + j] for j in range(len(names))],
+            hovertemplate="%{text}<br>Group: " + label
+                          + "<br>#%{customdata[0]}<extra></extra>",
         )
         if use_3d:
             return go.Scatter3d(x=data[:, 0].tolist(), y=data[:, 1].tolist(), z=data[:, 2].tolist(), **common)
         return go.Scatter(x=data[:, 0].tolist(), y=data[:, 1].tolist(), **common)
 
     fig = go.Figure(data=[
-        _trace(proj[:n_a], [p.name for p in paths_a], "#3498db", name_a),
-        _trace(proj[n_a:], [p.name for p in paths_b], "#e74c3c", name_b),
+        _trace(proj[:n_a], [p.name for p in paths_a], "#3498db", name_a, 0),
+        _trace(proj[n_a:], [p.name for p in paths_b], "#e74c3c", name_b, n_a),
     ])
-    layout = dict(legend=dict(title="Group"))
+    layout = dict(legend=dict(title="Group"), height=560)
     if use_3d:
         layout["scene"] = dict(xaxis_title="C1", yaxis_title="C2", zaxis_title="C3")
     else:
@@ -1294,6 +1297,60 @@ def _visualize_embeddings_ui() -> None:
         _render_right_panel(records, coords, selected_model, selected_split, scatter_key)
 
 
+def _set_cmp_active(idx: int | None, ctx: list[int] | None = None) -> None:
+    st.session_state["cmp_active_image"] = idx
+    if ctx is not None:
+        st.session_state["cmp_viewer_ctx"] = ctx
+
+
+@st.fragment
+def _render_cmp_panel(cmp_paths: list[Path], cmp_groups: list[str]) -> None:
+    """Compare 的 linked view 右欄：框選的影像縮圖 + 檢視槽（同 Visualize 的
+    互動模型；fragment 隔離，點縮圖不重繪散點）。"""
+    sel_state = st.session_state.get("cmp_selection") or {}
+    sel = (sel_state.get("indices", [])
+           if sel_state.get("token") == st.session_state.get("cmp_data_token") else [])
+    with st.container(height=240, border=True, key="cmp_image_viewer"):
+        idx = st.session_state.get("cmp_active_image")
+        if idx is None or not (0 <= idx < len(cmp_paths)):
+            st.caption("檢視槽 — 在左圖框選資料點後，點下方縮圖在此檢視大圖。")
+        else:
+            p = Path(cmp_paths[idx])
+            ctx = st.session_state.get("cmp_viewer_ctx") or [idx]
+            pos = ctx.index(idx) if idx in ctx else 0
+            h1, h2, h3, h4 = st.columns([5, 1, 1, 1])
+            h1.markdown(f"**{p.name}** — {cmp_groups[idx]} · {pos + 1}/{len(ctx)} · #{idx}")
+            h2.button("◀", key="cmp_img_prev", disabled=pos <= 0,
+                      on_click=_set_cmp_active, args=(ctx[max(pos - 1, 0)],))
+            h3.button("▶", key="cmp_img_next", disabled=pos >= len(ctx) - 1,
+                      on_click=_set_cmp_active, args=(ctx[min(pos + 1, len(ctx) - 1)],))
+            h4.button("✕", key="cmp_img_close", on_click=_set_cmp_active, args=(None,))
+            if p.exists():
+                st.image(str(p), use_container_width=True)
+            else:
+                st.warning(f"找不到檔案：{p}")
+    with st.container(height=420, key="cmp_grid"):
+        if not sel:
+            st.info("在左圖以點選、框選（box）或套索（lasso）圈出資料點，"
+                    "對應影像會立即顯示在這裡。")
+            return
+        shown = sel[:60]
+        st.caption(f"已選取 {len(sel)} 張" +
+                   (f" · 顯示前 {len(shown)}" if len(sel) > len(shown) else ""))
+        cols = st.columns(3)
+        for j, i in enumerate(shown):
+            with cols[j % 3]:
+                p = Path(cmp_paths[i])
+                thumb = _thumb_or_none(p)
+                if thumb is not None:
+                    st.image(thumb, use_container_width=True)
+                else:
+                    st.warning("⚠ 檔案遺失")
+                st.button(f"#{i}（{cmp_groups[i]}）", key=f"cmp_card_{i}",
+                          use_container_width=True,
+                          on_click=_set_cmp_active, args=(i, list(shown)))
+
+
 def _compare_distributions_ui() -> None:
     with st.sidebar:
         st.caption("Folder A（直接圖片資料夾）")
@@ -1440,6 +1497,10 @@ def _compare_distributions_ui() -> None:
         st.session_state["cmp_name_prefix"] = name
         st.session_state["cmp_model"] = selected_model
         st.session_state["cmp_coverage_gaps"] = coverage_gaps
+        st.session_state["cmp_data_token"] = uuid.uuid4().hex
+        st.session_state["cmp_selection"] = None
+        st.session_state["cmp_active_image"] = None
+        st.session_state["cmp_viewer_ctx"] = []
 
     if "cmp_projections" not in st.session_state:
         st.info("在左側設定 Folder A／Folder B 與模型後，按 ▶ Run 比較兩個分布。")
@@ -1479,58 +1540,93 @@ def _compare_distributions_ui() -> None:
             help="Inception Score：越高代表影像品質與多樣性越好。基於 ImageNet 分類器，數值供參考。",
         )
 
-    col_m, col_d = st.columns([3, 1])
-    selected_method = col_m.selectbox("Method", list(_METHOD_KEY))
-    dim = 3 if col_d.radio("維度", ["2D", "3D"], horizontal=True) == "3D" else 2
-    method_key = _METHOD_KEY[selected_method]
-    proj = projections[method_key]
+    cmp_paths = list(paths_a) + list(paths_b)
+    cmp_groups = [name_a] * len(paths_a) + [name_b] * len(paths_b)
+    cmp_token = st.session_state.get("cmp_data_token", "")
 
-    fig = _build_cmp_figure(paths_a, paths_b, proj, name_a, name_b, dim=dim)
-    st.plotly_chart(fig, use_container_width=True)
+    col_cmp, col_cmpsel = st.columns([5, 3], gap="medium")
+    with col_cmp:
+        col_m, col_d = st.columns([3, 1])
+        selected_method = col_m.selectbox("Method", list(_METHOD_KEY))
+        dim = 3 if col_d.radio("維度", ["2D", "3D"], horizontal=True) == "3D" else 2
+        method_key = _METHOD_KEY[selected_method]
+        proj = projections[method_key]
 
-    projections_2d = {k: v[:, :2] for k, v in projections.items()}
-    dl_fig = build_projection_figure(
-        paths_a, paths_b, projections_2d,
-        name_a=name_a, name_b=name_b,
-        fid_score=fid_score, lpips_score=lpips_score,
-        kid_score=kid_score, ssim_score=ssim_score,
-    )
+        fig = _build_cmp_figure(paths_a, paths_b, proj, name_a, name_b, dim=dim)
+        sel_state = st.session_state.get("cmp_selection") or {}
+        if sel_state.get("token") != cmp_token:
+            sel_state = {"token": cmp_token, "indices": []}
+        if not sel_state["indices"] and dim == 2:
+            st.caption("💡 在圖上拖曳框選或套索圈點，右欄會立即顯示對應影像。")
+        with st.container(key="cmp_scatter_wrap"):
+            if dim == 2:
+                event = st.plotly_chart(
+                    fig, use_container_width=True,
+                    key=f"cmp_scatter_{cmp_token[:8]}_{method_key}",
+                    on_select="rerun", selection_mode=("points", "box", "lasso"),
+                )
+                sel_points: list[dict] = []
+                if event is not None:
+                    sel_obj = event.get("selection") if hasattr(event, "get") else None
+                    if sel_obj:
+                        sel_points = list(sel_obj.get("points", []))
+                new_indices = selection_points_to_indices(sel_points)
+                if new_indices and new_indices != sel_state["indices"]:
+                    sel_state = {"token": cmp_token, "indices": new_indices}
+                    st.session_state["cmp_active_image"] = None
+                    st.session_state["cmp_viewer_ctx"] = []
+                    st.toast(f"已選取 {len(new_indices)} 張", icon="🎯")
+            else:
+                st.plotly_chart(fig, use_container_width=True, key="cmp_scatter_3d")
+                st.caption("ℹ 3D 模式不支援框選；切回 2D 以使用選取。")
+        st.session_state["cmp_selection"] = sel_state
 
-    if viz_only:
-        st.download_button(
-            "⬇ Download HTML (all views)",
-            data=dl_fig.to_html(include_plotlyjs="cdn"),
-            file_name=f"{name}_projection.html",
-            mime="text/html",
+        projections_2d = {k: v[:, :2] for k, v in projections.items()}
+        dl_fig = build_projection_figure(
+            paths_a, paths_b, projections_2d,
+            name_a=name_a, name_b=name_b,
+            fid_score=fid_score, lpips_score=lpips_score,
+            kid_score=kid_score, ssim_score=ssim_score,
         )
-    else:
-        metrics = {
-            "fid": round(fid_score, 4),
-            "kid": round(kid_score, 6),
-            "lpips": round(lpips_score, 4),
-            "ssim": round(ssim_score, 4),
-            "psnr": round(psnr_score, 2) if psnr_score is not None else None,
-            "is_a_mean": round(is_a[0], 4) if is_a is not None else None,
-            "is_a_std":  round(is_a[1], 4) if is_a is not None else None,
-            "is_b_mean": round(is_b[0], 4) if is_b is not None else None,
-            "is_b_std":  round(is_b[1], 4) if is_b is not None else None,
-            "n_a": len(paths_a),
-            "n_b": len(paths_b),
-            "model": selected_model,
-        }
-        dl1, dl2 = st.columns(2)
-        dl1.download_button(
-            "⬇ Download HTML (all views)",
-            data=dl_fig.to_html(include_plotlyjs="cdn"),
-            file_name=f"{name}_projection.html",
-            mime="text/html",
-        )
-        dl2.download_button(
-            "⬇ Download JSON",
-            data=json.dumps(metrics, indent=2),
-            file_name=f"{name}_metrics.json",
-            mime="application/json",
-        )
+
+        if viz_only:
+            st.download_button(
+                "⬇ Download HTML (all views)",
+                data=dl_fig.to_html(include_plotlyjs="cdn"),
+                file_name=f"{name}_projection.html",
+                mime="text/html",
+            )
+        else:
+            metrics = {
+                "fid": round(fid_score, 4),
+                "kid": round(kid_score, 6),
+                "lpips": round(lpips_score, 4),
+                "ssim": round(ssim_score, 4),
+                "psnr": round(psnr_score, 2) if psnr_score is not None else None,
+                "is_a_mean": round(is_a[0], 4) if is_a is not None else None,
+                "is_a_std":  round(is_a[1], 4) if is_a is not None else None,
+                "is_b_mean": round(is_b[0], 4) if is_b is not None else None,
+                "is_b_std":  round(is_b[1], 4) if is_b is not None else None,
+                "n_a": len(paths_a),
+                "n_b": len(paths_b),
+                "model": selected_model,
+            }
+            dl1, dl2 = st.columns(2)
+            dl1.download_button(
+                "⬇ Download HTML (all views)",
+                data=dl_fig.to_html(include_plotlyjs="cdn"),
+                file_name=f"{name}_projection.html",
+                mime="text/html",
+            )
+            dl2.download_button(
+                "⬇ Download JSON",
+                data=json.dumps(metrics, indent=2),
+                file_name=f"{name}_metrics.json",
+                mime="application/json",
+            )
+
+    with col_cmpsel:
+        _render_cmp_panel(cmp_paths, cmp_groups)
 
     # ── Coverage Gap Analysis ─────────────────────────────────────────
     if "cmp_coverage_gaps" in st.session_state:

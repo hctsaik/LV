@@ -625,3 +625,52 @@ def test_r_quick_start_demo(app_page):
     assert "未選取" in _status_text(page)
     expect(_grid_imgs(page).first).to_be_visible()
     _no_exception(page)
+
+
+# ── (s) Compare Distributions linked view: click → thumbnails → viewer ──
+
+def test_s_compare_linked_view(app_page, tmp_path):
+    import numpy as np
+    from PIL import Image
+    page = app_page
+    for name, bias, seed0 in (("setA", 0, 300), ("setB", 1, 400)):
+        d = tmp_path / name
+        d.mkdir()
+        for i in range(6):
+            arr = np.random.default_rng(seed0 + i).integers(0, 255, (64, 64, 3)).astype("uint8")
+            arr[:, :, bias] = 255
+            Image.fromarray(arr).save(d / f"{name}_{i}.jpg", quality=90)
+
+    page.locator('.st-key-tool_switch').get_by_text("Compare Distributions").click()
+    wait_idle(page)
+    page.locator('.st-key-cmp_folder_a input').fill(str(tmp_path / "setA"))
+    page.locator('.st-key-cmp_folder_b input').fill(str(tmp_path / "setB"))
+    # viz-only keeps this fast — the linked view must work without metrics
+    page.locator('[data-testid="stSidebar"] [data-testid="stCheckbox"] label').first.click()
+    wait_idle(page)
+    page.locator('.st-key-run_cmp button').click()
+    page.wait_for_selector('.st-key-cmp_scatter_wrap g.points path', timeout=300000)
+    wait_idle(page, timeout=120000)
+
+    # empty state is honest, hint visible
+    expect(page.get_by_text("對應影像會立即顯示在這裡", exact=False)).to_be_visible()
+    # click one marker → thumbnail appears in the right panel
+    pth = page.locator('.st-key-cmp_scatter_wrap g.points').nth(0).locator('path').nth(1)
+    bb = pth.bounding_box()
+    page.mouse.click(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+    page.wait_for_function(
+        """() => {
+            const el = document.querySelector('.st-key-cmp_grid');
+            return el && el.innerText.includes('已選取');
+        }""", timeout=10000)
+    wait_idle(page)
+    expect(page.locator('.st-key-cmp_grid [data-testid="stImage"] img').first).to_be_visible()
+    # card click → viewer slot shows the full image with group metadata
+    page.locator('.st-key-cmp_grid [class*="st-key-cmp_card_"] button').first.click()
+    wait_idle(page)
+    viewer = page.locator('.st-key-cmp_image_viewer')
+    img = viewer.locator('[data-testid="stImage"] img').first
+    expect(img).to_be_visible()
+    assert page.evaluate("el => el.naturalWidth", img.element_handle()) > 0
+    expect(viewer.get_by_text(re.compile("setA|setB"))).to_be_visible()
+    _no_exception(page)
