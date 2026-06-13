@@ -150,6 +150,55 @@ def compute_outlier_scores(
     return dist.mean(axis=1)
 
 
+def farthest_point_sampling(
+    embeddings: np.ndarray,
+    n: int,
+    seed_indices: Sequence[int] | None = None,
+) -> list[int]:
+    """k-center greedy / farthest-point sampling (F6 diversity selection).
+
+    Iteratively pick the row whose cosine distance to the already-covered
+    set is largest — the maximally-diverse subset to label next. With
+    ``seed_indices`` (already-labeled rows) the picks COVER the gaps:
+    points far from every seed are chosen first, which is the active-
+    learning use (complements the heatmap's per-cell candidate mining).
+    Without seeds it starts from the most peripheral point.
+
+    Returns up to ``n`` indices in pick order (most diverse first), never
+    including a seed.
+    """
+    emb = np.asarray(embeddings, dtype=float)
+    N = len(emb)
+    if N == 0 or n <= 0:
+        return []
+    norm = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+    excluded: set[int] = set()
+    selected: list[int] = []
+    seeds = [i for i in (seed_indices or []) if 0 <= i < N]
+    if seeds:
+        min_d = (1.0 - norm @ norm[seeds].T).min(axis=1)
+        excluded.update(seeds)
+    else:
+        centroid = norm.mean(axis=0)
+        centroid /= (np.linalg.norm(centroid) + 1e-12)
+        first = int(np.argmax(1.0 - norm @ centroid))
+        selected.append(first)
+        excluded.add(first)
+        min_d = 1.0 - norm @ norm[first]
+    n = min(n, N - len(excluded) + (0 if seeds else 1))
+    while len(selected) < n:
+        md = min_d.copy()
+        if excluded:
+            md[list(excluded)] = -1.0
+        nxt = int(np.argmax(md))
+        if md[nxt] < 0:
+            break
+        selected.append(nxt)
+        excluded.add(nxt)
+        min_d = np.minimum(min_d, 1.0 - norm @ norm[nxt])
+    return selected
+
+
 def load_scores_csv(csv_path: Path) -> dict[str, tuple[float, float | None]]:
     """Optional detection-score ingestion for the escape card (N4 gate).
 

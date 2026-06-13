@@ -195,3 +195,37 @@ def test_load_scores_csv(tmp_path):
     assert out["a.jpg"] == (0.42, 0.5)
     assert out["b.jpg"] == (0.9, None)  # blank threshold → None
     assert load_scores_csv(tmp_path / "nope.csv") == {}
+
+
+# ── F6 diversity selection (farthest-point sampling) ────────────────────
+
+from interaction import farthest_point_sampling  # noqa: E402
+
+
+def test_fps_picks_one_from_each_cluster():
+    emb = _two_clusters(10)  # cluster A rows 0-9, B rows 10-19
+    picks = farthest_point_sampling(emb, 2)
+    assert len(picks) == 2
+    a_picked = any(i < 10 for i in picks)
+    b_picked = any(i >= 10 for i in picks)
+    assert a_picked and b_picked  # diverse → spans both clusters
+
+
+def test_fps_seeds_cover_gaps():
+    emb = _two_clusters(10)
+    # seed the whole of cluster A → the first diverse pick must be from B
+    picks = farthest_point_sampling(emb, 1, seed_indices=list(range(10)))
+    assert picks and picks[0] >= 10
+    assert all(i not in range(10) for i in picks)  # never returns a seed
+
+
+def test_fps_clamps_and_degenerate():
+    emb = _two_clusters(3)
+    assert len(farthest_point_sampling(emb, 99)) == 6   # clamped to N
+    assert farthest_point_sampling(emb, 0) == []
+    assert farthest_point_sampling(np.zeros((0, 4)), 5) == []
+
+
+def test_fps_deterministic():
+    emb = _two_clusters(8, seed=3)
+    assert farthest_point_sampling(emb, 4) == farthest_point_sampling(emb, 4)

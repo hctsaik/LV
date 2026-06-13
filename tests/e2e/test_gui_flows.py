@@ -849,3 +849,28 @@ def test_w_completeness_calibration_and_mining(app_page, tmp_path):
     wait_idle(page, timeout=120000)
     expect(page.locator('.st-key-cov_cand_csv')).to_be_visible()
     _no_exception(page)
+
+
+# ── (x) F6 diversity sampling / active-learning tab ─────────────────────
+
+def test_x_diversity_sampling(flow_page):
+    page = flow_page
+    page.locator('.st-key-viz_panel_view').get_by_text("選樣", exact=True).click()
+    wait_idle(page)
+    panel = page.locator('.st-key-viz_sampling_panel')
+    expect(panel).to_be_visible()
+    page.locator('.st-key-viz_sampling_btn button').click()
+    wait_idle(page)
+    # diverse picks render as a ranked thumbnail grid + export
+    imgs = panel.locator('[data-testid="stImage"] img')
+    expect(imgs.first).to_be_visible()
+    expect(page.locator('.st-key-viz_sampling_csv')).to_be_visible()
+    # add all to the export list, verify it grew
+    page.locator('.st-key-viz_sampling_addall button').click()
+    wait_idle(page)
+    page.locator('.st-key-viz_panel_view').get_by_text("匯出清單", exact=True).click()
+    wait_idle(page)
+    expect(page.get_by_text(re.compile(r"共 [1-9]\d* 張"))).to_be_visible()
+    page.locator('.st-key-viz_panel_view').get_by_text("選取", exact=True).click()
+    wait_idle(page)
+    _no_exception(page)

@@ -34,6 +34,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     ensure_thumbnails,
     find_duplicate_pairs_embedding,
     find_duplicate_pairs_phash,
+    farthest_point_sampling,
     find_similar_indices,
     find_similar_to_vector,
     load_scores_csv,
@@ -781,6 +782,71 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
                               on_click=_add_one, args=(records, j))
 
 
+def _run_sampling(model_name: str, n: int, seed_from_list: bool) -> None:
+    """F6: pick the N most diverse unlabeled images to label next."""
+    raw = st.session_state.get("viz_raw_embeddings", {}).get(model_name)
+    if raw is None:
+        return
+    records = st.session_state["viz_records"]
+    seeds = None
+    if seed_from_list:
+        elist = st.session_state.get("viz_export_list", {})
+        by_path = {str(Path(r["path"]).resolve()): i for i, r in enumerate(records)}
+        seeds = [by_path[k] for k in elist if k in by_path] or None
+    picks = farthest_point_sampling(raw, int(n), seed_indices=seeds)
+    st.session_state["viz_sampling"] = {"token": st.session_state.get("viz_data_token"),
+                                        "picks": picks, "seeded": bool(seeds)}
+    st.toast(f"已選出 {len(picks)} 張多樣性樣本", icon="🎯")
+    _log_usage("sampling", n=len(picks), seeded=bool(seeds))
+
+
+def _render_sampling_view(records: list[dict], model_name: str) -> None:
+    """F6 多樣性選樣 / 主動學習：farthest-point 從資料集挑最該標的 N 張。"""
+    _render_viewer_slot(records, [])
+    with st.container(key="viz_sampling_panel"):
+        st.caption("用 farthest-point（k-center greedy）挑出彼此最不像、"
+                   "最該優先標註的一批樣本。勾「避開匯出清單」＝把清單當已覆蓋，"
+                   "只挑沒被涵蓋到的新樣本（主動學習）。")
+        c1, c2 = st.columns([1, 2])
+        n = c1.number_input("選幾張", min_value=1, max_value=min(200, len(records)),
+                            value=min(12, len(records)), key="viz_sampling_n")
+        seed = c2.toggle("避開匯出清單（主動學習）", key="viz_sampling_seed",
+                         help="把目前匯出清單視為『已標/已覆蓋』，只挑離它最遠的新樣本。")
+        st.button("🎯 挑選多樣性樣本", key="viz_sampling_btn", use_container_width=True,
+                  on_click=_run_sampling, args=(model_name, n, seed))
+
+        res = st.session_state.get("viz_sampling")
+        if not res or res.get("token") != st.session_state.get("viz_data_token"):
+            st.info("設定數量後按「挑選」。結果按多樣性排序（越前越獨特）。")
+            return
+        picks = res["picks"]
+        if not picks:
+            st.info("沒有可挑選的樣本（清單可能已覆蓋全部）。")
+            return
+        st.caption(f"選出 {len(picks)} 張"
+                   + ("（已避開匯出清單）" if res["seeded"] else "")
+                   + " · 多樣性排序，越前越該優先標")
+        st.button("⬇ 全部加入匯出清單", key="viz_sampling_addall",
+                  use_container_width=True,
+                  on_click=_batch_add, args=(records, picks))
+        with st.container(height=320):
+            cols = st.columns(3)
+            for j, i in enumerate(picks):
+                with cols[j % 3]:
+                    p = Path(records[i]["path"])
+                    thumb = _thumb_or_none(p)
+                    if thumb:
+                        st.image(thumb, use_container_width=True, caption=f"#{j + 1}")
+                    else:
+                        st.warning("⚠ 缺檔")
+                    st.button("看圖", key=f"viz_samp_view_{i}", use_container_width=True,
+                              on_click=_set_active_image, args=(i, list(picks)))
+        st.download_button(
+            "⬇ 匯出待標清單 CSV", data=records_to_csv(records, picks),
+            file_name="active_learning_picks.csv", mime="text/csv",
+            key="viz_sampling_csv", use_container_width=True)
+
+
 def _scores_for(path: Path) -> dict:
     """Walk up from an image to find a scores.csv (≤3 levels), cached per
     directory. Returns {filename: (score, threshold)} — empty if none."""
@@ -975,8 +1041,8 @@ def _render_right_panel(
     """
     st.session_state.setdefault("viz_panel_view", "選取")
     view = st.segmented_control(
-        "面板", ["選取", "相似", "重複", "體檢卡", "匯出清單"], key="viz_panel_view",
-        label_visibility="collapsed",
+        "面板", ["選取", "相似", "重複", "選樣", "體檢卡", "匯出清單"],
+        key="viz_panel_view", label_visibility="collapsed",
     ) or "選取"
 
     if view == "選取":
@@ -985,6 +1051,8 @@ def _render_right_panel(
         _render_similar_view(records, model_name)
     elif view == "重複":
         _render_dup_view(records, model_name)
+    elif view == "選樣":
+        _render_sampling_view(records, model_name)
     elif view == "體檢卡":
         _render_health_card(records, model_name)
     else:
@@ -2260,6 +2328,7 @@ def main() -> None:
             "- **重複／洩漏掃描**：右欄「重複」tab（phash 嚴格、embedding 語意，"
             "勾「僅跨 split」＝train/val 洩漏）\n"
             "- **離群度・標籤分歧**：Run 完自動計算，右欄排序選單切換\n"
+            "- **多樣性選樣／主動學習**：右欄「選樣」tab，farthest-point 挑最該優先標的 N 張\n"
             "- **體檢卡**：選一張圖 → 右欄「體檢卡」tab，看 N2 命中密度/N3 標籤熵/"
             "歸因（放 scores.csv 可加 N4 分數閘），可匯出 HTML\n"
             "- **匯出清單**：跨視圖累積選取，匯出 CSV（含 sha256）／ZIP\n"
