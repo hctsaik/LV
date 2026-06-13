@@ -2653,12 +2653,18 @@ def _gray_zone_ui() -> None:
             with cc[0]:
                 st.caption(f"🌫 灰帶 #{i}（原標 {r['label']}）")
                 t = _gray_thumb(records, i)
-                st.image(t, use_container_width=True) if t else st.warning("⚠ 缺檔")
+                if t:
+                    st.image(t, use_container_width=True)
+                else:
+                    st.warning("⚠ 缺檔")
             with cc[1]:
                 if a_idx is not None:
                     st.caption(f"⚓ 最近錨例：{records[a_idx]['label']}（cosine {a_d:.3f}）")
                     ta = _gray_thumb(records, a_idx)
-                    st.image(ta, use_container_width=True) if ta else st.warning("⚠ 缺檔")
+                    if ta:
+                        st.image(ta, use_container_width=True)
+                    else:
+                        st.warning("⚠ 缺檔")
                 else:
                     st.caption("（無可用錨例）")
 
