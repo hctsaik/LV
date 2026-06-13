@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>匯出清單 × 組考卷：設計討論</title>
+<style>
+  :root{--bg:#f7f8fa;--card:#fff;--ink:#1f2733;--mut:#5b6675;--line:#e3e7ee;--accent:#d62728;--ok:#1f9d55;--warn:#e8820c;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 "Noto Sans TC",system-ui,"Microsoft JhengHei",sans-serif;}
+  .wrap{max-width:880px;margin:0 auto;padding:32px 20px 80px;}
+  h1{font-size:28px;margin:0 0 6px;}
+  .sub{color:var(--mut);margin:0 0 20px;}
+  .rules{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 24px;}
+  .rules span{background:#eef2f7;border:1px solid var(--line);border-radius:999px;padding:4px 12px;font-size:13px;color:var(--mut);}
+  h2{font-size:20px;margin:34px 0 10px;padding-bottom:6px;border-bottom:2px solid var(--line);}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:14px 0;box-shadow:0 1px 2px rgba(0,0,0,.03);}
+  .who{font-weight:700;}
+  .姿萱{color:#b5179e}.小P{color:#3a86ff}.Maya{color:#7209b7}.阿傑{color:#1f6f3d}.Vivian{color:#bc6c00}.老張{color:#9d0208}
+  ul{margin:8px 0 8px 0;padding-left:22px}
+  li{margin:4px 0}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:15px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:#eef2f7;}
+  .pri{display:inline-block;font-weight:700;border-radius:6px;padding:1px 8px;font-size:13px;margin-right:6px;color:#fff;}
+  .p0{background:var(--accent)}.p1{background:var(--warn)}.p2{background:#6b7280}
+  .anti li{color:#9d0208}
+  .sumcard{background:#fff7f0;border:1px solid #f3d6b6;border-left:4px solid var(--warn);}
+  code{background:#eef1f5;padding:1px 5px;border-radius:4px;font-size:14px;}
+  .tag{font-size:12px;color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>匯出清單 × 組考卷：設計討論</h1>
+  <p class="sub">multi-agent 圓桌 · 先不寫程式 · 兩問：(1) 怎麼讓「選擇→匯出清單」更方便　(2) 匯出清單與組考卷的關係/連動</p>
+  <div class="rules">
+    <span>紀律：誠實命名（分數≠錯誤）</span><span>探索與治理分離（改標只在灰帶）</span><span>框選不重置（2D spec 要穩）</span>
+  </div>
+
+  <h2>0. 現況盤點</h2>
+  <div class="card">
+    <ul>
+      <li><b>匯出清單 <code>viz_export_list</code></b>：session dict，以影像路徑為鍵、跨 Run 保留；snapshot <code>{path,label,split,index}</code>。出口 CSV(含 sha256)+ZIP，<b>不寫回資料集</b>。加入途徑：選取「批次加入清單」、檢視槽、重複/選樣「全部加入」。<b>只活在 Visualize Embeddings。</b></li>
+      <li><b>組考卷</b>：獨立工具，自載資料夾 或 收覆蓋圖 inbound 候選（<code>quiz_records/quiz_inbound</code>）。</li>
+      <li><b>關鍵</b>：兩者目前<b>不相通</b>——挑好的一批，要出考卷得在組考卷重載資料夾、重挑一次。</li>
+    </ul>
+  </div>
+
+  <h2>1. 痛點</h2>
+  <div class="card">
+    <p><span class="who 姿萱">姿萱（power-user）</span>：日常是「框→加清單→換 model/split 再框→累積→匯出」。痛點：①清單只在 Visualize，覆蓋圖/灰帶看到的點丟不進同一個清單；②清單一坨，分不清手挑 vs 離群順手帶；③要送標註得去組考卷重載資料夾。</p>
+    <p><span class="who 小P">小P（新手）</span>：分不清「選取」和「匯出清單」差在哪——都是一排縮圖。為什麼選了還要再加一次？</p>
+  </div>
+
+  <h2>2. 「選取」與「清單」是兩個層級</h2>
+  <div class="card">
+    <p><span class="who Maya">Maya（設計）</span>：不該合併。<b>選取＝transient 游標</b>（框選即時看圖），<b>清單＝persistent 購物車</b>（跨視圖累積）。問題在命名與引導沒講清楚關係。心智模型：<b>選取＝貨架，清單＝購物車</b>。</p>
+    <p><span class="who Vivian">Vivian（PM）</span>：方向＝(a) 清單升級成<b>全工具通用策展購物車</b>；(b) 每件帶<b>來源標籤</b>；(c) 從購物車<b>一鍵分流</b>到下游。</p>
+  </div>
+
+  <h2>3. 來源與理由（provenance）</h2>
+  <div class="card">
+    <p><span class="who 老張">老張（MLOps）</span>：清單要餵下游，每筆得帶 <code>source</code>(手選/離群/分歧/稀疏/補洞/灰帶決策)、<code>score</code>(誠實：排序依據非錯誤)、<code>reason</code>(接策展日誌)。<b>清單就該是策展日誌的當前快照</b>。</p>
+    <p><span class="who 阿傑">阿傑（工程）</span>：零阻力——snapshot 多塞 <code>source/score/reason</code> 欄、CSV 多幾欄即可。</p>
+  </div>
+
+  <h2>4. 與組考卷的連動（核心）</h2>
+  <div class="card">
+    <p><span class="who 姿萱">姿萱</span>：最想要——<b>清單 → 一鍵出考卷</b>，別再去組考卷載資料夾。</p>
+    <p><span class="who 阿傑">阿傑</span>：inbound 契約已存在（覆蓋圖在用）：清單送考卷＝pseudo_records 當 <code>quiz_records</code>、分歧度取每筆 <code>score</code>(沒有就 kNN 重算)。與 <code>_cov_send_to_quiz</code> 同套。</p>
+    <p><span class="who Vivian">Vivian</span>：反向也有價值——考卷低一致/低 vs-golden 的題目<b>回推清單</b>標 <code>source=quiz_disputed</code>。形成迴圈 清單→考卷→爭議→清單。</p>
+    <p><span class="who 老張">老張</span>：守治理分離——組考卷是<b>量測</b>(不改資料)、考卷結果回清單是<b>收集</b>(不是改標)；<b>改標仍只在灰帶</b>。</p>
+    <p><span class="who Maya">Maya</span>：購物車底部一排分流鈕 <code>📝 出考卷</code> / <code>🌫 送灰帶</code> / <code>⬇ 匯出</code>——與既有 handoff 同語彙，學一次到處通用。</p>
+  </div>
+
+  <h2>5. 讓「選擇更方便」的具體手法</h2>
+  <div class="card">
+    <ul>
+      <li>一鍵加入<b>無所不在</b>：選取/覆蓋圖縮圖/灰帶佇列/相似/重複/選樣。</li>
+      <li>加入時<b>自動帶 source/score</b>（框選=manual、離群排序=帶分數…）。</li>
+      <li>清單面板可依 <b>source 篩選/分組</b>、可加註理由（接策展日誌）。</li>
+      <li>批次加入<b>回饋</b>「已加 N、略過 M」（現有 added/skipped 要顯示）。</li>
+      <li>跨工具共用同一個 cart key；反悔成本低（整批移除、依 source 清）。</li>
+    </ul>
+  </div>
+
+  <h2>6. 爭點與收斂</h2>
+  <table>
+    <tr><th>爭點</th><th>收斂</th></tr>
+    <tr><td>選取要併進清單？</td><td><b>不併</b>。transient 游標 vs persistent 購物車；UI 明說關係。</td></tr>
+    <tr><td>清單全域 vs 各工具各自？</td><td><b>全域一個 cart</b> 帶 source；使用者心智是「在收一批樣本」。</td></tr>
+    <tr><td>考卷結果回推清單違反誠實/治理？</td><td><b>不違反</b>，標 <code>quiz_disputed</code> 且不改標；改標只走灰帶。</td></tr>
+    <tr><td>風險：cart 變第二個選取</td><td>購物車語彙 + provenance + 分流鈕 三件事化解。</td></tr>
+  </table>
+
+  <h2>7. 共識建議（優先序）</h2>
+  <div class="card">
+    <p><span class="pri p0">P0</span><b>A. 清單→組考卷 一鍵 handoff</b>（沿用 <code>quiz_inbound</code>，與覆蓋圖→考卷對稱）。</p>
+    <p><span class="pri p0">P0</span><b>B. 清單每筆帶 provenance</b>（source/score），CSV 增欄。</p>
+    <p><span class="pri p0">P0</span><b>C. 凡有縮圖處都有「加入清單」</b>（先補覆蓋圖縮圖、灰帶佇列）。</p>
+    <p><span class="pri p1">P1</span><b>D. 購物車升級為跨工具全域 cart</b>：依 source 篩選/分組 + 理由（接策展日誌）。</p>
+    <p><span class="pri p1">P1</span><b>E. 清單→灰帶覆核 一鍵 handoff</b>（治理分流）。</p>
+    <p><span class="pri p2">P2</span><b>F. 下游結果回推 cart</b>（標 source），形成策展迴圈。</p>
+  </div>
+
+  <h2>8. 不做 / 反範圍</h2>
+  <div class="card anti">
+    <ul>
+      <li>不把「選取」與「清單」合併。</li>
+      <li>不在清單裡改標籤（改標只在灰帶覆核）。</li>
+      <li>不自動把離群/分歧整批塞進清單（要確認；分數≠錯誤）。</li>
+      <li>不讓清單寫回資料集（永遠只是 collection + 分流 + 匯出）。</li>
+    </ul>
+  </div>
+
+  <h2>9. 一句話總結</h2>
+  <div class="card sumcard">
+    <b>匯出清單應從「Visualize 內的 ZIP 暫存區」升級成「跨工具策展購物車」</b>：每件帶來源，底部一排分流鈕把同一批樣本一鍵送去 <b>組考卷</b>(量測一致性) / <b>灰帶覆核</b>(裁決) / <b>匯出</b>(訓練)。與「覆蓋圖→組考卷」「散點→灰帶」完全對稱——<b>組考卷正是購物車最自然的第一個下游</b>。
+  </div>
+</div>
+</body>
+</html>

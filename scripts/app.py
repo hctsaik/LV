@@ -553,36 +553,47 @@ def _load_more() -> None:
     st.session_state["viz_grid_limit"] = min(cur + _GRID_BATCH, _GRID_CAP)
 
 
-def _export_entry(records: list[dict], i: int) -> dict:
+def _export_entry(records: list[dict], i: int, source: str = "manual",
+                  score: float | None = None, reason: str = "") -> dict:
     r = records[i]
     p = Path(r["path"])
     man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
     return {"index": i, "filename": p.name, "path": str(p),
             "label": r.get("label", ""), "split": r.get("split", ""),
-            "sha256": man.get("sha256") if man else None}
+            "sha256": man.get("sha256") if man else None,
+            "source": source,
+            "score": (round(float(score), 4) if score is not None else None),
+            "reason": reason}
 
 
-def _add_to_export(records: list[dict], indices: list[int]) -> tuple[int, int]:
-    """Add records to the export list (keyed by image path). → (added, skipped)."""
+def _add_to_export(records: list[dict], indices: list[int], source: str = "manual",
+                   scores: dict | None = None, reason: str = "") -> tuple[int, int]:
+    """Add records to the策展購物車 (keyed by image path), tagging each with
+    its provenance (source / score / reason). → (added, skipped)."""
     elist = st.session_state.setdefault("viz_export_list", {})
     added = 0
     for i in indices:
         key = str(records[i]["path"])
         if key not in elist:
-            elist[key] = _export_entry(records, i)
+            sc = scores.get(i) if isinstance(scores, dict) else None
+            elist[key] = _export_entry(records, i, source=source, score=sc,
+                                       reason=reason)
             added += 1
     return added, len(indices) - added
 
 
-def _batch_add(records: list[dict], indices: list[int]) -> None:
-    added, skipped = _add_to_export(records, indices)
-    msg = f"已加入 {added} 張" + (f"（略過 {skipped} 張重複）" if skipped else "")
-    st.toast(msg, icon="⬇")
-    _log_usage("export_list_add", n=added)
+def _batch_add(records: list[dict], indices: list[int], source: str = "manual",
+               scores: dict | None = None) -> None:
+    added, skipped = _add_to_export(records, indices, source=source, scores=scores)
+    msg = f"已加入清單 {added} 張" + (f"（略過 {skipped} 張重複）" if skipped else "")
+    st.toast(msg, icon="🛒")
+    _log_usage("export_list_add", n=added, source=source)
 
 
-def _add_one(records: list[dict], idx: int) -> None:
-    _add_to_export(records, [idx])
+def _add_one(records: list[dict], idx: int, source: str = "manual",
+             score: float | None = None) -> None:
+    _add_to_export(records, [idx], source=source,
+                   scores=({idx: score} if score is not None else None))
 
 
 def _remove_from_export(path_key: str) -> None:
@@ -592,6 +603,65 @@ def _remove_from_export(path_key: str) -> None:
 def _clear_export_list() -> None:
     st.session_state["viz_export_list"] = {}
     st.session_state["viz_clear_list_confirm"] = False
+
+
+def _cart_snapshots(source_filter: str | None = None) -> list[dict]:
+    snaps = list(st.session_state.get("viz_export_list", {}).values())
+    if source_filter and source_filter != "全部":
+        snaps = [s for s in snaps if s.get("source", "") == source_filter]
+    return snaps
+
+
+def _cart_pseudo_records(snaps: list[dict]) -> tuple[list[dict], list[float]]:
+    """購物車快照 → (pseudo_records, scores)。score 缺則 0。"""
+    recs = [{"path": Path(s["path"]), "label": s.get("label", ""),
+             "split": s.get("split", "")} for s in snaps]
+    scores = [float(s["score"]) if s.get("score") is not None else 0.0 for s in snaps]
+    return recs, scores
+
+
+def _cart_to_quiz(snaps: list[dict]) -> None:
+    """購物車 → 組考卷 一鍵 handoff（與 _cov_send_to_quiz 對稱）。"""
+    recs, scores = _cart_pseudo_records(snaps)
+    if len(recs) < 4:
+        st.toast("購物車至少要 4 張才能出考卷（考卷有 4 種題型）。", icon="⚠")
+        return
+    st.session_state["quiz_records"] = recs
+    st.session_state["quiz_disagreement"] = np.asarray(scores, dtype=float)
+    st.session_state["quiz_class_opts"] = sorted({r["label"] for r in recs if r["label"]})
+    st.session_state["quiz_inbound"] = True
+    for k in ("quiz_spec", "quiz_answers", "quiz_pos"):
+        st.session_state.pop(k, None)
+    st.session_state["tool_switch"] = "組考卷"
+    st.session_state["_cart_app_rerun"] = True
+    _log_usage("cart_to_quiz", n=len(recs))
+
+
+def _cart_to_gray(snaps: list[dict], model: str) -> None:
+    """購物車 → 灰帶覆核 一鍵 handoff。購物車不帶 embedding，故以指定模型即時
+    重算清單影像特徵，供錨例（nearest_anchor）比對。"""
+    recs, scores = _cart_pseudo_records(snaps)
+    if not recs:
+        return
+    embed_fn = load_model(model)
+    with st.spinner(f"擷取清單特徵（{len(recs)} 張）以建立覆核佇列…"):
+        emb = extract_embeddings([r["path"] for r in recs], embed_fn)
+    labels = [r["label"] for r in recs]
+    order = sorted(range(len(recs)), key=lambda i: scores[i], reverse=True)
+    anchors: dict[str, int | None] = {}
+    for c in sorted(set(labels)):
+        cand = [i for i in range(len(recs)) if labels[i] == c]
+        anchors[c] = (min(cand, key=lambda i: scores[i]) if cand else None)
+    st.session_state["gray_records"] = recs
+    st.session_state["gray_emb"] = emb
+    st.session_state["gray_queue"] = order
+    st.session_state["gray_anchors"] = anchors
+    st.session_state["gray_state"] = {}
+    st.session_state["gray_pos"] = 0
+    st.session_state["gray_inbound"] = True
+    st.session_state["tool_switch"] = "灰帶覆核"
+    st.session_state["_cart_app_rerun"] = True
+    _log_usage("cart_to_gray", n=len(recs))
 
 
 def _nn_index_for(model_name: str):
@@ -876,7 +946,7 @@ def _render_text_search(records: list[dict], model_name: str,
                           on_click=_pivot_to_image_query, args=(i,))
                 st.button("⬇ 加入清單", key=f"viz_textadd_{i}",
                           use_container_width=True,
-                          on_click=_add_one, args=(records, i))
+                          on_click=_add_one, args=(records, i, "search"))
     st.download_button(
         "⬇ 匯出此結果 CSV", data=records_to_csv(records, idxs),
         file_name="text_search.csv", mime="text/csv", key="viz_export_textsearch",
@@ -939,7 +1009,7 @@ def _render_similar_view(records: list[dict], model_name: str) -> None:
                     st.button("↻ 以此為查詢", key=f"viz_requery_{i}", use_container_width=True,
                               on_click=_chain_query, args=(i,))
                     st.button("⬇ 加入清單", key=f"viz_simadd_{i}", use_container_width=True,
-                              on_click=_add_one, args=(records, i))
+                              on_click=_add_one, args=(records, i, "similar"))
         st.download_button(
             "⬇ 匯出此相似群 CSV", data=records_to_csv(records, [q] + idxs),
             file_name="similar_group.csv", mime="text/csv", key="viz_export_similar",
@@ -1021,7 +1091,7 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
         )
         st.button("⬇ 將全部右側加入匯出清單", key="viz_dup_add_all",
                   use_container_width=True,
-                  on_click=_batch_add, args=(records, [j for _, j, _ in pairs]))
+                  on_click=_batch_add, args=(records, [j for _, j, _ in pairs], "duplicate"))
         with st.container(height=330, key="viz_dup_list"):
             for row, (i, j, d) in enumerate(shown_pairs):
                 dd = f"{d}" if isinstance(d, int) else f"{d:.4f}"
@@ -1041,7 +1111,7 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
                     st.caption(f"d={dd}")
                     st.button("⬇ 右側入清單", key=f"viz_dup_addr_{row}",
                               use_container_width=True,
-                              on_click=_add_one, args=(records, j))
+                              on_click=_add_one, args=(records, j, "duplicate"))
 
 
 def _run_sampling(model_name: str, n: int, seed_from_list: bool) -> None:
@@ -1090,7 +1160,7 @@ def _render_sampling_view(records: list[dict], model_name: str) -> None:
                    + " · 多樣性排序，越前越該優先標")
         st.button("⬇ 全部加入匯出清單", key="viz_sampling_addall",
                   use_container_width=True,
-                  on_click=_batch_add, args=(records, picks))
+                  on_click=_batch_add, args=(records, picks, "sampling"))
         with st.container(height=320):
             cols = st.columns(3)
             for j, i in enumerate(picks):
@@ -1254,42 +1324,94 @@ S3 模型不確定度 <b>{s3:.2f}</b>（{'猶豫' if diag['s3_high'] else '篤�
 </body></html>"""
 
 
+_SOURCE_LABEL = {
+    "manual": "手選", "search": "以文搜圖", "similar": "以圖搜圖",
+    "duplicate": "重複/洩漏", "sampling": "多樣性選樣", "outlier": "離群",
+    "disagreement": "標籤分歧", "sparse": "稀疏盲區", "gap_filler": "補洞候選",
+    "gray": "灰帶", "quiz": "考卷爭議", "quiz_disputed": "考卷低一致",
+}
+
+
+def _cart_set_reason(snaps: list[dict], reason: str) -> None:
+    """為購物車裡（篩選後）這批寫上理由——snaps 是 elist 的活字典值，直接改即生效。"""
+    for s in snaps:
+        s["reason"] = reason
+    st.toast(f"已為 {len(snaps)} 張加註理由", icon="📝")
+    _log_usage("cart_reason", n=len(snaps))
+
+
 def _render_export_view() -> None:
     elist = st.session_state.get("viz_export_list", {})
-    st.caption(f"匯出清單 — 共 {len(elist)} 張（session 內有效；匯出後可清空，不寫回資料集）")
+    st.caption(f"策展購物車 — 共 {len(elist)} 張（跨工具累積、跨 Run 保留；"
+               "下方可一鍵分流到組考卷／灰帶覆核或匯出，不寫回資料集）")
     if not elist:
-        st.info("清單是空的。在「選取」面板批次加入，或在檢視槽逐張加入。")
+        st.info("購物車是空的。任何看得到縮圖的地方（選取／覆蓋圖／灰帶／相似／"
+                "重複／選樣）都能「加入清單」，會帶來源標籤累積到這裡。")
         return
-    snapshots = list(elist.values())
+    all_snaps = list(elist.values())
+
+    from collections import Counter
+    cnt = Counter((s.get("source") or "manual") for s in all_snaps)
+    breakdown = " · ".join(f"{_SOURCE_LABEL.get(k, k)} {v}" for k, v in cnt.most_common())
+    st.caption(f":gray[來源組成：{breakdown}]")
+    fcol, _sp = st.columns([1.5, 2])
+    src = fcol.selectbox(
+        "來源篩選", ["全部"] + [k for k, _ in cnt.most_common()],
+        format_func=lambda k: ("全部" if k == "全部"
+                               else f"{_SOURCE_LABEL.get(k, k)}（{cnt.get(k, 0)}）"),
+        key="cart_src_filter", label_visibility="collapsed")
+    snapshots = _cart_snapshots(src)
     pseudo_records = [
-        {"path": Path(s["path"]), "label": s["label"], "split": s["split"]}
-        for s in snapshots
-    ]
-    with st.container(height=400, key="viz_export_grid"):
+        {"path": Path(s["path"]), "label": s.get("label", ""),
+         "split": s.get("split", "")} for s in snapshots]
+
+    with st.container(height=340, key="viz_export_grid"):
         cols = st.columns(4)
         for j, s in enumerate(snapshots):
             with cols[j % 4]:
                 thumb = _thumb_or_none(Path(s["path"]))
+                cap = _SOURCE_LABEL.get(s.get("source", "manual"), s.get("source", ""))
+                if s.get("score") is not None:
+                    cap += f"·{s['score']:.2f}"
                 if thumb is not None:
-                    st.image(thumb, use_container_width=True)
+                    st.image(thumb, use_container_width=True, caption=cap)
                 else:
-                    st.warning("⚠ 檔案遺失")
+                    st.warning(f"⚠ 缺檔 · {cap}")
                 st.button(f"移除 #{s['index']}", key=f"viz_unlist_{j}",
                           use_container_width=True,
                           on_click=_remove_from_export, args=(s["path"],))
+
+    # ── 分流：同一批樣本一鍵送下游（與覆蓋圖→考卷、散點→灰帶同語彙）──
+    st.markdown(f"**分流這 {len(snapshots)} 張：**")
+    h1, h2 = st.columns(2)
+    h1.button("📝 拿這批出考卷 →", key="cart_to_quiz_btn", use_container_width=True,
+              type="primary", on_click=_cart_to_quiz, args=(snapshots,),
+              help="把購物車當盲測考卷題庫，量標註者一致性（量測，不改資料）。")
+    models = available_models()
+    h2.button("🌫 送灰帶覆核 →", key="cart_to_gray_btn", use_container_width=True,
+              disabled=not models,
+              on_click=_cart_to_gray, args=(snapshots, models[0] if models else ""),
+              help="送進有紀錄的裁決流程（對照錨例→提議→雙簽→匯出）；"
+                   "會以模型即時重算清單特徵供錨例比對。")
+
     d1, d2 = st.columns(2)
     d1.download_button(
-        "⬇ 匯出 CSV",
-        data=snapshots_to_csv(snapshots),
-        file_name="selection.csv", mime="text/csv",
-        key="viz_export_csv", use_container_width=True,
-    )
+        "⬇ 匯出 CSV（含來源/分數/sha256）", data=snapshots_to_csv(snapshots),
+        file_name="curation_cart.csv", mime="text/csv",
+        key="viz_export_csv", use_container_width=True)
     d2.download_button(
-        "⬇ 匯出 ZIP",
-        data=zip_selected_images(pseudo_records, list(range(len(pseudo_records)))),
-        file_name="selection_images.zip", mime="application/zip",
-        key="viz_export_zip", use_container_width=True,
-    )
+        "⬇ 匯出 ZIP", data=zip_selected_images(pseudo_records,
+                                              list(range(len(pseudo_records)))),
+        file_name="curation_cart_images.zip", mime="application/zip",
+        key="viz_export_zip", use_container_width=True)
+
+    with st.expander("📝 為這批加註理由（寫進 CSV 的 reason 欄）"):
+        reason = st.text_input("理由", key="cart_reason_text",
+                               placeholder="例：疑似 donut 與貝果混淆的一批",
+                               label_visibility="collapsed")
+        st.button("套用到目前篩選的這批", key="cart_reason_btn",
+                  disabled=not reason.strip(),
+                  on_click=_cart_set_reason, args=(snapshots, reason))
     c1, c2 = st.columns(2)
     confirm = c1.checkbox("確認清空", key="viz_clear_list_confirm")
     c2.button("🗑 清空清單", key="viz_clear_list_btn", disabled=not confirm,
@@ -1312,6 +1434,10 @@ def _render_right_panel(
     its box/lasso selection state. Selection itself is read from
     session_state inside（見 _current_selection）.
     """
+    # 購物車「分流」鈕在 fragment 內，其 callback 只重跑 fragment、切不了主工具——
+    # 收到旗標時跳出 fragment 作 app 範圍 rerun，讓外層 segmented_control 換頁。
+    if st.session_state.pop("_cart_app_rerun", False):
+        st.rerun(scope="app")
     st.session_state.setdefault("viz_panel_view", "選取")
     view = st.segmented_control(
         "面板", ["選取", "相似", "重複", "選樣", "體檢卡", "匯出清單"],
@@ -2793,6 +2919,13 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
             "縮圖改顯示原圖(含框)", key="cov_gal_fullimg",
             help="看物件在整張圖的位置脈絡（紅框為該圖所有標註）。")
         view_idx = base_idx[:gal_n]
+        if view_idx:
+            cart_src = "gap_filler" if (sel_idx and False) else "sparse"
+            st.button(f"🛒 把這 {len(view_idx)} {'物件' if is_obj else '張'}加入策展購物車",
+                      key="cov_add_cart", use_container_width=True,
+                      on_click=_batch_add,
+                      args=(records, view_idx, cart_src,
+                            {i: float(sparsity[i]) for i in view_idx}))
         if not view_idx:
             st.caption("目前沒有可顯示的影像。")
         else:
@@ -3258,8 +3391,8 @@ def _quiz_ui() -> None:
     class_opts = (st.session_state.get("quiz_class_opts")
                   or sorted({r["label"] for r in records}))
     if st.session_state.get("quiz_inbound"):
-        st.info("ℹ 這些是『嵌入覆蓋圖』送來的未標註補洞候選；暫定類別取自最近鄰"
-                "（非標準答案）。逐題盲標即可，最後匯出作答 CSV 作為新標籤。")
+        st.info("ℹ 這批題目是從別的工具送來的（嵌入覆蓋圖補洞候選 / 策展購物車）。"
+                "逐題盲標即可，最後匯出作答 CSV——量的是標註者一致性，不改資料集。")
 
     # ── 出題（尚無考卷）──
     if "quiz_spec" not in st.session_state:
@@ -3324,6 +3457,16 @@ def _quiz_ui() -> None:
     st.download_button("⬇ 匯出作答 CSV（給多人一致性用）", data=csv,
                        file_name="quiz_answers.csv", mime="text/csv",
                        key="quiz_answers_csv")
+    # 下游回推：把考卷量出的爭議樣本收回購物車（策展迴圈 清單→考卷→爭議→清單）
+    quiz_recs = st.session_state.get("quiz_records", [])
+    q_idx = sorted({int(q["record_idx"]) for q in questions
+                    if 0 <= int(q["record_idx"]) < len(quiz_recs)})
+    if q_idx:
+        st.button(f"🛒 把這 {len(q_idx)} 張爭議影像加入購物車", key="quiz_add_cart",
+                  use_container_width=True,
+                  help="考卷量出的爭議樣本收進跨工具購物車（標 source=考卷低一致），"
+                       "可再一鍵送灰帶覆核裁決。",
+                  on_click=_batch_add, args=(quiz_recs, q_idx, "quiz_disputed"))
     st.button("🔁 再出一卷", key="quiz_again", on_click=_quiz_reset)
     st.divider()
     _render_quiz_multirater()
@@ -3466,7 +3609,7 @@ def _gray_zone_ui() -> None:
         return
 
     if st.session_state.get("gray_inbound"):
-        st.info("ℹ 這批佇列是『Visualize Embeddings』框選的爭議點送來的（依標籤分歧度排序）。"
+        st.info("ℹ 這批佇列是從別的工具送來的（散點框選 / 策展購物車，依分數排序）。"
                 "對照錨例逐筆裁決即可——不直接寫回資料集，雙簽通過後匯出決策。")
 
     records = st.session_state["gray_records"]
@@ -3483,6 +3626,9 @@ def _gray_zone_ui() -> None:
     col_rev, col_done = st.columns([5, 3], gap="medium")
     with col_rev:
         st.markdown(f"**覆核佇列**（待處理 {len(pending)} · 已通過 {len(approved)}）")
+        st.button("🛒 佇列加入策展購物車", key="gray_add_cart", use_container_width=True,
+                  help="把這批灰帶樣本收進跨工具購物車（標 source=灰帶），之後可再分流或匯出。",
+                  on_click=_batch_add, args=(records, list(queue), "gray"))
         if not pending:
             st.success("佇列清空——所有灰帶都已雙簽通過或退回。")
         else:

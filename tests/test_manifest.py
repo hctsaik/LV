@@ -260,11 +260,15 @@ def test_snapshots_to_csv_header_and_rows():
     from interaction import snapshots_to_csv
     csv_text = snapshots_to_csv([
         {"filename": "a.jpg", "path": "C:/x/a.jpg", "label": "cat",
-         "split": "train", "sha256": "ab" * 32},
+         "split": "train", "sha256": "ab" * 32,
+         "source": "sparse", "score": 0.42, "reason": "blind spot"},
         {"filename": "b.jpg", "path": "C:/x/b.jpg", "label": "dog",
          "split": "val", "sha256": None},
     ])
     lines = csv_text.splitlines()
-    assert lines[0] == "index,filename,path,label,split,sha256"
-    assert lines[1].endswith("ab" * 32)
-    assert lines[2].endswith(",")  # missing hash → empty cell, not "None"
+    assert lines[0] == "index,filename,path,label,split,sha256,source,score,reason"
+    # provenance columns carry through
+    assert lines[1].split(",")[6:] == ["sparse", "0.42", "blind spot"]
+    assert "ab" * 32 in lines[1]
+    # missing sha256/source/score/reason → empty cells, not "None"
+    assert lines[2].endswith(",,,")

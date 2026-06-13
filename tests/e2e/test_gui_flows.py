@@ -311,11 +311,14 @@ def test_i_export_list_round_trip(flow_page):
         page.locator('.st-key-viz_export_csv button').click()
     text = Path(dl.value.path()).read_text(encoding="utf-8")
     lines = text.splitlines()
-    assert lines[0] == "index,filename,path,label,split,sha256"
+    # 策展購物車 CSV now carries provenance columns after sha256
+    assert lines[0] == "index,filename,path,label,split,sha256,source,score,reason"
     assert len(lines) == 1 + n_sel, "CSV rows must equal export-list size"
     for row in lines[1:]:
-        sha = row.rsplit(",", 1)[1]
+        cells = row.split(",")
+        sha = cells[5]
         assert len(sha) == 64, "exported rows must be content-addressed (manifest sha256)"
+        assert cells[6] == "manual", "box-selection adds carry source=manual"
 
     with page.expect_download() as dl:
         page.locator('.st-key-viz_export_zip button').click()

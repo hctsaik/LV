@@ -56,12 +56,34 @@ def test_build_viz_figure_trace_per_label_split():
     assert len(fig.data) == 2
 
 
-def test_build_viz_figure_title_contains_model_and_method():
+def test_build_viz_figure_no_redundant_title():
+    # model·method is shown in the Model/Method selectboxes above the chart;
+    # the in-figure centred title was removed because it overlapped the
+    # top-left 全選/全不選 buttons (排版重疊). The figure must carry no title.
     records = _make_records(2, "train", "apple")
     coords = np.random.rand(2, 2)
     fig = _build_viz_figure(records, coords, [0, 1], "mobilenet", "t-SNE")
-    assert "mobilenet" in fig.layout.title.text
-    assert "t-SNE" in fig.layout.title.text
+    assert not (fig.layout.title.text or "")
+
+
+def test_build_viz_figure_disagreement_mode():
+    # disagreement coloring: a single continuous-coloured points trace (carries
+    # customdata for selection) + a cross-class pair-line trace; drag=select.
+    records = _make_records(4, "train", "apple")
+    coords = np.random.rand(4, 2)
+    dis = np.array([0.0, 0.9, 0.3, 0.7])
+    fig = _build_viz_figure(records, coords, [0, 1, 2, 3], "m", "PCA",
+                            color_by="disagreement", disagreement=dis,
+                            pairs=[(0, 1), (2, 3)])
+    assert fig.layout.dragmode == "select"
+    line_traces = [t for t in fig.data if getattr(t, "mode", "") == "lines"]
+    pts = [t for t in fig.data if getattr(t, "mode", "") == "markers"]
+    assert line_traces and pts                     # both lines and points present
+    assert pts[0].customdata is not None           # selection still maps back
+    # class mode keeps the 全選/全不選 buttons; disagreement mode drops them
+    fig_cls = _build_viz_figure(records, coords, [0, 1, 2, 3], "m", "PCA")
+    assert fig_cls.layout.updatemenus
+    assert not fig.layout.updatemenus
 
 
 def test_build_viz_figure_split_filter():
