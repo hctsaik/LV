@@ -1024,3 +1024,21 @@ def test_ab_legend_toggle_buttons(flow_page):
     wrap.get_by_text("全不選").first.click()
     wrap.get_by_text("全選類別").first.click()
     _no_exception(page)
+
+
+# ── (ac) evaluation tool — one-click demo renders recall + escape gallery ─
+
+def test_ac_evaluation_demo(app_page):
+    page = app_page
+    page.locator('.st-key-tool_switch').get_by_text("評估", exact=True).click()
+    wait_idle(page)
+    # the quick-start demo button synthesizes predictions+consensus from coco8
+    demo = page.locator('.st-key-eval_demo_btn button')
+    expect(demo).to_be_visible()
+    demo.click()
+    wait_idle(page, timeout=120000)
+    # purpose is legible: a recall metric, an escape (FN) count, and the gallery
+    expect(page.get_by_text("整體 recall", exact=True)).to_be_visible()
+    expect(page.get_by_text("漏抓 FN（escape）", exact=True)).to_be_visible()
+    expect(page.get_by_text(re.compile(r"漏抓畫廊（escape"))).to_be_visible()
+    _no_exception(page)

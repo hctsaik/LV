@@ -4335,6 +4335,55 @@ def _eval_consensus_by_image(csv_text: str, gt_by_image: dict) -> tuple[dict, in
     return consensus_flags(rows, gt_by_image)
 
 
+def _load_eval_demo() -> None:
+    """One-click 評估 demo: synthesize predictions + a consensus subset from the
+    bundled coco8 GT so the tool's purpose (per-type recall + escape gallery +
+    gray-band exclusion) is visible without any uploads."""
+    from evaluation import consensus_flags, evaluate_detections
+    folder = _DEMO_DIR / "train"
+    if not (folder / "images").exists():
+        return
+    names = read_classes_txt(folder) or read_classes_txt(folder / "_") or []
+    gt = _eval_gt_by_image(folder, names)
+    if not gt:
+        return
+    imgs = list(gt)
+    miss_img = imgs[-1]                       # all its boxes become escapes (FN)
+    gray_img = imgs[-2] if len(imgs) >= 2 else None  # excluded from recall
+    preds = {f: ([] if f == miss_img else [{**b, "score": 0.9} for b in bx])
+             for f, bx in gt.items()}
+    rows = [{"filename": f, "consensus": f != gray_img,
+             "cx": b["cx"], "cy": b["cy"], "w": b["w"], "h": b["h"]}
+            for f, bx in gt.items() for b in bx]
+    cby, n_c, n_g = consensus_flags(rows, gt)
+    res = evaluate_detections(gt, preds, consensus_by_image=cby)
+    st.session_state["_eval_result"] = {
+        "res": res, "folder": str(folder), "used_consensus": True,
+        "n_cons_img": n_c, "n_gray_img": n_g, "n_pred_img": len(preds),
+        "is_demo": True}
+    _log_usage("eval_demo_load")
+
+
+def _render_eval_quick_start() -> None:
+    st.markdown("##### 快速開始")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1, st.container(border=True):
+        st.markdown("**① 選資料夾**")
+        st.caption("含 images/ 與 labels/（YOLO GT）的偵測資料夾。")
+    with c2, st.container(border=True):
+        st.markdown("**② 上傳模型預測**")
+        st.caption("predictions.csv：`filename,class,cx,cy,w,h[,score]`。")
+    with c3, st.container(border=True):
+        st.markdown("**③（可選）共識子集**")
+        st.caption("組考卷匯出的 consensus_set.csv——recall 只在共識上算。")
+    mid = st.columns([2, 1.9, 2])[1]
+    mid.button("✨ 用範例資料試跑（coco8，含刻意漏抓）", key="eval_demo_btn",
+               type="primary", use_container_width=True, on_click=_load_eval_demo,
+               disabled=not (_DEMO_DIR / "train" / "images").exists())
+    st.caption(":gray[範例：拿 coco8 的 GT 當靶，預測刻意漏掉一張圖（→ 漏抓畫廊）、"
+               "把一張標成灰帶（→ 排除於 recall），一眼看懂這工具在量什麼。]")
+
+
 def _evaluation_ui() -> None:
     import tempfile
 
@@ -4388,9 +4437,12 @@ def _evaluation_ui() -> None:
 
     data = st.session_state.get("_eval_result")
     if not data:
-        st.info("填資料夾＋上傳模型預測 CSV → ▶ 評估。需偵測（YOLO labels）資料。")
+        _render_eval_quick_start()
         return
     res = data["res"]
+    if data.get("is_demo"):
+        st.caption(":blue[範例資料（coco8）：預測刻意漏掉一張圖 → 看『漏抓畫廊』；"
+                   "一張標為灰帶 → 看它被排除於 recall。換成你的資料夾＋預測 CSV 即真評估。]")
     if data["n_pred_img"] == 0:
         st.warning("預測 CSV 沒對到任何影像（檢查 filename 欄是否為影像檔名）。")
     if not data["used_consensus"]:
