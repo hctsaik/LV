@@ -13,7 +13,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image
-import umap
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
@@ -70,7 +69,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     zip_selected_images,
 )
 from manifest import rel_key, set_embedding_refs, update_manifest, write_manifest
-from umap_ref import ref_path_for, stable_umap
+import labeling_handoff as LH  # unified LV → Labeling hand-over (framework-free)
 from completeness import (
     STATE_EMPTY,
     STATE_FAKE,
@@ -89,17 +88,41 @@ from quiz import (
     geometric_skin,
     score_quiz,
 )
-from compare_distributions import (
-    build_projection_figure,
-    compute_fid,
-    compute_inception_score,
-    compute_kid,
-    compute_lpips_score,
-    compute_psnr_score,
-    compute_ssim_score,
-    get_image_paths,
-)
+# compare_distributions imports umap (~22s) + torch + clean_fid + lpips at module
+# load — the real reason the shell was slow. Defer it via thin lazy wrappers so it
+# only costs time when the user actually opens "Compare Distributions".
+def _cmp():
+    import compare_distributions as _m
+    return _m
+
+
+def build_projection_figure(*a, **k): return _cmp().build_projection_figure(*a, **k)
+def compute_fid(*a, **k): return _cmp().compute_fid(*a, **k)
+def compute_inception_score(*a, **k): return _cmp().compute_inception_score(*a, **k)
+def compute_kid(*a, **k): return _cmp().compute_kid(*a, **k)
+def compute_lpips_score(*a, **k): return _cmp().compute_lpips_score(*a, **k)
+def compute_psnr_score(*a, **k): return _cmp().compute_psnr_score(*a, **k)
+def compute_ssim_score(*a, **k): return _cmp().compute_ssim_score(*a, **k)
+def get_image_paths(*a, **k): return _cmp().get_image_paths(*a, **k)
 from visualize_embeddings import build_plotly_figure, discover_images, discover_images_classifier
+
+
+# umap-learn costs ~22s to import (numba JIT) — by far LV's biggest startup cost.
+# Load it (and umap_ref, which imports it) LAZILY so the UI shell renders instantly;
+# they materialise only when the user actually runs a UMAP projection.
+def _umap():
+    import umap
+    return umap
+
+
+def stable_umap(*args, **kwargs):
+    from umap_ref import stable_umap as _f
+    return _f(*args, **kwargs)
+
+
+def ref_path_for(*args, **kwargs):
+    from umap_ref import ref_path_for as _f
+    return _f(*args, **kwargs)
 
 def _pick_folder(session_key: str) -> None:
     root = tk.Tk()
@@ -697,6 +720,18 @@ def _thumb_or_none(path: Path) -> str | None:
 
 # ── right-panel renderers（兩欄佈局的右欄）────────────────────────────────
 
+@st.dialog("🔍 放大檢視", width="large")
+def _zoom_image_dialog(path: Path, show_boxes: bool, class_names, caption: str) -> None:
+    """全螢幕大圖檢視（沿用『顯示標註框』的當前狀態）。"""
+    try:
+        src = (draw_yolo_boxes(path, yolo_label_path_for(path), class_names)
+               if (show_boxes and class_names) else str(path))
+        st.image(src, use_container_width=True)
+    except OSError as exc:
+        st.warning(f"無法讀取影像：{exc}")
+    st.caption(caption)
+
+
 def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
     """Fixed-height, always-present viewer slot.
 
@@ -711,6 +746,10 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
             return
         r = records[idx]
         p = Path(r["path"])
+        class_names = st.session_state.get("viz_class_names")
+        if class_names:
+            st.session_state.setdefault("viz_img_boxes", True)  # 預設顯示標註框
+        show_boxes = bool(class_names) and st.session_state.get("viz_img_boxes", False)
         ctx = st.session_state.get("viz_viewer_ctx") or list(ctx_default) or [idx]
         pos = ctx.index(idx) if idx in ctx else 0
         h1, h2, h3, h4 = st.columns([5, 1, 1, 1])
@@ -726,19 +765,19 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
             if not p.exists():
                 st.warning(f"找不到檔案：{p}")
             else:
-                class_names = st.session_state.get("viz_class_names")
-                show_boxes = bool(class_names) and st.session_state.get("viz_img_boxes", False)
                 try:
-                    if show_boxes:
-                        st.image(draw_yolo_boxes(p, yolo_label_path_for(p), class_names),
-                                 use_container_width=True)
-                    else:
-                        st.image(str(p), use_container_width=True)
+                    src = (draw_yolo_boxes(p, yolo_label_path_for(p), class_names)
+                           if show_boxes else str(p))
+                    st.image(src, use_container_width=True)
                 except OSError as exc:
                     st.warning(f"無法讀取影像：{exc}")
         with ctl_col:
-            if st.session_state.get("viz_class_names"):
+            if class_names:
                 st.toggle("顯示標註框", key="viz_img_boxes")
+            if p.exists():
+                if st.button("🔍 放大檢視", key="viz_slot_zoom", use_container_width=True):
+                    _zoom_image_dialog(p, show_boxes, class_names,
+                                       f"{p.name} — {r['label']}（{r['split']}）· #{idx}")
             elist = st.session_state.get("viz_export_list", {})
             if str(p) in elist:
                 st.button("✓ 已在清單 — 移除", key="viz_slot_remove", use_container_width=True,
@@ -748,6 +787,11 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
                           on_click=_add_one, args=(records, idx))
             st.button("🔎 以此找相似", key="viz_slot_similar", use_container_width=True,
                       on_click=_start_query, args=(idx,))
+            _send_to_labeling_ui(
+                records, [idx], source="viewer",
+                task=LH.TASK_RELABEL,
+                label="📤 送這張到 Labeling", key=f"viz_slot_to_lbl_{idx}",
+                original_labels={idx: r.get("label", "")})
             man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
             if man:
                 # 資料合約可追溯性：複核時一鍵看到這張圖的 manifest 身分
@@ -802,6 +846,37 @@ def _render_select_view(
                         key="viz_grid_sort", label_visibility="collapsed")
     a4.button("✕ 清除", key="viz_clear_btn", use_container_width=True,
               disabled=not sel_indices, on_click=_clear_selection, args=(scatter_key,))
+
+    if sel_indices:
+        _dis = st.session_state.get("viz_label_disagreement", {}).get(model_name)
+        _out = st.session_state.get("viz_outlier_scores", {}).get(model_name)
+        _scores = {}
+        for i in sel_indices:
+            s = {}
+            if _dis is not None:
+                s["disagreement"] = round(float(_dis[i]), 4)
+            if _out is not None:
+                s["outlier"] = round(float(_out[i]), 4)
+            if s:
+                _scores[str(i)] = s
+        # 依排序語境推導任務：離群度排序＝多半是「這張對不對」(verify)，否則重標
+        _sel_task = LH.TASK_VERIFY if sort == "離群度" else LH.TASK_RELABEL
+        # 兩個「送這批選取出去」的動作並排放在右上角選取區
+        g_col, l_col = st.columns(2)
+        g_col.button(
+            f"🌫 送 {len(sel_indices)} 張進灰帶覆核 →", key="viz_sel_to_gray",
+            use_container_width=True, on_click=_viz_send_to_gray,
+            args=(list(sel_indices), model_name),
+            help="把這批爭議樣本送進有紀錄的裁決流程（對照錨例→提議→品保雙簽→匯出）；"
+                 "散點只負責探索，改標籤這種決定留在灰帶覆核做。")
+        with l_col:
+            _send_to_labeling_ui(
+                records, sel_indices, source="selection", task=_sel_task,
+                label="📤 送到 Labeling 標註", key="viz_sel_to_labeling",
+                original_labels={i: records[i].get("label", "") for i in sel_indices},
+                payload={"scores": _scores} if _scores else None,
+                help="把框選的這批（分歧／離群／重複皆可）送到 Labeling 逐張標／改類別；"
+                     "分歧／離群分數隨件帶過。標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
 
     outlier = st.session_state.get("viz_outlier_scores", {}).get(model_name)
     disagreement = st.session_state.get("viz_label_disagreement", {}).get(model_name)
@@ -1094,6 +1169,16 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
         st.button("⬇ 將全部右側加入匯出清單", key="viz_dup_add_all",
                   use_container_width=True,
                   on_click=_batch_add, args=(records, [j for _, j, _ in pairs], "duplicate"))
+        # 成對送 Labeling 覆核（keep/drop）；配對關係+距離隨 payload 帶過、不被攤平
+        _dup_all = sorted({i for i, _j, _ in pairs} | {j for _i, j, _ in pairs})
+        _send_to_labeling_ui(
+            records, _dup_all, source="duplicate", task=LH.TASK_VERIFY,
+            label="📤 送重複對到 Labeling 覆核", key="viz_dup_to_lbl",
+            original_labels={k: records[k].get("label", "") for k in _dup_all},
+            payload={"pairs": [[int(i), int(j), (d if isinstance(d, int) else float(d))]
+                               for i, j, d in pairs]},
+            help="把疑似重複／跨 split 洩漏『對』成對送到 Labeling 覆核（保留/丟棄）；"
+                 "配對關係與距離隨件帶過，去重決策在 Labeling 端完成（不自動刪），不用回 LV。")
         with st.container(height=330, key="viz_dup_list"):
             for row, (i, j, d) in enumerate(shown_pairs):
                 dd = f"{d}" if isinstance(d, int) else f"{d:.4f}"
@@ -1163,6 +1248,11 @@ def _render_sampling_view(records: list[dict], model_name: str) -> None:
         st.button("⬇ 全部加入匯出清單", key="viz_sampling_addall",
                   use_container_width=True,
                   on_click=_batch_add, args=(records, picks, "sampling"))
+        _send_to_labeling_ui(
+            records, list(picks), source="diversity", task=LH.TASK_FRESH,
+            label="📤 送待標清單到 Labeling 標註", key="viz_sampling_to_lbl",
+            help="主動學習：把最多樣的未標樣本送到 Labeling 從頭標註（fresh）；"
+                 "標完在 Labeling 端「匯出 / 回傳」匯出即為新標籤，不用回 LV。")
         with st.container(height=320):
             cols = st.columns(3)
             for j, i in enumerate(picks):
@@ -1596,6 +1686,15 @@ def _render_export_view() -> None:
               help="送進有紀錄的裁決流程（對照錨例→提議→雙簽→匯出）；"
                    "會以模型即時重算清單特徵供錨例比對。")
 
+    # 跨工具：把整車送到 Labeling 工具實際標註（單向交棒，標完在 Labeling 端匯出）
+    _send_to_labeling_ui(
+        pseudo_records, range(len(pseudo_records)), source="cart",
+        task=LH.TASK_RELABEL,
+        label="📤 送整車到 Labeling 標註", key="cart_to_labeling",
+        original_labels={i: s.get("label", "") for i, s in enumerate(snapshots)},
+        help="把整車影像送到 Labeling 工具逐張標/改類別；標完在 Labeling 端"
+             "「匯出 / 回傳」匯出即完成，不用回 LV。")
+
     d1, d2 = st.columns(2)
     d1.download_button(
         "⬇ 匯出 CSV（含來源/分數/sha256）", data=snapshots_to_csv(snapshots),
@@ -1618,6 +1717,9 @@ def _render_export_view() -> None:
     confirm = c1.checkbox("確認清空", key="viz_clear_list_confirm")
     c2.button("🗑 清空清單", key="viz_clear_list_btn", disabled=not confirm,
               on_click=_clear_export_list)
+
+    st.divider()
+    _render_send_confirmation()
 
 
 @st.fragment
@@ -2031,7 +2133,7 @@ def _visualize_embeddings_ui() -> None:
                             mlabel = (f"{mlabel}（重擬合參考系）" if refitted
                                       else f"{mlabel}（參考系沿用，+{n_new} 新點）")
                         else:
-                            arr = umap.UMAP(n_components=n_comps, n_neighbors=n_neighbors,
+                            arr = _umap().UMAP(n_components=n_comps, n_neighbors=n_neighbors,
                                             random_state=42).fit_transform(embeddings)
                     proj[mkey] = _pad2d(arr)
                     _step += 1
@@ -2204,15 +2306,7 @@ def _visualize_embeddings_ui() -> None:
                     st.caption("ℹ 3D 模式不支援框選；切回 2D 框選後，轉來 3D 會高亮那批點。")
         st.session_state["viz_selection"] = sel_state
 
-        # 探索→治理 handoff：框選的爭議點一鍵送進灰帶覆核（與覆蓋圖→組考卷對稱）
-        if sel_state["indices"]:
-            st.button(
-                f"🌫 送選取的 {len(sel_state['indices'])} 張進灰帶覆核 →",
-                key="viz_to_gray", use_container_width=True,
-                help="把這批爭議樣本送進有紀錄的裁決流程（對照錨例→提議→品保雙簽→匯出）；"
-                     "散點只負責探索，改標籤這種決定留在灰帶覆核做。",
-                on_click=_viz_send_to_gray,
-                args=(list(sel_state["indices"]), selected_model))
+        # 「送灰帶覆核」與「送 Labeling」兩個出口已移到右上角選取區並排（_render_select_view）
 
         dl_fig = build_plotly_figure(records, embeddings_per_model)
         st.download_button(
@@ -2421,7 +2515,7 @@ def _compare_distributions_ui() -> None:
         _step += 1; _prog.progress(_step / _CMP_STEPS, text="t-SNE 完成")
 
         n_neighbors = min(15, max(2, n_emb - 1))
-        umap_2d = umap.UMAP(n_components=n_comps, n_neighbors=n_neighbors, random_state=42).fit_transform(combined)
+        umap_2d = _umap().UMAP(n_components=n_comps, n_neighbors=n_neighbors, random_state=42).fit_transform(combined)
         _step += 1; _prog.progress(_step / _CMP_STEPS, text="UMAP 完成")
 
         projections = {"pca": pca_2d, "tsne": tsne_2d, "umap": umap_2d}
@@ -2820,7 +2914,7 @@ def _cov_projection(dataset_emb, cand_emb, method, dim, token, cand_token):
         arr = TSNE(n_components=n_comps, random_state=42,
                    perplexity=min(30, max(1, n - 1))).fit_transform(combined)
     elif method == "umap" and n >= 4:
-        arr = umap.UMAP(n_components=n_comps, n_neighbors=min(15, max(2, n - 1)),
+        arr = _umap().UMAP(n_components=n_comps, n_neighbors=min(15, max(2, n - 1)),
                         random_state=42).fit_transform(combined)
     else:  # PCA，或極小樣本保底
         arr = PCA(n_components=n_comps, random_state=42).fit_transform(combined)
@@ -3317,6 +3411,15 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
         bq2.button("🛒 加入策展購物車", key="cov_cand_cart", use_container_width=True,
                    on_click=_batch_add,
                    args=(cand_records, list(picks), cart_src, dict(work_score)))
+        # 直接送 Labeling 從頭標註（fresh）；保住「補哪一格／相對外部 B 缺」語境
+        _send_to_labeling_ui(
+            cand_records, list(picks), source=cart_src, task=LH.TASK_FRESH,
+            label="📤 送這批到 Labeling 標註", key=f"{send_key}_lbl",
+            original_labels={i: (provisional[i] or "") for i in picks},
+            payload={"kind": cart_src,
+                     "scores": {str(i): float(work_score[i]) for i in picks}},
+            help="把補洞／未覆蓋候選送到 Labeling 從頭標註（fresh，未標新樣本）；"
+                 "標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
         st.caption(":gray[候選無標籤——暫定類別取自最近鄰，送考卷後盲標即為新標籤。]")
         with st.container(height=280):
             cols = st.columns(3)
@@ -3649,6 +3752,101 @@ def _render_quiz_quick_start() -> None:
                disabled=not _QUIZ_DEMO_DIR.exists())
 
 
+def _open_labeling_tool(tool_id: str = "module_026") -> bool:
+    """Best-effort: ask the host engine to open a labeling tool. Uses
+    CIM_CONTROL_PORT (injected by ToolProcessManager._make_env). Returns True if
+    the start was accepted; False if we can't reach the engine (the caller then
+    just tells the user to switch tools via the portal)."""
+    import os
+    import urllib.request
+    port = os.environ.get("CIM_CONTROL_PORT")
+    if not port:
+        return False
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/tools/{tool_id}/start", method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return 200 <= resp.status < 300
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _quiz_handoff_root() -> Path:
+    import os
+    base = os.environ.get("CIM_LOG_DIR") or str(Path(__file__).parent.parent / "output")
+    return Path(base) / "lv_quiz_handoff"
+
+
+# ── Unified LV → Labeling hand-over (every feature rides this) ────────────────
+def _lv_class_opts() -> list[str]:
+    """Label palette for the handoff: the dataset's classes."""
+    cn = st.session_state.get("viz_class_names")
+    if cn:
+        return list(cn)
+    recs = st.session_state.get("viz_records") or st.session_state.get("quiz_records") or []
+    opts = sorted({r.get("label", "") for r in recs if r.get("label")})
+    return opts or ["object"]
+
+
+def _send_to_labeling_ui(records: list[dict], indices, *, source: str, task: str,
+                         class_opts: list[str] | None = None, label: str = "📤 送到 Labeling 標註",
+                         key: str | None = None, help: str | None = None, **kw) -> None:
+    """One shared button every LV feature drops in: export the subset to a
+    content-addressed handoff folder and switch to Labeling. The hand-over is
+    one-way (LV → Labeling): annotation and feedback complete on the Labeling
+    side, with no return to LV. State lives on disk (_pending.json) and is
+    consumed by Labeling (module_026 auto-prefills the source; module_014 marks
+    the batch done after export)."""
+    import labeling_handoff as LH
+    idxs = sorted(set(int(i) for i in indices))
+    n = len(idxs)
+    if st.button(f"{label}（{n}）", key=key or f"send_lbl_{source}",
+                 use_container_width=True, disabled=(n == 0),
+                 help=help or "把這批影像送到 Labeling 工具標註；標完在 Labeling 端"
+                              "「匯出 / 回傳」匯出即完成，不用回 LV。"):
+        out = LH.send_to_labeling(records, idxs, source=source, task=task,
+                                  class_options=class_opts or _lv_class_opts(),
+                                  manifest=st.session_state.get("viz_manifest"), **kw)
+        if out is None:
+            st.warning("沒有可送出的影像。")
+            return
+        _log_usage("send_to_labeling", source=source, n=n)
+        # 不在這裡叫 engine 啟動 Labeling：單工具架構下 start(module_026) 會先 stop() 把
+        # 正在跑的 LV 自己關掉（Streamlit 連線中斷）。改由 _render_send_confirmation 用
+        # postMessage 請 portal 自動切到 Labeling——module_026 會自動帶入此批路徑。
+        # 單向交棒：標完在 Labeling 端匯出即完成，不回 LV。
+        st.session_state["_lv_just_sent"] = (n, source)
+        st.rerun()
+
+
+def _render_send_confirmation() -> None:
+    """送出後的確認 + 自動切換到 Labeling。
+
+    LV 對 Labeling 是『單向交棒（送出即忘）』：標註與回饋都在 Labeling 端完成，
+    不需回 LV，所以這裡只負責「送出成功 + 切換」，不再有交接箱／待標清單／讀回。
+    批次狀態仍寫進磁碟 _pending.json，由 Labeling 端消費（module_026 自動帶入來源、
+    module_014 匯出後標記完成）。"""
+    sent = st.session_state.pop("_lv_just_sent", None)
+    if not sent:
+        return
+    st.success(
+        f"✅ 已送 {sent[0]} 張到 Labeling（{sent[1]}），正在切換到 Labeling 工具…\n\n"
+        "在「資料來源」按「執行」載入此批（路徑已自動帶入）即可標註；"
+        "標完到「匯出 / 回傳」匯出即完成，**不用回 LV**。\n\n"
+        ":gray[（若沒自動切換：請用上方「工作流程」下拉手動切到 Labeling。"
+        "批次已存到磁碟，跨重啟不丟。）]")
+    # 請 portal（最上層視窗）自動切到 Labeling 整張 sheet（sheet-annotation）——
+    # 它才有「資料來源 / 標注工作台 / 審查 / 匯出」四個 tab；指向單一 module_026 會
+    # 沒有 tab 列。資料來源 tab 會自動帶入此批路徑。若 portal 不支援 OPEN_TOOL 則
+    # 無事發生，使用者照上面提示手動切。
+    import streamlit.components.v1 as _components
+    _components.html(
+        '<script>try{window.top.postMessage({source:"cim-platform",'
+        'type:"OPEN_TOOL",payload:{toolId:"sheet-annotation"},'
+        'timestamp:new Date().toISOString()},"*");}catch(e){}</script>',
+        height=0)
+
+
 def _quiz_ui() -> None:
     st.markdown("##### 組考卷 · 標註者一致性盲測")
     st.caption("把爭議樣本變成盲測考卷，量「同一人會不會自打嘴巴」與「跨人是否一致」。"
@@ -3728,6 +3926,7 @@ def _quiz_ui() -> None:
     answers = st.session_state.setdefault("quiz_answers", {})
     pos = st.session_state.get("quiz_pos", 0)
 
+    # 組考卷為 LV 內建盲標（量標註者一致性）——不送 Labeling、不讀回，純單向工具
     # ── 作答中 ──
     if pos < len(questions):
         q = questions[pos]
@@ -3939,6 +4138,18 @@ def _gray_zone_ui() -> None:
     class_opts = sorted({r["label"] for r in records})
     anchor_indices = [a for a in anchors.values() if a is not None]
 
+    # 直接送 Labeling 裁決（adjudicate）；錨例類別/範例隨 payload 帶過、不被攤平
+    _send_to_labeling_ui(
+        records, list(queue), source="gray-zone", task=LH.TASK_ADJUDICATE,
+        label="📤 送佇列到 Labeling 裁決標註", key="gray_to_lbl",
+        class_opts=class_opts or None,
+        original_labels={i: records[i].get("label", "") for i in queue},
+        payload={"anchors": {str(c): {"idx": int(a), "label": records[a].get("label", ""),
+                                      "file": Path(records[a]["path"]).name}
+                             for c, a in anchors.items() if a is not None}},
+        help="把灰帶佇列送到 Labeling 對照錨例裁決標註；錨例類別／範例隨件帶過。"
+             "標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
+
     pending = [i for i in queue if gstate.get(i, {}).get("status") != "approved"]
     approved = [i for i in queue if gstate.get(i, {}).get("status") == "approved"]
 
@@ -4022,6 +4233,16 @@ def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
                        initial_sidebar_state=400)
+    # 壓掉 Streamlit 預設頂部留白（block-container ~6rem padding + 預設 header），
+    # 把首屏高度還給工作區（嵌在 portal iframe 內時尤其明顯）。
+    st.markdown(
+        "<style>"
+        ".block-container{padding-top:1.2rem!important;padding-bottom:1rem!important}"
+        "[data-testid='stHeader']{height:0;min-height:0}"
+        "[data-testid='stSidebar']>div:first-child{padding-top:1.2rem}"
+        "</style>",
+        unsafe_allow_html=True,
+    )
     if not st.session_state.get("_usage_session_logged"):
         st.session_state["_usage_session_logged"] = True
         _log_usage("session_start")
@@ -4079,6 +4300,9 @@ def main() -> None:
             "- **資料合約 manifest.jsonl**：每次 Run 自動寫入各資料夾"
             "（sha256／phash／embedding refs），供去重、回溯與下游工具使用"
         )
+
+    # 單向交棒：送出後顯示確認並自動切到 Labeling（不在 LV 端追蹤待標／讀回）
+    _render_send_confirmation()
 
     if tool == "Visualize Embeddings":
         _visualize_embeddings_ui()
