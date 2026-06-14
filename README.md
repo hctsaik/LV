@@ -2,6 +2,8 @@
 
 A Streamlit web app for visualising and comparing image dataset distributions using deep feature embeddings.
 
+> 📖 **怎麼使用？** 新手先看 **[使用指南](docs/usage_guide.md)**（逐工具教學）＋ **[五工具總覽圖](docs/tools_overview.html)**；完整文件索引見 **[文件中心](docs/index.html)**。
+
 ## Features
 
 | Tool | Description |
