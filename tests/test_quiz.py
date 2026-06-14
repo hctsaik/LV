@@ -9,12 +9,39 @@ from quiz import (
     SKINS,
     build_quiz,
     cohen_kappa,
+    consensus_labels,
     fleiss_kappa,
     geometric_skin,
     score_quiz,
     self_consistency,
     vs_golden_accuracy,
 )
+
+
+# ── consensus aggregation (M1: 組考卷 → consensus subset / gray band) ────
+
+def test_consensus_unanimous_vs_split():
+    # qid 1: all agree "缺陷" → consensus; qid 2: 2-2 split → gray band
+    r1 = {1: "缺陷", 2: "缺陷", 3: "OK"}
+    r2 = {1: "缺陷", 2: "OK", 3: "OK"}
+    r3 = {1: "缺陷", 2: "缺陷"}
+    r4 = {1: "缺陷", 2: "OK"}
+    out = consensus_labels([r1, r2, r3, r4])
+    assert out[1] == {"label": "缺陷", "agreement": 1.0, "n_votes": 4,
+                      "consensus": True}
+    assert out[2]["agreement"] == 0.5 and out[2]["consensus"] is False
+    assert out[3]["label"] == "OK" and out[3]["consensus"] is True  # 2/2 agree
+
+
+def test_consensus_threshold_and_min_votes():
+    maps = [{1: "A"}, {1: "A"}, {1: "A"}, {1: "B"}]  # 3/4 = 0.75
+    # unanimous default → not consensus
+    assert consensus_labels(maps)[1]["consensus"] is False
+    # 0.7 threshold → consensus, label = majority A
+    relaxed = consensus_labels(maps, agree_thresh=0.7)
+    assert relaxed[1]["consensus"] is True and relaxed[1]["label"] == "A"
+    # a qid only one rater answered is omitted (can't judge agreement)
+    assert consensus_labels([{5: "A"}, {6: "B"}]) == {}
 
 
 # ── geometric_skin whitelist ────────────────────────────────────────────

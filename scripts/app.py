@@ -3706,9 +3706,15 @@ def _quiz_reset() -> None:
 
 
 def _quiz_generate(records: list[dict], dis, n_q: int) -> None:
-    st.session_state["quiz_spec"] = build_quiz(records, dis, n_questions=int(n_q))
+    spec = build_quiz(records, dis, n_questions=int(n_q))
+    st.session_state["quiz_spec"] = spec
     st.session_state["quiz_answers"] = {}
     st.session_state["quiz_pos"] = 0
+    # qid → image, so multi-rater consensus can be tied back to images (M2)
+    st.session_state["quiz_qid_map"] = {
+        q["qid"]: {"path": str(records[q["record_idx"]].get("path", "")),
+                   "label": records[q["record_idx"]].get("label", "")}
+        for q in spec["questions"] if 0 <= q["record_idx"] < len(records)}
 
 
 def _quiz_skip(pos: int) -> None:
@@ -4010,6 +4016,54 @@ def _render_quiz_multirater() -> None:
             c2.metric("共同題數", n_common)
             if n_common == 0:
                 st.warning("這些作答檔沒有共同題（qid 不重疊）。")
+
+            # ── M2：把逐題投票聚合成「共識子集 + 灰帶」——這把尺給『評估』當靶 ──
+            import csv as _csv
+            import io
+
+            from quiz import consensus_labels
+            cons = consensus_labels(maps)
+            qid_map = st.session_state.get("quiz_qid_map", {})
+            cons_rows, gray_rows = [], []
+            for qid, c in cons.items():
+                info = qid_map.get(qid, {})
+                fname = (Path(info["path"]).name if info.get("path")
+                         else f"qid_{qid}")
+                (cons_rows if c["consensus"] else gray_rows).append({
+                    "filename": fname, "consensus": c["consensus"],
+                    "label": c["label"], "agreement": c["agreement"],
+                    "n_votes": c["n_votes"], "qid": qid})
+            d1, d2 = st.columns(2)
+            d1.metric("共識題（可當評估靶）", len(cons_rows))
+            d2.metric("灰帶題（送灰帶覆核）", len(gray_rows))
+            if cons and not qid_map:
+                st.caption(":gray[（本機沒有這份考卷的出題紀錄，匯出以 qid 為鍵；"
+                           "在同一 session 產生考卷後再上傳作答，才能對回影像檔名。）]")
+            if cons_rows or gray_rows:
+                buf = io.StringIO()
+                w = _csv.writer(buf)
+                w.writerow(["filename", "consensus", "label", "agreement",
+                            "n_votes", "qid"])
+                for r in cons_rows + gray_rows:
+                    w.writerow([r["filename"], r["consensus"], r["label"],
+                                r["agreement"], r["n_votes"], r["qid"]])
+                st.download_button(
+                    "⬇ 匯出共識子集 CSV（給『評估』tab 當 ③ 共識子集）",
+                    buf.getvalue(), "consensus_set.csv", "text/csv",
+                    key="quiz_consensus_csv", use_container_width=True)
+            if gray_rows:
+                gbuf = io.StringIO()
+                gw = _csv.writer(gbuf)
+                gw.writerow(["filename", "label", "agreement", "n_votes", "qid"])
+                for r in gray_rows:
+                    gw.writerow([r["filename"], r["label"], r["agreement"],
+                                 r["n_votes"], r["qid"]])
+                st.download_button(
+                    "⬇ 匯出灰帶清單 CSV（送灰帶覆核裁決）", gbuf.getvalue(),
+                    "gray_band.csv", "text/csv", key="quiz_gray_csv",
+                    use_container_width=True)
+            st.caption(":gray[共識子集＝多人一致的題，拿去『評估』tab 當靶，recall 才"
+                       "落在穩定的尺上；灰帶題＝票分裂、沒有真值，送灰帶覆核。]")
         elif files:
             st.info("至少需要 2 份作答 CSV。")
 
@@ -4229,6 +4283,167 @@ def _gray_zone_ui() -> None:
         st.caption(":gray[註：灰帶不直接寫回資料集；確認後匯出決策，由下游流程併入。]")
 
 
+# ── 評估：在組考卷共識子集上量逐型態 recall ─────────────────────────────
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def _eval_gt_by_image(folder: Path, names: list[str]) -> dict[str, list[dict]]:
+    """Build {image_basename: [GT box dicts]} from a folder's YOLO labels.
+    Pure (no streamlit) so the data path is headless-testable."""
+    from interaction import parse_yolo_boxes, yolo_label_path_for
+
+    def cname(cid: int) -> str:
+        return names[cid] if 0 <= cid < len(names) else f"class_{cid}"
+
+    gt: dict[str, list[dict]] = {}
+    images_dir = folder / "images"
+    for img in sorted(images_dir.rglob("*")):
+        if img.suffix.lower() not in _IMG_EXTS:
+            continue
+        boxes = parse_yolo_boxes(yolo_label_path_for(img))
+        if boxes:
+            gt[img.name] = [{"cls": cname(c), "cx": cx, "cy": cy, "w": w, "h": h}
+                            for c, cx, cy, w, h in boxes]
+    return gt
+
+
+def _eval_consensus_by_image(csv_text: str, gt_by_image: dict) -> tuple[dict, int, int]:
+    """Parse a 組考卷 consensus CSV (filename, consensus[, …]) → per-box bool
+    lists for evaluate_detections. Images not listed (ruler unvalidated) are
+    treated as gray. Returns (consensus_by_image, n_consensus_img, n_gray_img)."""
+    truthy = {"true", "1", "yes", "共識", "consensus"}
+    cons_true = set()
+    for line in csv_text.splitlines()[1:]:
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) >= 2 and parts[1].lower() in truthy:
+            cons_true.add(parts[0])
+    out, n_c, n_g = {}, 0, 0
+    for fname, boxes in gt_by_image.items():
+        flag = fname in cons_true
+        out[fname] = [flag] * len(boxes)
+        n_c += flag
+        n_g += not flag
+    return out, n_c, n_g
+
+
+def _evaluation_ui() -> None:
+    import tempfile
+
+    from evaluation import evaluate_detections
+    from interaction import crop_bbox, load_predictions_csv
+
+    st.markdown("##### 評估 · 在共識子集上量逐型態 recall")
+    st.caption("匯入模型預測 + GT，做 IoU 配對 → 逐型態 recall、漏抓(FN)畫廊、類別混淆。"
+               "搭配『組考卷』的共識子集，recall 才落在穩定的尺上、可簽、可跨版本比"
+               "（重定義文件 §5.3）。")
+    with st.sidebar:
+        st.markdown("**① 資料夾（含 images/ 與 labels/）**")
+        st.button("📁 選擇資料夾", key="eval_pick", use_container_width=True,
+                  on_click=_pick_folder_into_text, args=("eval_folder_text",))
+        st.text_area("資料夾", key="eval_folder_text", height=58,
+                     placeholder="例：datasets/neu_det", label_visibility="collapsed")
+        st.markdown("**② 模型預測 CSV** `filename,class,cx,cy,w,h[,score]`")
+        pred_file = st.file_uploader("predictions.csv", type="csv", key="eval_pred_file")
+        st.markdown("**③（可選）組考卷共識子集 CSV**")
+        cons_file = st.file_uploader("consensus_set.csv", type="csv", key="eval_cons_file")
+        iou = st.slider("IoU 門檻", 0.1, 0.9, 0.5, 0.05, key="eval_iou")
+        conf = st.slider("信心門檻", 0.0, 1.0, 0.0, 0.05, key="eval_conf")
+        class_aware = st.checkbox("類別需相符（class-aware）", value=True, key="eval_ca")
+        run = st.button("▶ 評估", type="primary", use_container_width=True, key="eval_run")
+
+    if run:
+        lines = (st.session_state.get("eval_folder_text") or "").strip().splitlines()
+        folder = Path(lines[0].strip()) if lines and lines[0].strip() else None
+        if not folder or not (folder / "images").exists():
+            st.error("資料夾需含 images/（與 labels/）。"); return
+        if pred_file is None:
+            st.error("請上傳模型預測 CSV。"); return
+        names = read_classes_txt(folder) or read_classes_txt(folder / "_") or []
+        gt_by_image = _eval_gt_by_image(folder, names)
+        if not gt_by_image:
+            st.error("labels/ 裡找不到任何 GT 框。"); return
+        with tempfile.NamedTemporaryFile("wb", suffix=".csv", delete=False) as tf:
+            tf.write(pred_file.getvalue()); pred_path = Path(tf.name)
+        pred_by_image = load_predictions_csv(pred_path)
+        pred_path.unlink(missing_ok=True)
+        cons_by_image = n_c = n_g = None
+        if cons_file is not None:
+            cons_by_image, n_c, n_g = _eval_consensus_by_image(
+                cons_file.getvalue().decode("utf-8"), gt_by_image)
+        res = evaluate_detections(gt_by_image, pred_by_image, iou_thresh=iou,
+                                  conf_thresh=conf, class_aware=class_aware,
+                                  consensus_by_image=cons_by_image)
+        st.session_state["_eval_result"] = {
+            "res": res, "folder": str(folder), "used_consensus": cons_by_image is not None,
+            "n_cons_img": n_c, "n_gray_img": n_g, "n_pred_img": len(pred_by_image)}
+
+    data = st.session_state.get("_eval_result")
+    if not data:
+        st.info("填資料夾＋上傳模型預測 CSV → ▶ 評估。需偵測（YOLO labels）資料。")
+        return
+    res = data["res"]
+    if data["n_pred_img"] == 0:
+        st.warning("預測 CSV 沒對到任何影像（檢查 filename 欄是否為影像檔名）。")
+    if not data["used_consensus"]:
+        st.warning("未提供組考卷共識子集——尺未校時 recall 僅供參考（§5.3）。"
+                   "建議先在『組考卷』產生共識子集再評估。")
+    o = res["overall"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("整體 recall", f"{o['recall'] * 100:.1f}%", help="分母＝(共識)GT，越高漏抓越少")
+    c2.metric("整體 precision", f"{o['precision'] * 100:.1f}%")
+    c3.metric("漏抓 FN（escape）", o["fn"])
+    c4.metric("誤報 FP", o["fp"])
+    if data["used_consensus"]:
+        st.caption(f":gray[共識影像 {data['n_cons_img']}・灰帶影像 {data['n_gray_img']}；"
+                   f"灰帶 GT {res['gray']['total']} 個不計入 recall（無穩定真值）。]")
+
+    rows = [{"型態": k, "n_GT": v["n_gt"], "recall": f"{v['recall'] * 100:.0f}%",
+             "precision": f"{v['precision'] * 100:.0f}%", "TP": v["tp"],
+             "FN": v["fn"], "FP": v["fp"]}
+            for k, v in sorted(res["per_class"].items(), key=lambda kv: -kv[1]["fn"])]
+    if rows:
+        st.markdown("**逐型態（FN 多的在前）**")
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    fns = res["false_negatives"]
+    if fns:
+        st.markdown(f"**漏抓畫廊（escape，共 {len(fns)}）** — 每張是被漏掉的缺陷區")
+        folder = Path(data["folder"])
+        with st.container(height=330):
+            cols = st.columns(4)
+            for j, fn in enumerate(fns[:40]):
+                with cols[j % 4]:
+                    try:
+                        with Image.open(folder / "images" / fn["filename"]) as im:
+                            b = fn["box"]
+                            crop = crop_bbox(im.convert("RGB"), b["cx"], b["cy"],
+                                             b["w"], b["h"], pad=0.4)
+                            crop.thumbnail((180, 180))
+                            st.image(crop, use_container_width=True,
+                                     caption=f'{fn["cls"]}·{fn["filename"]}')
+                    except (OSError, ValueError):
+                        st.warning(f'⚠ {fn["filename"]}')
+        import csv as _csv
+        import io
+        buf = io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["filename", "cls", "cx", "cy", "w", "h"])
+        for fn in fns:
+            b = fn["box"]
+            w.writerow([fn["filename"], fn["cls"], b["cx"], b["cy"], b["w"], b["h"]])
+        st.download_button("⬇ 匯出漏抓清單 CSV", buf.getvalue(), "escapes.csv",
+                           "text/csv", key="eval_fn_csv", use_container_width=True)
+        st.caption(":gray[每個漏抓 → 送『體檢卡／桶①佔比』判物理可偵測性與根因（分桶）。]")
+
+    from collections import Counter
+    conf_c = Counter((g, p) for g, p in res["confusion"] if g and p and g != p)
+    if conf_c:
+        st.markdown("**最常見的類別混淆（GT → 預測）**")
+        for (g, p), n in conf_c.most_common(8):
+            st.write(f"- {g} → {p}：{n}")
+
+
 def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
@@ -4254,7 +4469,7 @@ def main() -> None:
     with switch_col:
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "組考卷", "灰帶覆核"],
+                     "完整度熱力圖", "組考卷", "灰帶覆核", "評估"],
             key="tool_switch", label_visibility="collapsed",
         ) or "Visualize Embeddings"
     with help_col, st.popover("✨ 功能地圖", use_container_width=True):
@@ -4312,8 +4527,10 @@ def main() -> None:
         _completeness_ui()
     elif tool == "組考卷":
         _quiz_ui()
-    else:
+    elif tool == "灰帶覆核":
         _gray_zone_ui()
+    else:
+        _evaluation_ui()
 
 
 if __name__ == "__main__":

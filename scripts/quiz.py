@@ -18,6 +18,7 @@ Framework-free: no streamlit imports, unit-testable.
 """
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 
 import numpy as np
@@ -189,6 +190,49 @@ def fleiss_kappa(rating_counts: np.ndarray) -> float:
     P_bar = P_i.mean()
     P_e = float(np.sum(p_j * p_j))
     return (P_bar - P_e) / (1 - P_e) if (1 - P_e) > 1e-12 else 1.0
+
+
+def consensus_labels(
+    answer_maps: Sequence[dict],
+    *,
+    agree_thresh: float = 1.0,
+    min_votes: int = 2,
+) -> dict:
+    """Aggregate raters' ``{qid: answer}`` maps into per-question consensus.
+
+    This is what turns 組考卷 from "a kappa number" into "a usable subset":
+    kappa says whether the ruler is stable overall, but the per-question vote
+    tally says WHICH items the raters actually agree on (trustworthy ground
+    truth) versus which are split (the gray band, no ground truth).
+
+    For every qid answered by at least ``min_votes`` raters, tallies the votes:
+      - ``label``: the majority answer,
+      - ``agreement``: top-vote share ∈ (0,1],
+      - ``n_votes``: how many raters answered it,
+      - ``consensus``: ``agreement >= agree_thresh`` (1.0 = unanimous).
+
+    Returns ``{qid: {label, agreement, n_votes, consensus}}``. Items below
+    ``min_votes`` are omitted (can't judge agreement from one vote). The
+    caller joins qid → image/box and exports the consensus subset (for the
+    evaluation gate) and routes non-consensus items to gray-zone review.
+    """
+    qids: set = set()
+    for m in answer_maps:
+        qids |= set(m)
+    out: dict = {}
+    for qid in sorted(qids):
+        votes = [m[qid] for m in answer_maps if qid in m]
+        if len(votes) < min_votes:
+            continue
+        label, top = Counter(votes).most_common(1)[0]
+        agreement = top / len(votes)
+        out[qid] = {
+            "label": label,
+            "agreement": round(agreement, 3),
+            "n_votes": len(votes),
+            "consensus": agreement >= agree_thresh,
+        }
+    return out
 
 
 def score_quiz(answers: dict, quiz: dict) -> dict:

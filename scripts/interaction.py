@@ -319,6 +319,47 @@ def load_scores_csv(csv_path: Path) -> dict[str, tuple[float, float | None]]:
     return out
 
 
+def load_predictions_csv(csv_path: Path) -> dict[str, list[dict]]:
+    """Ingest a detection model's per-image predictions for the evaluation gate.
+
+    Generalises ``load_scores_csv`` from one score/image to many boxes/image,
+    so LV can do IoU evaluation against (consensus) ground truth WITHOUT
+    running the detector itself — it only ingests the detector's output.
+
+    Reads a ``predictions.csv`` whose header (case-insensitive, order-free)
+    has ``filename, class, cx, cy, w, h[, score]``; the box is normalized YOLO
+    format (cx,cy,w,h ∈ [0,1]) to match the GT label files. ``class`` may be a
+    name or id and is kept as a string. Missing file / unparseable rows are
+    skipped → partial/empty map.
+
+    Returns ``{filename: [{cls, cx, cy, w, h, score}, …]}``.
+    """
+    csv_path = Path(csv_path)
+    out: dict[str, list[dict]] = {}
+    if not csv_path.exists():
+        return out
+    with csv_path.open(encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            r = {(k or "").strip().lower(): (v or "").strip()
+                 for k, v in row.items()}
+            name = r.get("filename") or r.get("file") or r.get("image")
+            cls = r.get("class") or r.get("label") or r.get("class_id")
+            if not name or not cls:
+                continue
+            try:
+                cx, cy, w, h = (float(r[k]) for k in ("cx", "cy", "w", "h"))
+            except (KeyError, ValueError):
+                continue
+            score_s = r.get("score") or r.get("confidence") or ""
+            try:
+                score = float(score_s) if score_s else 1.0
+            except ValueError:
+                score = 1.0
+            out.setdefault(name, []).append(
+                {"cls": cls, "cx": cx, "cy": cy, "w": w, "h": h, "score": score})
+    return out
+
+
 def neighbor_hit_density(
     emb_matrix: np.ndarray,
     query_idx: int,
