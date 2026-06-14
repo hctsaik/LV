@@ -265,8 +265,8 @@ def _viz_send_to_gray(indices: list[int], model: str) -> None:
     st.session_state["gray_emb"] = raw
     st.session_state["gray_queue"] = queue
     st.session_state["gray_anchors"] = anchors
-    st.session_state["gray_state"] = {}
-    st.session_state["gray_pos"] = 0
+    st.session_state["gray_dis"] = dis
+    st.session_state["gray_disp"] = {}
     st.session_state["gray_inbound"] = True
     st.session_state["tool_switch"] = "灰帶覆核"
     _log_usage("viz_send_to_gray", n=len(queue))
@@ -681,8 +681,8 @@ def _cart_to_gray(snaps: list[dict], model: str) -> None:
     st.session_state["gray_emb"] = emb
     st.session_state["gray_queue"] = order
     st.session_state["gray_anchors"] = anchors
-    st.session_state["gray_state"] = {}
-    st.session_state["gray_pos"] = 0
+    st.session_state["gray_dis"] = np.asarray(scores, dtype=float)
+    st.session_state["gray_disp"] = {}
     st.session_state["gray_inbound"] = True
     st.session_state["tool_switch"] = "灰帶覆核"
     st.session_state["_cart_app_rerun"] = True
@@ -4128,21 +4128,18 @@ def _load_gray_demo() -> None:
     _log_usage("gray_demo_load")
 
 
-def _gray_propose(idx: int, label: str, conf: float, reason: str, anchor: str) -> None:
-    st.session_state.setdefault("gray_state", {})[idx] = {
-        "status": "proposed", "soft_label": label, "confidence": f"{conf:.2f}",
-        "reason": reason, "anchor": anchor, "proposer": "標註者", "approver": "",
-    }
-
-
-def _gray_approve(idx: int) -> None:
-    s = st.session_state.get("gray_state", {}).get(idx)
-    if s and s["status"] == "proposed":
-        s["status"], s["approver"] = "approved", "品保QA"
-
-
-def _gray_reject(idx: int) -> None:
-    st.session_state.get("gray_state", {}).pop(idx, None)
+def _gray_dispose(indices, action: str, soft_map: dict | None = None) -> None:
+    """Record a disposition for a batch of gray samples (站內：分級 soft / 排除).
+    Relabeling itself goes to Labeling, not here."""
+    disp = st.session_state.setdefault("gray_disp", {})
+    for i in indices:
+        i = int(i)
+        if action == "soft" and soft_map and i in soft_map:
+            lbl, conf = soft_map[i]
+            disp[i] = {"action": "soft", "soft_label": lbl, "confidence": conf}
+        else:
+            disp[i] = {"action": action}
+    st.toast(f"已處置 {len(indices)} 筆 → {action}", icon="✅")
 
 
 def _render_gray_quick_start() -> None:
@@ -4150,13 +4147,13 @@ def _render_gray_quick_start() -> None:
     c1, c2, c3 = st.columns(3, gap="medium")
     with c1, st.container(border=True):
         st.markdown("**① 貼資料夾**")
-        st.caption("含類別子資料夾的影像——佇列自動撈出最爭議（灰帶）的樣本。")
+        st.caption("含類別子資料夾的影像——自動撈出最爭議（灰帶）的樣本。")
     with c2, st.container(border=True):
-        st.markdown("**② 對照雙錨**")
-        st.caption("每筆灰帶旁顯示最近的『明確』錨例，幫你裁決離哪個近。")
+        st.markdown("**② 看 backlog + 總覽**")
+        st.caption("一眼看整個資料集有多少要 audit、各多可疑；總覽一次列出整批。")
     with c3, st.container(border=True):
-        st.markdown("**③ 提議→覆核（雙簽）**")
-        st.caption("標註者提議 soft label＋理由，品保覆核通過才進決策清單匯出。")
+        st.markdown("**③ 分流三選一**")
+        st.caption("可解的送 Labeling 裁決；模稜兩可的給分級標籤或標記排除。")
     mid = st.columns([2, 1.6, 2])[1]
     mid.button("✨ 用範例資料試跑（imagenette）", key="gray_demo_btn",
                type="primary", use_container_width=True, on_click=_load_gray_demo)
@@ -4168,12 +4165,10 @@ def _gray_thumb(records, i):
 
 
 def _gray_zone_ui() -> None:
-    st.markdown("##### 灰帶覆核 · 暫存煉獄")
-    st.caption("把判定爭議的『灰帶』樣本攔在這裡：對照明確錨例裁決、標註者提議＋"
-               "品保覆核（雙簽）後才進決策清單——不直接寫回資料集，確認後匯出。")
-    st.caption(":gray[👉 和 Visualize 的「標籤分歧」是**同一條線的兩端**："
-               "標籤分歧只**探索**哪些點可疑（畫紅、連線）；這裡是對每一筆做"
-               "**有紀錄的裁決**（提議→雙簽→匯出）。**改標只在這裡**，不在散點上隨手做。]")
+    st.markdown("##### 灰帶覆核 · 分流閘")
+    st.caption("組考卷／散點分歧送來的『灰帶』樣本在這裡 **triage**：一眼看 backlog 有多少、"
+               "多可疑，再**分流三選一**——可解的送 Labeling 正式裁決、模稜兩可的給分級標籤或"
+               "標記排除。**改標走 Labeling，不在這裡做**；分級/排除回流評估、不寫回資料集。")
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
@@ -4187,9 +4182,9 @@ def _gray_zone_ui() -> None:
             st.error("models/ 內找不到模型檔。"); return
         st.markdown("**② 模型**")
         model = st.selectbox("模型", all_models, label_visibility="collapsed")
-        n_q = st.number_input("佇列張數（最爭議的前 N）", min_value=1, max_value=200,
+        n_q = st.number_input("本批張數（最爭議的前 N）", min_value=1, max_value=200,
                               value=20, key="gray_n")
-        run = st.button("▶ 建立覆核佇列", use_container_width=True, key="run_gray",
+        run = st.button("▶ 建立分流佇列", use_container_width=True, key="run_gray",
                         type="primary")
 
     if st.session_state.pop("_gray_autorun", False):
@@ -4212,8 +4207,7 @@ def _gray_zone_ui() -> None:
             labels = [r["label"] for r in records]
             dis = compute_label_disagreement(emb, labels, k=min(10, len(records) - 1))
         queue = select_gray_zone(dis, int(n_q))
-        # 錨例：每類最不爭議（最明確）的一張
-        anchors = {}
+        anchors = {}  # 每類最不爭議（最明確）的一張當錨例
         for c in sorted(set(labels)):
             cand = [i for i in range(len(records)) if labels[i] == c]
             anchors[c] = min(cand, key=lambda i: dis[i]) if cand else None
@@ -4221,9 +4215,9 @@ def _gray_zone_ui() -> None:
         st.session_state["gray_emb"] = emb
         st.session_state["gray_queue"] = queue
         st.session_state["gray_anchors"] = anchors
-        st.session_state["gray_state"] = {}
-        st.session_state["gray_pos"] = 0
-        st.session_state.pop("gray_inbound", None)  # 從資料夾建立＝非散點送來
+        st.session_state["gray_dis"] = dis
+        st.session_state["gray_disp"] = {}
+        st.session_state.pop("gray_inbound", None)
         st.toast(f"佇列建立：{len(queue)} 筆灰帶候選", icon="🌫")
 
     if "gray_records" not in st.session_state:
@@ -4231,106 +4225,114 @@ def _gray_zone_ui() -> None:
         return
 
     if st.session_state.get("gray_inbound"):
-        st.info("ℹ 這批佇列是從別的工具送來的（散點框選 / 策展購物車，依分數排序）。"
-                "對照錨例逐筆裁決即可——不直接寫回資料集，雙簽通過後匯出決策。")
+        st.info("ℹ 這批佇列是從別的工具送來的（散點框選 / 策展購物車 / 組考卷灰帶清單）。")
 
     records = st.session_state["gray_records"]
     emb = st.session_state["gray_emb"]
     queue = st.session_state["gray_queue"]
     anchors = st.session_state["gray_anchors"]
-    gstate = st.session_state.setdefault("gray_state", {})
+    dis = st.session_state.get("gray_dis")
+    disp = st.session_state.setdefault("gray_disp", {})
     class_opts = sorted({r["label"] for r in records})
     anchor_indices = [a for a in anchors.values() if a is not None]
 
-    # 直接送 Labeling 裁決（adjudicate）；錨例類別/範例隨 payload 帶過、不被攤平
-    _send_to_labeling_ui(
-        records, list(queue), source="gray-zone", task=LH.TASK_ADJUDICATE,
-        label="📤 送佇列到 Labeling 裁決標註", key="gray_to_lbl",
-        class_opts=class_opts or None,
-        original_labels={i: records[i].get("label", "") for i in queue},
-        payload={"anchors": {str(c): {"idx": int(a), "label": records[a].get("label", ""),
-                                      "file": Path(records[a]["path"]).name}
-                             for c, a in anchors.items() if a is not None}},
-        help="把灰帶佇列送到 Labeling 對照錨例裁決標註；錨例類別／範例隨件帶過。"
-             "標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
+    # ── backlog 量化：整個資料集有多少要 audit（用全集 dis，不是只有前 N）──
+    if dis is not None:
+        from interaction import gray_zone_summary
+        s = gray_zone_summary(dis)
+        st.markdown("**🩺 Backlog — 整個資料集有多少要 audit**")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("灰帶（分歧≥0.5）", s["n_gray"], f"{s['pct_gray']}%")
+        b2.metric("🔴 高 ≥0.6", s["high"])
+        b3.metric("🟡 中 0.3–0.6", s["mid"])
+        b4.metric("🟢 低 <0.3", s["low"])
+        st.caption(f":gray[本批＝分歧度最高的前 {len(queue)} 筆"
+                   f"（灰帶共 {s['n_gray']} 筆，另 {max(0, s['n_gray'] - len(queue))} 筆未排入；"
+                   "想多看就調左側『本批張數』）。分歧度＝鄰域標籤不一致比例，"
+                   "是探索線索、**非錯標判決**。]")
 
-    pending = [i for i in queue if gstate.get(i, {}).get("status") != "approved"]
-    approved = [i for i in queue if gstate.get(i, {}).get("status") == "approved"]
+    # ── 每筆 triage 資料（分歧度、原標→最近錨例、是否指向他類）──
+    items = []
+    for i in queue:
+        a_idx, _ = nearest_anchor(emb, i, anchor_indices)
+        a_cls = records[a_idx]["label"] if a_idx is not None else None
+        orig = records[i]["label"]
+        items.append({"i": i, "score": float(dis[i]) if dis is not None else 0.0,
+                      "orig": orig, "anchor": a_cls,
+                      "points_other": a_cls is not None and a_cls != orig})
 
-    col_rev, col_done = st.columns([5, 3], gap="medium")
-    with col_rev:
-        st.markdown(f"**覆核佇列**（待處理 {len(pending)} · 已通過 {len(approved)}）")
-        st.button("🛒 佇列加入策展購物車", key="gray_add_cart", use_container_width=True,
-                  help="把這批灰帶樣本收進跨工具購物車（標 source=灰帶），之後可再分流或匯出。",
-                  on_click=_batch_add, args=(records, list(queue), "gray"))
-        if not pending:
-            st.success("佇列清空——所有灰帶都已雙簽通過或退回。")
-        else:
-            i = pending[0]
-            r = records[i]
-            a_idx, a_d = nearest_anchor(emb, i, anchor_indices)
-            cc = st.columns(2)
-            with cc[0]:
-                st.caption(f"🌫 灰帶 #{i}（原標 {r['label']}）")
-                t = _gray_thumb(records, i)
+    flt = st.radio("分流篩選", ["全部", "⚠ 指向他類（可解→送 Labeling）",
+                              "同類高分歧（模稜兩可→分級/排除）"],
+                   horizontal=True, key="gray_filter")
+    if flt.startswith("⚠"):
+        view = [it for it in items if it["points_other"]]
+    elif flt.startswith("同類"):
+        view = [it for it in items if not it["points_other"]]
+    else:
+        view = items
+    view_idx = [it["i"] for it in view]
+    soft_map = {it["i"]: (it["anchor"] or it["orig"], round(1 - it["score"], 2))
+                for it in view}
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        _send_to_labeling_ui(
+            records, view_idx, source="gray-zone", task=LH.TASK_ADJUDICATE,
+            label="📤 送 Labeling 裁決", key="gray_to_lbl", class_opts=class_opts or None,
+            original_labels={i: records[i].get("label", "") for i in view_idx},
+            payload={"anchors": {str(c): {"idx": int(a), "label": records[a].get("label", ""),
+                                          "file": Path(records[a]["path"]).name}
+                                 for c, a in anchors.items() if a is not None}},
+            help="可解的灰帶送 Labeling 正式對錨裁決；錨例隨件帶過，標完在 Labeling 端匯出即完成。")
+    a2.button("🏷 給分級 soft label（這批）", key="gray_soft_btn",
+              use_container_width=True, disabled=not view_idx,
+              on_click=_gray_dispose, args=(view_idx, "soft", soft_map),
+              help="模稜兩可、不送外標：給分級標籤（=最近錨例類別，信賴=1−分歧度），以群體處理。")
+    a3.button("🚫 標記排除（這批）", key="gray_exclude_btn",
+              use_container_width=True, disabled=not view_idx,
+              on_click=_gray_dispose, args=(view_idx, "exclude"),
+              help="標為灰帶排除——評估的 recall 不計入這些（無穩定真值）。")
+
+    _badge = {"soft": "🏷分級", "exclude": "🚫排除"}
+    st.markdown(f"**總覽（{len(view)} 筆）** — 每張帶分歧度、原標→最近錨例、處置狀態")
+    with st.container(height=360):
+        cols = st.columns(5)
+        for j, it in enumerate(view):
+            with cols[j % 5]:
+                arrow = f'{it["orig"]}→{it["anchor"]}' + (" ⚠" if it["points_other"] else "")
+                badge = _badge.get((disp.get(it["i"]) or {}).get("action"), "")
+                cap = f'分歧{it["score"]:.2f}·{arrow} {badge}'
+                t = _gray_thumb(records, it["i"])
                 if t:
-                    st.image(t, use_container_width=True)
+                    st.image(t, use_container_width=True, caption=cap)
                 else:
-                    st.warning("⚠ 缺檔")
-            with cc[1]:
-                if a_idx is not None:
-                    st.caption(f"⚓ 最近錨例：{records[a_idx]['label']}（cosine {a_d:.3f}）")
-                    ta = _gray_thumb(records, a_idx)
-                    if ta:
-                        st.image(ta, use_container_width=True)
-                    else:
-                        st.warning("⚠ 缺檔")
-                else:
-                    st.caption("（無可用錨例）")
+                    st.warning(f"⚠缺檔 {cap}")
 
-            cur = gstate.get(i)
-            if not cur or cur.get("status") != "proposed":
-                # 階段一：標註者提議
-                st.markdown("**① 標註者提議**")
-                p1, p2 = st.columns([2, 1])
-                label = p1.selectbox("soft label（屬於哪類）", class_opts,
-                                     key=f"gray_lbl_{i}")
-                conf = p2.slider("信賴度", 0.0, 1.0, 0.67, 0.01, key=f"gray_conf_{i}")
-                reason = st.text_input("一句理由（必填）", key=f"gray_reason_{i}")
-                anchor_tag = (f"{records[a_idx]['label']}#{a_idx}"
-                              if a_idx is not None else "—")
-                st.button("提議", key=f"gray_propose_{i}", type="primary",
-                          disabled=not reason.strip(),
-                          on_click=_gray_propose,
-                          args=(i, label, conf, reason.strip(), anchor_tag))
-            else:
-                # 階段二：品保覆核（雙簽，人員不可重疊——此處以兩個顯式步驟表達）
-                st.markdown("**② 品保覆核**")
-                st.info(f"提議：soft label = **{cur['soft_label']}**（信賴 {cur['confidence']}）"
-                        f"· 對照錨例 {cur['anchor']}\n\n理由：{cur['reason']}")
-                q1, q2 = st.columns(2)
-                q1.button("✅ 覆核通過（進決策清單）", key=f"gray_ok_{i}",
-                          type="primary", use_container_width=True,
-                          on_click=_gray_approve, args=(i,))
-                q2.button("↩ 退回（重議）", key=f"gray_no_{i}",
-                          use_container_width=True, on_click=_gray_reject, args=(i,))
-
-    with col_done:
-        st.markdown("**決策清單（已雙簽通過）**")
-        if not approved:
-            st.caption("通過的決策會列在這裡，可匯出 CSV（含 4 欄：誰確認/錨例/soft label/理由）。")
-        else:
-            with st.container(height=300):
-                for i in approved:
-                    s = gstate[i]
-                    st.caption(f"#{i} → **{s['soft_label']}** · {s['anchor']} · "
-                               f"{s['reason']}")
-            decisions = [{**gstate[i], "path": str(records[i]["path"])}
-                         for i in approved]
-            st.download_button("⬇ 匯出決策 CSV", data=gray_decision_csv(decisions),
-                               file_name="gray_zone_decisions.csv", mime="text/csv",
-                               key="gray_decisions_csv", use_container_width=True)
-        st.caption(":gray[註：灰帶不直接寫回資料集；確認後匯出決策，由下游流程併入。]")
+    st.caption(f":gray[已站內處置 {len(disp)} 筆（分級/排除）；送 Labeling 的已交棒、不在此計。]")
+    if disp:
+        import csv as _csv
+        import io
+        buf = io.StringIO()
+        w = _csv.DictWriter(buf, fieldnames=["filename", "score", "orig_label",
+                                             "anchor_label", "action", "soft_label",
+                                             "confidence"])
+        w.writeheader()
+        for it in items:
+            d = disp.get(it["i"])
+            if not d:
+                continue
+            w.writerow({"filename": Path(records[it["i"]]["path"]).name,
+                        "score": round(it["score"], 3), "orig_label": it["orig"],
+                        "anchor_label": it["anchor"] or "", "action": d["action"],
+                        "soft_label": d.get("soft_label", ""),
+                        "confidence": d.get("confidence", "")})
+        st.download_button("⬇ 匯出灰帶處置 CSV（分級/排除 → 給評估排除/下游併入）",
+                           buf.getvalue(), "gray_disposition.csv", "text/csv",
+                           key="gray_disp_csv", use_container_width=True)
+    st.button("🛒 佇列加入策展購物車", key="gray_add_cart", use_container_width=True,
+              on_click=_batch_add, args=(records, list(queue), "gray"))
+    st.caption(":gray[定位：灰帶覆核＝組考卷下游的 triage＋分流。改標走 Labeling、"
+               "分級/排除留站內並回流評估；不直接寫回資料集。]")
 
 
 # ── 評估：在組考卷共識子集上量逐型態 recall ─────────────────────────────

@@ -233,7 +233,19 @@ def test_fps_deterministic():
 
 # ── §3 gray-zone purgatory helpers ──────────────────────────────────────
 
-from interaction import gray_decision_csv, nearest_anchor, select_gray_zone  # noqa: E402
+from interaction import (  # noqa: E402
+    gray_decision_csv, gray_zone_summary, nearest_anchor, select_gray_zone)
+
+
+def test_gray_zone_summary_backlog_and_buckets():
+    # 10 scores: 3 high(≥0.6), 2 mid(0.3–0.6), 2 low(>0–0.3), 3 clean(0)
+    s = np.array([0.9, 0.7, 0.6, 0.5, 0.4, 0.2, 0.1, 0.0, 0.0, 0.0])
+    out = gray_zone_summary(s, thr=0.5, hi=0.6, lo=0.3)
+    assert out["n_total"] == 10
+    assert out["n_gray"] == 4 and out["pct_gray"] == 40.0  # ≥0.5
+    assert out["high"] == 3 and out["mid"] == 2
+    assert out["low"] == 2 and out["clean"] == 3
+    assert gray_zone_summary(np.array([]))["n_total"] == 0
 
 
 def test_select_gray_zone_most_ambiguous_first():

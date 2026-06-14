@@ -200,6 +200,30 @@ def select_gray_zone(scores: np.ndarray, k: int) -> list[int]:
     return [int(i) for i in np.argsort(s)[::-1][:min(k, len(s))]]
 
 
+def gray_zone_summary(
+    scores: np.ndarray, *, thr: float = 0.5, hi: float = 0.6, lo: float = 0.3,
+) -> dict:
+    """Backlog stats for the gray-zone queue from per-sample label-disagreement
+    scores — so the UI can show "how much actually needs auditing" instead of a
+    fixed top-N. ``thr`` is the gray-band cutoff; ``hi``/``lo`` split severity.
+
+    Returns {n_total, n_gray (≥thr), pct_gray, high (≥hi), mid (lo–hi),
+    low (>0–lo), clean (==0)}.
+    """
+    d = np.asarray(scores, dtype=float)
+    n = int(d.size)
+    n_gray = int((d >= thr).sum())
+    return {
+        "n_total": n,
+        "n_gray": n_gray,
+        "pct_gray": round(100.0 * n_gray / n, 1) if n else 0.0,
+        "high": int((d >= hi).sum()),
+        "mid": int(((d >= lo) & (d < hi)).sum()),
+        "low": int(((d > 0) & (d < lo)).sum()),
+        "clean": int((d == 0).sum()),
+    }
+
+
 def nearest_anchor(
     embeddings: np.ndarray, idx: int, anchor_indices: Sequence[int],
 ) -> tuple[int | None, float]:

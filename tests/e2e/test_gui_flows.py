@@ -949,22 +949,18 @@ def test_z_gray_zone_review(app_page, tmp_path):
     page.locator('.st-key-run_gray button').click()
     wait_idle(page, timeout=300000)
     _no_exception(page)
-    # the review item shows the gray sample next to its nearest anchor
-    expect(page.get_by_text(re.compile("待處理")).first).to_be_visible()
-    expect(page.get_by_text(re.compile("最近錨例")).first).to_be_visible()
-
-    # stage 1: propose requires a reason, then enables the propose button
-    reason = page.locator('[class*="st-key-gray_reason_"] input')
-    reason.fill("邊界樣本，偏向 p")
-    page.keyboard.press("Tab")
+    # backlog dashboard shows how much needs auditing + the triage overview
+    expect(page.get_by_text(re.compile("Backlog")).first).to_be_visible()
+    expect(page.get_by_text(re.compile("灰帶（分歧")).first).to_be_visible()
+    expect(page.get_by_text(re.compile("總覽")).first).to_be_visible()
+    # disposition routing: the three actions are present
+    expect(page.locator('.st-key-gray_to_lbl button').first).to_be_visible()
+    expect(page.locator('.st-key-gray_soft_btn button').first).to_be_visible()
+    expect(page.locator('.st-key-gray_exclude_btn button').first).to_be_visible()
+    # give the batch a graded soft label → the disposition export appears
+    page.locator('.st-key-gray_soft_btn button').first.click()
     wait_idle(page)
-    page.locator('[class*="st-key-gray_propose_"] button').click()
-    # stage 2: QA approval button appears (double sign-off); approve it
-    page.wait_for_selector('[class*="st-key-gray_ok_"] button', timeout=15000)
-    page.locator('[class*="st-key-gray_ok_"] button').click()
-    wait_idle(page)
-    # approved decision lands in the export list
-    expect(page.locator('.st-key-gray_decisions_csv')).to_be_visible()
+    expect(page.locator('.st-key-gray_disp_csv')).to_be_visible()
     _no_exception(page)
 
 
