@@ -1777,12 +1777,52 @@ _MODE_CLEAR_KEYS = (
 _DEMO_DIR = Path(__file__).parent.parent / "demo" / "coco8"
 
 
+def _sample_root() -> Path:
+    """Writable cache dir for generated sample datasets (under gitignored output/)."""
+    import os
+    base = os.environ.get("CIM_LOG_DIR") or str(Path(__file__).parent.parent / "output")
+    p = Path(base) / "_samples"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _demo_classifier_dir() -> str:
+    """imagenette demo if provisioned, else a generated tiny classifier set."""
+    d = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
+    if d.exists():
+        return str(d)
+    from sample_data import ensure_classifier_sample
+    return str(ensure_classifier_sample(_sample_root() / "classify"))
+
+
+def _demo_compare_dirs() -> tuple[str, str]:
+    """imagenette cassette_player/chainsaw if provisioned, else two synthetic sets."""
+    base = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
+    a, b = base / "cassette_player", base / "chainsaw"
+    if a.exists() and b.exists():
+        return str(a), str(b)
+    from sample_data import ensure_compare_sample
+    sa, sb = ensure_compare_sample(_sample_root() / "compare")
+    return str(sa), str(sb)
+
+
+def _demo_detection_dir() -> str:
+    """coco8 demo if provisioned, else a generated tiny YOLO detection set."""
+    d = Path(__file__).parent.parent / "demo" / "coco8" / "train"
+    if (d / "images").exists():
+        return str(d)
+    from sample_data import ensure_detection_sample
+    return str(ensure_detection_sample(_sample_root() / "detect"))
+
+
 def _load_demo() -> None:
-    """快速開始：一鍵載入 coco8 範例並自動執行（detector 模式，零下載）。"""
+    """快速開始：一鍵載入範例並自動執行（detector 模式）。coco8 沒提供時用合成迷你偵測集。"""
+    coco = _DEMO_DIR / "train"
+    folders = ([str(coco), str(_DEMO_DIR / "val")] if coco.exists()
+               else [_demo_detection_dir()])
     st.session_state["viz_mode"] = "Object Detector"
     st.session_state["_viz_mode_prev"] = "Object Detector"
-    st.session_state["viz_folder_list"] = [
-        str(_DEMO_DIR / "train"), str(_DEMO_DIR / "val")]
+    st.session_state["viz_folder_list"] = folders
     st.session_state["_viz_autorun"] = True
     _log_usage("demo_load")
 
@@ -1818,8 +1858,7 @@ def _render_quick_start() -> None:
                    "進階功能（以文搜圖、重複掃描…）見右上「✨ 功能地圖」。")
     mid = st.columns([2, 1.6, 2])[1]
     mid.button("▶ 一鍵體驗（coco8 範例）", key="viz_demo_btn", type="primary",
-               use_container_width=True, on_click=_load_demo,
-               disabled=not (_DEMO_DIR / "train").exists())
+               use_container_width=True, on_click=_load_demo)
 
 
 def _visualize_embeddings_ui() -> None:
@@ -2381,8 +2420,9 @@ _CMP_CACHE_DIRS = ("embeddings_", "object_crops", ".thumbs")
 
 def _load_cmp_demo() -> None:
     """一鍵填入兩個範例『直接含圖片』資料夾並自動跑（對齊其他工具的 demo）。"""
-    st.session_state["cmp_folder_a"] = str(_CMP_DEMO_A)
-    st.session_state["cmp_folder_b"] = str(_CMP_DEMO_B)
+    a, b = _demo_compare_dirs()
+    st.session_state["cmp_folder_a"] = a
+    st.session_state["cmp_folder_b"] = b
     st.session_state["_cmp_autorun"] = True
     _log_usage("cmp_demo_load")
 
@@ -2586,8 +2626,7 @@ def _compare_distributions_ui() -> None:
         mid = st.columns([2, 1.6, 2])[1]
         mid.button("✨ 用範例資料試跑（cassette_player vs chainsaw）",
                    key="cmp_demo_btn", type="primary", use_container_width=True,
-                   on_click=_load_cmp_demo,
-                   disabled=not (_CMP_DEMO_A.exists() and _CMP_DEMO_B.exists()))
+                   on_click=_load_cmp_demo)
         return
 
     projections = st.session_state["cmp_projections"]
@@ -2850,7 +2889,7 @@ _D_STAR_PRESET = {"寬鬆": 0.45, "標準": 0.6, "嚴格": 0.75}
 
 
 def _load_cov_demo() -> None:
-    st.session_state["cov_folder_text"] = str(_COV_DEMO_DIR)
+    st.session_state["cov_folder_text"] = _demo_classifier_dir()
     st.session_state["_cov_autorun"] = True
     _log_usage("cov_demo_load")
 
@@ -2871,8 +2910,7 @@ def _render_cov_quick_start() -> None:
     mid = st.columns([2, 1.6, 2])[1]
     mid.button("✨ 用範例資料試跑（imagenette）", key="cov_demo_btn",
                type="primary", use_container_width=True,
-               on_click=_load_cov_demo,
-               disabled=not _COV_DEMO_DIR.exists())
+               on_click=_load_cov_demo)
 
 
 # ── 嵌入覆蓋圖（embedding-space coverage / gap-filling）─────────────────────
@@ -3690,7 +3728,7 @@ _QUIZ_DEMO_DIR = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
 
 
 def _load_quiz_demo() -> None:
-    st.session_state["quiz_folder_text"] = str(_QUIZ_DEMO_DIR)
+    st.session_state["quiz_folder_text"] = _demo_classifier_dir()
     st.session_state["_quiz_autorun"] = True
     _log_usage("quiz_demo_load")
 
@@ -3757,8 +3795,7 @@ def _render_quiz_quick_start() -> None:
         st.caption("逐題盲答，算自我一致率與 vs golden；多人可算 Fleiss kappa。")
     mid = st.columns([2, 1.6, 2])[1]
     mid.button("✨ 用範例資料試跑（imagenette）", key="quiz_demo_btn",
-               type="primary", use_container_width=True, on_click=_load_quiz_demo,
-               disabled=not _QUIZ_DEMO_DIR.exists())
+               type="primary", use_container_width=True, on_click=_load_quiz_demo)
 
 
 def _open_labeling_tool(tool_id: str = "module_026") -> bool:
@@ -4086,7 +4123,7 @@ _GRAY_DEMO_DIR = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
 
 
 def _load_gray_demo() -> None:
-    st.session_state["gray_folder_text"] = str(_GRAY_DEMO_DIR)
+    st.session_state["gray_folder_text"] = _demo_classifier_dir()
     st.session_state["_gray_autorun"] = True
     _log_usage("gray_demo_load")
 
@@ -4122,8 +4159,7 @@ def _render_gray_quick_start() -> None:
         st.caption("標註者提議 soft label＋理由，品保覆核通過才進決策清單匯出。")
     mid = st.columns([2, 1.6, 2])[1]
     mid.button("✨ 用範例資料試跑（imagenette）", key="gray_demo_btn",
-               type="primary", use_container_width=True, on_click=_load_gray_demo,
-               disabled=not _GRAY_DEMO_DIR.exists())
+               type="primary", use_container_width=True, on_click=_load_gray_demo)
 
 
 def _gray_thumb(records, i):
@@ -4340,9 +4376,7 @@ def _load_eval_demo() -> None:
     bundled coco8 GT so the tool's purpose (per-type recall + escape gallery +
     gray-band exclusion) is visible without any uploads."""
     from evaluation import consensus_flags, evaluate_detections
-    folder = _DEMO_DIR / "train"
-    if not (folder / "images").exists():
-        return
+    folder = Path(_demo_detection_dir())
     names = read_classes_txt(folder) or read_classes_txt(folder / "_") or []
     gt = _eval_gt_by_image(folder, names)
     if not gt:
@@ -4377,9 +4411,8 @@ def _render_eval_quick_start() -> None:
         st.markdown("**③（可選）共識子集**")
         st.caption("組考卷匯出的 consensus_set.csv——recall 只在共識上算。")
     mid = st.columns([2, 1.9, 2])[1]
-    mid.button("✨ 用範例資料試跑（coco8，含刻意漏抓）", key="eval_demo_btn",
-               type="primary", use_container_width=True, on_click=_load_eval_demo,
-               disabled=not (_DEMO_DIR / "train" / "images").exists())
+    mid.button("✨ 用範例資料試跑（含刻意漏抓）", key="eval_demo_btn",
+               type="primary", use_container_width=True, on_click=_load_eval_demo)
     st.caption(":gray[範例：拿 coco8 的 GT 當靶，預測刻意漏掉一張圖（→ 漏抓畫廊）、"
                "把一張標成灰帶（→ 排除於 recall），一眼看懂這工具在量什麼。]")
 
