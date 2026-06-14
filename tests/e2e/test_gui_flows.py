@@ -949,16 +949,20 @@ def test_z_gray_zone_review(app_page, tmp_path):
     page.locator('.st-key-run_gray button').click()
     wait_idle(page, timeout=300000)
     _no_exception(page)
-    # backlog dashboard shows how much needs auditing + the triage overview
-    expect(page.get_by_text(re.compile("Backlog")).first).to_be_visible()
-    expect(page.get_by_text(re.compile("灰帶（分歧")).first).to_be_visible()
+    # OVERVIEW: one-line backlog + triage grid + the three batch actions
+    expect(page.get_by_text(re.compile("灰帶待 audit")).first).to_be_visible()
     expect(page.get_by_text(re.compile("總覽")).first).to_be_visible()
-    # disposition routing: the three actions are present
     expect(page.locator('.st-key-gray_to_lbl button').first).to_be_visible()
     expect(page.locator('.st-key-gray_soft_btn button').first).to_be_visible()
-    expect(page.locator('.st-key-gray_exclude_btn button').first).to_be_visible()
-    # give the batch a graded soft label → the disposition export appears
-    page.locator('.st-key-gray_soft_btn button').first.click()
+    # click 對照 on a grid cell → FOCUS pair view (gray vs anchors)
+    page.locator('[class*="st-key-gray_focus_"] button').first.click()
+    wait_idle(page)
+    expect(page.get_by_text(re.compile("最近他類錨例")).first).to_be_visible()
+    expect(page.get_by_text(re.compile("這一張的處置")).first).to_be_visible()
+    # single-item disposition → back to overview → disposition export appears
+    page.locator('[class*="st-key-gray_f_soft_"] button').first.click()
+    wait_idle(page)
+    page.locator('.st-key-gray_back button').first.click()
     wait_idle(page)
     expect(page.locator('.st-key-gray_disp_csv')).to_be_visible()
     _no_exception(page)

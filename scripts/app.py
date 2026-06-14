@@ -267,6 +267,8 @@ def _viz_send_to_gray(indices: list[int], model: str) -> None:
     st.session_state["gray_anchors"] = anchors
     st.session_state["gray_dis"] = dis
     st.session_state["gray_disp"] = {}
+    st.session_state.pop("gray_mode", None)
+    st.session_state.pop("gray_pos", None)
     st.session_state["gray_inbound"] = True
     st.session_state["tool_switch"] = "灰帶覆核"
     _log_usage("viz_send_to_gray", n=len(queue))
@@ -683,6 +685,8 @@ def _cart_to_gray(snaps: list[dict], model: str) -> None:
     st.session_state["gray_anchors"] = anchors
     st.session_state["gray_dis"] = np.asarray(scores, dtype=float)
     st.session_state["gray_disp"] = {}
+    st.session_state.pop("gray_mode", None)
+    st.session_state.pop("gray_pos", None)
     st.session_state["gray_inbound"] = True
     st.session_state["tool_switch"] = "灰帶覆核"
     st.session_state["_cart_app_rerun"] = True
@@ -4142,6 +4146,19 @@ def _gray_dispose(indices, action: str, soft_map: dict | None = None) -> None:
     st.toast(f"已處置 {len(indices)} 筆 → {action}", icon="✅")
 
 
+def _gray_enter_focus(pos: int) -> None:
+    st.session_state["gray_pos"] = int(pos)
+    st.session_state["gray_mode"] = "focus"
+
+
+def _gray_nav(step: int) -> None:
+    st.session_state["gray_pos"] = st.session_state.get("gray_pos", 0) + int(step)
+
+
+def _gray_set_mode(mode: str) -> None:
+    st.session_state["gray_mode"] = mode
+
+
 def _render_gray_quick_start() -> None:
     st.markdown("##### 快速開始")
     c1, c2, c3 = st.columns(3, gap="medium")
@@ -4162,6 +4179,69 @@ def _render_gray_quick_start() -> None:
 def _gray_thumb(records, i):
     t = _thumb_or_none(Path(records[i]["path"]))
     return t
+
+
+def _gray_focus_view(records, emb, anchors, anchor_indices, disp, view,
+                     class_opts, soft_map) -> None:
+    """焦點對照（接回舊版的一對一對）：原標類錨例 ｜ 灰帶 ｜ 最近他類錨例 並排 +
+    cosine 距離 + 上/下一張 + 單筆三選一動作。"""
+    pos = max(0, min(st.session_state.get("gray_pos", 0), len(view) - 1))
+    it = view[pos]
+    cur_i, orig = it["i"], it["orig"]
+    orig_anchor = anchors.get(orig)
+    other_anchors = [a for c, a in anchors.items() if c != orig and a is not None]
+    orig_idx, orig_dist = (nearest_anchor(emb, cur_i, [orig_anchor])
+                           if orig_anchor is not None else (None, float("inf")))
+    other_idx, other_dist = nearest_anchor(emb, cur_i, other_anchors)
+
+    n1, n2, n3 = st.columns([1, 2.4, 1])
+    n1.button("← 上一張", key="gray_prev", use_container_width=True,
+              disabled=pos == 0, on_click=_gray_nav, args=(-1,))
+    warn = " ⚠指向他類" if it["points_other"] else ""
+    n2.markdown(f"第 **{pos + 1} / {len(view)}** 筆　·　分歧 {it['score']:.2f}　·　"
+                f"{orig}→{it['anchor']}{warn}")
+    n3.button("下一張 →", key="gray_next", use_container_width=True,
+              disabled=pos >= len(view) - 1, on_click=_gray_nav, args=(1,))
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.caption(f"原標類錨例 · **{orig}**"
+                   + (f"　cos {orig_dist:.3f}" if orig_idx is not None else ""))
+        t = _gray_thumb(records, orig_idx) if orig_idx is not None else None
+        st.image(t, use_container_width=True) if t else st.caption("（無）")
+    with c2:
+        st.caption(f"🌫 灰帶候選 · 原標 **{orig}**")
+        t = _gray_thumb(records, cur_i)
+        st.image(t, use_container_width=True) if t else st.warning("⚠缺檔")
+    with c3:
+        oc = records[other_idx]["label"] if other_idx is not None else "—"
+        st.caption(f"最近他類錨例 · **{oc}**"
+                   + (f"　cos {other_dist:.3f}" if other_idx is not None else ""))
+        t = _gray_thumb(records, other_idx) if other_idx is not None else None
+        st.image(t, use_container_width=True) if t else st.caption("（無他類錨例）")
+
+    if orig_idx is not None and other_idx is not None:
+        closer = "他類" if other_dist < orig_dist else "原標類"
+        st.caption(f":gray[它離 **{closer}** 錨例較近（原標 {orig_dist:.3f} vs 他類 "
+                   f"{other_dist:.3f}）。明顯靠他類 → 送 Labeling 改標；兩邊都不近 → 分級/排除。]")
+
+    d = disp.get(cur_i)
+    cur_badge = {"soft": "🏷已分級", "exclude": "🚫已排除"}.get(
+        (d or {}).get("action"), "未處置")
+    st.markdown(f"**這一張的處置**（目前：{cur_badge}）")
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        _send_to_labeling_ui(
+            records, [cur_i], source="gray-zone-focus", task=LH.TASK_ADJUDICATE,
+            label="📤 送這張裁決", key=f"gray_f_send_{cur_i}", class_opts=class_opts or None,
+            original_labels={cur_i: records[cur_i].get("label", "")},
+            help="送 Labeling 正式對錨改標。")
+    b2.button("🏷 給這張分級", key=f"gray_f_soft_{cur_i}", use_container_width=True,
+              on_click=_gray_dispose, args=([cur_i], "soft", soft_map))
+    b3.button("🚫 排除這張", key=f"gray_f_excl_{cur_i}", use_container_width=True,
+              on_click=_gray_dispose, args=([cur_i], "exclude"))
+    st.button("← 回總覽（看 backlog／批次）", key="gray_back",
+              on_click=_gray_set_mode, args=("overview",))
 
 
 def _gray_zone_ui() -> None:
@@ -4218,6 +4298,8 @@ def _gray_zone_ui() -> None:
         st.session_state["gray_dis"] = dis
         st.session_state["gray_disp"] = {}
         st.session_state.pop("gray_inbound", None)
+        st.session_state.pop("gray_mode", None)  # 新批重新自適應 overview/focus
+        st.session_state.pop("gray_pos", None)
         st.toast(f"佇列建立：{len(queue)} 筆灰帶候選", icon="🌫")
 
     if "gray_records" not in st.session_state:
@@ -4236,77 +4318,94 @@ def _gray_zone_ui() -> None:
     class_opts = sorted({r["label"] for r in records})
     anchor_indices = [a for a in anchors.values() if a is not None]
 
-    # ── backlog 量化：整個資料集有多少要 audit（用全集 dis，不是只有前 N）──
-    if dis is not None:
-        from interaction import gray_zone_summary
-        s = gray_zone_summary(dis)
-        st.markdown("**🩺 Backlog — 整個資料集有多少要 audit**")
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("灰帶（分歧≥0.5）", s["n_gray"], f"{s['pct_gray']}%")
-        b2.metric("🔴 高 ≥0.6", s["high"])
-        b3.metric("🟡 中 0.3–0.6", s["mid"])
-        b4.metric("🟢 低 <0.3", s["low"])
-        st.caption(f":gray[本批＝分歧度最高的前 {len(queue)} 筆"
-                   f"（灰帶共 {s['n_gray']} 筆，另 {max(0, s['n_gray'] - len(queue))} 筆未排入；"
-                   "想多看就調左側『本批張數』）。分歧度＝鄰域標籤不一致比例，"
-                   "是探索線索、**非錯標判決**。]")
+    # ── mode 預設（依佇列大小自適應：小批直接逐筆、大批先總覽）──
+    if "gray_mode" not in st.session_state:
+        st.session_state["gray_mode"] = "focus" if len(queue) <= 8 else "overview"
+    st.session_state.setdefault("gray_pos", 0)
+    mode = st.session_state["gray_mode"]
 
-    # ── 每筆 triage 資料（分歧度、原標→最近錨例、是否指向他類）──
+    # ── 每筆 triage 資料（保留 anchor 索引與 cosine 距離，不再丟）──
     items = []
     for i in queue:
-        a_idx, _ = nearest_anchor(emb, i, anchor_indices)
+        a_idx, a_dist = nearest_anchor(emb, i, anchor_indices)
         a_cls = records[a_idx]["label"] if a_idx is not None else None
         orig = records[i]["label"]
         items.append({"i": i, "score": float(dis[i]) if dis is not None else 0.0,
-                      "orig": orig, "anchor": a_cls,
+                      "orig": orig, "anchor": a_cls, "anchor_idx": a_idx,
+                      "anchor_dist": a_dist,
                       "points_other": a_cls is not None and a_cls != orig})
 
-    flt = st.radio("分流篩選", ["全部", "⚠ 指向他類（可解→送 Labeling）",
-                              "同類高分歧（模稜兩可→分級/排除）"],
-                   horizontal=True, key="gray_filter")
+    # 篩選（讀持久值算 view）+ 排序（高分歧在前，輕重一眼分）
+    flt = st.session_state.get("gray_filter", "全部")
     if flt.startswith("⚠"):
         view = [it for it in items if it["points_other"]]
     elif flt.startswith("同類"):
         view = [it for it in items if not it["points_other"]]
     else:
-        view = items
+        view = list(items)
+    view.sort(key=lambda it: -it["score"])
     view_idx = [it["i"] for it in view]
-    soft_map = {it["i"]: (it["anchor"] or it["orig"], round(1 - it["score"], 2))
-                for it in view}
 
-    a1, a2, a3 = st.columns(3)
-    with a1:
+    def _soft_conf(it) -> float:
+        d = it["anchor_dist"]
+        return (round(max(0.0, 1.0 - d), 2) if d not in (None, float("inf"))
+                else round(1.0 - it["score"], 2))
+    soft_map = {it["i"]: (it["anchor"] or it["orig"], _soft_conf(it)) for it in view}
+
+    # ===== 焦點對照（一對一對）=====
+    if mode == "focus" and view:
+        _gray_focus_view(records, emb, anchors, anchor_indices, disp, view,
+                         class_opts, soft_map)
+        return
+
+    # ===== 總覽（看 backlog + 批次分流）=====
+    if dis is not None:
+        from interaction import gray_zone_summary
+        s = gray_zone_summary(dis)
+        bk1, bk2 = st.columns([1.1, 3])
+        bk1.metric("灰帶待 audit", f"{s['n_gray']}/{s['n_total']}", f"{s['pct_gray']}%")
+        bk2.caption(f"嚴重度　:red[🔴 高 {s['high']}]　:orange[🟡 中 {s['mid']}]　"
+                    f":green[🟢 低 {s['low']}]　·　本批前 {len(queue)} 筆"
+                    "（想多看調左側『本批張數』）。分歧度＝鄰域標籤不一致比例，"
+                    "探索線索、**非錯標判決**。")
+
+    f_col, ab1, ab2, ab3 = st.columns([3, 1.3, 1.3, 1.3])
+    with f_col:
+        st.radio("分流篩選", ["全部", "⚠ 指向他類（可解→送 Labeling）",
+                            "同類高分歧（模稜兩可→分級/排除）"],
+                 horizontal=True, key="gray_filter", label_visibility="collapsed")
+    with ab1:
         _send_to_labeling_ui(
             records, view_idx, source="gray-zone", task=LH.TASK_ADJUDICATE,
-            label="📤 送 Labeling 裁決", key="gray_to_lbl", class_opts=class_opts or None,
+            label="📤 送裁決", key="gray_to_lbl", class_opts=class_opts or None,
             original_labels={i: records[i].get("label", "") for i in view_idx},
             payload={"anchors": {str(c): {"idx": int(a), "label": records[a].get("label", ""),
                                           "file": Path(records[a]["path"]).name}
                                  for c, a in anchors.items() if a is not None}},
-            help="可解的灰帶送 Labeling 正式對錨裁決；錨例隨件帶過，標完在 Labeling 端匯出即完成。")
-    a2.button("🏷 給分級 soft label（這批）", key="gray_soft_btn",
-              use_container_width=True, disabled=not view_idx,
-              on_click=_gray_dispose, args=(view_idx, "soft", soft_map),
-              help="模稜兩可、不送外標：給分級標籤（=最近錨例類別，信賴=1−分歧度），以群體處理。")
-    a3.button("🚫 標記排除（這批）", key="gray_exclude_btn",
-              use_container_width=True, disabled=not view_idx,
-              on_click=_gray_dispose, args=(view_idx, "exclude"),
-              help="標為灰帶排除——評估的 recall 不計入這些（無穩定真值）。")
+            help="把篩選後的這批送 Labeling 正式對錨裁決；標完在 Labeling 端匯出即完成。")
+    ab2.button("🏷 分級", key="gray_soft_btn", use_container_width=True,
+               disabled=not view_idx, on_click=_gray_dispose,
+               args=(view_idx, "soft", soft_map),
+               help="這批給分級 soft label（=最近錨例類別，信賴=1−錨例距離），以群體處理。")
+    ab3.button("🚫 排除", key="gray_exclude_btn", use_container_width=True,
+               disabled=not view_idx, on_click=_gray_dispose,
+               args=(view_idx, "exclude"), help="標為灰帶排除——評估 recall 不計入。")
 
     _badge = {"soft": "🏷分級", "exclude": "🚫排除"}
-    st.markdown(f"**總覽（{len(view)} 筆）** — 每張帶分歧度、原標→最近錨例、處置狀態")
-    with st.container(height=360):
+    st.markdown(f"**總覽（{len(view)} 筆）** — 點「🔍對照」看大圖三方對照；高分歧在前、紅色跳出")
+    with st.container(height=380):
         cols = st.columns(5)
         for j, it in enumerate(view):
-            with cols[j % 5]:
-                arrow = f'{it["orig"]}→{it["anchor"]}' + (" ⚠" if it["points_other"] else "")
+            with cols[j % 5], st.container(border=True):
+                sc = it["score"]
+                col = "red" if sc >= 0.6 else ("orange" if sc >= 0.3 else "green")
+                warn = " :red[⚠]" if it["points_other"] else ""
                 badge = _badge.get((disp.get(it["i"]) or {}).get("action"), "")
-                cap = f'分歧{it["score"]:.2f}·{arrow} {badge}'
+                st.markdown(f':{col}[● {sc:.2f}]{warn} {it["orig"]}→{it["anchor"]} {badge}')
                 t = _gray_thumb(records, it["i"])
-                if t:
-                    st.image(t, use_container_width=True, caption=cap)
-                else:
-                    st.warning(f"⚠缺檔 {cap}")
+                st.image(t, use_container_width=True) if t else st.warning("⚠缺檔")
+                st.button("🔍對照", key=f"gray_focus_{it['i']}", use_container_width=True,
+                          on_click=_gray_enter_focus, args=(j,))
 
     st.caption(f":gray[已站內處置 {len(disp)} 筆（分級/排除）；送 Labeling 的已交棒、不在此計。]")
     if disp:
