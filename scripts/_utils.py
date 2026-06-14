@@ -7,13 +7,9 @@ from typing import Callable
 import numpy as np
 from tqdm import tqdm
 
-from models import (
-    ChineseClipExtractor,
-    ChineseClipTextEncoder,
-    Dinov2Extractor,
-    ImagePreprocessor,
-    ResNetExtractor,
-)
+# `models` imports torch/torchvision (~6s) at module load. Imported LAZILY inside
+# load_model / load_text_encoder so that `import _utils` (used for available_models /
+# extract_embeddings, which need no torch) stays cheap and the LV UI shell starts fast.
 
 # Model weights live in ``models/`` by default; the host platform (CIM) points
 # this at a writable "model-house" via LV_MODELS_DIR so the vendored submodule
@@ -47,6 +43,8 @@ def load_model(
     model_name: str, models_dir: Path = _DEFAULT_MODELS_DIR
 ) -> Callable[[Path], np.ndarray]:
     """Load a model by name. Returns embed_fn(path) -> np.ndarray."""
+    from models import (ChineseClipExtractor, Dinov2Extractor,
+                        ImagePreprocessor, ResNetExtractor)
     preprocessor = ImagePreprocessor()
 
     if supports_text_query(model_name):
@@ -93,6 +91,7 @@ def load_text_encoder(
             f"Chinese-CLIP weights not found: {model_dir}\n"
             "Run scripts/download_chinese_clip.py first."
         )
+    from models import ChineseClipTextEncoder
     return ChineseClipTextEncoder(model_dir)
 
 
