@@ -2650,7 +2650,7 @@ def _compare_distributions_ui() -> None:
         col2.metric("KID ↓", f"{kid_score:.6f}")
         col3.metric("LPIPS ↓", f"{lpips_score:.4f}")
         col4.metric("SSIM ↑", f"{ssim_score:.4f}")
-        col5, col6, col7 = st.columns(3)
+        col5, col6, col7, _col8 = st.columns(4)  # 4-col grid aligns with row 1
         col5.metric("PSNR ↑ (dB)", f"{psnr_score:.2f}" if psnr_score is not None else "—")
         col6.metric(
             f"IS ↑  ({name_a})",
