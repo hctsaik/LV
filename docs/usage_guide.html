@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LV 使用指南（VisualLatent）</title>
+<style>
+:root{--ink:#1f2933;--muted:#5c6b7a;--line:#e3e8ee;--bg:#f7f9fb;--card:#fff;
+--accent:#2c6fb5;--accent2:#9b59b6;--warn:#c0392b;--ok:#1e8449;--soft:#eef4fa;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+font-family:-apple-system,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;
+line-height:1.75;font-size:15.5px;}
+.wrap{max-width:980px;margin:24px auto;padding:0 20px 60px}
+h1{font-size:26px;border-bottom:3px solid var(--accent);padding-bottom:8px}
+h2{font-size:21px;margin-top:34px;color:var(--accent);
+border-left:5px solid var(--accent);padding-left:10px}
+h3{font-size:17px;margin-top:22px;color:#22303c}
+h4{font-size:15px;margin-top:16px;color:#2c3e50}
+blockquote{margin:14px 0;padding:10px 16px;background:var(--soft);
+border-left:4px solid var(--accent2);border-radius:6px;color:#33424f}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+th,td{border:1px solid var(--line);padding:7px 11px;text-align:left;vertical-align:top}
+th{background:var(--soft)}
+code{background:#eef2f6;padding:1px 6px;border-radius:5px;font-size:13.5px;
+font-family:"SFMono-Regular",Consolas,monospace}
+pre{background:#1c2733;color:#e6edf3;padding:14px 16px;border-radius:10px;overflow-x:auto}
+pre code{background:none;color:inherit;padding:0}
+ul,ol{padding-left:22px}
+li{margin:3px 0}
+hr{border:none;border-top:1px solid var(--line);margin:28px 0}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+</style>
+</head>
+<body><div class="wrap">
+<h1 id="lv-visuallatent">LV 使用指南（VisualLatent）</h1>
+<blockquote>
+<p><strong>一句話</strong>：先用 <strong>Visualize</strong> 探索＋診斷，再從樞紐<strong>分流</strong>到其餘四個工具。
+每個工具回答一個<strong>不同的問題</strong>、對應瑕疵漏逮的<strong>不同「桶」</strong>。
+圖解見 <a href="tools_overview.html">tools_overview.html</a>（五工具樞紐圖＋四桶對應）。</p>
+</blockquote>
+<hr />
+<h2 id="_1">心智模型：探索 → 行動，對應四桶</h2>
+<p>LV 不是五個各自獨立的功能，而是一條「<strong>探索 → 診斷 → 分流 → 處置</strong>」的線。
+<strong>Visualize Embeddings 是樞紐</strong>（探索＋單筆診斷＋策展分流），其餘四個是你從樞紐走向的「行動」。</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>回答的問題</th>
+<th>對應四桶</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>① Visualize Embeddings</strong></td>
+<td>這批影像長怎樣？這筆漏逮為何沒抓到？</td>
+<td>樞紐（碰①②③）</td>
+</tr>
+<tr>
+<td><strong>② Compare Distributions</strong></td>
+<td>兩堆資料像不像？我覆蓋了對方多少？</td>
+<td>桶② 分布·覆蓋</td>
+</tr>
+<tr>
+<td><strong>③ 完整度熱力圖</strong></td>
+<td>我這堆內部哪裡缺／假完整？</td>
+<td>桶② 覆蓋不足</td>
+</tr>
+<tr>
+<td><strong>④ 組考卷</strong></td>
+<td>「什麼算瑕疵」這把尺準不準？</td>
+<td>桶③ 量這把尺</td>
+</tr>
+<tr>
+<td><strong>⑤ 灰帶覆核</strong></td>
+<td>連人都會吵的邊界樣本怎麼處置？</td>
+<td>桶③ 處置·人機協作</td>
+</tr>
+</tbody>
+</table>
+<p><strong>瑕疵漏逮四桶</strong>（問題本質，詳見 <a href="defect_problem_redefinition.md">defect_problem_redefinition.md</a>）：</p>
+<ul>
+<li><strong>桶① 物理天花板</strong>：訊號沒進資料，補資料無效 →（Visualize 的 🧱桶①佔比 / 體檢卡 S0 閘先攔截）</li>
+<li><strong>桶② 覆蓋不足</strong>：樣本太少，補了大概率有效 →（完整度熱力圖＋Compare＋Visualize 選樣/相似挖補）</li>
+<li><strong>桶③ 邊界帶</strong>：連人都會吵，逐筆不可判定 →（組考卷「量」＋灰帶覆核「處置」）</li>
+<li><strong>桶④ 迴圈漂移</strong>：追「最近被大聲抱怨的東西」→ 非工具能解，屬合約/權力，誠實標記為非工程帳</li>
+</ul>
+<hr />
+<h2 id="_2">啟動與前置</h2>
+<p><strong>完全離線</strong>：模型權重只從本機讀取。</p>
+<pre><code class="language-bash">pip install -r requirements.txt
+
+# 模型權重（不在版控；冪等 provisioning）
+python scripts/setup_models.py                # 核心：DINOv2 + Chinese-CLIP
+python scripts/setup_models.py --with-compare # 多：Compare 用的 Inception / LPIPS
+
+# 啟動
+streamlit run scripts/app.py                  # 開在 http://localhost:8501
+</code></pre>
+<p><strong>資料夾結構</strong>：
+- <strong>Object Detector（YOLO）</strong>：<code>&lt;folder&gt;/images/</code>（＋可選 <code>labels/</code> 為 YOLO <code>.txt</code>）。類別名取 <code>classes.txt</code>。
+- <strong>Image Classifier</strong>：<code>&lt;folder&gt;/類別名/影像.jpg</code>（依類別分子資料夾）。</p>
+<p>冷啟動可按主畫面「✨ 用範例資料試跑」零下載體驗（coco8）。</p>
+<hr />
+<h2 id="1-visualize-embeddings">① Visualize Embeddings — 探索＋診斷＋分流（樞紐）</h2>
+<h3 id="_3">解決什麼問題</h3>
+<p>把一個或多個圖片資料夾丟進深度模型萃取特徵，降維成可框選的散點圖，讓你「肉眼＋語意」一次看清資料分布。它不只是視覺化：右欄 7 個面板把探索（找相似、以文搜圖）、診斷（離群、標籤分歧、體檢卡根因、桶①佔比）與分流（多樣性選樣、購物車送考卷／灰帶）串成一條龍。整個流程<strong>完全離線</strong>，且<strong>不寫回資料集</strong>——只產出清單與報告。</p>
+<h3 id="_4">什麼時候用</h3>
+<ul>
+<li>拿到新資料、想先看分布與異常，再決定怎麼清理或補樣。</li>
+<li>懷疑 train/val 有洩漏、重複、標錯，想用一張圖找出可疑群。</li>
+<li>模型在某類樣本一直判錯，想釐清「補資料到底有沒有用」（根因 H0–H5）。</li>
+<li>想量「物理上根本拍不到的缺陷」佔多少（桶①），避免白補資料。</li>
+</ul>
+<h3 id="_5">怎麼操作</h3>
+<p><strong>1. 載入資料夾（左側 sidebar「① 資料」）</strong> — 先選「模式」（切換模式會清空舊結果，但提供「↩ 復原上個模式的結果」後悔藥）：
+- <strong>Object Detector</strong>：YOLO 格式，每個資料夾需含 <code>images/</code>（及可選 <code>labels/</code>）。類別名優先序：手動選的 <code>classes.txt</code> ＞ 父目錄 <code>classes.txt</code> ＞「類別來源」expander 手動輸入。
+- <strong>Image Classifier</strong>：依類別分子資料夾，類別自動偵測。</p>
+<p>用「📁 新增資料夾」挑路徑，或在文字框貼多行路徑（兩者合併）。</p>
+<p><strong>2. 選模型（「② 模型」）</strong> — 從 <code>models/</code> 多選（各算一份 embedding）。選 <strong>chinese-clip</strong> 會解鎖「相似」面板的<strong>以文搜圖</strong>。</p>
+<p><strong>3. 投影方法（「③ 投影方法」）＋執行</strong> — 勾選 PCA / t-SNE / UMAP（只勾要的可大幅縮短時間）。UMAP 可開「固定 UMAP 參考系」凍結座標讓跨 Run 可比較。按 <strong>▶ Run</strong>：縮圖快取 → 更新 manifest（增量）→ 逐模型特徵擷取（快取於 <code>embeddings_&lt;model&gt;/embeddings.npz</code>）→ 降維。</p>
+<p>主畫面用 <strong>Model / Method / Split</strong> 下拉切換視圖，在散點圖<strong>框選/套索</strong>，右欄即時對應。右欄頂端切換 7 個面板：</p>
+<ul>
+<li><strong>選取</strong>：框選後縮圖牆；排序（空間順序／離群度／標籤分歧／檔名）；未選取時自動顯示離群前 N（標明「僅供排序，非品質判定」）。含「📝 策展日誌」落盤、可重選、匯出 CSV。</li>
+<li><strong>相似</strong>：以圖搜圖 kNN，可「↻ 以此為查詢」鏈式續查；chinese-clip 時多<strong>以文搜圖</strong>（繁簡自動正規化）。</li>
+<li><strong>重複</strong>：phash（嚴格）或 embedding（語意）去重；勾「僅跨 split」＝ <strong>train/val 洩漏候選</strong>。並排複核，標明非自動判決。</li>
+<li><strong>選樣</strong>：farthest-point 多樣性／主動學習，勾「避開匯出清單」只挑離已覆蓋最遠的新樣本。</li>
+<li><strong>體檢卡</strong>：單張 escape 根因報告（先點一張縮圖/散點）。三訊號 <strong>S1 人類一致性</strong>（滑桿，來自組考卷）、<strong>S2 命中密度</strong>、<strong>S3 模型不確定度</strong>（有 <code>scores.csv</code> 用分數 margin，否則退鄰域標籤熵代理）＋ <strong>S0 桶①閘</strong>（🟢明顯/🟡疑似/🔴確無/⚪未知），經 <code>diagnose_root_cause</code> 給出 <strong>H0–H5</strong> 與「補資料有效性」：</li>
+<li><strong>H0 物理天花板</strong>（S0=確無）→ 補資料<strong>無效</strong>，要動成像鏈。</li>
+<li><strong>H1 覆蓋缺口</strong> → 補這格大概率<strong>有效</strong>（訊號未確認為明顯時會出 ⚠ caveat 提醒先量訊號）。</li>
+<li><strong>H2 定義歧義 / H3 標籤雜訊 / H4 容量限制 / H5 OOD</strong> → 各有對應行動。
+  附最近鄰縮圖牆，可「⬇ 匯出體檢卡 HTML」。</li>
+<li><strong>桶①佔比</strong>：逐影像類型統計 🔴確無(桶①)/🟡疑似/🟢明顯/⚪未知＋整體佔比。按「🎯 從目前資料重新校正門檻」就地量 SNR 校準（全域＋逐類型），再「📊 計算桶①佔比」。標明「確無是桶①<strong>下界</strong>，校準前偏估」。</li>
+<li><strong>匯出清單</strong>：跨工具累積的「策展購物車」（帶來源標籤、跨 Run 保留）。可篩選/加註理由、<strong>分流</strong>到「📝 出考卷」「🌫 送灰帶覆核」、匯出 CSV/ZIP。</li>
+</ul>
+<h3 id="_6">輸入 / 輸出</h3>
+<ul>
+<li><strong>輸入</strong>：圖片資料夾；可選 <code>classes.txt</code>；<strong>可選 <code>scores.csv</code></strong>（<code>filename,score[,threshold]</code>）→ 體檢卡 S3 的 N4 閘來源。</li>
+<li><strong>輸出</strong>：縮圖/embedding 快取、<code>manifest</code>（含 sha256）、桶①校準 <code>signal_gate.json</code>、策展日誌與各面板 CSV、購物車 ZIP、<strong>體檢卡 HTML</strong>。</li>
+</ul>
+<h3 id="_7">注意事項與限制</h3>
+<ul>
+<li>離群度／標籤分歧／命中密度都是<strong>幾何/鄰域統計，不是品質判定或誤標判決</strong>，只供排序與線索。</li>
+<li>重複掃描<strong>僅供人工複核，非自動判決</strong>。</li>
+<li>體檢卡歸因只涵蓋 <strong>N2（覆蓋）/N3（標籤分歧）＋可選 N4（分數）</strong>；<strong>N0 影像品質、N1 定義仲裁需人工</strong>，訊號不足會回「需人工覆核」。</li>
+<li>桶①門檻是教科書起點，<strong>必須就地用真實 escape 校準</strong>才可信；無 ROI 一律判「未知」不臆測。</li>
+<li><strong>UMAP 不保密度</strong>：投影只供肉眼定位，不可當密度量尺。</li>
+</ul>
+<h3 id="_8">對應四桶</h3>
+<ul>
+<li><strong>桶①</strong>：「桶①佔比」面板逐類型量、體檢卡 <strong>S0/H0</strong> 對單張下判（唯一能直接量到的一桶，且只到下界）。</li>
+<li><strong>桶②</strong>：「選樣」做主動學習挑該補的、「相似/以文搜圖」針對缺口挖補（對應體檢卡 H1）。</li>
+<li><strong>桶③</strong>：找出可疑邊界樣本→體檢卡判 H2/H3→從「匯出清單」分流送組考卷（量一致性）或灰帶覆核（雙簽裁決）。</li>
+</ul>
+<hr />
+<h2 id="2-compare-distributions">② Compare Distributions — 兩堆資料像不像 + 覆蓋盲區</h2>
+<h3 id="_9">解決什麼問題</h3>
+<p>回答「<strong>A、B 這兩堆影像在特徵空間像不像、B 漏抓了 A 哪些區域</strong>」。各自抽 embedding，算一組分布距離指標（FID/KID/LPIPS/SSIM/PSNR/IS），疊在同一張投影圖，並做 Coverage Gap 象限分析找「兩群都沒覆蓋到」的盲點。服務<strong>桶② 覆蓋/分布</strong>。</p>
+<h3 id="_10">什麼時候用</h3>
+<ul>
+<li>真實 vs 生成（合成/擴增逼不逼近真實）。</li>
+<li>train vs val、資料 v1 vs v2（分布漂移偵測）。</li>
+</ul>
+<blockquote>
+<p>與「完整度熱力圖」的根本差別：<strong>Compare 比兩堆之間（A 對 B）；完整度熱力圖看單一堆內部哪裡缺/假完整。</strong></p>
+</blockquote>
+<h3 id="_11">怎麼操作</h3>
+<p>側欄依序：<strong>Folder A / Folder B</strong>（各填<strong>直接含圖片</strong>的資料夾，例如 <code>dataset/train/images</code>、<code>goal/images</code>）→ <strong>Model</strong> → <strong>Output name prefix</strong> → 可勾「<strong>僅視覺化（跳過指標計算）</strong>」→ <strong>Pairwise metric samples</strong>（預設 500，LPIPS/SSIM/PSNR 隨機配對數）→ <strong>▶ Run</strong>。
+跑完上方出指標卡；下方左欄投影疊圖（<strong>Method</strong> 切 PCA/t-SNE/UMAP、維度 2D/3D，2D 可框選）；再下面 <strong>Coverage Gap Analysis</strong>。</p>
+<h3 id="_12">指標怎麼讀（箭頭＝好的方向）</h3>
+<ul>
+<li><strong>FID ↓ / KID ↓</strong>：整體分布距離越小越像（KID 在小資料更可靠）。</li>
+<li><strong>LPIPS ↓ / SSIM ↑ / PSNR ↑</strong>：抽 <code>n_pairs</code> 對跨組影像的感知/結構/訊噪平均（隨機配對，受 <code>n_pairs</code> 影響）。</li>
+<li><strong>IS ↑ (A) / IS ↑ (B)</strong>：各堆自己的品質/多樣性（基於 ImageNet，供參考、非相似度）。</li>
+</ul>
+<h3 id="coverage-gap">Coverage Gap（盲區象限圖）</h3>
+<p>對每點算到「最近 A 樣本」距離 d_A（x）與「最近 B 樣本」距離 d_B（y），閾值取各自<strong>中位數 P50</strong>切四象限：
+- <strong>右上（d_A、d_B 都大）= 盲點/異常（漏抓風險）</strong>：兩堆都沒覆蓋。
+- <strong>左下（都小）= 邊界重疊（誤報風險）</strong>。
+上方顯示樣本數、盲點數（占比）、邊界重疊數（占比）。可下載 Coverage HTML。</p>
+<h3 id="_13">輸入 / 輸出</h3>
+<ul>
+<li><strong>輸入</strong>：兩個直接含圖片的資料夾、一個模型、<code>n_pairs</code>。</li>
+<li><strong>輸出</strong>：指標卡、投影疊圖、Coverage Gap 象限圖；下載 HTML（all views）/ JSON / Coverage HTML。</li>
+</ul>
+<h3 id="_14">注意事項與限制</h3>
+<ul>
+<li><strong>投影只是「畫」，不是密度量尺</strong>：不可拿投影上的距離當相似度分母；真正相似度看指標與 Coverage Gap（後者在高維算）。</li>
+<li>FID/KID/LPIPS/IS 需 Inception/LPIPS 權重，離線機先 <code>python scripts/setup_models.py --with-compare</code>。</li>
+<li>LPIPS/SSIM/PSNR 有抽樣噪音（調大 <code>n_pairs</code> 換穩定）。</li>
+<li>Coverage Gap 閾值是這兩堆自己的 P50，<strong>相對</strong>盲區，換資料就變。</li>
+<li><strong>對應四桶</strong>：桶② 覆蓋/分布。</li>
+</ul>
+<hr />
+<h2 id="3">③ 完整度熱力圖 — 單一資料集內部完整度</h2>
+<h3 id="_15">解決什麼問題</h3>
+<p>回答「<strong>我這一堆資料，內部哪些格子缺、哪些是『假完整』（量夠但都是近重複）</strong>」。把單一資料集切成可解讀的小棋盤格，每格同時看<strong>量（n vs 目標 t）</strong>與<strong>embedding 多樣性 d</strong>，滾成一個 Coverage Health 數字＋護欄（Gini、假完整比例）。服務<strong>桶② 覆蓋</strong>，視角是「單一堆內部」。</p>
+<h3 id="_16">操作流程</h3>
+<p>側欄：貼<strong>含類別子資料夾</strong>的影像資料夾 → 選模型 → <strong>▶ 開始分析</strong>。跑完最上方切換<strong>屬性棋盤</strong> vs <strong>嵌入覆蓋圖</strong>。</p>
+<h4 id="a">子檢視 A：屬性棋盤</h4>
+<p>依<strong>可解讀屬性軸</strong>切格（不用 UMAP 切格，那會扭曲密度）。熱力圖上方可即時調整免重跑：
+- <strong>橫看(X)/直看(Y)</strong>：<code>類別</code>、<code>資料集(split)</code>，或自動屬性 <code>亮度/對比/銳利度/長寬比</code>。
+- <strong>連續特徵分幾檔</strong>、<strong>每格至少幾張(t_abs)</strong>、<strong>近重複警戒(d*：寬鬆0.45/標準0.6/嚴格0.75)</strong>。</p>
+<p>五態（優先序高→低）：🟥<strong>缺</strong> n&lt;0.5t｜🟧<strong>偏缺</strong> 0.5t≤n&lt;t｜🟩<strong>健康</strong> n≥t且d≥d*｜🟪<strong>假完整</strong> n≥t但<strong>d&lt;d*</strong>（近重複充數）｜🟦<strong>過多</strong> n≥1.5t且d≥d*。<strong>低多樣性優先於過多</strong>（量夠但近重複先判假完整，因為該去重不是再補）。
+指標卡：Coverage Health（達標格佔比，假完整打0.7折）、缺格數、Gini 不均度、假完整比例。
+<strong>真實分佈校正</strong>（🎚）：每格設頻率先驗 高(×2)/中(×1)/低(×0.4)/不適用，避免稀有格被誤判缺。
+右欄：缺格清單、點格看格內影像；缺格可 <strong>🔎 撈候選補此格</strong>（<code>mine_candidates</code> 以格心做以圖搜圖）。</p>
+<h4 id="b">子檢視 B：嵌入覆蓋圖</h4>
+<p>不切格，直接在特徵空間真實形狀裡找稀疏盲區（<strong>稀疏度一律高維算</strong>，投影只供畫）。稀疏度 ≥ 自參照 <strong>P80</strong> 即盲區候選。偵測資料集可切「物件級」（裁 bbox 各自算）。
+<strong>根因 H1–H5 誠實閘</strong>（🧭，<code>diagnose_sparse_points</code>）：用 S1 人類一致性、S2 密度、S3 標籤熵（＋S0 訊號）交叉定位，統計「補資料有效(H1/H5)」與「桶①物理天花板(H0)」各幾點。
+<strong>參照分佈 B 模式</strong>：投影一個外部資料夾後，可當「採礦池」（<code>rank_gap_fillers</code> 挑最補洞的）或「參照分佈」（<code>reference_coverage</code> 量「覆蓋參照 B X%」與未覆蓋點）——<strong>這是覆蓋圖第一次有外部真值</strong>（自我參照稀疏看不出「全資料集都缺的類型」）。</p>
+<h3 id="_17">注意事項與限制</h3>
+<ul>
+<li><strong>稀疏 = 自我參照、未校正真實分佈</strong>：全資料集都缺的類型不會顯示為稀疏；要量「相對真實分佈缺多少」須用<strong>參照分佈 B 模式</strong>。</li>
+<li><strong>假完整看多樣性 d 不是量</strong>；屬性棋盤目標 t 預設均勻假設，需頻率先驗校正才誠實。</li>
+<li><strong>稀疏 ≠ 模型一定弱</strong>：是否真該補由 H1–H5 閘判（只有 H1 與新樣態 H5 補才有效）。</li>
+<li><strong>對應四桶</strong>：桶② 覆蓋；根因閘會把 H0 點歸給桶①。</li>
+</ul>
+<hr />
+<h2 id="4">④ 組考卷 — 量「什麼算瑕疵」這把尺準不準</h2>
+<h3 id="_18">解決什麼問題</h3>
+<p>「同一張圖、同一定義，不同人（甚至同一人不同時間）給不同標籤」——把<strong>爭議樣本</strong>變成<strong>盲測考卷</strong>，量兩件事：<strong>自我一致性（intra-rater）</strong>＝同一人換皮重測答不答得一致；<strong>跨人一致性（inter-rater）</strong>＝多人是否彼此同意。<strong>它是量測，不改任何資料。</strong></p>
+<h3 id="_19">什麼時候用</h3>
+<ul>
+<li>上線新標註者或定期校準時，先量對既有案例穩不穩。</li>
+<li>懷疑某類「人說不清」（概念歧義）時，用考卷分數當體檢卡的 <strong>S1</strong> 輸入。</li>
+<li>從別工具收到一批可疑樣本，想先盲標量一致性而非急著改標。</li>
+</ul>
+<h3 id="_20">怎麼操作</h3>
+<ol>
+<li><strong>載入資料</strong>：貼含類別子資料夾的影像資料夾、選模型（只用來算 kNN 標籤分歧挑爭議樣本）、「載入資料」（需 ≥2 類別）。</li>
+<li><strong>出題</strong>：設單卷題數（預設 16），「產生考卷」。依分歧度排序後混入四種題型：<strong>爭議題</strong>（分歧最高，主體）｜<strong>對照題 distractor</strong>（約25%，明確且不同類，分開「判斷漂移」與「題本身難」）｜<strong>換皮重測 repeat</strong>（約20%，自我一致性配對）｜<strong>golden 定錨</strong>（約12%，最清楚樣本當標準）。出題後打亂、切斷原題與重測的相鄰。</li>
+<li><strong>盲測換皮只允許幾何變換</strong>：白名單 <code>rot90/180/270、fliplr、flipud、crop90</code>；對比/亮度/銳化等光度變換<strong>直接拋例外</strong>（會擾動灰帶判定）。</li>
+<li><strong>逐題作答</strong>：不顯示原標籤，按類別鈕作答。</li>
+<li><strong>單卷成績</strong>：自我一致率、vs golden 一致率、達標與否；匯出作答 CSV（<code>qid,answer</code>）。</li>
+<li><strong>多人一致性</strong>：每人各自跑同卷、各自匯出 CSV，到「👥 多人一致性」<strong>上傳 ≥2 份</strong>，取共同題算 <strong>Fleiss kappa</strong>。</li>
+</ol>
+<h3 id="_21">統計量與及格線</h3>
+<table>
+<thead>
+<tr>
+<th>指標</th>
+<th>及格線</th>
+<th>量什麼</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自我一致率 self-consistency</td>
+<td><strong>≥ 0.90</strong></td>
+<td>換皮重測配對答一致比例（intra-rater）</td>
+</tr>
+<tr>
+<td>vs golden 一致</td>
+<td><strong>≥ 0.85</strong></td>
+<td>golden+distractor 與標準答案一致率</td>
+</tr>
+<tr>
+<td>Fleiss kappa</td>
+<td><strong>≥ 0.75</strong></td>
+<td>多人在共同題上的一致性</td>
+</tr>
+</tbody>
+</table>
+<p>（缺答配對跳過；無已答配對 self=0；Fleiss 要求每題評分人數一致且 ≥2。）</p>
+<h3 id="_22">注意事項與限制</h3>
+<ul>
+<li><strong>量的是「對既有案例的判定穩定性與一致性」</strong>——不是新型瑕疵檢出率，也<strong>不保證 golden 本身正確</strong>。</li>
+<li>補洞候選帶<strong>暫定標籤</strong>（1-NN 轉移），不是真值宣稱。</li>
+<li>kappa <strong>沒有信賴區間</strong>，小樣本波動大，須留意共同題數。</li>
+<li><strong>這是量測工具，全程不改資料。</strong> 要改標到「灰帶覆核」。</li>
+<li><strong>對應四桶</strong>：桶③ —「量」這把尺（群體層級）。</li>
+</ul>
+<hr />
+<h2 id="5">⑤ 灰帶覆核 — 邊界樣本的人機協作裁決</h2>
+<h3 id="_23">解決什麼問題</h3>
+<p>有些樣本天生落在判定邊界（「灰帶」）。若讓人在散點圖隨手改標，裁決<strong>沒紀錄、沒第二人把關、無法回溯</strong>。灰帶覆核把爭議樣本攔在暫存區，提供「<strong>對照明確錨例 → 提議軟標籤 → 雙簽覆核 → 匯出決策</strong>」的有紀錄裁決。<strong>改標只在這裡做，且不直接寫回資料集。</strong></p>
+<h3 id="_24">什麼時候用</h3>
+<ul>
+<li>標籤分歧（散點探索）已<strong>找出</strong>可疑點，需對<strong>每筆</strong>做可稽核處置。標籤分歧與灰帶覆核是「同一條線兩端」——前者<strong>探索</strong>、後者<strong>裁決</strong>。</li>
+<li>組考卷量出低一致批、或散點/購物車送來的批需逐筆處置。</li>
+</ul>
+<h3 id="_25">怎麼操作</h3>
+<ol>
+<li><strong>建立覆核佇列</strong>：貼資料夾、選模型、設「佇列張數（最爭議前 N）」、「建立覆核佇列」。系統用 <code>compute_label_disagreement</code> 取分歧最高前 N 入列，並為每類選最明確一張當錨例（需 ≥2 類別）。</li>
+<li><strong>疊圖對照錨例</strong>：每筆灰帶樣本顯示其 cosine 最近的明確錨例（含距離），幫判斷「離哪個明確例近」。</li>
+<li><strong>① 標註者提議軟標籤</strong>：選 soft label、拉信賴度（預設 0.67）、<strong>填一句理由（必填）</strong>。記 <code>proposer=標註者</code>、狀態 <code>proposed</code>。</li>
+<li><strong>② 品保覆核（雙簽，人員不可重疊）</strong>：品保按「覆核通過」標 <code>approved</code>、<code>approver=品保QA</code>，或「退回（重議）」。<strong>提議者與核可者是兩個角色，不可同一人包辦。</strong></li>
+<li><strong>匯出決策</strong>：通過雙簽的進決策清單，匯出 CSV（<code>path, soft_label, confidence, anchor, reason, proposer, approver, status</code>）。</li>
+</ol>
+<h3 id="_26">注意事項與限制</h3>
+<ul>
+<li><strong>灰帶不直接寫回資料集</strong>：確認後匯出決策，由<strong>下游流程</strong>併入。</li>
+<li><strong>改標只在這裡做</strong>，不在散點圖隨手改。</li>
+<li>錨例與最近鄰是<strong>參考訊號，不替代雙簽裁決</strong>。</li>
+<li><strong>對應四桶</strong>：桶③ —「處置」邊界帶（群體/受控流程，非散點上逐筆隨手）。</li>
+</ul>
+<hr />
+<h2 id="1">桶① 訊號強度閘與校正（跨工具的物理可偵測性軸）</h2>
+<p>三訊號根因（H1–H5）原本沒有「<strong>訊號到底在不在像素裡</strong>」這個軸，導致物理上看不見的 escape 會被判 H1「補資料有效」——其實補了也沒用。桶①閘（<code>scripts/signal_strength.py</code>）在 H1–H5 前先量缺陷 ROI 對局部背景的 <strong>SNR</strong>，粗分 🟢明顯/🟡疑似/🔴確無/⚪未知；<code>確無</code> → 直接判 <strong>H0 物理天花板</strong>。</p>
+<p><strong>門檻要校準才可信</strong>（教科書起點只是 starting point）。兩條路：</p>
+<ul>
+<li><strong>App 內</strong>（免命令列）：Visualize → 「桶①佔比」面板 → 「🎯 從目前資料重新校正門檻」。從目前載入資料量 SNR、算全域＋<strong>逐影像類型</strong>門檻、存入 <code>signal_gate.json</code>（已 gitignore），自動套用。</li>
+<li><strong>CLI</strong>：
+  <code>bash
+  python scripts/calibrate_signal_gate.py --dataset &lt;YOLO資料&gt; --type-from class --write</code>
+  從既有標註框的 SNR 分佈反推門檻（確無線在分佈下方、明顯線以 Rose=5 為硬上限），<code>--type-from {parent,class,none}</code> 逐類型校正，<code>--write</code> 持久化。</li>
+</ul>
+<p>校準後，體檢卡與「桶①佔比」會顯示「該類型門檻（none/obvious、來源）」，匯出的體檢卡 HTML 也帶上。</p>
+<blockquote>
+<p><strong>為什麼要逐類型</strong>：實測 NEU-DET 鋼材瑕疵，crazing（細裂紋）SNR 中位數 0.24、scratches（刮痕）2.02，差約 8 倍。單一全域門檻會把真實 crazing 誤判成桶①、又對 scratches 太鬆。<strong>請拿你自己的瑕疵資料跑一次校正</strong>——COCO/NEU-DET 只是驗證流程的替身。</p>
+</blockquote>
+<hr />
+<h2 id="escape">典型工作流：一筆 escape 來了怎麼走</h2>
+<ol>
+<li><strong>進 Visualize</strong>（Object Detector 模式），把客戶回報的漏逮影像載入、▶ Run。</li>
+<li>在散點上找到它 → 右欄「<strong>體檢卡</strong>」看根因：
+   - <strong>S0=確無 → H0 物理天花板</strong>：補資料無效，標記為桶①，回報需改成像（非工程帳）。
+   - <strong>H1 覆蓋缺口</strong>：補這格有效 → 用「<strong>選樣/相似</strong>」挖同型樣本、或到「<strong>完整度熱力圖</strong>」找該補的格、撈候選 → 補資料重訓。
+   - <strong>H2 定義歧義 / 標籤分歧高</strong>：別急著塞訓練集 → 從「<strong>匯出清單</strong>」送「<strong>組考卷</strong>」量人類一致性；爭議的送「<strong>灰帶覆核</strong>」雙簽裁決。</li>
+<li>想確認新一批資料分布對不對 → 「<strong>Compare Distributions</strong>」比新批 vs 舊批 / 真實 vs 生成。</li>
+<li>桶①門檻沒校過 → 先在「桶①佔比」按「重新校正」，再讀佔比與根因。</li>
+</ol>
+<hr />
+<h2 id="cli">附錄：CLI 速查</h2>
+<pre><code class="language-bash"># 視覺化（CLI）
+python scripts/visualize_embeddings.py --folders dataset/train dataset/test --models resnet18 --output-dir output/
+# 分布比較（CLI）
+python scripts/compare_distributions.py --folder-a dataset/train/images --folder-b goal/images --model resnet18 --name cmp --n-pairs 500 --output-dir output/
+# 桶①閘校正（逐類型、寫入設定）
+python scripts/calibrate_signal_gate.py --dataset demo/coco8/train --type-from class --write
+# 測試
+pytest tests/ -v
+</code></pre>
+<h2 id="_27">附錄：原始碼地圖</h2>
+<table>
+<thead>
+<tr>
+<th>區塊</th>
+<th>檔案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Streamlit UI（全部工具）</td>
+<td><code>scripts/app.py</code></td>
+</tr>
+<tr>
+<td>框架無關邏輯（kNN/離群/分歧/根因/灰帶/匯出）</td>
+<td><code>scripts/interaction.py</code></td>
+</tr>
+<tr>
+<td>桶①訊號強度閘 + 校正</td>
+<td><code>scripts/signal_strength.py</code>、<code>scripts/calibrate_signal_gate.py</code></td>
+</tr>
+<tr>
+<td>完整度熱力圖</td>
+<td><code>scripts/completeness.py</code></td>
+</tr>
+<tr>
+<td>組考卷一致性</td>
+<td><code>scripts/quiz.py</code></td>
+</tr>
+<tr>
+<td>分布比較指標</td>
+<td><code>scripts/compare_distributions.py</code></td>
+</tr>
+<tr>
+<td>資料合約 manifest</td>
+<td><code>scripts/manifest.py</code></td>
+</tr>
+<tr>
+<td>固定 UMAP 參考系</td>
+<td><code>scripts/umap_ref.py</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>圖解：<a href="tools_overview.html">tools_overview.html</a>　·　問題定義：<a href="defect_problem_redefinition.md">defect_problem_redefinition.md</a></p>
+</blockquote>
+</div></body></html>

@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LV 五工具總覽 — 各別解決什麼問題</title>
+<style>
+  :root{
+    --ink:#1a2433; --sub:#5a6b80; --line:#e3e8ef; --bg:#f6f8fb;
+    --hub:#e8442e; --hubbg:#fff1ee;
+    --b1:#b4232a; --b2:#1f7a4d; --b3:#9a6a00; --b4:#5a6b80;
+  }
+  *{box-sizing:border-box}
+  body{font-family:"Noto Sans TC","Microsoft JhengHei",sans-serif;
+       max-width:1080px;margin:24px auto;padding:0 18px;color:var(--ink);background:#fff}
+  h1{font-size:24px;margin:0 0 4px}
+  .lead{color:var(--sub);margin:0 0 22px;font-size:15px}
+  .hub{border:2px solid var(--hub);background:var(--hubbg);border-radius:14px;
+       padding:16px 20px;margin-bottom:6px}
+  .hub h2{margin:0 0 6px;font-size:19px;color:var(--hub)}
+  .hub .role{display:inline-block;font-size:12px;color:#fff;background:var(--hub);
+       border-radius:999px;padding:2px 10px;margin-left:8px;vertical-align:middle}
+  .hub ul{margin:8px 0 0;padding-left:18px;color:var(--ink);font-size:14px;line-height:1.7}
+  .flowlabel{text-align:center;color:var(--sub);font-size:13px;margin:10px 0 12px}
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .card{border:1px solid var(--line);border-radius:12px;padding:14px 16px;background:var(--bg)}
+  .card h3{margin:0 0 2px;font-size:16px}
+  .card .q{font-size:14px;color:var(--ink);margin:6px 0 8px;font-weight:600}
+  .card .when{font-size:13px;color:var(--sub);line-height:1.6}
+  .card .route{font-size:12px;color:var(--sub);margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
+  .badge{display:inline-block;font-size:11px;color:#fff;border-radius:6px;padding:1px 8px;margin-top:8px}
+  .bk2{background:var(--b2)} .bk3{background:var(--b3)} .bk1{background:var(--b1)}
+  .legend{margin-top:26px;border-top:2px solid var(--line);padding-top:14px}
+  .legend h2{font-size:16px;margin:0 0 10px}
+  .legend table{border-collapse:collapse;width:100%;font-size:13.5px}
+  .legend td,.legend th{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+  .legend th{background:var(--bg)}
+  .pill{display:inline-block;color:#fff;border-radius:6px;padding:1px 8px;font-size:12px}
+  .note{color:var(--sub);font-size:12.5px;margin-top:10px;line-height:1.6}
+  @media(max-width:680px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+  <h1>LV 五個工具 — 各別在解決什麼問題</h1>
+  <p class="lead">心智模型：<b>先探索、再行動</b>。Visualize 是樞紐（探索＋單筆診斷＋分流），
+     其餘四個是你從樞紐一鍵走向的「行動」。每個工具回答一個<b>不同的問題</b>、對應瑕疵漏逮的<b>不同「桶」</b>。</p>
+
+  <div class="hub">
+    <h2>① Visualize Embeddings<span class="role">樞紐 HUB</span></h2>
+    <div style="font-weight:600">「這批影像在特徵空間長怎樣？這筆漏逮為什麼沒抓到？」</div>
+    <ul>
+      <li><b>探索</b>：特徵空間散點，撈出異類（離群）、標籤分歧、近重複。</li>
+      <li><b>🩺 體檢卡 H0–H5</b>：對單筆 escape 自動歸因——是覆蓋缺口、定義歧義、標籤雜訊還是容量限制；「補資料有沒有用」一眼看出。</li>
+      <li><b>🧱 桶①佔比</b>：量訊號強度，先判斷「缺陷訊號到底在不在像素裡」（物理天花板，補資料無效）。</li>
+      <li><b>策展分流</b>：把可疑樣本一鍵送到下面四個工具。</li>
+    </ul>
+  </div>
+
+  <div class="flowlabel">▼ 從樞紐一鍵分流到 ▼</div>
+
+  <div class="grid">
+    <div class="card">
+      <h3>② Compare Distributions</h3>
+      <div class="q">「兩堆資料像不像？我覆蓋了對方多少？」</div>
+      <div class="when">比兩個資料夾的分布（FID/KID/LPIPS/SSIM）＋覆蓋盲區散點。
+        用在：真實 vs 生成、train vs val、新批 vs 舊批——確認分布有沒有漂、哪裡沒覆蓋到。</div>
+      <span class="badge bk2">→ 桶② 分布·覆蓋</span>
+      <div class="route">何時進來：想拿手上這堆「和另一堆」對照時。</div>
+    </div>
+
+    <div class="card">
+      <h3>③ 完整度熱力圖</h3>
+      <div class="q">「我自己這堆，哪種屬性組合收太少／假完整？」</div>
+      <div class="when">把<b>單一資料集</b>切成屬性棋盤（型態×尺寸×對比…），每格看量夠不夠＋多樣性。
+        🟥缺 / 🟪假完整（量夠但都是近重複充數）。直接變成「補哪格」工單。</div>
+      <span class="badge bk2">→ 桶② 覆蓋不足</span>
+      <div class="route">何時進來：想盤點自己資料的內部完整度時。</div>
+    </div>
+
+    <div class="card">
+      <h3>④ 組考卷</h3>
+      <div class="q">「『什麼算瑕疵』這把尺準不準？」</div>
+      <div class="when">把爭議樣本變成盲測考卷，量標註者<b>彼此</b>與<b>自己</b>的一致性（Fleiss/Cohen kappa、自我一致率）。
+        尺不準時，量到的 precision/recall 只是「模型 vs 某人某天的意見」。</div>
+      <span class="badge bk3">→ 桶③ 量這把尺</span>
+      <div class="route">何時進來：懷疑「人對瑕疵沒有一致標準」時——先量，再決定要不要重訓。</div>
+    </div>
+
+    <div class="card">
+      <h3>⑤ 灰帶覆核</h3>
+      <div class="q">「連人都會吵的邊界樣本，怎麼處置？」</div>
+      <div class="when">邊界帶樣本<b>不逐筆硬塞訓練集</b>（會灌矛盾標籤）。走有紀錄的裁決：
+        疊圖對照「明確是/明確否」錨例 → 提議軟標籤 → 雙簽覆核 → 匯出。</div>
+      <span class="badge bk3">→ 桶③ 處置·人機協作</span>
+      <div class="route">何時進來：體檢卡判為標準漂移/邊界，或散點上標籤分歧高的一批。</div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <h2>對應「瑕疵漏逮四桶」</h2>
+    <table>
+      <tr><th>桶</th><th>本質</th><th>哪個工具碰它</th></tr>
+      <tr><td><span class="pill bk1">桶① 物理天花板</span></td>
+          <td>訊號沒進資料，補資料無效</td>
+          <td>Visualize 的 <b>🧱桶①佔比</b> / 體檢卡 S0 閘（先攔截）</td></tr>
+      <tr><td><span class="pill bk2">桶② 覆蓋不足</span></td>
+          <td>樣本太少/稀有，補了大概率有效</td>
+          <td><b>完整度熱力圖</b>（內部）＋<b>Compare</b>（對外比）＋Visualize 選樣/相似挖補</td></tr>
+      <tr><td><span class="pill bk3">桶③ 邊界帶</span></td>
+          <td>連人都會吵，逐筆不可判定</td>
+          <td><b>組考卷</b>（量一致性）＋<b>灰帶覆核</b>（群體層級處置）</td></tr>
+      <tr><td><span class="pill" style="background:var(--b4)">桶④ 迴圈漂移</span></td>
+          <td>追「最近被大聲抱怨的東西」</td>
+          <td>非工具能解——屬合約/期望/權力，該誠實標記、交給碰得到的人</td></tr>
+    </table>
+    <p class="note">一句話：<b>Visualize 探索＋診斷 → 分流</b>；覆蓋問題走 <b>完整度熱力圖 / Compare</b>，
+      尺與邊界問題走 <b>組考卷 / 灰帶覆核</b>。桶①先用訊號強度閘攔下、桶④誠實標記為非工程帳。</p>
+  </div>
+</body>
+</html>
