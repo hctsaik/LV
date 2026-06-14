@@ -1,3 +1,5 @@
+[← LV 文件中心](index.html)
+
 # LV 使用指南（VisualLatent）
 
 > **一句話**：先用 **Visualize** 探索＋診斷，再從樞紐**分流**到其餘四個工具。

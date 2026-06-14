@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LV 文件中心 — 網站地圖</title>
+<style>
+  :root{--ink:#1f2933;--muted:#5c6b7a;--line:#e3e8ee;--bg:#f7f9fb;--card:#fff;
+        --accent:#2c6fb5;--accent2:#9b59b6;--hero:#e8442e;--herobg:#fff1ee;--soft:#eef4fa;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif;
+       line-height:1.7;font-size:15.5px}
+  .wrap{max-width:1000px;margin:28px auto;padding:0 20px 64px}
+  h1{font-size:27px;margin:0 0 2px;border-bottom:3px solid var(--accent);padding-bottom:10px}
+  .sub{color:var(--muted);margin:8px 0 26px}
+  .start{font-size:12px;letter-spacing:1px;color:var(--hero);font-weight:700;margin:0 0 8px}
+  .hero{display:grid;grid-template-columns:1.4fr 1fr;gap:16px;margin-bottom:34px}
+  .hcard{border:2px solid var(--hero);background:var(--herobg);border-radius:14px;
+         padding:18px 20px;text-decoration:none;color:var(--ink);display:block;transition:.15s}
+  .hcard.alt{border-color:var(--accent2);background:#f6f0fb}
+  .hcard:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.08)}
+  .hcard h2{margin:0 0 6px;font-size:20px;color:var(--hero)}
+  .hcard.alt h2{color:var(--accent2)}
+  .hcard p{margin:0;color:#3a4856;font-size:14px}
+  h3{font-size:17px;margin:30px 0 10px;color:var(--accent);
+     border-left:5px solid var(--accent);padding-left:10px}
+  ul.docs{list-style:none;padding:0;margin:0}
+  ul.docs li{border:1px solid var(--line);background:var(--card);border-radius:10px;
+             padding:11px 15px;margin:8px 0}
+  ul.docs a{color:var(--accent);text-decoration:none;font-weight:600;font-size:15px}
+  ul.docs a:hover{text-decoration:underline}
+  ul.docs .d{color:var(--muted);font-size:13.5px;margin-top:2px}
+  ul.docs .alt{font-size:12px;color:#8a97a5;margin-left:8px;font-weight:400}
+  .foot{color:var(--muted);font-size:13px;margin-top:34px;border-top:1px solid var(--line);padding-top:14px}
+  @media(max-width:720px){.hero{grid-template-columns:1fr}}
+</style>
+</head>
+<body><div class="wrap">
+  <h1>LV — VisualLatent 文件中心</h1>
+  <p class="sub">資料集嵌入分析工具的文件總覽（網站地圖）。第一次用？從下面兩張卡片開始。</p>
+
+  <p class="start">▸ 先從這裡開始 · START HERE</p>
+  <div class="hero">
+    <a class="hcard" href="usage_guide.html">
+      <h2>📖 使用指南</h2>
+      <p>逐工具教學：每個功能<b>解決什麼問題、何時用、怎麼一步步操作、輸入輸出與限制</b>。
+         含啟動前置、桶①訊號強度閘與校正、典型 escape 工作流、CLI 速查。</p>
+    </a>
+    <a class="hcard alt" href="tools_overview.html">
+      <h2>🗺 五工具總覽圖</h2>
+      <p>一眼看懂五個工具各解什麼問題：Visualize 為樞紐 → 分流到其餘四個，
+         並對應「瑕疵漏逮四桶」。</p>
+    </a>
+  </div>
+
+  <h3>問題定義 — 為什麼這樣設計</h3>
+  <ul class="docs">
+    <li><a href="defect_problem_redefinition.html">瑕疵「漏逮」問題重定義</a>
+        <span class="alt">· <a href="defect_problem_redefinition.md">md</a></span>
+        <div class="d">退一步：把「漏逮」重定義成四桶分類待辦（只定義問題、不提解法）。</div></li>
+    <li><a href="defect_requirements_recommendation.html">該承諾哪些「需求」</a>
+        <span class="alt">· <a href="defect_requirements_recommendation.md">md</a></span>
+        <div class="d">若要真正解決，先建 P0 量測儀器（盲測重標＋訊號粗分＋四桶歸因＋比例匯出）。</div></li>
+  </ul>
+
+  <h3>機制設計討論</h3>
+  <ul class="docs">
+    <li><a href="defect_escape_analysis.html">漏逮分析機制設計</a>
+        <span class="alt">· <a href="defect_escape_analysis.md">md</a></span>
+        <div class="d">Escape 決策樹 N0–N4、雙軌制、gauge study、規格改簽。</div></li>
+    <li><a href="defect_mechanisms_v2.html">機制第二輪設計</a>
+        <span class="alt">· <a href="defect_mechanisms_v2.md">md</a></span>
+        <div class="d">組考卷、N2/N3 閾值、灰帶煉獄、體檢卡、完整度熱力圖。</div></li>
+    <li><a href="vision_judgment_boundary_framework.html">視覺判斷邊界框架</a>
+        <div class="d">三訊號 S1/S2/S3（人/資料/模型）與 H1–H5 根因矩陣的源頭。</div></li>
+    <li><a href="feature_discussion.html">功能藍圖討論</a>
+        <div class="d">F1–F9 功能（manifest／搜圖／去重／選樣／文搜圖…）的初始規劃。</div></li>
+    <li><a href="heatmap_compare_merge_discussion.html">熱力圖／Compare 合併討論</a>
+        <span class="alt">· <a href="heatmap_compare_merge_discussion.md">md</a></span>
+        <div class="d">覆蓋圖加「參照分佈 B」外部真值、抽共用引擎。</div></li>
+    <li><a href="export_list_quiz_design_discussion.html">匯出清單／組考卷交接設計</a>
+        <span class="alt">· <a href="export_list_quiz_design_discussion.md">md</a></span>
+        <div class="d">策展購物車 → 一鍵分流到組考卷／灰帶覆核的設計。</div></li>
+  </ul>
+
+  <h3>調查與平台整合</h3>
+  <ul class="docs">
+    <li><a href="fiftyone_3d_enterprise_investigation.html">FiftyOne 3D / Enterprise 調查</a>
+        <span class="alt">· <a href="fiftyone_3d_enterprise_investigation.md">md</a></span>
+        <div class="d">對標 FiftyOne 的 3D 與 Enterprise 功能、釐清哪些是偽需求。</div></li>
+    <li><a href="fiftyone_reeval_against_lv.md">FiftyOne 對 LV 的再評估</a>
+        <div class="d">盤點 LV 已長成的五工具、把機制列為既成成果與下一輪排序。</div></li>
+    <li><a href="platform_integration_discussion.md">平台整合討論</a>
+        <div class="d">把 LV 掛進 CIM 平台：torch 相依、模型路徑參數化、submodule。</div></li>
+    <li><a href="port-from-vix.md">從 VIX 移植</a>
+        <div class="d">起點：移植六個 GUI 互動（框選／看圖／搜相似／離群排序／匯出）。</div></li>
+  </ul>
+
+  <p class="foot">提示：<code>.html</code> 為可直接瀏覽的排版版本，<code>md</code> 連結為原始 Markdown。
+     新手請先讀 <a href="usage_guide.html">使用指南</a>。</p>
+</div></body></html>
