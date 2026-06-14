@@ -4246,9 +4246,6 @@ def _gray_focus_view(records, emb, anchors, anchor_indices, disp, view,
 
 def _gray_zone_ui() -> None:
     st.markdown("##### 灰帶覆核 · 分流閘")
-    st.caption("組考卷／散點分歧送來的『灰帶』樣本在這裡 **triage**：一眼看 backlog 有多少、"
-               "多可疑，再**分流三選一**——可解的送 Labeling 正式裁決、模稜兩可的給分級標籤或"
-               "標記排除。**改標走 Labeling，不在這裡做**；分級/排除回流評估、不寫回資料集。")
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
@@ -4359,15 +4356,21 @@ def _gray_zone_ui() -> None:
         return
 
     # ===== 總覽（看 backlog + 批次分流）=====
+    # 說明＋backlog 細節收進可折疊區（預設折起，關鍵數字留在標題列）——把版面還給總覽
     if dis is not None:
         from interaction import gray_zone_summary
         s = gray_zone_summary(dis)
-        bk1, bk2 = st.columns([1.1, 3])
-        bk1.metric("灰帶待 audit", f"{s['n_gray']}/{s['n_total']}", f"{s['pct_gray']}%")
-        bk2.caption(f"嚴重度　:red[🔴 高 {s['high']}]　:orange[🟡 中 {s['mid']}]　"
-                    f":green[🟢 低 {s['low']}]　·　本批前 {len(queue)} 筆"
-                    "（想多看調左側『本批張數』）。分歧度＝鄰域標籤不一致比例，"
-                    "探索線索、**非錯標判決**。")
+        with st.expander(
+                f"ℹ️ 灰帶待 audit {s['n_gray']}/{s['n_total']}（{s['pct_gray']}%）　"
+                f"🔴{s['high']} 🟡{s['mid']} 🟢{s['low']}　— 點開看說明", expanded=False):
+            st.caption("組考卷／散點分歧送來的『灰帶』樣本在這裡 **triage**：一眼看 backlog "
+                       "有多少、多可疑，再**分流三選一**——可解的送 Labeling 正式裁決、模稜兩可的"
+                       "給分級標籤或標記排除。**改標走 Labeling，不在這裡做**；分級/排除回流評估、"
+                       "不寫回資料集。")
+            st.caption(f"嚴重度　:red[🔴 高 {s['high']}]　:orange[🟡 中 {s['mid']}]　"
+                       f":green[🟢 低 {s['low']}]　·　本批前 {len(queue)} 筆"
+                       "（想多看調左側『本批張數』）。分歧度＝鄰域標籤不一致比例，"
+                       "探索線索、**非錯標判決**。")
 
     f_col, ab1, ab2, ab3 = st.columns([3, 1.3, 1.3, 1.3])
     with f_col:
@@ -4392,7 +4395,7 @@ def _gray_zone_ui() -> None:
                args=(view_idx, "exclude"), help="標為灰帶排除——評估 recall 不計入。")
 
     _badge = {"soft": "🏷分級", "exclude": "🚫排除"}
-    st.markdown(f"**總覽（{len(view)} 筆）** — 點「🔍對照」看大圖三方對照；高分歧在前、紅色跳出")
+    st.markdown(f"**總覽（{len(view)} 筆）**　:gray[點「🔍對照」看大圖三方對照·高分歧在前]")
     with st.container(height=380):
         cols = st.columns(5)
         for j, it in enumerate(view):
