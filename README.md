@@ -28,15 +28,25 @@ pip install -r requirements.txt
 
 ## Model weights
 
-Weights are **not** included in the repository (large binaries). Place `.pth` files in `models/`:
+Weights are **not** in the repository (large binaries). Provision them once with the
+idempotent setup script — the clean "clone → run → it works" flow (no manual file placement):
 
+```bash
+python scripts/setup_models.py                # core: DINOv2 + Chinese-CLIP
+python scripts/setup_models.py --with-compare # + Compare Distributions (Inception, LPIPS)
 ```
-models/
-  resnet18.pth
-  resnet50.pth
-  dinov2_vits14.pth
-  ...
-```
+
+It downloads into a **model-house** you can relocate via env vars (so a host platform
+can keep its checkout/submodule thin and point everything at one writable dir):
+
+| Env var | Overrides | Holds |
+|---|---|---|
+| `LV_MODELS_DIR` | `models/` | DINOv2 `.pth`, Chinese-CLIP, ResNet `.pth` |
+| `LV_INCEPTION_DIR` | `model/` | clean-fid Inception (FID/KID) |
+
+Unset → the package-local `models/` and `model/`. The script skips anything already present.
+FID/KID Inception and LPIPS also auto-download on first use, so `--with-compare` is only
+needed to pre-seed an offline machine. For ResNet, drop `resnet*.pth` into the models dir.
 
 Supported model name prefixes:
 

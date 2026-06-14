@@ -27,12 +27,12 @@ _MODEL_DIR = Path(
 
 def _load_inception(device: torch.device):
     from cleanfid.inception_torchscript import InceptionV3W
-    if not (_MODEL_DIR / "inception-2015-12-05.pt").exists():
-        raise FileNotFoundError(
-            f"InceptionV3 model not found: {_MODEL_DIR / 'inception-2015-12-05.pt'}\n"
-            "Place inception-2015-12-05.pt in the model/ directory."
-        )
-    model = InceptionV3W(str(_MODEL_DIR), download=False, resize_inside=False)
+    # Auto-provision: if the weight isn't in the model-house yet, clean-fid fetches
+    # it (download=True) into _MODEL_DIR (LV_INCEPTION_DIR / local model/). A fresh
+    # clone or the platform model-house then needs no manual file placement; offline
+    # machines pre-seed it via `python scripts/setup_models.py --with-compare`.
+    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    model = InceptionV3W(str(_MODEL_DIR), download=True, resize_inside=False)
     return model.to(device).eval()
 
 
