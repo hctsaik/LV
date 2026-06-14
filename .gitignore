@@ -34,6 +34,8 @@ demo/
 streamlit_log.txt
 **/.thumbs/
 tests/e2e/_server.log
+# 桶① gate calibration (modality-specific; written by calibrate_signal_gate.py --write)
+signal_gate.json
 
 # Chinese-CLIP weights (~1.4GB) - run scripts/download_chinese_clip.py instead
 models/chinese-clip*/

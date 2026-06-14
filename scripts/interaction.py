@@ -17,6 +17,8 @@ import numpy as np
 from PIL import Image, ImageDraw
 from sklearn.neighbors import NearestNeighbors
 
+from signal_strength import SIGNAL_NONE, SIGNAL_OBVIOUS
+
 
 def parse_folder_paths(text: str) -> list[Path]:
     """Parse a newline-separated folder list into Path objects.
@@ -415,6 +417,12 @@ def attribute_escape(
 
 # ── three-orthogonal-signal root-cause diagnosis (H1–H5) ────────────────
 # (vision-judgment-boundary framework §3 / defect-mechanisms decision tree)
+# H0 is the 桶① physical-detectability gate that sits in FRONT of H1–H5
+# (signal_strength.py): the original three-signal framework had no axis for
+# "is the defect's signal even in the pixels", so a never-captured defect
+# would fall through to H1 and be told "補資料大概率有效" — the exact wrong
+# advice. H0 short-circuits that case.
+CAUSE_H0 = "H0 物理天花板"
 CAUSE_H1 = "H1 覆蓋缺口"
 CAUSE_H2 = "H2 定義歧義"
 CAUSE_H3 = "H3 標籤雜訊"
@@ -422,6 +430,9 @@ CAUSE_H4 = "H4 容量/特徵限制"
 CAUSE_H5 = "H5 分布外 OOD"
 
 _CAUSE_ACTION = {
+    CAUSE_H0: "訊號未進資料（桶①）：ROI 內沒有高於背景的可偵測證據——補資料／調閾值／"
+              "換模型都無效，要動成像鏈（解析度／放大／打光／曝光）。這是粗判，"
+              "務必用真實 escape 就地校準訊號門檻後再下定論。",
     CAUSE_H1: "補這一格的資料——『本該判對只是資料太少』，補了大概率有效。",
     CAUSE_H2: "定義問題，非資料問題：凍結為灰帶、送仲裁人、更新定義書（補資料不會收斂，標籤互相矛盾）。",
     CAUSE_H3: "稽核這一帶的訓練標籤、查混淆變數——模型可能其實是對的、GT 錯了。",
@@ -429,6 +440,7 @@ _CAUSE_ACTION = {
     CAUSE_H5: "看似 in-distribution 實則新樣態：收新樣態資料，並檢查 embedding 分不分得開。",
 }
 _CAUSE_ADD_DATA = {
+    CAUSE_H0: "無效（訊號不在資料裡，需改成像）",
     CAUSE_H1: "有效（補這格）",
     CAUSE_H2: "無效（是定義問題，補資料不收斂）",
     CAUSE_H3: "先別補（先稽核標籤，GT 可能才錯）",
@@ -442,13 +454,18 @@ def diagnose_root_cause(
     s2_density: float,
     s3_entropy: float,
     *,
+    signal_level: str | None = None,
     consistency_thr: float = 0.75,
     density_thr: float = 3,
     entropy_thr: float = 0.5,
 ) -> dict:
     """Cross-locate why a misjudged sample failed, from three ORTHOGONAL
-    signals (none alone is enough):
+    signals (none alone is enough), gated by a 桶① physical-detectability
+    screen:
 
+      S0 ``signal_level`` — is the defect's signal even in the pixels?
+        (signal_strength.classify_signal). SIGNAL_NONE ("確無") overrides
+        everything → H0 物理天花板: no data can help. None = not measured.
       S1 ``s1_consistency`` — concept ambiguity (HUMAN consistency, e.g.
         the quiz / gauge-R&R score). Low = experts themselves disagree.
       S2 ``s2_density`` — local data coverage (embedding neighbour count
@@ -456,24 +473,38 @@ def diagnose_root_cause(
       S3 ``s3_entropy`` — model uncertainty (softmax entropy / 1−margin).
         High = the model itself hesitates; low = confidently wrong.
 
-    Returns {cause, action, add_data, s1_low, s2_sparse, s3_high}. The
-    headline ``add_data`` answers the founding question — does adding data
-    actually help — which only H1 (and H5, for new regimes) does.
+    Returns {cause, action, add_data, s1_low, s2_sparse, s3_high,
+    signal_level, caveat}. The headline ``add_data`` answers the founding
+    question — does adding data actually help — which only H1 (and H5, for
+    new regimes) does. ``caveat`` is non-empty when an H1 "補資料有效"
+    verdict rests on UNVERIFIED detectability (signal not confirmed
+    present), so the advice is never trusted blindly without the 桶① check.
     """
     s1_low = s1_consistency < consistency_thr
     s2_sparse = s2_density <= density_thr
     s3_high = s3_entropy >= entropy_thr
-    if s1_low:                       # humans disagree → it's a spec problem
+    if signal_level == SIGNAL_NONE:  # 桶①: signal not in the pixels at all
+        cause = CAUSE_H0
+    elif s1_low:                     # humans disagree → it's a spec problem
         cause = CAUSE_H2
     elif s3_high:                    # model hesitates
         cause = CAUSE_H1 if s2_sparse else CAUSE_H4
     else:                            # confidently wrong
         cause = CAUSE_H5 if s2_sparse else CAUSE_H3
+
+    caveat = ""
+    if cause == CAUSE_H1 and signal_level != SIGNAL_OBVIOUS:
+        caveat = (
+            f"H1 假設『缺陷可偵測、只是資料太少』，但訊號強度為 "
+            f"{signal_level or '未量測'}——尚未確認訊號真的在資料裡。"
+            "若其實落在桶①（物理天花板），補再多資料也無效；建議先量訊號強度再投資補樣。"
+        )
     return {
         "cause": cause,
         "action": _CAUSE_ACTION[cause],
         "add_data": _CAUSE_ADD_DATA[cause],
         "s1_low": s1_low, "s2_sparse": s2_sparse, "s3_high": s3_high,
+        "signal_level": signal_level, "caveat": caveat,
     }
 
 
@@ -925,8 +956,9 @@ def diagnose_sparse_points(
     s1_consistency: float,
     radius: float,
     k: int = 20,
+    signal_level_for: Callable[[int], str] | None = None,
 ) -> list[dict]:
-    """Run the H1–H5 root-cause gate over a set of sparse-region points so
+    """Run the H0/H1–H5 root-cause gate over a set of sparse-region points so
     the coverage map never bare-claims "sparse → go collect".
 
     Per point, three orthogonal signals feed diagnose_root_cause:
@@ -934,19 +966,26 @@ def diagnose_sparse_points(
       S3 = neighbor_label_entropy(k)    — proxy model uncertainty,
       S1 = s1_consistency               — human consistency (supplied; from
            the quiz / gauge-R&R, shared across the region).
-    Returns [{idx, cause, add_data, s2_density, s3_entropy}] so the UI can
-    report how many sparse points are H1/H5 (collecting helps) vs H2/H3/H4
-    (collecting won't). Reuses diagnose_root_cause unchanged.
+    ``signal_level_for`` (global index → 桶① signal level, e.g. from
+    signal_strength) adds the S0 physical-detectability screen: a point whose
+    signal is 確無 is reported as H0 物理天花板 (collecting cannot help) rather
+    than a coverage gap. Without it the gate runs exactly as before.
+
+    Returns [{idx, cause, add_data, s2_density, s3_entropy, signal_level,
+    caveat}] so the UI can report how many sparse points are H1/H5
+    (collecting helps), H0 (physically unrecoverable) vs H2/H3/H4.
     """
     out: list[dict] = []
     for i in indices:
         i = int(i)
         dens = neighbor_hit_density(embeddings, i, radius)
         ent = neighbor_label_entropy(embeddings, labels, i, k=k)
-        diag = diagnose_root_cause(s1_consistency, dens, ent)
+        sig = signal_level_for(i) if signal_level_for is not None else None
+        diag = diagnose_root_cause(s1_consistency, dens, ent, signal_level=sig)
         out.append({
             "idx": i, "cause": diag["cause"], "add_data": diag["add_data"],
             "s2_density": dens, "s3_entropy": round(float(ent), 3),
+            "signal_level": diag["signal_level"], "caveat": diag["caveat"],
         })
     return out
 

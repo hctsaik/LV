@@ -27,6 +27,7 @@ from _utils import (
     supports_text_query,
 )
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
+    CAUSE_H0,
     CAUSE_H1,
     CAUSE_H5,
     attribute_escape,
@@ -1199,6 +1200,57 @@ def _scores_for(path: Path) -> dict:
     return {}
 
 
+def _record_image_type(r: dict, type_from: str | None) -> str | None:
+    """The record's image type, matching the calibration's grouping rule so
+    the right per-type threshold is selected. ``class``/``label`` use the
+    record's class label (object-mode label == the box class); ``parent``
+    uses the image's parent directory name."""
+    if type_from in ("class", "label"):
+        return str(r.get("label") or "") or None
+    if type_from == "parent":
+        p = r.get("image_path") or r.get("path")
+        return Path(p).parent.name if p else None
+    return None
+
+
+def _resolve_record_roi(r: dict):
+    """(image_path, pixel_bbox (x0,y0,x1,y1), source_note) for the record's
+    reported defect location, or None. Object-mode records carry a normalized
+    YOLO bbox; a whole-image record falls back to its single YOLO label box."""
+    from interaction import bbox_to_pixels, parse_yolo_boxes, yolo_label_path_for
+    try:
+        bbox_norm = r.get("bbox")  # object mode: (cx, cy, w, h) normalized
+        if bbox_norm is not None:
+            img_path = r.get("image_path") or r["path"]
+            with Image.open(img_path) as im:
+                iw, ih = im.size
+            return img_path, bbox_to_pixels(*bbox_norm, iw, ih), "YOLO 物件框"
+        boxes = parse_yolo_boxes(yolo_label_path_for(Path(r["path"])))
+        if len(boxes) == 1:  # one reported defect location → use it as the ROI
+            with Image.open(r["path"]) as im:
+                iw, ih = im.size
+            _, cx, cy, w, h = boxes[0]
+            return r["path"], bbox_to_pixels(cx, cy, w, h, iw, ih), "YOLO 標註框（單框）"
+    except (OSError, ValueError, KeyError):
+        return None
+    return None
+
+
+def _signal_level_for_record(r: dict) -> tuple[str, str, str | None]:
+    """桶① physical-detectability for the active record, if a defect ROI is
+    known. Returns (signal_level, source_note, image_type). No locatable ROI →
+    UNKNOWN (never guess a 桶① verdict). ``image_type`` selects the matching
+    per-type calibration."""
+    from signal_strength import (
+        SIGNAL_UNKNOWN, load_calibration, signal_level_for_image)
+    itype = _record_image_type(r, (load_calibration() or {}).get("type_from"))
+    roi = _resolve_record_roi(r)
+    if roi is None:
+        return SIGNAL_UNKNOWN, "無缺陷框，無法定位 ROI", itype
+    img_path, px, src = roi
+    return signal_level_for_image(img_path, px, image_type=itype), src, itype
+
+
 def _render_health_card(records: list[dict], model_name: str) -> None:
     """Escape report card (defect-mechanisms §4): embedding-side diagnostics
     + decision-tree attribution for the active image. Reads an optional
@@ -1257,10 +1309,28 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
                             "低於門檻才會判 H2 定義歧義（補資料不收斂）。"
                             "跑過組考卷會自動帶入其自我一致率。")
 
-        diag = diagnose_root_cause(s1, density, s3)
+        signal_level, sig_src, sig_type = _signal_level_for_record(r)
+        diag = diagnose_root_cause(s1, density, s3, signal_level=signal_level)
+        _sig_emoji = {"明顯": "🟢", "疑似": "🟡", "確無": "🔴",
+                      "未知": "⚪"}.get(signal_level, "⚪")
         st.markdown(f"### 根因：{diag['cause']}")
         st.markdown(f"**補資料有效性：{diag['add_data']}**")
         st.caption(diag["action"])
+        if diag.get("caveat"):
+            st.warning(diag["caveat"], icon="⚠️")
+        from signal_strength import effective_thresholds
+        _thr = effective_thresholds(image_type=sig_type)
+        if _thr["calibrated"]:
+            _scope = (f"此類型「{sig_type}」" if _thr["source"] == "config:type"
+                      else "全域")
+            _cal = (f"門檻已校準（{_scope}：none={_thr['snr_none']}, "
+                    f"obvious={_thr['snr_obvious']}"
+                    + (f"，n={_thr['n']}" if _thr.get("n") else "") + "）")
+        else:
+            _cal = "門檻為預設、未校準——跑 calibrate_signal_gate.py --write 即自動套用"
+        st.caption(f":gray[S0 訊號強度（桶①閘）：{_sig_emoji} {signal_level}"
+                   f"（{sig_src}）。『確無』直接判 H0 物理天花板（補資料無效）；"
+                   f"未量到 ROI 時為『未知』，不臆測。{_cal}]")
 
         # 三正交訊號
         c1, c2, c3 = st.columns(3)
@@ -1288,7 +1358,8 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
                                  caption=f"{records[ni]['label']} d={nd:.3f}")
         # 匯出
         report = _health_card_report(p, r, idx, diag, s1, density, s3, s3_src,
-                                     score_v, thr_v, radius, nbr_idx, nbr_d, records)
+                                     score_v, thr_v, radius, nbr_idx, nbr_d, records,
+                                     _thr, sig_type)
         st.download_button("⬇ 匯出體檢卡 HTML", data=report,
                            file_name=f"healthcard_{p.stem}.html",
                            mime="text/html", key="viz_card_export",
@@ -1296,7 +1367,8 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
 
 
 def _health_card_report(p, r, idx, diag, s1, density, s3, s3_src,
-                        score_v, thr_v, radius, nbr_idx, nbr_d, records) -> str:
+                        score_v, thr_v, radius, nbr_idx, nbr_d, records,
+                        thr_info=None, sig_type=None) -> str:
     rows = "".join(
         f"<tr><td>#{ni}</td><td>{records[ni]['label']}</td>"
         f"<td>{records[ni]['split']}</td><td>{nd:.4f}</td></tr>"
@@ -1304,6 +1376,15 @@ def _health_card_report(p, r, idx, diag, s1, density, s3, s3_src,
     score_line = (f"模型分數 {score_v:.3f}" +
                   (f"，閾值 {thr_v:.3f}" if thr_v is not None else "（無閾值）")
                   ) if score_v is not None else "未提供 scores.csv"
+    caveat_html = (f'<p style="color:#b4232a">⚠️ {diag["caveat"]}</p>'
+                   if diag.get("caveat") else "")
+    thr_info = thr_info or {"snr_none": "?", "snr_obvious": "?",
+                            "source": "default", "calibrated": False}
+    _scope = ({"config:type": f"此類型「{sig_type}」", "config:global": "全域"}
+              .get(thr_info["source"], "預設未校準"))
+    gate_html = (f'<br>桶①閘門檻：<b>{_scope}</b>'
+                 f'（none={thr_info["snr_none"]}, obvious={thr_info["snr_obvious"]}'
+                 f'，來源 {thr_info["source"]}）')
     return f"""<!DOCTYPE html><html lang="zh-Hant"><head><meta charset="utf-8">
 <title>體檢卡 {p.name}</title><style>
 body{{font-family:"Noto Sans TC",sans-serif;max-width:720px;margin:24px auto;color:#1a2433}}
@@ -1313,7 +1394,8 @@ td,th{{border:1px solid #e3e8ef;padding:6px 10px;font-size:14px}}
 <h1>🩺 Escape 體檢卡 · {p.name}</h1>
 <p class="k">{r['label']}（{r['split']}）· #{idx} · {p}</p>
 <div class="attr"><b>根因：{diag['cause']}</b><br>補資料有效性：<b>{diag['add_data']}</b>
-<p>{diag['action']}</p></div>
+<br>S0 訊號強度（桶①閘）：<b>{diag.get('signal_level') or '未量測'}</b>{gate_html}
+<p>{diag['action']}</p>{caveat_html}</div>
 <p>三正交訊號 —
 S1 人類一致性 <b>{s1*100:.0f}%</b>（{'歧義' if diag['s1_low'] else '清楚'}）　·
 S2 命中密度 <b>{density}</b>（半徑 {radius:.3f}，{'稀疏' if diag['s2_sparse'] else '密集'}）　·
@@ -1323,6 +1405,125 @@ S3 模型不確定度 <b>{s3:.2f}</b>（{'猶豫' if diag['s3_high'] else '篤�
 {rows}</table>
 <p class="k">由 LV 產生。歸因僅含 N2/N3（與可選 N4）embedding 訊號；N0 品質、N1 定義仲裁需人工。</p>
 </body></html>"""
+
+
+# ── 桶①佔比 view + in-app recalibration ─────────────────────────────────
+
+def _bucket1_record_metrics(records: list[dict]):
+    """{image_type: [snr, …]} over records with a resolvable ROI, grouped by
+    the active calibration's type_from (default 'label')."""
+    from signal_strength import load_calibration, roi_background_metrics
+    type_from = (load_calibration() or {}).get("type_from") or "label"
+    groups: dict[str, list[float]] = {}
+    for r in records:
+        roi = _resolve_record_roi(r)
+        if roi is None:
+            continue
+        img_path, px, _src = roi
+        try:
+            with Image.open(img_path) as im:
+                g = np.asarray(im.convert("L"), dtype=np.float64) / 255.0
+        except (OSError, ValueError):
+            continue
+        m = roi_background_metrics(g, px)
+        if not m:
+            continue
+        groups.setdefault(_record_image_type(r, type_from) or "_global",
+                          []).append(m["snr"])
+    return groups, type_from
+
+
+def _do_recalibrate_bucket1(records: list[dict]) -> None:
+    """Recalibrate the 桶① gate from the loaded data and persist it (no CLI)."""
+    from signal_strength import calibrate_thresholds, save_calibration
+    with st.spinner("量測各框訊號強度、校正中…"):
+        groups, type_from = _bucket1_record_metrics(records)
+    if not groups:
+        st.warning("目前資料沒有可定位 ROI 的標註框（需偵測/物件模式）。")
+        return
+    all_snr = np.concatenate([np.asarray(v) for v in groups.values()])
+    g_cal = calibrate_thresholds(all_snr)
+    if not g_cal["calibrated"]:
+        st.warning(f"可量測框數 {g_cal['n']} < 10，樣本太少不足以校準。")
+        return
+    per_type = {}
+    for t, v in groups.items():
+        c = calibrate_thresholds(np.asarray(v))
+        if c["calibrated"]:
+            per_type[t] = {"snr_none": c["snr_none"],
+                           "snr_obvious": c["snr_obvious"], "n": c["n"]}
+    folders = st.session_state.get("viz_folder_list", [])
+    save_calibration({**g_cal, "type_from": type_from, "per_type": per_type,
+                      "dataset": " ; ".join(map(str, folders)) or "in-app"})
+    st.session_state.pop("_bucket1_rows", None)  # recompute with new thresholds
+    st.success(f"已從目前 {int(g_cal['n'])} 個框校準桶①門檻："
+               f"全域 none={g_cal['snr_none']}/obvious={g_cal['snr_obvious']}、"
+               f"逐類型 {len(per_type)} 組。重新計算佔比即套用。")
+
+
+def _bucket1_proportions(records: list[dict]) -> list[dict]:
+    """Per image type: 明顯/疑似/確無/未知 counts from the 桶① gate."""
+    from collections import Counter
+    from signal_strength import (
+        SIGNAL_NONE, SIGNAL_OBVIOUS, SIGNAL_SUSPECT, SIGNAL_UNKNOWN,
+        load_calibration)
+    type_from = (load_calibration() or {}).get("type_from")
+    per: dict[str, Counter] = {}
+    for r in records:
+        level, _src, _it = _signal_level_for_record(r)
+        per.setdefault(_record_image_type(r, type_from) or "（未分型）",
+                       Counter())[level] += 1
+    rows = []
+    for t, c in per.items():
+        meas = c[SIGNAL_NONE] + c[SIGNAL_SUSPECT] + c[SIGNAL_OBVIOUS]
+        rows.append({
+            "影像類型": t, "可量測框": meas,
+            "🔴確無(桶①)": c[SIGNAL_NONE], "🟡疑似": c[SIGNAL_SUSPECT],
+            "🟢明顯": c[SIGNAL_OBVIOUS], "⚪未知": c[SIGNAL_UNKNOWN],
+            "桶①佔比": f"{100 * c[SIGNAL_NONE] / meas:.0f}%" if meas else "—",
+        })
+    rows.sort(key=lambda x: -x["可量測框"])
+    return rows
+
+
+def _render_bucket1_view(records: list[dict], model_name: str) -> None:
+    """桶① physical-detectability proportions per image type — serves the
+    『四桶比例』open question (the 桶① cell only)."""
+    from signal_strength import effective_thresholds, load_calibration
+    st.subheader("🧱 桶①佔比（物理可偵測性）")
+    st.caption("對每筆有缺陷框的影像量訊號強度，統計各影像類型多少落在桶①"
+               "（🔴確無＝訊號沒進資料、補資料無效）。直接回答『四桶比例』的桶①格；"
+               "桶②③④需配合覆蓋/盲測重標，這裡只量得到桶①下界。")
+    cfg = load_calibration()
+    thr = effective_thresholds()
+    if thr["calibrated"]:
+        n_pt = len((cfg or {}).get("per_type") or {})
+        st.caption(f":green[門檻已校準（{thr['source']}）：全域 none={thr['snr_none']}, "
+                   f"obvious={thr['snr_obvious']}"
+                   + (f"，{n_pt} 個逐類型" if n_pt else "") + "]")
+    else:
+        st.caption(":orange[門檻為預設、未校準——先按『重新校正』用目前資料校準，"
+                   "桶①佔比才可信。]")
+    b1, b2 = st.columns(2)
+    if b1.button("🎯 從目前資料重新校正門檻", key="bucket1_recal",
+                 use_container_width=True):
+        _do_recalibrate_bucket1(records)
+    if b2.button("📊 計算桶①佔比", key="bucket1_calc", type="primary",
+                 use_container_width=True):
+        with st.spinner("量測各框訊號強度中…"):
+            st.session_state["_bucket1_rows"] = _bucket1_proportions(records)
+    rows = st.session_state.get("_bucket1_rows")
+    if not rows:
+        st.info("按「計算桶①佔比」開始；需偵測/物件模式（每筆有缺陷框）。")
+        return
+    tot_meas = sum(x["可量測框"] for x in rows)
+    tot_none = sum(x["🔴確無(桶①)"] for x in rows)
+    if tot_meas:
+        st.metric("整體桶①佔比（確無 / 可量測）", f"{100 * tot_none / tot_meas:.0f}%",
+                  help="物理上看不見、補資料無效的下界估計。校準後才可信。")
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.caption(":gray[『確無』是桶①下界，校準前偏估；可疑框送『體檢卡』或『組考卷』"
+               "再分清桶②(覆蓋)/桶③(邊界帶)。]")
 
 
 _SOURCE_LABEL = {
@@ -1441,7 +1642,7 @@ def _render_right_panel(
         st.rerun(scope="app")
     st.session_state.setdefault("viz_panel_view", "選取")
     view = st.segmented_control(
-        "面板", ["選取", "相似", "重複", "選樣", "體檢卡", "匯出清單"],
+        "面板", ["選取", "相似", "重複", "選樣", "體檢卡", "桶①佔比", "匯出清單"],
         key="viz_panel_view", label_visibility="collapsed",
     ) or "選取"
 
@@ -1455,6 +1656,8 @@ def _render_right_panel(
         _render_sampling_view(records, model_name)
     elif view == "體檢卡":
         _render_health_card(records, model_name)
+    elif view == "桶①佔比":
+        _render_bucket1_view(records, model_name)
     else:
         _render_export_view()
 
@@ -1466,6 +1669,7 @@ _MODE_CLEAR_KEYS = (
     "viz_query_chain", "viz_outlier_scores", "viz_grid_limit",
     "viz_export_list", "viz_panel_view", "viz_manifest",
     "viz_phashes", "viz_label_disagreement", "viz_dup_result",
+    "_bucket1_rows",
 )
 
 _DEMO_DIR = Path(__file__).parent.parent / "demo" / "coco8"
@@ -3025,14 +3229,25 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
             if not sparse_idx:
                 st.caption("目前沒有稀疏點。")
             else:
+                _sig_memo: dict[int, str] = {}
+
+                def _sig_for(i: int) -> str:
+                    if i not in _sig_memo:
+                        _sig_memo[i] = _signal_level_for_record(records[i])[0]
+                    return _sig_memo[i]
+
                 diags = diagnose_sparse_points(emb, labels, sparse_idx,
-                                               s1_consistency=s1, radius=radius)
+                                               s1_consistency=s1, radius=radius,
+                                               signal_level_for=_sig_for)
                 from collections import Counter
                 cnt = Counter(d["cause"] for d in diags)
                 helps = sum(v for c, v in cnt.items() if c in (CAUSE_H1, CAUSE_H5))
+                phys = cnt.get(CAUSE_H0, 0)
                 st.caption(f"稀疏點 {len(sparse_idx)} 個 · "
                            f":green[補資料有效（H1/H5）：{helps}] · "
-                           f"其餘為定義/標籤/容量問題（補資料幫助有限）")
+                           + (f":red[桶①物理天花板（H0，補資料無效）：{phys}] · "
+                              if phys else "")
+                           + "其餘為定義/標籤/容量問題（補資料幫助有限）")
                 for c, v in cnt.most_common():
                     st.write(f"- {c}：{v} 點")
 

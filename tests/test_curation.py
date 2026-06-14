@@ -318,6 +318,33 @@ def test_diag_threshold_boundaries_configurable():
     assert r2["cause"] == CAUSE_H2
 
 
+# ── 桶① physical-detectability gate (H0) in front of H1–H5 ──────────────
+
+def test_diag_h0_signal_none_overrides_to_physical_ceiling():
+    from interaction import CAUSE_H0
+    from signal_strength import SIGNAL_NONE
+    # signals that would otherwise read H1 覆蓋缺口 (sparse + consistent +
+    # high entropy) — but the defect's signal is not in the pixels at all.
+    r = diagnose_root_cause(0.95, 1, 0.8, signal_level=SIGNAL_NONE)
+    assert r["cause"] == CAUSE_H0
+    assert "無效" in r["add_data"]  # adding data cannot help 桶①
+    assert r["signal_level"] == SIGNAL_NONE
+
+
+def test_diag_h1_caveat_flags_unverified_detectability():
+    from signal_strength import SIGNAL_OBVIOUS, SIGNAL_SUSPECT
+    # signal not measured → H1 still fires, but the verdict is flagged as
+    # resting on an unverified 桶① assumption.
+    r = diagnose_root_cause(0.95, 1, 0.8)
+    assert r["cause"] == CAUSE_H1 and r["caveat"]
+    # weak/borderline signal → still caveated.
+    r_s = diagnose_root_cause(0.95, 1, 0.8, signal_level=SIGNAL_SUSPECT)
+    assert r_s["cause"] == CAUSE_H1 and r_s["caveat"]
+    # signal confirmed clearly present → advice trustworthy, no caveat.
+    r_ok = diagnose_root_cause(0.95, 1, 0.8, signal_level=SIGNAL_OBVIOUS)
+    assert r_ok["cause"] == CAUSE_H1 and not r_ok["caveat"]
+
+
 # ── curation log (time dimension: selection + reason) ───────────────────
 
 from interaction import curation_log_csv, match_shas_to_indices  # noqa: E402
