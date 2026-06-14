@@ -3710,9 +3710,12 @@ def _quiz_generate(records: list[dict], dis, n_q: int) -> None:
     st.session_state["quiz_spec"] = spec
     st.session_state["quiz_answers"] = {}
     st.session_state["quiz_pos"] = 0
-    # qid → image, so multi-rater consensus can be tied back to images (M2)
+    # qid → image (+ bbox for object/box-mode), so multi-rater consensus can be
+    # tied back to images/boxes (M2/M3)
     st.session_state["quiz_qid_map"] = {
         q["qid"]: {"path": str(records[q["record_idx"]].get("path", "")),
+                   "image_path": str(records[q["record_idx"]].get("image_path", "") or ""),
+                   "bbox": records[q["record_idx"]].get("bbox"),
                    "label": records[q["record_idx"]].get("label", "")}
         for q in spec["questions"] if 0 <= q["record_idx"] < len(records)}
 
@@ -4027,37 +4030,48 @@ def _render_quiz_multirater() -> None:
             cons_rows, gray_rows = [], []
             for qid, c in cons.items():
                 info = qid_map.get(qid, {})
-                fname = (Path(info["path"]).name if info.get("path")
-                         else f"qid_{qid}")
-                (cons_rows if c["consensus"] else gray_rows).append({
-                    "filename": fname, "consensus": c["consensus"],
-                    "label": c["label"], "agreement": c["agreement"],
-                    "n_votes": c["n_votes"], "qid": qid})
+                bbox = info.get("bbox")
+                if bbox:  # box-level: key by the full image + the defect box
+                    img = info.get("image_path") or info.get("path") or ""
+                    fname = Path(img).name if img else f"qid_{qid}"
+                else:
+                    fname = (Path(info["path"]).name if info.get("path")
+                             else f"qid_{qid}")
+                row = {"filename": fname, "consensus": c["consensus"],
+                       "label": c["label"], "agreement": c["agreement"],
+                       "n_votes": c["n_votes"], "qid": qid}
+                if bbox:
+                    row.update({k: round(float(v), 6) for k, v in
+                                zip(("cx", "cy", "w", "h"), bbox)})
+                (cons_rows if c["consensus"] else gray_rows).append(row)
             d1, d2 = st.columns(2)
             d1.metric("共識題（可當評估靶）", len(cons_rows))
             d2.metric("灰帶題（送灰帶覆核）", len(gray_rows))
             if cons and not qid_map:
                 st.caption(":gray[（本機沒有這份考卷的出題紀錄，匯出以 qid 為鍵；"
                            "在同一 session 產生考卷後再上傳作答，才能對回影像檔名。）]")
-            if cons_rows or gray_rows:
+            all_rows = cons_rows + gray_rows
+            if all_rows:
+                box_level = any("cx" in r for r in all_rows)
+                cols = (["filename", "consensus", "label", "agreement", "n_votes",
+                         "qid"] + (["cx", "cy", "w", "h"] if box_level else []))
                 buf = io.StringIO()
-                w = _csv.writer(buf)
-                w.writerow(["filename", "consensus", "label", "agreement",
-                            "n_votes", "qid"])
-                for r in cons_rows + gray_rows:
-                    w.writerow([r["filename"], r["consensus"], r["label"],
-                                r["agreement"], r["n_votes"], r["qid"]])
+                w = _csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(all_rows)
                 st.download_button(
-                    "⬇ 匯出共識子集 CSV（給『評估』tab 當 ③ 共識子集）",
+                    f"⬇ 匯出共識子集 CSV（{'框層級' if box_level else '圖層級'}，"
+                    "給『評估』tab 當 ③ 共識子集）",
                     buf.getvalue(), "consensus_set.csv", "text/csv",
                     key="quiz_consensus_csv", use_container_width=True)
             if gray_rows:
+                gbox = any("cx" in r for r in gray_rows)
+                gcols = (["filename", "label", "agreement", "n_votes", "qid"]
+                         + (["cx", "cy", "w", "h"] if gbox else []))
                 gbuf = io.StringIO()
-                gw = _csv.writer(gbuf)
-                gw.writerow(["filename", "label", "agreement", "n_votes", "qid"])
-                for r in gray_rows:
-                    gw.writerow([r["filename"], r["label"], r["agreement"],
-                                 r["n_votes"], r["qid"]])
+                gw = _csv.DictWriter(gbuf, fieldnames=gcols, extrasaction="ignore")
+                gw.writeheader()
+                gw.writerows(gray_rows)
                 st.download_button(
                     "⬇ 匯出灰帶清單 CSV（送灰帶覆核裁決）", gbuf.getvalue(),
                     "gray_band.csv", "text/csv", key="quiz_gray_csv",
@@ -4309,22 +4323,16 @@ def _eval_gt_by_image(folder: Path, names: list[str]) -> dict[str, list[dict]]:
 
 
 def _eval_consensus_by_image(csv_text: str, gt_by_image: dict) -> tuple[dict, int, int]:
-    """Parse a 組考卷 consensus CSV (filename, consensus[, …]) → per-box bool
-    lists for evaluate_detections. Images not listed (ruler unvalidated) are
-    treated as gray. Returns (consensus_by_image, n_consensus_img, n_gray_img)."""
-    truthy = {"true", "1", "yes", "共識", "consensus"}
-    cons_true = set()
-    for line in csv_text.splitlines()[1:]:
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) >= 2 and parts[1].lower() in truthy:
-            cons_true.add(parts[0])
-    out, n_c, n_g = {}, 0, 0
-    for fname, boxes in gt_by_image.items():
-        flag = fname in cons_true
-        out[fname] = [flag] * len(boxes)
-        n_c += flag
-        n_g += not flag
-    return out, n_c, n_g
+    """Parse a 組考卷 consensus CSV → per-GT-box consensus flags. Supports both
+    image-level (filename,consensus,…) and box-level (…,cx,cy,w,h) CSVs via
+    evaluation.consensus_flags. Returns (consensus_by_image, n_consensus_boxes,
+    n_gray_boxes)."""
+    import csv as _csv
+    import io
+
+    from evaluation import consensus_flags
+    rows = list(_csv.DictReader(io.StringIO(csv_text)))
+    return consensus_flags(rows, gt_by_image)
 
 
 def _evaluation_ui() -> None:
@@ -4395,8 +4403,8 @@ def _evaluation_ui() -> None:
     c3.metric("漏抓 FN（escape）", o["fn"])
     c4.metric("誤報 FP", o["fp"])
     if data["used_consensus"]:
-        st.caption(f":gray[共識影像 {data['n_cons_img']}・灰帶影像 {data['n_gray_img']}；"
-                   f"灰帶 GT {res['gray']['total']} 個不計入 recall（無穩定真值）。]")
+        st.caption(f":gray[共識 GT {data['n_cons_img']}・灰帶 GT {res['gray']['total']}"
+                   "（灰帶不計入 recall，無穩定真值）。]")
 
     rows = [{"型態": k, "n_GT": v["n_gt"], "recall": f"{v['recall'] * 100:.0f}%",
              "precision": f"{v['precision'] * 100:.0f}%", "TP": v["tp"],

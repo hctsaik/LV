@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from evaluation import evaluate_detections, iou_xywh, match_image
+from evaluation import (
+    consensus_flags,
+    evaluate_detections,
+    iou_xywh,
+    match_image,
+)
 from interaction import load_predictions_csv
 
 
@@ -84,6 +89,33 @@ def test_confusion_records_cross_class_when_not_class_aware():
     pred = {"a.jpg": [box("scratch", 0.5, 0.5, score=0.9)]}
     r = evaluate_detections(gt, pred, class_aware=False)
     assert ("crack", "scratch") in r["confusion"]  # predicted scratch for a crack
+
+
+# ── consensus → per-box flags (M3) ──────────────────────────────────────
+
+def test_consensus_flags_image_level():
+    gt = {"a.jpg": [box("d", 0.5, 0.5)],
+          "b.jpg": [box("d", 0.3, 0.3), box("d", 0.7, 0.7)]}
+    rows = [{"filename": "a.jpg", "consensus": "True"},
+            {"filename": "b.jpg", "consensus": "False"}]
+    cby, n_c, n_g = consensus_flags(rows, gt)
+    assert cby == {"a.jpg": [True], "b.jpg": [False, False]}
+    assert n_c == 1 and n_g == 2
+
+
+def test_consensus_flags_box_level_iou_match():
+    # two GT boxes; a box-level consensus row matches only the first
+    gt = {"a.jpg": [box("d", 0.5, 0.5), box("d", 0.2, 0.2)]}
+    rows = [{"filename": "a.jpg", "consensus": "true",
+             "cx": "0.5", "cy": "0.5", "w": "0.2", "h": "0.2"}]
+    cby, n_c, n_g = consensus_flags(rows, gt)
+    assert cby["a.jpg"] == [True, False]  # 2nd GT box has no consensus → gray
+    assert n_c == 1 and n_g == 1
+    # a box that annotators disagreed on (consensus=false) → its GT box is gray
+    rows2 = [{"filename": "a.jpg", "consensus": "false",
+              "cx": "0.5", "cy": "0.5", "w": "0.2", "h": "0.2"}]
+    cby2, n_c2, _ = consensus_flags(rows2, gt)
+    assert cby2["a.jpg"] == [False, False] and n_c2 == 0
 
 
 # ── predictions ingestion (M5) ──────────────────────────────────────────

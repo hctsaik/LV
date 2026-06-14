@@ -85,6 +85,64 @@ def _pr(tp: int, fp: int, fn: int) -> tuple[float, float]:
     return round(prec, 4), round(rec, 4)
 
 
+def consensus_flags(
+    rows: Sequence[dict],
+    gt_by_image: dict[str, list[dict]],
+    *,
+    iou_thresh: float = 0.3,
+) -> tuple[dict, int, int]:
+    """Turn 組考卷 consensus rows into per-GT-box consensus flags for
+    ``evaluate_detections``'s ``consensus_by_image``.
+
+    Each row is a dict with ``filename`` and ``consensus`` (truthy string).
+    IMAGE-level rows (no box) mark every GT box of a consensus image True.
+    BOX-level rows additionally carry ``cx, cy, w, h`` and are matched to GT
+    boxes by IoU (≥ ``iou_thresh``) — so consensus is per defect box. A GT box
+    with no matching consensus row is treated as gray (its ruler was never
+    validated). Returns (consensus_by_image, n_consensus_boxes, n_gray_boxes).
+    """
+    truthy = {"true", "1", "yes", "共識", "consensus"}
+
+    def is_true(r: dict) -> bool:
+        return str(r.get("consensus", "")).strip().lower() in truthy
+
+    box_level = bool(rows) and any(
+        all(k in r and str(r[k]).strip() != "" for k in ("cx", "cy", "w", "h"))
+        for r in rows)
+    out: dict[str, list[bool]] = {}
+    n_c = n_g = 0
+    if box_level:
+        by_file: dict[str, list[tuple[dict, bool]]] = {}
+        for r in rows:
+            try:
+                box = {k: float(r[k]) for k in ("cx", "cy", "w", "h")}
+            except (KeyError, ValueError, TypeError):
+                continue
+            by_file.setdefault(str(r.get("filename", "")).strip(), []).append(
+                (box, is_true(r)))
+        for fname, gboxes in gt_by_image.items():
+            crows = by_file.get(fname, [])
+            flags: list[bool] = []
+            for g in gboxes:
+                best, best_iou = False, iou_thresh
+                for box, cons in crows:
+                    v = iou_xywh(g, box)
+                    if v >= best_iou:
+                        best, best_iou = cons, v  # unmatched stays gray (False)
+                flags.append(bool(best))
+                n_c += bool(best)
+                n_g += not bool(best)
+            out[fname] = flags
+    else:
+        cons_true = {str(r.get("filename", "")).strip() for r in rows if is_true(r)}
+        for fname, gboxes in gt_by_image.items():
+            flag = fname in cons_true
+            out[fname] = [flag] * len(gboxes)
+            n_c += flag * len(gboxes)
+            n_g += (not flag) * len(gboxes)
+    return out, n_c, n_g
+
+
 def evaluate_detections(
     gt_by_image: dict[str, list[dict]],
     pred_by_image: dict[str, list[dict]],
