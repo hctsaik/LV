@@ -20,17 +20,22 @@ _DEFAULT_MODELS_DIR = Path(
 
 
 def available_models(models_dir: Path = _DEFAULT_MODELS_DIR) -> list[str]:
-    """Return model names found in models_dir: *.pth stems plus HF-style
-    chinese-clip* directories (downloaded via scripts/download_chinese_clip.py)."""
+    """Return selectable model names found in models_dir. Recognises:
+    - `<name>/<name>.pth`  → the per-model folder layout (see MODELS.md)
+    - `<name>.pth`         → loose file (back-compat; e.g. a dropped-in resnet*.pth)
+    - `chinese-clip*/`     → HF-style directory with a config.json
+    """
     if not models_dir.exists():
         return []
-    names = [p.stem for p in models_dir.glob("*.pth")]
+    names = [p.stem for p in models_dir.glob("*.pth")]                       # loose
+    names += [p.parent.name for p in models_dir.glob("*/*.pth")              # folder
+              if p.stem == p.parent.name]
     names += [
         d.name for d in models_dir.iterdir()
         if d.is_dir() and d.name.startswith("chinese-clip")
         and (d / "config.json").exists()
     ]
-    return sorted(names)
+    return sorted(set(names))
 
 
 def supports_text_query(model_name: str) -> bool:
@@ -50,18 +55,23 @@ def load_model(
     if supports_text_query(model_name):
         model_dir = models_dir / model_name
         if not (model_dir / "config.json").exists():
-            raise FileNotFoundError(
-                f"Chinese-CLIP weights not found: {model_dir}\n"
-                "Run scripts/download_chinese_clip.py first."
-            )
+            from model_manifest import explain
+            raise FileNotFoundError(explain(
+                model_name, feature="以文搜圖 (F7) / 影像 embedding",
+                expected=model_dir / "config.json"))
         extractor = ChineseClipExtractor(model_dir)
     else:
-        pth_path = models_dir / f"{model_name}.pth"
+        # Folder layout (models/<name>/<name>.pth) first, then loose file.
+        pth_path = models_dir / model_name / f"{model_name}.pth"
         if not pth_path.exists():
+            pth_path = models_dir / f"{model_name}.pth"
+        if not pth_path.exists():
+            from model_manifest import explain
             raise FileNotFoundError(
-                f"Model file not found: {pth_path}\n"
-                f"Available: {available_models(models_dir)}"
-            )
+                explain(model_name,
+                        feature="影像 embedding / 視覺化 / 相似搜尋",
+                        expected=models_dir / model_name / f"{model_name}.pth")
+                + f"\n  目前 models/ 內可用: {available_models(models_dir)}")
         if model_name.startswith("resnet"):
             extractor = ResNetExtractor(arch=model_name, pth_path=pth_path)
         elif model_name.startswith("dinov2"):
@@ -87,10 +97,10 @@ def load_text_encoder(
         raise ValueError(f"Model '{model_name}' has no text tower.")
     model_dir = models_dir / model_name
     if not (model_dir / "config.json").exists():
-        raise FileNotFoundError(
-            f"Chinese-CLIP weights not found: {model_dir}\n"
-            "Run scripts/download_chinese_clip.py first."
-        )
+        from model_manifest import explain
+        raise FileNotFoundError(explain(
+            model_name, feature="以文搜圖 (F7) · 文字塔",
+            expected=model_dir / "config.json"))
     from models import ChineseClipTextEncoder
     return ChineseClipTextEncoder(model_dir)
 

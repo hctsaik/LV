@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 from pathlib import Path
 
@@ -17,22 +16,31 @@ from sklearn.manifold import TSNE
 
 from _utils import available_models, extract_embeddings, load_model
 
-# Inception (FID/KID) weights dir. LV_INCEPTION_DIR lets the host platform point
-# at a writable model-house; default resolves next to the package (not cwd, which
-# previously broke when launched from another working dir). Unset → local default.
-_MODEL_DIR = Path(
-    os.environ.get("LV_INCEPTION_DIR") or (Path(__file__).parent.parent / "model")
-)
+# Compare-metric weights live under the single models/ root, each in its own
+# same-named folder (see MODELS.md). LV_MODELS_DIR relocates the whole root.
+from model_manifest import _models_base
+
+_MODELS_DIR = _models_base()
+_FID_DIR = _MODELS_DIR / "inception-fid-kid"     # clean-fid: inception-2015-12-05.pt
+_IS_DIR = _MODELS_DIR / "inception-score"        # torchvision: checkpoints/inception_v3_*
+_LPIPS_DIR = _MODELS_DIR / "lpips"               # checkpoints/alexnet-* + v0.1/alex.pth
 
 
 def _load_inception(device: torch.device):
     from cleanfid.inception_torchscript import InceptionV3W
     # Auto-provision: if the weight isn't in the model-house yet, clean-fid fetches
-    # it (download=True) into _MODEL_DIR (LV_INCEPTION_DIR / local model/). A fresh
-    # clone or the platform model-house then needs no manual file placement; offline
-    # machines pre-seed it via `python scripts/setup_models.py --with-compare`.
-    _MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    model = InceptionV3W(str(_MODEL_DIR), download=True, resize_inside=False)
+    # it (download=True) into models/inception-fid-kid/. A fresh clone or the
+    # platform model-house then needs no manual file placement; offline machines
+    # pre-seed it via `python scripts/setup_models.py --with-compare`.
+    _FID_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        model = InceptionV3W(str(_FID_DIR), download=True, resize_inside=False)
+    except Exception as e:  # offline / fetch failed → say which feature+model
+        from model_manifest import explain
+        raise FileNotFoundError(
+            explain("inception-2015-12-05", feature="Compare · FID / KID",
+                    expected=_FID_DIR / "inception-2015-12-05.pt")
+            + f"\n  原始錯誤 : {e}") from e
     return model.to(device).eval()
 
 
@@ -70,14 +78,13 @@ def compute_lpips_score(
 ) -> float:
     import lpips
 
-    lpips_head = _MODEL_DIR / "lpips" / "v0.1" / "alex.pth"
+    lpips_head = _LPIPS_DIR / "v0.1" / "alex.pth"
     if not lpips_head.exists():
-        raise FileNotFoundError(
-            f"LPIPS weights not found: {lpips_head}\n"
-            "Place alex.pth in model/lpips/v0.1/."
-        )
+        from model_manifest import explain
+        raise FileNotFoundError(explain(
+            "lpips_alex_head", feature="Compare · LPIPS", expected=lpips_head))
     _prev_hub = torch.hub.get_dir()
-    torch.hub.set_dir(str(_MODEL_DIR / "hub"))
+    torch.hub.set_dir(str(_LPIPS_DIR))  # alexnet backbone → models/lpips/checkpoints/
     try:
         loss_fn = lpips.LPIPS(net="alex", model_path=str(lpips_head), verbose=False)
     finally:
@@ -147,16 +154,15 @@ def compute_inception_score(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    weights_path = _MODEL_DIR / "hub" / "checkpoints" / "inception_v3_google-0cc3c7bd.pth"
+    weights_path = _IS_DIR / "checkpoints" / "inception_v3_google-0cc3c7bd.pth"
     if not weights_path.exists():
-        raise FileNotFoundError(
-            f"InceptionV3 weights not found: {weights_path}\n"
-            "Run once with internet to auto-download, or copy "
-            "inception_v3_google-0cc3c7bd.pth to model/hub/checkpoints/."
-        )
+        from model_manifest import explain
+        raise FileNotFoundError(explain(
+            "inception_v3_google", feature="Compare · Inception Score",
+            expected=weights_path))
 
     _prev_hub = torch.hub.get_dir()
-    torch.hub.set_dir(str(_MODEL_DIR / "hub"))
+    torch.hub.set_dir(str(_IS_DIR))  # checkpoints/inception_v3_google-*.pth
     try:
         from torchvision.models import Inception_V3_Weights
         model = tvm.inception_v3(weights=Inception_V3_Weights.DEFAULT)

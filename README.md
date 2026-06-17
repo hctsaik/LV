@@ -30,25 +30,26 @@ pip install -r requirements.txt
 
 ## Model weights
 
-Weights are **not** in the repository (large binaries). Provision them once with the
-idempotent setup script — the clean "clone → run → it works" flow (no manual file placement):
+Weights are **not** in the repository (large binaries). The full list of what's
+needed — which **feature** uses which model, where it lives, where it's fetched from —
+is the single source of truth in **[MODELS.md](MODELS.md)**; `setup_models.py` reads it
+to provision, and runtime errors quote it so a missing weight tells you exactly which
+feature is blocked.
 
 ```bash
 python scripts/setup_models.py                # core: DINOv2 + Chinese-CLIP
 python scripts/setup_models.py --with-compare # + Compare Distributions (Inception, LPIPS)
+python scripts/model_manifest.py              # check what's present / missing (✅/❌)
 ```
 
-It downloads into a **model-house** you can relocate via env vars (so a host platform
-can keep its checkout/submodule thin and point everything at one writable dir):
+Everything lives under a single **`models/`** root — one same-named folder per model
+(`models/dinov2_vits14/`, `models/lpips/`, …; the full map is in [MODELS.md](MODELS.md)).
+Set `LV_MODELS_DIR` to relocate the whole root (so a host platform can point at one
+writable model-house and keep its checkout thin).
 
-| Env var | Overrides | Holds |
-|---|---|---|
-| `LV_MODELS_DIR` | `models/` | DINOv2 `.pth`, Chinese-CLIP, ResNet `.pth` |
-| `LV_INCEPTION_DIR` | `model/` | clean-fid Inception (FID/KID) |
-
-Unset → the package-local `models/` and `model/`. The script skips anything already present.
-FID/KID Inception and LPIPS also auto-download on first use, so `--with-compare` is only
-needed to pre-seed an offline machine. For ResNet, drop `resnet*.pth` into the models dir.
+The script skips anything already present. FID/KID Inception and LPIPS also auto-download
+on first use, so `--with-compare` is only needed to pre-seed an offline machine. For
+ResNet, drop `resnet*.pth` into `models/` (or `models/<name>/<name>.pth`).
 
 Supported model name prefixes:
 

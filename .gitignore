@@ -13,14 +13,12 @@ pyvenv.cfg
 .DS_Store
 CLAUDE.md
 
-# Model weights (large binaries — store separately, via Git LFS for model/)
-models/*.pth
-models/*.pt
-*.pt
-!model/**/*.pth
-!model/**/*.pt
-!model/*.pt
-!model/*.pth
+# Model weights — large binaries, NOT committed (download via scripts/setup_models.py;
+# see MODELS.md). The named placeholder FOLDERS under models/ ARE committed (.gitkeep)
+# so you can see where each model goes; everything else under models/ is ignored.
+models/**
+!models/**/
+!models/**/.gitkeep
 
 # Dataset & goal images
 dataset/
@@ -36,7 +34,4 @@ streamlit_log.txt
 tests/e2e/_server.log
 # 桶① gate calibration (modality-specific; written by calibrate_signal_gate.py --write)
 signal_gate.json
-
-# Chinese-CLIP weights (~1.4GB) - run scripts/download_chinese_clip.py instead
-models/chinese-clip*/
 output/curation_log.jsonl
