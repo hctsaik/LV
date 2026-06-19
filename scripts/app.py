@@ -249,6 +249,60 @@ def _viz_color_map(records: list[dict]) -> dict:
     """Stable class→colour map (matches the scatter's sorted-label ordering)."""
     classes = sorted({r.get("label", "") for r in records})
     return {c: _VIZ_COLORS[j % len(_VIZ_COLORS)] for j, c in enumerate(classes)}
+
+
+def _hex_rgb(hexc: str) -> list[int]:
+    h = hexc.lstrip("#")
+    return [int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)]
+
+
+def _viz_kmeans_blocks(coords, indices, k: int, cache_key: str):
+    """KMeans-partition the shown 3D points into k numbered blocks → lets the
+    user pick a block number in 3D and box-select it in a native 2D sub-scatter.
+    Returns (blocks {global_idx: block_id}, centers (k,3)). Cached per cache_key+k."""
+    ck = f"_viz_blocks_{cache_key}_{k}"
+    cached = st.session_state.get(ck)
+    if cached and cached.get("n") == len(indices):
+        return cached["blocks"], cached["centers"]
+    if not indices:
+        return {}, np.zeros((0, 3))
+    pts = np.array([list(coords[i][:3]) for i in indices], dtype=float)
+    if pts.shape[1] < 3:
+        pts = np.hstack([pts, np.zeros((len(pts), 3 - pts.shape[1]))])
+    from sklearn.cluster import KMeans
+    kk = max(1, min(k, len(indices)))
+    km = KMeans(n_clusters=kk, n_init=4, random_state=42).fit(pts)
+    blocks = {int(i): int(lab) for i, lab in zip(indices, km.labels_)}
+    centers = km.cluster_centers_
+    st.session_state[ck] = {"n": len(indices), "blocks": blocks, "centers": centers}
+    return blocks, centers
+
+
+def _viz_deck_thumbs(records: list[dict], data_token: str) -> list[str]:
+    """Small base64 thumbnails (one per record) for the deck.gl 3D hover preview.
+    Encoded once per data_token and cached in session (≈1KB each)."""
+    import base64
+    import io
+    ck = f"_viz_deck_thumbs_{data_token[:8]}"
+    cached = st.session_state.get(ck)
+    if cached is not None and len(cached) == len(records):
+        return cached
+    out: list[str] = []
+    for r in records:
+        uri = ""
+        try:
+            src = _thumb_or_none(Path(r["path"])) or str(r["path"])
+            with Image.open(src) as im:
+                im = im.convert("RGB")
+                im.thumbnail((56, 56))
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=70)
+            uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        except (OSError, ValueError):
+            uri = ""
+        out.append(uri)
+    st.session_state[ck] = out
+    return out
 _VIZ_SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
 _METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap",
                "LDA(監督)": "lda", "監督UMAP": "sumap"}
@@ -881,7 +935,7 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
     moves (zero layout shift), and the YOLO toggle keeps a fixed key so its
     state survives across images.
     """
-    with st.container(height=280, border=True, key="viz_image_viewer"):
+    with st.container(border=True, key="viz_image_viewer"):
         idx = st.session_state.get("viz_active_image")
         if idx is None or not (0 <= idx < len(records)):
             st.caption("檢視槽 — 點選下方任一縮圖，在此檢視大圖與標註框，並可逐張加入匯出清單。")
@@ -914,51 +968,49 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
             view = "物件"
         disp = Path(image_path) if (is_obj_rec and view == "原圖") else p
 
-        img_col, ctl_col = st.columns([3, 2])
-        with img_col:
-            if not disp.exists():
-                st.warning(f"找不到檔案：{disp}")
-            else:
-                try:
-                    src = (draw_yolo_boxes(disp, yolo_label_path_for(disp), class_names)
-                           if show_boxes else str(disp))
-                    st.image(src, use_container_width=True)
-                except OSError as exc:
-                    st.warning(f"無法讀取影像：{exc}")
-        with ctl_col:
-            if class_names:
-                st.toggle("顯示標註框", key="viz_img_boxes")
-            if disp.exists():
-                if st.button("🔍 放大檢視", key="viz_slot_zoom", use_container_width=True):
-                    _zoom_image_dialog(disp, show_boxes, class_names,
-                                       f"{disp.name}（{view}）— {r['label']}"
-                                       f"（{r['split']}）· #{idx}")
-            elist = st.session_state.get("viz_export_list", {})
-            if str(p) in elist:
-                st.button("✓ 已在清單 — 移除", key="viz_slot_remove", use_container_width=True,
-                          on_click=_remove_from_export, args=(str(p),))
-            else:
-                st.button("⬇ 加入匯出清單", key="viz_slot_add", use_container_width=True,
-                          on_click=_add_one, args=(records, idx))
-            st.button("🔎 以此找相似", key="viz_slot_similar", use_container_width=True,
-                      on_click=_start_query, args=(idx,))
+        # 圖片用滿整個寬度（更大、不再被窄欄壓小）；控制列移到圖片下方
+        if not disp.exists():
+            st.warning(f"找不到檔案：{disp}")
+        else:
+            try:
+                src = (draw_yolo_boxes(disp, yolo_label_path_for(disp), class_names)
+                       if show_boxes else str(disp))
+                st.image(src, use_container_width=True)
+            except OSError as exc:
+                st.warning(f"無法讀取影像：{exc}")
+        a, b, c = st.columns(3)
+        if class_names:
+            a.toggle("顯示標註框", key="viz_img_boxes")
+        if disp.exists() and b.button("🔍 放大檢視", key="viz_slot_zoom",
+                                      use_container_width=True):
+            _zoom_image_dialog(disp, show_boxes, class_names,
+                               f"{disp.name}（{view}）— {r['label']}（{r['split']}）· #{idx}")
+        elist = st.session_state.get("viz_export_list", {})
+        if str(p) in elist:
+            c.button("✓ 移除清單", key="viz_slot_remove", use_container_width=True,
+                     on_click=_remove_from_export, args=(str(p),))
+        else:
+            c.button("⬇ 加入清單", key="viz_slot_add", use_container_width=True,
+                     on_click=_add_one, args=(records, idx))
+        d, e = st.columns(2)
+        d.button("🔎 以此找相似", key="viz_slot_similar", use_container_width=True,
+                 on_click=_start_query, args=(idx,))
+        with e:
             _send_to_labeling_ui(
-                records, [idx], source="viewer",
-                task=LH.TASK_RELABEL,
-                label="📤 送這張到 Labeling", key=f"viz_slot_to_lbl_{idx}",
+                records, [idx], source="viewer", task=LH.TASK_RELABEL,
+                label="📤 送 Labeling", key=f"viz_slot_to_lbl_{idx}",
                 original_labels={idx: r.get("label", "")})
-            man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
-            if man:
-                # 資料合約可追溯性：複核時一鍵看到這張圖的 manifest 身分
-                with st.popover("📄 Manifest", use_container_width=True):
-                    st.caption(f"sha256：`{man.get('sha256', '—')}`")
-                    st.caption(f"phash：`{man.get('phash') or '—'}`")
-                    st.caption(f"大小：{man.get('size', 0):,} bytes · "
-                               f"檔案時間：{man.get('captured_at', '—')}")
-                    refs = man.get("embedding_refs", {})
-                    if refs:
-                        st.caption("embedding refs：" +
-                                   "、".join(f"{m} → 列 {r}" for m, r in refs.items()))
+        man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
+        if man:  # 資料合約可追溯性
+            with st.popover("📄 Manifest", use_container_width=True):
+                st.caption(f"sha256：`{man.get('sha256', '—')}`")
+                st.caption(f"phash：`{man.get('phash') or '—'}`")
+                st.caption(f"大小：{man.get('size', 0):,} bytes · "
+                           f"檔案時間：{man.get('captured_at', '—')}")
+                refs = man.get("embedding_refs", {})
+                if refs:
+                    st.caption("embedding refs：" +
+                               "、".join(f"{m} → 列 {r}" for m, r in refs.items()))
 
 
 def _render_grid(records: list[dict], shown: list[int], show_rank: bool) -> None:
@@ -1603,7 +1655,7 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
         st.markdown("**最近鄰（它長得像誰）**")
         nbr_idx, nbr_d = find_similar_indices(raw, idx, k=6,
                                               nn_index=_nn_index_for(model_name))
-        with st.container(height=170):
+        with st.container(height=330):
             cols = st.columns(3)
             for j, (ni, nd) in enumerate(zip(nbr_idx, nbr_d)):
                 with cols[j % 3]:
@@ -1780,11 +1832,34 @@ def _render_bucket1_view(records: list[dict], model_name: str) -> None:
     tot_meas = sum(x["可量測框"] for x in rows)
     tot_none = sum(x["🔴確無(桶①)"] for x in rows)
     if tot_meas:
-        st.metric("整體桶①佔比（確無 / 可量測）", f"{100 * tot_none / tot_meas:.0f}%",
-                  help="物理上看不見、補資料無效的下界估計。校準後才可信。")
-    st.dataframe(rows, use_container_width=True, hide_index=True)
-    st.caption(":gray[『確無』是桶①下界，校準前偏估；可疑框送『體檢卡』或『組考卷』"
-               "再分清桶②(覆蓋)/桶③(邊界帶)。]")
+        st.metric("整體『看不見』佔比（物理天花板）", f"{100 * tot_none / tot_meas:.0f}%",
+                  help="🔴看不見 ÷ 可量測。越高＝越多目標在影像裡根本看不到，"
+                       "補同類資料救不了。門檻未校準前偏估。")
+    st.caption(":gray[名詞：每個框量它的「訊號強度」=在影像裡看不看得見。"
+               "桶①＝物理看不見（四桶之一：①物理 ②覆蓋 ③邊界 ④標註）。滑到表頭看說明。]")
+    _bucket1_colcfg = {
+        "影像類型": st.column_config.TextColumn(
+            "影像類型", help="YOLO 類別／影像分型；未設定則為（未分型）。"),
+        "可量測框": st.column_config.NumberColumn(
+            "可量測框", help="量得到訊號強度的框數（＝分母，排除未量測）。"),
+        "🔴確無(桶①)": st.column_config.NumberColumn(
+            "🔴看不見(桶①)",
+            help="訊號太弱、物理上看不見 → 補同類資料無效。"
+                 "動作：改善拍攝（打光／對比／解析度）重拍，或排除。"),
+        "🟡疑似": st.column_config.NumberColumn(
+            "🟡邊界", help="訊號在臨界，可能看得到也可能不行。"
+                          "動作：送體檢卡／組考卷判定。"),
+        "🟢明顯": st.column_config.NumberColumn(
+            "🟢清楚", help="訊號夠強、清楚可見 → 正常，不需處理。"),
+        "⚪未知": st.column_config.NumberColumn(
+            "⚪未量測", help="沒有可定位的框／ROI，量不到 → 不列入分母。"),
+        "桶①佔比": st.column_config.TextColumn(
+            "看不見佔比", help="🔴看不見 ÷ 可量測。越高＝資料品質天花板越低。"),
+    }
+    st.dataframe(rows, use_container_width=True, hide_index=True,
+                 column_config=_bucket1_colcfg)
+    st.caption(":gray[『看不見』是桶①下界，校準前偏估；可疑（邊界）框送『體檢卡』或"
+               "『組考卷』再分清桶②(覆蓋)/桶③(邊界帶)。下方可下鑽看/選實際影像。]")
 
     # ── 下鑽:選某一格 → 看/選取那批實際影像 → 走右上既有出口 ──
     idx_map = st.session_state.get("_bucket1_idx", {})
@@ -1810,13 +1885,17 @@ def _render_bucket1_view(records: list[dict], model_name: str) -> None:
                 st.session_state["viz_active_image"] = None
                 st.toast(f"已選取 {len(picks)} 個；切到『選取』分頁或用右上出口處理")
                 st.rerun()
-            cols = st.columns(4)
-            for j, i in enumerate(picks[:8]):
-                with cols[j % 4]:
-                    th = _thumb_or_none(Path(records[i]["path"]))
-                    if th is not None:
-                        st.image(th, use_container_width=True)
-                    st.caption(records[i].get("label", ""))
+            _cap = 60
+            st.caption(f"預覽（捲動看；最多顯示 {_cap}，共 {len(picks)}）。"
+                       "要完整檢視/處理請按上方『選取這…個』。")
+            with st.container(height=360):
+                cols = st.columns(3)
+                for j, i in enumerate(picks[:_cap]):
+                    with cols[j % 3]:
+                        th = _thumb_or_none(Path(records[i]["path"]))
+                        if th is not None:
+                            st.image(th, use_container_width=True)
+                        st.caption(records[i].get("label", ""))
 
 
 _SOURCE_LABEL = {
@@ -2917,23 +2996,122 @@ def _visualize_embeddings_ui() -> None:
                     st.session_state["viz_viewer_ctx"] = []
                     st.toast(f"已選取 {len(new_indices)} 個點", icon="🎯")
             else:
-                event = st.plotly_chart(
-                    fig, use_container_width=True,
-                    key=f"viz_scatter_3d_{_clear_nonce}",
-                    on_select="rerun", selection_mode="points")
-                _clk = []
-                if event is not None:
-                    _so = event.get("selection") if hasattr(event, "get") else None
-                    if _so:
-                        _clk = selection_points_to_indices(list(_so.get("points", [])))
-                if _clk:  # 點一下＝把該物件「加選」(連點累積、去重)；區域框選 3D 不支援
-                    merged = list(dict.fromkeys(list(sel_state["indices"]) + _clk))
-                    if merged != sel_state["indices"]:
-                        sel_state = {"token": data_token, "indices": merged}
-                        st.session_state["viz_grid_limit"] = _GRID_BATCH
-                        st.toast(f"3D 加選 {len(_clk)} 點（共 {len(merged)}）", icon="🎯")
-                st.caption("ℹ 3D：**點一下任一點＝加選該物件**（可連點累積）；黑圈＝目前選取。"
-                           "區域框選請切 2D；清空用右上『✕ 取消框選』。")
+                # 3D 引擎切換：deck.gl(可 hover 看圖＋拖框選取)；plotly 為舊版退路
+                _eng = st.radio(
+                    "3D 引擎", ["plotly（穩定，預設）", "deck.gl（可框選＋滑點看圖，實驗）"],
+                    key="viz_3d_engine", horizontal=True,
+                    help="plotly：穩定，但 3D 無法框選。deck.gl：滑點看縮圖＋Shift 拖框選取。")
+                if _eng.startswith("deck"):
+                    import deck3d
+                    cmap = _viz_color_map(records)
+                    with st.spinner("準備 3D 縮圖…"):
+                        thumbs = _viz_deck_thumbs(records, data_token)
+                    _z = coords.shape[1] > 2
+                    pts = [{"index": int(i),
+                            "position": [float(coords[i][0]), float(coords[i][1]),
+                                         float(coords[i][2]) if _z else 0.0],
+                            "color": _hex_rgb(cmap.get(records[i].get("label", ""), "#9aa0a6")),
+                            "thumb": thumbs[i] if i < len(thumbs) else "",
+                            "label": records[i].get("label", "")}
+                           for i in indices]
+                    picked = deck3d.render_deck3d(
+                        pts, key=f"viz_deck3d_{data_token[:8]}_{selected_model}_{method_key}")
+                    if picked:
+                        merged = list(dict.fromkeys(
+                            list(sel_state["indices"])
+                            + [pi for pi in picked if 0 <= pi < len(records)]))
+                        if merged != sel_state["indices"]:
+                            sel_state = {"token": data_token, "indices": merged}
+                            st.session_state["viz_grid_limit"] = _GRID_BATCH
+                            st.session_state["viz_selection"] = sel_state
+                            st.toast(f"3D 框選 {len(picked)} 點（共 {len(merged)}）", icon="🎯")
+                    st.caption("ℹ deck.gl 3D：拖曳=旋轉、滾輪=縮放、**滑點=看縮圖**、"
+                               "**Shift+拖框=選取**。點多時首次較久；不順可切回 plotly。")
+                else:
+                    # 3D 總覽(plotly)標上「區塊號碼」→ 選號碼進入該塊做原生 2D 框選
+                    _ckey = f"{data_token[:8]}_{selected_model}_{method_key}_{selected_split}"
+                    _K = st.slider("區塊數 K", 4, 30, 12, key="viz_3d_blocks_k",
+                                   help="把 3D 點以 KMeans 分成 K 塊並標號;選一個號碼進該塊做 2D 框選。")
+                    blocks, centers = _viz_kmeans_blocks(coords, indices, _K, _ckey)
+                    if len(centers):
+                        fig.add_trace(go.Scatter3d(
+                            x=centers[:, 0].tolist(), y=centers[:, 1].tolist(),
+                            z=centers[:, 2].tolist(), mode="text",
+                            text=[str(b) for b in range(len(centers))],
+                            textfont=dict(size=20, color="#111"),
+                            name="區塊號", hoverinfo="skip", showlegend=False))
+                    st.plotly_chart(fig, use_container_width=True, key="viz_scatter_3d")
+                    st.caption("旋轉看各區塊的號碼 → 下方選號碼進入該塊做 **2D 框選/套索**。")
+                    from collections import Counter as _Counter
+                    _cnt = _Counter(blocks.values())
+                    _opts = [f"#{b}（{_cnt[b]}）" for b in range(len(centers)) if _cnt.get(b)]
+                    if _opts:
+                        _pick = st.selectbox("進入區塊 → 2D 框選", _opts,
+                                             key="viz_3d_block_pick")
+                        _bk = int(_pick.split("（")[0][1:])
+                        _bidx = [i for i in indices if blocks.get(int(i)) == _bk]
+                        if _bidx:
+                            # 該塊單獨 PCA→2D,把塊內結構攤開(比沿用 3D 座標更好框選)
+                            _raw = st.session_state.get(
+                                "viz_raw_embeddings", {}).get(selected_model)
+                            _cmap = _viz_color_map(records)
+                            if _raw is not None and len(_bidx) > 2:
+                                _xy = PCA(n_components=2, random_state=42).fit_transform(
+                                    _raw[_bidx])
+                            else:
+                                _xy = np.array([[coords[i][0], coords[i][1]] for i in _bidx])
+                            _bfig = go.Figure(go.Scatter(
+                                x=_xy[:, 0].tolist(), y=_xy[:, 1].tolist(), mode="markers",
+                                marker=dict(size=9, color=[
+                                    _cmap.get(records[i].get("label", ""), "#9aa0a6")
+                                    for i in _bidx]),
+                                customdata=[[i] for i in _bidx],
+                                text=[f"#{i} · {records[i].get('label', '')}" for i in _bidx],
+                                hovertemplate="%{text}<extra></extra>"))
+                            _bfig.update_layout(height=360, dragmode="select",
+                                                margin=dict(l=10, r=10, t=10, b=10))
+                            _bev = st.plotly_chart(
+                                _bfig, use_container_width=True,
+                                key=f"viz_block2d_{_ckey}_{_bk}",
+                                on_select="rerun",
+                                selection_mode=("points", "box", "lasso"))
+                            _bpts = []
+                            if _bev is not None:
+                                _so = _bev.get("selection") if hasattr(_bev, "get") else None
+                                if _so:
+                                    _bpts = selection_points_to_indices(
+                                        list(_so.get("points", [])))
+                            if _bpts:
+                                merged = list(dict.fromkeys(
+                                    list(sel_state["indices"]) + _bpts))
+                                if merged != sel_state["indices"]:
+                                    sel_state = {"token": data_token, "indices": merged}
+                                    st.session_state["viz_grid_limit"] = _GRID_BATCH
+                                    st.session_state["viz_selection"] = sel_state
+                                    st.toast(f"區塊#{_bk} 框選 {len(_bpts)} 點"
+                                             f"（共 {len(merged)}）", icon="🎯")
+                    with st.expander("或：依 # 編號加選"):
+                        pc1, pc2 = st.columns([3, 1])
+                        _ids = pc1.text_input(
+                            "輸入 # 編號", key="viz_3d_pick_input",
+                            placeholder="例：12, 45, 88", label_visibility="collapsed")
+                        if pc2.button("➕ 加選", key="viz_3d_pick_btn",
+                                      use_container_width=True):
+                            try:
+                                nums = [int(x) for x in _ids.replace("，", ",").split(",")
+                                        if x.strip()]
+                            except ValueError:
+                                nums = []
+                            valid = [n for n in nums if 0 <= n < len(records)]
+                            if valid:
+                                merged = list(dict.fromkeys(list(sel_state["indices"]) + valid))
+                                sel_state = {"token": data_token, "indices": merged}
+                                st.session_state["viz_grid_limit"] = _GRID_BATCH
+                                st.session_state["viz_selection"] = sel_state
+                                st.toast(f"已加選 {len(valid)} 點", icon="🎯")
+                                st.rerun()
+                            else:
+                                st.warning("沒有有效的 # 編號。")
         st.session_state["viz_selection"] = sel_state
 
         if _clear_slot is not None:  # fill now that sel_state is final → correct enabled state
