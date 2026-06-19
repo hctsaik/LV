@@ -154,10 +154,19 @@ _DINOV2_HUB_DIR = Path(__file__).parent / "dinov2_hub"
 
 
 class Dinov2Extractor:
-    """DINOv2 feature extractor — architecture and weights both loaded locally."""
+    """DINOv2 feature extractor — architecture and weights both loaded locally.
 
-    def __init__(self, model_name: str, pth_path: Path) -> None:
+    ``head`` picks the pooled output (both stay D=384 so caches/indices/UMAP frames
+    are unaffected):
+    - ``"cls"``      : the CLS token (default; what the whole-image path uses).
+    - ``"meanpool"`` : mean of the patch tokens, L2-normalised PER TOKEN first. The
+      on-disk checkpoint is the non-register variant, so a few high-norm "artifact"
+      tokens would otherwise dominate a raw mean — per-token L2 neutralises them.
+    """
+
+    def __init__(self, model_name: str, pth_path: Path, head: str = "cls") -> None:
         self.device = _DEVICE
+        self.head = head
         model = torch.hub.load(
             str(_DINOV2_HUB_DIR), model_name,
             source="local", pretrained=False,
@@ -176,5 +185,11 @@ class Dinov2Extractor:
     def __call__(self, image: Any) -> np.ndarray:
         tensor = self.transform(image).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            feat = self.model(tensor)  # CLS token, shape (1, D)
+            if self.head == "meanpool":
+                out = self.model.forward_features(tensor)
+                patch = out["x_norm_patchtokens"]            # (1, N, D)
+                patch = nn.functional.normalize(patch, dim=-1)  # per-token L2
+                feat = patch.mean(dim=1)                      # (1, D)
+            else:
+                feat = self.model(tensor)                    # CLS token, (1, D)
         return feat.squeeze(0).cpu().numpy()

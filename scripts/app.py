@@ -236,8 +236,83 @@ def _expand_sidebar() -> None:
 _VIZ_COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c",
                "#95a5a6", "#e84393", "#fdcb6e", "#34495e", "#0984e3", "#6c5ce7",
                "#badc58", "#576574"]
+
+
+def _text_on(hex_color: str) -> str:
+    """Readable text colour (dark/light) for a given background hex."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return "#111" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#fff"
+
+
+def _viz_color_map(records: list[dict]) -> dict:
+    """Stable class→colour map (matches the scatter's sorted-label ordering)."""
+    classes = sorted({r.get("label", "") for r in records})
+    return {c: _VIZ_COLORS[j % len(_VIZ_COLORS)] for j, c in enumerate(classes)}
 _VIZ_SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
-_METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap"}
+_METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap",
+               "LDA(監督)": "lda", "監督UMAP": "sumap"}
+# 預設算這幾種；監督UMAP 預設也算並作為預設顯示(用標籤排版,最易看出分群/挑標錯)
+_DEFAULT_METHODS = ["PCA", "t-SNE", "UMAP", "監督UMAP"]
+_SUPERVISED_METHODS = {"lda", "sumap"}
+
+# ── Remember last selections across Streamlit restarts ───────────────────────
+# Sidebar choices are written to a small JSON and reloaded on the next launch,
+# so you don't re-pick mode/folders/models/methods every time.
+_PERSIST_KEYS = ("viz_mode", "viz_granularity", "viz_methods", "viz_models_sel",
+                 "viz_object_policy", "viz_folder_list", "viz_umap_ref")
+
+
+def _ui_state_path() -> Path:
+    import os
+    return Path(os.environ.get("LV_UI_STATE")
+                or (Path(__file__).resolve().parent.parent / ".lv_ui_state.json"))
+
+
+def _load_ui_state_once() -> None:
+    """Seed session_state from the saved file ONCE per session (before widgets),
+    validating against currently-available options so a stale choice can't crash."""
+    if st.session_state.get("_ui_state_loaded"):
+        return
+    st.session_state["_ui_state_loaded"] = True
+    import json
+    try:
+        data = json.loads(_ui_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    method_opts = set(_METHOD_KEY)
+    try:
+        model_opts = set(available_models())
+    except Exception:
+        model_opts = set()
+    for k, v in data.items():
+        if k not in _PERSIST_KEYS:
+            continue
+        if k == "viz_methods" and isinstance(v, list):
+            v = [m for m in v if m in method_opts] or _DEFAULT_METHODS
+        elif k == "viz_models_sel" and isinstance(v, list):
+            v = [m for m in v if m in model_opts]
+            if not v:
+                continue
+        elif k == "viz_folder_list" and isinstance(v, list):
+            v = [f for f in v if Path(f).exists()]
+        st.session_state.setdefault(k, v)
+    # keep the mode/granularity change-detectors in sync so the restored folder
+    # list isn't wiped by the "mode changed → clear" guard on first load
+    if "viz_mode" in st.session_state:
+        st.session_state.setdefault("_viz_mode_prev", st.session_state["viz_mode"])
+    if "viz_granularity" in st.session_state:
+        st.session_state.setdefault("_viz_gran_prev", st.session_state["viz_granularity"])
+
+
+def _save_ui_state() -> None:
+    import json
+    data = {k: st.session_state.get(k) for k in _PERSIST_KEYS if k in st.session_state}
+    try:
+        _ui_state_path().write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 _GRID_BATCH = 60          # cards appended per「載入更多」click
 _GRID_CAP = 240           # DOM ceiling agreed in the UX review
@@ -631,6 +706,8 @@ def _clear_selection(scatter_key: str) -> None:
         "token": st.session_state.get("viz_data_token"), "indices": []
     }
     st.session_state.pop(scatter_key, None)
+    # bump the nonce so the scatter widget remounts fresh (drops the browser-side box)
+    st.session_state["_viz_clear_nonce"] = st.session_state.get("_viz_clear_nonce", 0) + 1
     st.session_state["viz_active_image"] = None
     st.session_state["viz_viewer_ctx"] = []
     st.session_state["viz_grid_limit"] = _GRID_BATCH
@@ -811,6 +888,9 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
             return
         r = records[idx]
         p = Path(r["path"])
+        # 物件級記錄同時帶 crop(path)與來源整張圖(image_path)→ 可切換檢視
+        image_path = r.get("image_path")
+        is_obj_rec = bool(image_path) and str(image_path) != str(p)
         class_names = st.session_state.get("viz_classes")
         if class_names:
             st.session_state.setdefault("viz_img_boxes", True)  # 預設顯示標註框
@@ -825,24 +905,34 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
                   on_click=_set_active_image, args=(ctx[min(pos + 1, len(ctx) - 1)],))
         h4.button("✕", key="viz_img_close", on_click=_set_active_image, args=(None,))
 
+        # 物件 / 原圖 切換(僅物件級記錄);原圖會畫上該圖所有 YOLO 框,看物件在場景中的脈絡
+        if is_obj_rec:
+            view = st.radio("檢視", ["物件", "原圖"], horizontal=True,
+                            key="viz_view_mode", label_visibility="collapsed",
+                            help="物件＝裁切的 crop;原圖＝此物件來源的整張影像。")
+        else:
+            view = "物件"
+        disp = Path(image_path) if (is_obj_rec and view == "原圖") else p
+
         img_col, ctl_col = st.columns([3, 2])
         with img_col:
-            if not p.exists():
-                st.warning(f"找不到檔案：{p}")
+            if not disp.exists():
+                st.warning(f"找不到檔案：{disp}")
             else:
                 try:
-                    src = (draw_yolo_boxes(p, yolo_label_path_for(p), class_names)
-                           if show_boxes else str(p))
+                    src = (draw_yolo_boxes(disp, yolo_label_path_for(disp), class_names)
+                           if show_boxes else str(disp))
                     st.image(src, use_container_width=True)
                 except OSError as exc:
                     st.warning(f"無法讀取影像：{exc}")
         with ctl_col:
             if class_names:
                 st.toggle("顯示標註框", key="viz_img_boxes")
-            if p.exists():
+            if disp.exists():
                 if st.button("🔍 放大檢視", key="viz_slot_zoom", use_container_width=True):
-                    _zoom_image_dialog(p, show_boxes, class_names,
-                                       f"{p.name} — {r['label']}（{r['split']}）· #{idx}")
+                    _zoom_image_dialog(disp, show_boxes, class_names,
+                                       f"{disp.name}（{view}）— {r['label']}"
+                                       f"（{r['split']}）· #{idx}")
             elist = st.session_state.get("viz_export_list", {})
             if str(p) in elist:
                 st.button("✓ 已在清單 — 移除", key="viz_slot_remove", use_container_width=True,
@@ -873,6 +963,8 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
 
 def _render_grid(records: list[dict], shown: list[int], show_rank: bool) -> None:
     elist = st.session_state.get("viz_export_list", {})
+    cmap = _viz_color_map(records)
+    css_rules: list[str] = []
     with st.container(height=440, key="viz_grid"):
         if not shown:
             st.info("在左圖以點選、框選（box）或套索（lasso）圈出資料點，縮圖會立即顯示在這裡。")
@@ -888,9 +980,17 @@ def _render_grid(records: list[dict], shown: list[int], show_rank: bool) -> None
                     st.warning("⚠ 檔案遺失")
                 mark = "✓ " if str(p) in elist else ""
                 rank = f"｜第{j + 1}" if show_rank else ""
-                st.button(f"{mark}#{i}{rank}", key=f"viz_card_{i}",
-                          use_container_width=True,
+                label = records[i].get("label") or f"#{i}"
+                st.button(f"{mark}{label}{rank}", key=f"viz_card_{i}",
+                          use_container_width=True, help=f"#{i}",
                           on_click=_set_active_image, args=(i, list(shown)))
+                col = cmap.get(records[i].get("label", ""), "#9aa0a6")
+                css_rules.append(
+                    f".st-key-viz_card_{i} button{{background:{col}!important;"
+                    f"color:{_text_on(col)}!important;border-color:{col}!important;}}")
+    if css_rules:  # tint each caption box to its class colour (matches the dots)
+        st.markdown("<style>" + "".join(css_rules) + "</style>",
+                    unsafe_allow_html=True)
 
 
 def _render_select_view(
@@ -1616,18 +1716,22 @@ def _do_recalibrate_bucket1(records: list[dict]) -> None:
                f"逐類型 {len(per_type)} 組。重新計算佔比即套用。")
 
 
-def _bucket1_proportions(records: list[dict]) -> list[dict]:
-    """Per image type: 明顯/疑似/確無/未知 counts from the 桶① gate."""
+def _bucket1_proportions(records: list[dict]):
+    """Per image type: 明顯/疑似/確無/未知 counts from the 桶① gate.
+    Returns (rows, idx_map) where idx_map[(image_type, level)] = [record index],
+    so the table can drill down to the actual images behind each count."""
     from collections import Counter
     from signal_strength import (
         SIGNAL_NONE, SIGNAL_OBVIOUS, SIGNAL_SUSPECT, SIGNAL_UNKNOWN,
         load_calibration)
     type_from = (load_calibration() or {}).get("type_from")
     per: dict[str, Counter] = {}
-    for r in records:
+    idx_map: dict[tuple, list[int]] = {}
+    for i, r in enumerate(records):
         level, _src, _it = _signal_level_for_record(r)
-        per.setdefault(_record_image_type(r, type_from) or "（未分型）",
-                       Counter())[level] += 1
+        it = _record_image_type(r, type_from) or "（未分型）"
+        per.setdefault(it, Counter())[level] += 1
+        idx_map.setdefault((it, level), []).append(i)
     rows = []
     for t, c in per.items():
         meas = c[SIGNAL_NONE] + c[SIGNAL_SUSPECT] + c[SIGNAL_OBVIOUS]
@@ -1638,7 +1742,7 @@ def _bucket1_proportions(records: list[dict]) -> list[dict]:
             "桶①佔比": f"{100 * c[SIGNAL_NONE] / meas:.0f}%" if meas else "—",
         })
     rows.sort(key=lambda x: -x["可量測框"])
-    return rows
+    return rows, idx_map
 
 
 def _render_bucket1_view(records: list[dict], model_name: str) -> None:
@@ -1666,7 +1770,9 @@ def _render_bucket1_view(records: list[dict], model_name: str) -> None:
     if b2.button("📊 計算桶①佔比", key="bucket1_calc", type="primary",
                  use_container_width=True):
         with st.spinner("量測各框訊號強度中…"):
-            st.session_state["_bucket1_rows"] = _bucket1_proportions(records)
+            _rows, _imap = _bucket1_proportions(records)
+            st.session_state["_bucket1_rows"] = _rows
+            st.session_state["_bucket1_idx"] = _imap
     rows = st.session_state.get("_bucket1_rows")
     if not rows:
         st.info("按「計算桶①佔比」開始；需偵測/物件模式（每筆有缺陷框）。")
@@ -1679,6 +1785,38 @@ def _render_bucket1_view(records: list[dict], model_name: str) -> None:
     st.dataframe(rows, use_container_width=True, hide_index=True)
     st.caption(":gray[『確無』是桶①下界，校準前偏估；可疑框送『體檢卡』或『組考卷』"
                "再分清桶②(覆蓋)/桶③(邊界帶)。]")
+
+    # ── 下鑽:選某一格 → 看/選取那批實際影像 → 走右上既有出口 ──
+    idx_map = st.session_state.get("_bucket1_idx", {})
+    if idx_map:
+        from signal_strength import (SIGNAL_NONE, SIGNAL_OBVIOUS,
+                                     SIGNAL_SUSPECT, SIGNAL_UNKNOWN)
+        _LV = {"🔴確無": SIGNAL_NONE, "🟡疑似": SIGNAL_SUSPECT,
+               "🟢明顯": SIGNAL_OBVIOUS, "⚪未知": SIGNAL_UNKNOWN}
+        st.markdown("**🔎 下鑽:看 / 選取某一格的實際影像**")
+        d1, d2 = st.columns(2)
+        sel_type = d1.selectbox("影像類型", [x["影像類型"] for x in rows],
+                                key="bucket1_dd_type")
+        sel_lv = d2.selectbox("訊號等級", list(_LV), key="bucket1_dd_lv")
+        picks = idx_map.get((sel_type, _LV[sel_lv]), [])
+        st.caption(f"{sel_type} · {sel_lv}：{len(picks)} 個")
+        if picks:
+            if st.button(f"🎯 選取這 {len(picks)} 個"
+                         "（再用右上『送體檢卡／組考卷／灰帶／加入清單』）",
+                         key="bucket1_pick", use_container_width=True):
+                st.session_state["viz_selection"] = {
+                    "token": st.session_state.get("viz_data_token"), "indices": picks}
+                st.session_state["viz_grid_limit"] = _GRID_BATCH
+                st.session_state["viz_active_image"] = None
+                st.toast(f"已選取 {len(picks)} 個；切到『選取』分頁或用右上出口處理")
+                st.rerun()
+            cols = st.columns(4)
+            for j, i in enumerate(picks[:8]):
+                with cols[j % 4]:
+                    th = _thumb_or_none(Path(records[i]["path"]))
+                    if th is not None:
+                        st.image(th, use_container_width=True)
+                    st.caption(records[i].get("label", ""))
 
 
 _SOURCE_LABEL = {
@@ -1926,10 +2064,33 @@ def _render_quick_start() -> None:
                use_container_width=True, on_click=_load_demo)
 
 
-def _project_object_embeddings(embeddings: np.ndarray, method_pairs) -> dict:
-    """PCA / t-SNE / UMAP projections for object-level embeddings. Plain UMAP
-    (the stable reference frame is image-level only). Mirrors the image-level
-    projection in the Run loop but kept separate so that path stays untouched."""
+def _supervised_projection(embeddings, labels, mkey: str, n_comps: int):
+    """Label-guided projection — LDA (max class separation) or supervised UMAP.
+    A VISUAL AID (it uses the labels to lay points out), not proof of real
+    separability. Returns an array, or None when not computable."""
+    y = np.asarray(labels)
+    classes = np.unique(y)
+    if len(classes) < 2 or len(y) < 4:
+        return None
+    yi = np.searchsorted(classes, y)
+    if mkey == "lda":
+        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+        nc = min(n_comps, len(classes) - 1)
+        if nc < 1:
+            return None
+        return LinearDiscriminantAnalysis(n_components=nc).fit_transform(embeddings, yi)
+    if mkey == "sumap":
+        n_neighbors = min(15, max(2, len(embeddings) - 1))
+        return _umap().UMAP(n_components=n_comps, n_neighbors=n_neighbors,
+                            random_state=42).fit_transform(embeddings, y=yi)
+    return None
+
+
+def _project_object_embeddings(embeddings: np.ndarray, method_pairs,
+                               labels=None) -> dict:
+    """PCA / t-SNE / UMAP (+ optional supervised LDA / 監督UMAP, needs labels)
+    projections for object-level embeddings. Plain UMAP (the stable reference
+    frame is image-level only)."""
     n_samples = len(embeddings)
     n_comps = min(3, max(1, n_samples - 2))
 
@@ -1938,6 +2099,14 @@ def _project_object_embeddings(embeddings: np.ndarray, method_pairs) -> dict:
 
     proj: dict[str, np.ndarray] = {}
     for mkey, _mlabel in method_pairs:
+        if mkey in _SUPERVISED_METHODS:
+            if labels is None:
+                continue
+            arr = _supervised_projection(embeddings, labels, mkey, n_comps)
+            if arr is None:
+                continue
+            proj[mkey] = _pad2d(arr)
+            continue
         if mkey != "pca" and n_samples < 4:
             continue
         if mkey == "pca":
@@ -1957,7 +2126,188 @@ def _project_object_embeddings(embeddings: np.ndarray, method_pairs) -> dict:
     return proj
 
 
+def _fmt_eta(sec: float) -> str:
+    sec = int(max(0, sec))
+    return f"{sec}s" if sec < 60 else f"{sec // 60}m{sec % 60:02d}s"
+
+
+def _active_object_policy() -> dict:
+    import object_eval as oe
+    return st.session_state.get("viz_object_policy", oe.DEFAULT_POLICY)
+
+
+def _render_object_policy_ui(folders: list[Path]) -> None:
+    """物件 embedding 設定:資料指紋→建議設定檔(套用需確認)+ 🔬 自動找最佳設定。"""
+    import object_eval as oe
+
+    active = _active_object_policy()
+    with st.expander(f"⚙ 物件 embedding 設定 — 目前 {oe.policy_tag(active)}"):
+        # 資料指紋 + 設定檔比對(每組資料夾只算一次,存 session)
+        ftoken = repr(sorted(str(f) for f in folders))
+        cache = st.session_state.get("_viz_fp_cache")
+        if not cache or cache.get("token") != ftoken:
+            imgs: list[Path] = []
+            for f in folders:
+                imgs += oe.list_images(f)
+            cnames = oe.classes_for(folders[0]) if folders else None
+            fp = oe.dataset_fingerprint(imgs, cnames) if imgs else None
+            prof, sim = oe.match_profile(fp) if fp else (None, 0.0)
+            cache = {"token": ftoken, "imgs": [str(p) for p in imgs],
+                     "cnames": cnames, "fp": fp, "prof": prof, "sim": sim}
+            st.session_state["_viz_fp_cache"] = cache
+        fp, prof, sim = cache["fp"], cache["prof"], cache["sim"]
+        if fp:
+            st.caption(f"資料指紋:{fp['n_objects']} 物件 / {fp['n_classes']} 類 · "
+                       f"短邊 px 中位 ≈ {round(fp['size_q'][1])}")
+        st.caption("套用設定後請重新 ▶ Run 才會生效。")
+
+        if prof and sim >= 0.6 and prof["policy"] != active:
+            st.info(f"這份資料跟設定檔『{prof['name']}』很像(相似度 {sim:.2f})。")
+            if st.button(f"套用『{prof['name']}』的設定", key="viz_apply_prof",
+                         use_container_width=True):
+                st.session_state["viz_object_policy"] = prof["policy"]
+                st.toast(f"已套用『{prof['name']}』:{oe.policy_tag(prof['policy'])}")
+                st.rerun()
+
+        if st.button("🔬 自動找最佳設定", key="viz_autotune_btn",
+                     use_container_width=True,
+                     help="對目前資料各試幾種 pad／解析度／head,依同類 kNN 純度排名。需幾分鐘。"):
+            imgs = [Path(p) for p in cache["imgs"]]
+            if not imgs:
+                st.warning("先選含 images/+labels/ 的資料夾。")
+            else:
+                with st.status("自動找最佳設定中…", expanded=True) as _s:
+                    _b = st.progress(0.0, text="量測…")
+                    import time
+                    _at0 = time.time()
+
+                    def _p(ci, n, pol, od, ot):
+                        frac = (ci + od / max(ot, 1)) / max(n, 1)
+                        el = time.time() - _at0
+                        eta = (el / frac - el) if frac > 0.02 else 0.0
+                        txt = f"[{ci + 1}/{n}] {oe.policy_tag(pol)} · 物件 {od}/{ot}"
+                        if eta > 1:
+                            txt += f" · 剩約 {_fmt_eta(eta)}"
+                        _b.progress(min(frac, 1.0), text=txt)
+
+                    rows, best, fp2 = oe.run_autotune(
+                        imgs, cache["cnames"],
+                        cache_dir=folders[0] / "object_crops" / "_autotune",
+                        progress=_p)
+                    _s.update(label="完成", state="complete", expanded=False)
+                st.session_state["viz_autotune"] = {
+                    "token": ftoken, "rows": rows, "best": best, "fp": fp2}
+                st.rerun()
+
+        at = st.session_state.get("viz_autotune")
+        if at and at.get("token") == ftoken and at.get("rows"):
+            import pandas as pd
+
+            def _pct(x):
+                return None if x is None else round(x * 100, 1)
+
+            data = []
+            for r in at["rows"]:
+                b = r["buckets"]
+                data.append({"設定": oe.policy_tag(r["policy"]),
+                             "總體%": _pct(r["macro_purity"]),
+                             "<32": _pct(b["<32"]["purity"]),
+                             "32-96": _pct(b["32-96"]["purity"]),
+                             "96-224": _pct(b["96-224"]["purity"]),
+                             ">224": _pct(b[">224"]["purity"])})
+            st.markdown("**量測結果 — macro kNN 純度 %(越高越好)**")
+            st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
+            best = at["best"]
+            st.success(f"建議設定:{oe.policy_tag(best)}")
+            if st.button("✅ 套用建議設定", key="viz_apply_best", use_container_width=True):
+                st.session_state["viz_object_policy"] = best
+                st.toast(f"已套用建議:{oe.policy_tag(best)}")
+                st.rerun()
+            nm = st.text_input("設定檔名稱", value=(folders[0].parent.name or "profile"),
+                               key="viz_prof_name")
+            if st.button("💾 存成設定檔(之後類似資料自動建議)", key="viz_save_prof",
+                         use_container_width=True):
+                oe.save_profile(nm, at["fp"], best, at["rows"][0])
+                st.session_state.pop("_viz_fp_cache", None)
+                st.toast(f"已存設定檔『{nm}』")
+                st.rerun()
+
+
+def _render_label_quality(records, raw, model, data_token) -> None:
+    """🩹 標錯偵測:每類別混淆/分離度 + 疑似標錯清單(現標→建議標)。
+    全部在 384 維算(neighbor_confusion),不受 2D/3D 投影擠壓影響。"""
+    import object_eval as oe
+
+    labels = [r.get("label", "") for r in records]
+    if len(records) < 3 or len(set(labels)) < 2:
+        st.caption("需要 ≥3 物件、≥2 類別才能分析。")
+        return
+    ckey = f"_viz_conf_{data_token[:8]}_{model}"
+    res = st.session_state.get(ckey)
+    if not res:
+        res = oe.neighbor_confusion(raw, labels, k=10)
+        st.session_state[ckey] = res
+    classes, conf = res["classes"], np.asarray(res["confusion"])
+    counts, per = res["counts"], res["per_object"]
+    C = len(classes)
+
+    tab_conf, tab_bad = st.tabs(["🔀 類別混淆 / 分離度", "🩹 疑似標錯"])
+
+    with tab_conf:
+        z = (conf * 100).round(1)
+        hm = go.Figure(go.Heatmap(
+            z=z, x=classes, y=classes, colorscale="Blues", zmin=0, zmax=100,
+            colorbar=dict(title="鄰居%"),
+            hovertemplate="標為 %{y}・鄰居是 %{x}:%{z}%<extra></extra>"))
+        hm.update_layout(height=380, margin=dict(l=10, r=10, t=34, b=10),
+                         title="每列＝該類物件的 k 近鄰類別分布(對角=分離度,離對角=混淆)",
+                         yaxis=dict(autorange="reversed"))
+        st.plotly_chart(hm, use_container_width=True, key=f"conf_hm_{model}")
+
+        order = sorted(range(C), key=lambda i: conf[i, i])
+        st.markdown("**最難分離的類別(對角越低＝越糊)**")
+        for i in order[:5]:
+            row = conf[i].copy()
+            row[i] = -1.0
+            j = int(np.argmax(row))
+            st.write(f"- **{classes[i]}** 分離度 {conf[i, i] * 100:.0f}%"
+                     f"（{int(counts[i])} 個）· 最常混 → {classes[j]} {row[j] * 100:.0f}%")
+
+        pairs = [(classes[i], classes[j], conf[i, j])
+                 for i in range(C) for j in range(C) if i != j and conf[i, j] > 0]
+        pairs.sort(key=lambda t: -t[2])
+        st.markdown("**最常混淆的方向(標為 A 的鄰居常是 B)**")
+        for a, b, v in pairs[:8]:
+            st.write(f"- {a} → {b}:{v * 100:.0f}%")
+
+    with tab_bad:
+        cand = sorted((p for p in per if p["mismatch"]),
+                      key=lambda p: p["suggested_frac"], reverse=True)
+        st.caption(f"共 {len(cand)} 個物件的鄰居多數是別類(現標→建議標),越上面越可疑。")
+        if not cand:
+            st.success("沒有明顯的疑似標錯 🎉")
+            return
+        topn = cand[:30]
+        if st.button(f"🎯 選取這 {len(topn)} 個可疑物件(再用右上『送灰帶覆核／加入清單』)",
+                     key=f"sel_bad_{model}", use_container_width=True):
+            st.session_state["viz_selection"] = {
+                "token": data_token, "indices": [p["idx"] for p in topn]}
+            st.session_state["viz_grid_limit"] = _GRID_BATCH
+            st.session_state["viz_active_image"] = None
+            st.toast(f"已選取 {len(topn)} 個可疑物件")
+            st.rerun()
+        cols = st.columns(4)
+        for _k, p in enumerate(topn):
+            with cols[_k % 4]:
+                th = _thumb_or_none(Path(records[p["idx"]]["path"]))
+                if th is not None:
+                    st.image(th, use_container_width=True)
+                st.caption(f"**{p['own']} → {p['suggested']}** "
+                           f"({p['suggested_frac'] * 100:.0f}%)")
+
+
 def _visualize_embeddings_ui() -> None:
+    _load_ui_state_once()  # restore last session's sidebar choices (before widgets)
     with st.sidebar:
         st.markdown("**① 資料**")
         mode = st.radio(
@@ -2049,21 +2399,29 @@ def _visualize_embeddings_ui() -> None:
         else:
             class_input = ""
 
+        if is_object_level and st.session_state.get("viz_folder_list"):
+            _render_object_policy_ui(
+                [Path(f) for f in st.session_state["viz_folder_list"]])
+
         st.markdown("**② 模型**")
         all_models = available_models()
         if not all_models:
             st.error("models/ 內找不到模型檔，請放入 .pth 模型後重啟。")
             return
+        _def_models = [m for m in all_models if m == "dinov2_vitb14"] or all_models
         selected_models = st.multiselect(
-            "模型", all_models, default=all_models, label_visibility="collapsed",
-            help="每個模型各算一份 embedding；chinese-clip 同時解鎖「以文搜圖」。",
+            "模型", all_models, default=_def_models, key="viz_models_sel",
+            label_visibility="collapsed",
+            help="每個模型各算一份 embedding；chinese-clip 同時解鎖「以文搜圖」。"
+                 "預設用較大的 dinov2_vitb14；要比較可再加 dinov2_vits14。",
         )
 
         st.markdown("**③ 投影方法**")
         selected_method_labels = st.multiselect(
-            "投影方法", list(_METHOD_KEY), default=list(_METHOD_KEY),
+            "投影方法", list(_METHOD_KEY), default=_DEFAULT_METHODS,
             key="viz_methods", label_visibility="collapsed",
-            help="只勾選需要的投影可大幅縮短計算時間。",
+            help="只勾選需要的投影可大幅縮短計算時間。LDA／監督UMAP 用類別標籤排版，"
+                 "讓 2D 依類別分明——僅視覺輔助，不代表真實可分性。",
         )
         if "UMAP" in selected_method_labels:
             st.toggle(
@@ -2104,6 +2462,8 @@ def _visualize_embeddings_ui() -> None:
         run = st.button("▶ Run", use_container_width=True, key="run_viz",
                         disabled=hard_missing,
                         type="secondary" if missing else "primary")
+
+        _save_ui_state()  # remember sidebar choices for the next launch
 
     if st.session_state.pop("_viz_autorun", False):
         run = True
@@ -2171,16 +2531,39 @@ def _visualize_embeddings_ui() -> None:
         # 保長寬比、自適應 pad），存好 session_state 後 rerun 進共用的散點渲染。
         if is_object_level:
             base_token = repr(sorted(str(f) for f in folders))
+            active_policy = _active_object_policy()
             obj_records = None
             o_raw: dict[str, np.ndarray] = {}
             o_proj: dict[str, dict[str, np.ndarray]] = {}
-            with st.status("計算中（物件級）…", expanded=True) as _status:
+            import time
+            _t0 = time.time()
+            _nm = max(len(selected_models), 1)
+            with st.status(f"計算中（物件級 · {active_policy['head']}）…",
+                           expanded=True) as _status:
                 _obar = st.progress(0.0, text="裁切＋特徵…")
+
+                def _mk_cb(mi, mname):
+                    # crop = 前半 (0–50%)、特徵 = 後半 (50–100%);跨模型再均分
+                    def _cb(done, total, phase):
+                        sub = done / max(total, 1)
+                        mfrac = 0.5 * sub if phase == "crop" else 0.5 + 0.5 * sub
+                        frac = (mi + mfrac) / _nm
+                        el = time.time() - _t0
+                        eta = (el / frac - el) if frac > 0.03 else 0.0
+                        lbl = "裁切" if phase == "crop" else "特徵"
+                        txt = f"[{mname}] {lbl} {done}/{total}"
+                        if eta > 1:
+                            txt += f" · 剩約 {_fmt_eta(eta)}"
+                        _obar.progress(min(frac, 1.0), text=txt)
+                    return _cb
+
                 for _mi, model_name in enumerate(selected_models):
                     orecs, oemb, _ = _crop_and_embed_objects(
-                        records, model_name, class_names, 0.12,
+                        records, model_name, class_names,
+                        active_policy.get("pad", 0.12),
                         base_token=base_token, session_key="_viz_obj",
-                        spinner=f"[{model_name}] 裁切＋特徵")
+                        spinner=f"[{model_name}] 裁切＋特徵", policy=active_policy,
+                        progress_cb=_mk_cb(_mi, model_name))
                     if not orecs:
                         st.error("此偵測資料集的 labels/ 找不到任何 bbox，無法做物件級。"
                                  "請改『整張影像』或先補標註。")
@@ -2188,7 +2571,8 @@ def _visualize_embeddings_ui() -> None:
                     if obj_records is None:
                         obj_records = orecs
                     o_raw[model_name] = oemb
-                    o_proj[model_name] = _project_object_embeddings(oemb, method_pairs)
+                    o_proj[model_name] = _project_object_embeddings(
+                        oemb, method_pairs, labels=[r["label"] for r in orecs])
                     _obar.progress((_mi + 1) / max(len(selected_models), 1),
                                    text=f"[{model_name}] 完成")
                 _status.update(label="完成", state="complete", expanded=False)
@@ -2328,6 +2712,14 @@ def _visualize_embeddings_ui() -> None:
                         perplexity = min(30, max(1, n_samples - 1))
                         arr = TSNE(n_components=n_comps, random_state=42,
                                    perplexity=perplexity).fit_transform(embeddings)
+                    elif mkey in _SUPERVISED_METHODS:
+                        arr = _supervised_projection(
+                            embeddings, [r["label"] for r in records], mkey, n_comps)
+                        if arr is None:
+                            _step += 1
+                            _bar.progress(_step / _n_steps,
+                                          text=f"[{model_name}] {mlabel} 跳過（需 ≥2 類別）")
+                            continue
                     else:
                         n_neighbors = min(15, max(2, n_samples - 1))
                         if st.session_state.get("viz_umap_ref"):
@@ -2421,10 +2813,14 @@ def _visualize_embeddings_ui() -> None:
         st.caption(f"{len(records)} {_unit} · {len(model_names)} 模型 · "
                    f"{len(unique_splits)} 個 split")
         c1, c2, c3, c4 = st.columns([2, 2, 2, 1.4])
-        selected_model = c1.selectbox("Model", model_names, key="viz_model_select")
+        _md = model_names.index("dinov2_vitb14") if "dinov2_vitb14" in model_names else 0
+        selected_model = c1.selectbox("Model", model_names, index=_md,
+                                      key="viz_model_select")
         method_labels = [lbl for lbl, key in _METHOD_KEY.items()
                          if key in embeddings_per_model[selected_model]]
-        selected_method = c2.selectbox("Method", method_labels, key="viz_method_select")
+        _xd = method_labels.index("監督UMAP") if "監督UMAP" in method_labels else 0
+        selected_method = c2.selectbox("Method", method_labels, index=_xd,
+                                       key="viz_method_select")
         selected_split = c3.selectbox("Split", ["All"] + unique_splits, key="viz_split_select")
         dim = 3 if c4.radio("維度", ["2D", "3D"], horizontal=True, key="viz_dim_radio") == "3D" else 2
 
@@ -2442,6 +2838,9 @@ def _visualize_embeddings_ui() -> None:
 
         method_key = _METHOD_KEY[selected_method]
         coords = embeddings_per_model[selected_model][method_key]
+        if method_key in _SUPERVISED_METHODS:
+            st.caption(":orange[⚠ 監督式投影：用類別標籤排版，讓 2D 依類別分明——"
+                       "僅視覺輔助/便於挑標錯；真實可分性請看『標錯偵測』的 kNN 純度。]")
 
         if selected_split == "All":
             indices = list(range(len(records)))
@@ -2457,8 +2856,11 @@ def _visualize_embeddings_ui() -> None:
 
         # scatter widget key 帶 view 資訊：舊視圖的 widget 事件不可能滲入新視圖
         # （含 color_by：切換著色模式＝乾淨重掛，避免跨模式殘留選取狀態）
+        # _clear_nonce 只在按「取消框選」時 +1 → key 改變 → 散點 widget 重新掛載、
+        # 瀏覽器端的框真正被丟掉(否則同一個 key 會把舊選取再回報回來,等於沒清掉)。
+        _clear_nonce = st.session_state.get("_viz_clear_nonce", 0)
         scatter_key = (f"viz_scatter_{data_token[:8]}_{selected_model}"
-                       f"_{method_key}_{selected_split}_{color_by}")
+                       f"_{method_key}_{selected_split}_{color_by}_{_clear_nonce}")
 
         # NOTE: the 2D interactive chart must keep a STABLE figure spec across
         # reruns — mutating it (e.g. adding a highlight trace) makes Streamlit
@@ -2486,6 +2888,14 @@ def _visualize_embeddings_ui() -> None:
                        "單點 hover 精度略降。")
         if not sel_state["indices"] and dim == 2:
             st.caption("💡 在圖上拖曳框選或套索圈點，右欄會立即顯示對應縮圖。")
+        # plotly 工具列的按鈕無法回寫伺服器端選取狀態,故以右上角小「✕」圖示鈕貼著工具列。
+        # 用 placeholder 佔位、等散點事件處理完(sel_state 定案)再填入,才不會永遠反灰。
+        _clear_slot = st.columns([11, 1])[1].empty() if dim == 2 else None
+        if dim == 2:
+            st.markdown(
+                "<style>.st-key-viz_clear_sel_plot button{min-height:0;height:34px;"
+                "padding:0 .55rem;border-radius:6px;font-size:1rem;line-height:1;}</style>",
+                unsafe_allow_html=True)
         with st.container(key="viz_scatter_wrap"):
             if dim == 2:
                 event = st.plotly_chart(
@@ -2507,13 +2917,39 @@ def _visualize_embeddings_ui() -> None:
                     st.session_state["viz_viewer_ctx"] = []
                     st.toast(f"已選取 {len(new_indices)} 個點", icon="🎯")
             else:
-                st.plotly_chart(fig, use_container_width=True, key="viz_scatter_3d")
-                if sel_state["indices"]:
-                    st.caption(f"ℹ 3D 看：黑圈為目前選取的 {len(sel_state['indices'])} 點"
-                               "（在 2D 框選、轉到 3D 看它們的空間分布）；3D 不支援框選。")
-                else:
-                    st.caption("ℹ 3D 模式不支援框選；切回 2D 框選後，轉來 3D 會高亮那批點。")
+                event = st.plotly_chart(
+                    fig, use_container_width=True,
+                    key=f"viz_scatter_3d_{_clear_nonce}",
+                    on_select="rerun", selection_mode="points")
+                _clk = []
+                if event is not None:
+                    _so = event.get("selection") if hasattr(event, "get") else None
+                    if _so:
+                        _clk = selection_points_to_indices(list(_so.get("points", [])))
+                if _clk:  # 點一下＝把該物件「加選」(連點累積、去重)；區域框選 3D 不支援
+                    merged = list(dict.fromkeys(list(sel_state["indices"]) + _clk))
+                    if merged != sel_state["indices"]:
+                        sel_state = {"token": data_token, "indices": merged}
+                        st.session_state["viz_grid_limit"] = _GRID_BATCH
+                        st.toast(f"3D 加選 {len(_clk)} 點（共 {len(merged)}）", icon="🎯")
+                st.caption("ℹ 3D：**點一下任一點＝加選該物件**（可連點累積）；黑圈＝目前選取。"
+                           "區域框選請切 2D；清空用右上『✕ 取消框選』。")
         st.session_state["viz_selection"] = sel_state
+
+        if _clear_slot is not None:  # fill now that sel_state is final → correct enabled state
+            _nsel = len(sel_state["indices"])
+            _clear_slot.button(
+                f"✕ {_nsel}" if _nsel else "✕",
+                key="viz_clear_sel_plot", use_container_width=True,
+                disabled=not _nsel, help="取消框選",
+                on_click=_clear_selection, args=(scatter_key,))
+
+        with st.expander("🩹 標錯偵測 / 類別混淆（全 384 維，不受 2D 擠壓影響）"):
+            _raw = st.session_state.get("viz_raw_embeddings", {}).get(selected_model)
+            if _raw is not None:
+                _render_label_quality(records, _raw, selected_model, data_token)
+            else:
+                st.caption("此檢視需要原始高維特徵。")
 
         # 「送灰帶覆核」與「送 Labeling」兩個出口已移到右上角選取區並排（_render_select_view）
 
@@ -3305,7 +3741,7 @@ def _is_detection_dataset(records: list[dict], probe: int = 25) -> bool:
 
 def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
                             session_key="_cov_obj", crops_subdir="object_crops",
-                            spinner="裁切物件"):
+                            spinner="裁切物件", policy=None, progress_cb=None):
     """把 records 裡每個 YOLO bbox 各自算 embedding（一個物件一個點）。
 
     embedding 取自「原圖即時裁切」的記憶體影像（不讀回 q88 JPEG，避免雙重壓縮傷
@@ -3314,8 +3750,13 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
     以 (base_token, model, pad, n) 在 session 快取；crop 檔與 npz 皆落地、第二次
     極快。回傳 (object_records, object_emb, token)；object_records 的 path＝crop 檔、
     另帶 image_path / bbox / label(類別) / class_id。"""
-    # _arv1 = crop/resize policy version → 換策略即換目錄/npz，舊的擠壓版快取自然作廢
-    seed = repr((base_token, model, round(pad, 3), len(records), "arv1"))
+    # policy = {pad, target_res, head}；換策略即換目錄/npz/seed，舊版快取自然作廢
+    policy = policy or {}
+    pad = float(policy.get("pad", pad))
+    target_res = int(policy.get("target_res", 224))
+    head = str(policy.get("head", "cls"))
+    ptag = f"pad{int(round(pad * 100))}_r{target_res}_{head}_arv2"
+    seed = repr((base_token, model, round(pad, 3), target_res, head, len(records)))
     cached = st.session_state.get(session_key)
     if cached and cached.get("seed") == seed:
         return cached["records"], cached["emb"], cached["token"]
@@ -3326,8 +3767,7 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
         empty = {"seed": seed, "records": [], "emb": np.zeros((0, 1)), "token": ""}
         st.session_state[session_key] = empty
         return [], np.zeros((0, 1)), ""
-    crops_dir = (_cov_object_root(records) / crops_subdir
-                 / f"pad{int(round(pad * 100))}_arv1")
+    crops_dir = _cov_object_root(records) / crops_subdir / ptag
     crops_dir.mkdir(parents=True, exist_ok=True)
 
     def _adaptive_pad_px(bbox, iw, ih) -> int:
@@ -3351,7 +3791,9 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
     crop_paths: list[Path] = []
     spec_by_path: dict[Path, tuple] = {}  # crop_path -> (image_path, bbox)
     with st.spinner(f"{spinner}（{len(meta)} 個物件）…"):
-        for o in meta:
+        for _i, o in enumerate(meta):
+            if progress_cb:
+                progress_cb(_i + 1, len(meta), "crop")
             ip = o["image_path"]
             out = crops_dir / f"{ip.stem}__obj{o['obj_index']}.jpg"
             if not out.exists():
@@ -3371,7 +3813,8 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
                 "bbox": o["bbox"], "obj_index": o["obj_index"],
             })
         # Embed from the in-memory crop of the FULL-RES original (never the JPEG).
-        embed_fn = load_model(model, keep_aspect=True)
+        embed_fn = load_model(model, keep_aspect=True,
+                              target_res=target_res, head=head)
 
         def _embed(crop_path):
             ip, bbox = spec_by_path[crop_path]
@@ -3381,8 +3824,53 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
             crop = crop_bbox(img, *bbox, pad_px=_adaptive_pad_px(bbox, *img.size))
             return embed_fn(crop)
 
+        # ── 增量 + 定期存檔 ──────────────────────────────────────────────
+        # 逐物件算,key = crop 檔名(穩定);已算過的直接重用,每 200 筆 atomic 存檔。
+        # → 中途當掉只需補算缺的;新增資料也只算新物件,不會整批重跑。
         cache = crops_dir / f"embeddings_{model}.npz"
-        emb = extract_embeddings(crop_paths, _embed, cache_path=cache)
+        keys = [cp.stem for cp in crop_paths]
+        cached: dict = {}
+        if cache.exists():
+            try:
+                with np.load(str(cache), allow_pickle=False) as _d:  # close handle (Windows replace)
+                    if "emb" in _d.files and "keys" in _d.files:          # new incremental format
+                        _e = _d["emb"]
+                        cached = {k: _e[i] for i, k in enumerate(_d["keys"].tolist())}
+                    elif "embeddings" in _d.files and "filenames" in _d.files:  # old format → reuse
+                        _e = _d["embeddings"]
+                        cached = {Path(fn).stem: _e[i]
+                                  for i, fn in enumerate(_d["filenames"].tolist())}
+            except (OSError, ValueError, KeyError):
+                cached = {}
+
+        def _flush_cache() -> None:
+            if not cached:
+                return
+            ks = list(cached.keys())
+            arr = np.stack([cached[k] for k in ks]).astype(np.float32)
+            tmp = cache.with_name(cache.stem + ".part.npz")  # 須以 .npz 結尾(np.savez 否則自動補)
+            np.savez(str(tmp), emb=arr, keys=np.array(ks))
+            tmp.replace(cache)  # atomic：當掉也不會留半個壞檔
+
+        total = len(keys)
+        done = sum(1 for k in keys if k in cached)
+        if progress_cb:
+            progress_cb(done, total, "embed")
+        since = 0
+        for i, k in enumerate(keys):
+            if k in cached:
+                continue
+            cached[k] = np.asarray(_embed(crop_paths[i]), dtype=np.float32)
+            done += 1
+            since += 1
+            if progress_cb:
+                progress_cb(done, total, "embed")
+            if since >= 200:
+                _flush_cache()
+                since = 0
+        if since:
+            _flush_cache()
+        emb = np.stack([cached[k] for k in keys]) if keys else np.zeros((0, 1))
     token = uuid.uuid4().hex
     st.session_state[session_key] = {
         "seed": seed, "records": obj_records, "emb": emb, "token": token}

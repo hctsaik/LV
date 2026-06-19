@@ -34,4 +34,8 @@ streamlit_log.txt
 tests/e2e/_server.log
 # 桶① gate calibration (modality-specific; written by calibrate_signal_gate.py --write)
 signal_gate.json
+# object-embedding policy profiles (dataset-specific; written by object_eval.py)
+object_policy_profiles.json
+# remembered UI selections (per-user; written by the app)
+.lv_ui_state.json
 output/curation_log.jsonl

@@ -62,6 +62,17 @@ App 執行期若讀不到某個 model,錯誤訊息也會明講**哪個功能讀�
       "size_mb": 85
     },
     {
+      "id": "dinov2_vitb14",
+      "title": "DINOv2 ViT-B/14 (768-d, 更大容量)",
+      "features": ["影像 embedding / 視覺化 / 相似搜尋（比 ViT-S 分離度更高、較慢）"],
+      "tier": "core",
+      "path": "dinov2_vitb14/dinov2_vitb14.pth",
+      "sentinel": "dinov2_vitb14/dinov2_vitb14.pth",
+      "acquire": "url",
+      "url": "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14/dinov2_vitb14_pretrain.pth",
+      "size_mb": 331
+    },
+    {
       "id": "chinese-clip-vit-base-patch16",
       "title": "Chinese-CLIP ViT-B/16",
       "features": ["以文搜圖 (F7)", "影像 embedding"],

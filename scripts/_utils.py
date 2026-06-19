@@ -46,16 +46,18 @@ def supports_text_query(model_name: str) -> bool:
 
 def load_model(
     model_name: str, models_dir: Path = _DEFAULT_MODELS_DIR,
-    keep_aspect: bool = False,
+    keep_aspect: bool = False, target_res: int = 224, head: str = "cls",
 ) -> Callable[[Path], np.ndarray]:
     """Load a model by name. Returns embed_fn(path_or_PIL) -> np.ndarray.
 
     ``keep_aspect=True`` (object-crop path) preserves aspect ratio and resizes to
     multiples of 14 instead of squashing to a square — see ImagePreprocessor.
-    The returned embed_fn accepts a path OR an in-memory PIL image."""
+    ``target_res`` sets the resize budget (longest side); ``head`` ('cls'|'meanpool')
+    picks the DINOv2 pooled output (both D=384). The returned embed_fn accepts a path
+    OR an in-memory PIL image."""
     from models import (ChineseClipExtractor, Dinov2Extractor,
                         ImagePreprocessor, ResNetExtractor)
-    preprocessor = ImagePreprocessor(keep_aspect=keep_aspect)
+    preprocessor = ImagePreprocessor(size=target_res, keep_aspect=keep_aspect)
 
     if supports_text_query(model_name):
         model_dir = models_dir / model_name
@@ -80,7 +82,8 @@ def load_model(
         if model_name.startswith("resnet"):
             extractor = ResNetExtractor(arch=model_name, pth_path=pth_path)
         elif model_name.startswith("dinov2"):
-            extractor = Dinov2Extractor(model_name=model_name, pth_path=pth_path)
+            extractor = Dinov2Extractor(model_name=model_name, pth_path=pth_path,
+                                        head=head)
         else:
             raise ValueError(
                 f"Unknown model type '{model_name}'. "
@@ -156,42 +159,69 @@ def extract_embeddings(
     if cache_keys is not None and len(cache_keys) != n_total:
         raise ValueError(
             f"cache_keys length {len(cache_keys)} != image count {n_total}")
-    if cache_path is not None and cache_path.exists():
-        data = np.load(str(cache_path), allow_pickle=False)
-        cached_rows = None
-        if cache_keys is not None:
-            cached_rows = _cache_rows_for_keys(data, cache_keys)
-        else:
-            cached_names = data["filenames"].tolist()
-            current_names = [p.name for p in image_paths]
-            if set(cached_names) == set(current_names):
-                name_to_idx = {name: i for i, name in enumerate(cached_names)}
-                cached_rows = data["embeddings"][[name_to_idx[p.name]
-                                                  for p in image_paths]]
-        if cached_rows is not None:
-            print(f"  [cache] {cache_path}")
-            if progress_cb is not None:
-                progress_cb(n_total, n_total)
-            return cached_rows
+    # per-item identity key: content key (sha256) when given, else filename
+    item_keys = ([str(k) for k in cache_keys] if cache_keys is not None
+                 else [p.name for p in image_paths])
 
-    emb_list = []
-    for i, p in enumerate(tqdm(image_paths, desc="Extracting embeddings")):
-        emb_list.append(embed_fn(p))
+    # ── load existing cache → key→row (incremental: reuse what's already done) ──
+    cached_emb: dict = {}
+    cached_name: dict = {}
+    if cache_path is not None and Path(cache_path).exists():
+        try:
+            with np.load(str(cache_path), allow_pickle=False) as data:  # close → Windows replace
+                emb_all = data["embeddings"]
+                if "keys" in data.files:
+                    ks = [str(k) for k in data["keys"].tolist()]
+                elif "filenames" in data.files:
+                    ks = [str(k) for k in data["filenames"].tolist()]
+                else:
+                    ks = []
+                fns = ([str(k) for k in data["filenames"].tolist()]
+                       if "filenames" in data.files else ks)
+                for j, k in enumerate(ks):
+                    cached_emb[k] = emb_all[j]
+                    cached_name[k] = fns[j] if j < len(fns) else k
+        except (OSError, ValueError, KeyError):
+            cached_emb, cached_name = {}, {}
+
+    if item_keys and all(k in cached_emb for k in item_keys):  # full hit
+        print(f"  [cache] {cache_path}")
         if progress_cb is not None:
-            progress_cb(i + 1, n_total)
-    embeddings = np.stack(emb_list)
+            progress_cb(n_total, n_total)
+        return np.stack([cached_emb[k] for k in item_keys])
 
-    if cache_path is not None:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        arrays = dict(
-            embeddings=embeddings,
-            filenames=np.array([p.name for p in image_paths]),
-        )
-        if cache_keys is not None:
-            arrays["keys"] = np.array(cache_keys)
-        np.savez(str(cache_path), **arrays)
-        print(f"  [cache] Saved → {cache_path}")
+    def _flush() -> None:  # checkpoint: atomic, .npz-suffixed temp (np.savez appends otherwise)
+        if cache_path is None or not cached_emb:
+            return
+        cp = Path(cache_path)
+        cp.parent.mkdir(parents=True, exist_ok=True)
+        ks = list(cached_emb.keys())
+        arr = np.stack([cached_emb[k] for k in ks])
+        fns = np.array([cached_name.get(k, k) for k in ks])
+        tmp = cp.with_name(cp.stem + ".part.npz")
+        np.savez(str(tmp), embeddings=arr, keys=np.array(ks), filenames=fns)
+        tmp.replace(cp)
 
-    return embeddings
+    # ── compute only the missing items, checkpoint every 200 ──
+    done = sum(1 for k in item_keys if k in cached_emb)
+    if progress_cb is not None:
+        progress_cb(done, n_total)
+    since = 0
+    for i, p in enumerate(image_paths):
+        k = item_keys[i]
+        if k in cached_emb:
+            continue
+        cached_emb[k] = np.asarray(embed_fn(p))
+        cached_name[k] = p.name
+        done += 1
+        since += 1
+        if progress_cb is not None:
+            progress_cb(done, n_total)
+        if since >= 200:
+            _flush()
+            since = 0
+    if since:
+        _flush()
+    return np.stack([cached_emb[k] for k in item_keys])
 
 
