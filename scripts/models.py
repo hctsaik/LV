@@ -17,17 +17,43 @@ _IMAGENET_MEAN = [0.485, 0.456, 0.406]
 _IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 
+def _resize_keep_ar_mult14(img: Image.Image, target: int, patch: int = 14) -> Image.Image:
+    """Aspect-ratio-preserving resize: longest side → ``target``, both sides
+    snapped to the nearest multiple of ``patch`` (DINOv2 requires multiples of
+    14 and interpolates its position grid for non-square inputs). Lanczos when
+    downscaling (the common case), bicubic when upscaling — avoids the aliasing
+    of a plain ``resize`` and the geometry distortion of squashing to a square."""
+    w, h = img.size
+    scale = target / max(w, h)
+    nw = max(patch, int(round(w * scale / patch)) * patch)
+    nh = max(patch, int(round(h * scale / patch)) * patch)
+    resample = Image.LANCZOS if scale < 1.0 else Image.BICUBIC
+    return img.resize((nw, nh), resample)
+
+
 class ImagePreprocessor:
-    def __init__(self, size: int = 224) -> None:
+    """Resize an image for the extractor. ``keep_aspect`` switches from the
+    default square squash (whole-image path) to aspect-ratio-preserving,
+    multiple-of-14 resizing (object-crop path) — see :func:`_resize_keep_ar_mult14`."""
+
+    def __init__(self, size: int = 224, keep_aspect: bool = False,
+                 patch: int = 14) -> None:
         self.size = size
+        self.keep_aspect = keep_aspect
+        self.patch = patch
+
+    def _resize(self, img: Image.Image) -> Image.Image:
+        if self.keep_aspect:
+            return _resize_keep_ar_mult14(img, self.size, self.patch)
+        return img.resize((self.size, self.size))
 
     def preprocess(self, image: ImageInput) -> Image.Image:
         if isinstance(image, (str, Path)):
             with Image.open(image) as img:
-                return img.convert("RGB").resize((self.size, self.size))
+                return self._resize(img.convert("RGB"))
         if not isinstance(image, Image.Image):
             raise TypeError("Image must be a PIL Image, str, or Path")
-        return image.convert("RGB").resize((self.size, self.size))
+        return self._resize(image.convert("RGB"))
 
 
 class ResNetExtractor:

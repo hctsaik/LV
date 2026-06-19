@@ -174,7 +174,68 @@ def _pick_folder_into_text(text_key: str) -> None:
         st.session_state[text_key] = "\n".join(lines)
 
 
-_VIZ_COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c", "#95a5a6"]
+def _folder_add_cb(list_key: str, input_key: str) -> None:
+    """Append a typed/pasted path to a managed folder list (on_change of the
+    small single-line add field), then clear the field."""
+    v = (st.session_state.get(input_key) or "").strip()
+    if v:
+        lst = st.session_state.setdefault(list_key, [])
+        if v not in lst:
+            lst.append(v)
+    st.session_state[input_key] = ""
+
+
+def _folder_add_input(list_key: str, *, help: str | None = None) -> None:
+    """Small single-line '輸入路徑 → Enter 加入' field — replaces the old multi-line
+    paste textarea, and is the only Playwright/headless-driveable folder input
+    (the 📁 picker is a native dialog)."""
+    st.text_input("或輸入路徑後 Enter 加入", key=f"{list_key}_add",
+                  on_change=_folder_add_cb, args=(list_key, f"{list_key}_add"),
+                  placeholder="例：demo/coco8/train", label_visibility="collapsed",
+                  help=help)
+
+
+def _folder_picker_list(list_key: str, *, add_help: str | None = None) -> list:
+    """📁 native picker + managed list (× removers) + add-input. Returns paths.
+    The unified folder-input pattern (no multi-line paste textarea)."""
+    st.session_state.setdefault(list_key, [])
+    if st.button("📁 新增資料夾", use_container_width=True, key=f"add_{list_key}"):
+        _pick_folder_append(list_key)
+        st.rerun()
+    for i, folder in enumerate(st.session_state[list_key]):
+        c1, c2 = st.columns([5, 1])
+        c1.caption(folder)
+        if c2.button("✕", key=f"rm_{list_key}_{i}"):
+            st.session_state[list_key].pop(i)
+            st.rerun()
+    if not st.session_state[list_key]:
+        st.caption(":gray[尚未選擇資料夾]")
+    _folder_add_input(list_key, help=add_help)
+    return list(st.session_state[list_key])
+
+
+# ── sidebar 執行期收合（Streamlit 1.58 無 runtime API → CSS 注入）──
+_SIDEBAR_COLLAPSE_CSS = (
+    "<style>[data-testid='stSidebar']{transform:translateX(-110%)!important;"
+    "width:0!important;min-width:0!important;visibility:hidden!important;"
+    "transition:transform .2s ease}"
+    "[data-testid='stSidebarCollapseButton']{display:none!important}</style>"
+)
+
+
+def _collapse_sidebar() -> None:
+    st.session_state["_sidebar_collapsed"] = True
+
+
+def _expand_sidebar() -> None:
+    st.session_state["_sidebar_collapsed"] = False
+
+
+# 14 perceptually distinct hues — first 7 kept stable; the rest let ≥10-class
+# datasets (e.g. detection object-level) get a unique colour per class.
+_VIZ_COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c",
+               "#95a5a6", "#e84393", "#fdcb6e", "#34495e", "#0984e3", "#6c5ce7",
+               "#badc58", "#576574"]
 _VIZ_SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
 _METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap"}
 
@@ -750,7 +811,7 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
             return
         r = records[idx]
         p = Path(r["path"])
-        class_names = st.session_state.get("viz_class_names")
+        class_names = st.session_state.get("viz_classes")
         if class_names:
             st.session_state.setdefault("viz_img_boxes", True)  # 預設顯示標註框
         show_boxes = bool(class_names) and st.session_state.get("viz_img_boxes", False)
@@ -1770,7 +1831,7 @@ def _render_right_panel(
 
 _MODE_CLEAR_KEYS = (
     "viz_records", "viz_embeddings", "viz_raw_embeddings",
-    "viz_data_token", "viz_nn_index", "viz_class_names",
+    "viz_data_token", "viz_nn_index", "viz_classes",
     "viz_selection", "viz_active_image", "viz_viewer_ctx",
     "viz_query_chain", "viz_outlier_scores", "viz_grid_limit",
     "viz_export_list", "viz_panel_view", "viz_manifest",
@@ -1865,6 +1926,37 @@ def _render_quick_start() -> None:
                use_container_width=True, on_click=_load_demo)
 
 
+def _project_object_embeddings(embeddings: np.ndarray, method_pairs) -> dict:
+    """PCA / t-SNE / UMAP projections for object-level embeddings. Plain UMAP
+    (the stable reference frame is image-level only). Mirrors the image-level
+    projection in the Run loop but kept separate so that path stays untouched."""
+    n_samples = len(embeddings)
+    n_comps = min(3, max(1, n_samples - 2))
+
+    def _pad2d(a: np.ndarray) -> np.ndarray:
+        return a if a.shape[1] >= 2 else np.hstack([a, np.zeros((len(a), 1))])
+
+    proj: dict[str, np.ndarray] = {}
+    for mkey, _mlabel in method_pairs:
+        if mkey != "pca" and n_samples < 4:
+            continue
+        if mkey == "pca":
+            arr = PCA(n_components=n_comps, random_state=42).fit_transform(embeddings)
+        elif mkey == "tsne":
+            perplexity = min(30, max(1, n_samples - 1))
+            arr = TSNE(n_components=n_comps, random_state=42,
+                       perplexity=perplexity).fit_transform(embeddings)
+        else:
+            n_neighbors = min(15, max(2, n_samples - 1))
+            arr = _umap().UMAP(n_components=n_comps, n_neighbors=n_neighbors,
+                               random_state=42).fit_transform(embeddings)
+        proj[mkey] = _pad2d(arr)
+    if not proj:
+        proj["pca"] = _pad2d(
+            PCA(n_components=n_comps, random_state=42).fit_transform(embeddings))
+    return proj
+
+
 def _visualize_embeddings_ui() -> None:
     with st.sidebar:
         st.markdown("**① 資料**")
@@ -1873,6 +1965,24 @@ def _visualize_embeddings_ui() -> None:
             key="viz_mode", horizontal=True,
             captions=["YOLO 格式（images/ + labels/）", "依類別分子資料夾"],
         )
+        # 分析單位：物件級（YOLO，預設）vs 整張影像 — 僅偵測資料集可選物件級。
+        # 兩種粒度是不同的點集（且物件級用保長寬比裁切策略），請分開 Run，勿混看。
+        if mode == "Object Detector":
+            granularity = st.radio(
+                "分析單位", ["物件級（YOLO）", "整張影像"],
+                key="viz_granularity", horizontal=True,
+                help="物件級＝讀 labels/ 每個框→裁出物件各自算 embedding（一個物件一個點，"
+                     "保長寬比裁切、不擠壓）；整張影像＝每張圖一個點。兩者分開 Run。",
+            )
+        else:
+            granularity = "整張影像"
+        is_object_level = (mode == "Object Detector"
+                           and granularity == "物件級（YOLO）")
+        # 切粒度→清舊結果，避免散點圖混到另一種粒度的點
+        if st.session_state.get("_viz_gran_prev") not in (None, granularity):
+            st.session_state.pop("viz_records", None)
+        st.session_state["_viz_gran_prev"] = granularity
+
         # 切換模式時清除舊結果（先快照，留一鍵復原）
         if st.session_state.get("_viz_mode_prev") != mode:
             prev = st.session_state.get("_viz_mode_prev")
@@ -1911,13 +2021,9 @@ def _visualize_embeddings_ui() -> None:
         if not st.session_state["viz_folder_list"]:
             st.caption("尚未選擇任何資料夾")
 
-        st.text_area(
-            "或貼上資料夾路徑（每行一個）",
-            key="viz_folder_text",
-            placeholder="例：C:\\data\\coco8\\train",
-            height=68,
-            help="與上方清單合併。Detector 模式貼含 images/ 與 labels/ 的資料夾；Classifier 模式貼含類別子資料夾的資料夾。",
-        )
+        _folder_add_input("viz_folder_list",
+                          help="或按上方「📁 新增資料夾」。Detector 貼含 images/+labels/ 的"
+                               "資料夾；Classifier 貼含類別子資料夾的資料夾。")
 
         if mode == "Object Detector":
             # 類別來源屬進階設定（預設自動偵測 classes.txt），收進 expander（G4）
@@ -1938,7 +2044,7 @@ def _visualize_embeddings_ui() -> None:
 
                 class_input = st.text_input(
                     "Class names — 手動輸入（classes.txt 未選擇時使用）",
-                    value="apple,banana,orange",
+                    value="apple,banana,orange", key="viz_class_names",
                 )
         else:
             class_input = ""
@@ -1978,8 +2084,7 @@ def _visualize_embeddings_ui() -> None:
                     st.caption(":orange[↻ 已標記：下次 Run 將重建 UMAP 參考系]")
 
         st.markdown("**④ 執行**")
-        n_folders = len(st.session_state.get("viz_folder_list", [])) + len(
-            parse_folder_paths(st.session_state.get("viz_folder_text", "")))
+        n_folders = len(st.session_state.get("viz_folder_list", []))
         missing = []
         if n_folders == 0:
             missing.append("①資料夾")
@@ -2004,9 +2109,6 @@ def _visualize_embeddings_ui() -> None:
         run = True
     if run:
         folders = [Path(f) for f in st.session_state.get("viz_folder_list", [])]
-        for p in parse_folder_paths(st.session_state.get("viz_folder_text", "")):
-            if p not in folders:
-                folders.append(p)
         if not folders:
             st.error("請先選擇至少一個資料夾。")
             return
@@ -2014,6 +2116,7 @@ def _visualize_embeddings_ui() -> None:
         if missing_dirs:
             st.error(f"資料夾不存在：{', '.join(missing_dirs)}")
             return
+        _collapse_sidebar()
 
         if not selected_models:
             st.error("Select at least one model.")
@@ -2062,6 +2165,67 @@ def _visualize_embeddings_ui() -> None:
         empty_folders = [f.name for f in folders if not any(r["split"] == f.name for r in records)]
         if empty_folders:
             st.warning(f"No images found in folder(s): {', '.join(empty_folders)}")
+
+        # ── 物件級（YOLO）路徑：每個 bbox 一個點 ──────────────────────────
+        # 與整圖路徑分流：裁切+特徵走升級後的 _crop_and_embed_objects（記憶體裁切、
+        # 保長寬比、自適應 pad），存好 session_state 後 rerun 進共用的散點渲染。
+        if is_object_level:
+            base_token = repr(sorted(str(f) for f in folders))
+            obj_records = None
+            o_raw: dict[str, np.ndarray] = {}
+            o_proj: dict[str, dict[str, np.ndarray]] = {}
+            with st.status("計算中（物件級）…", expanded=True) as _status:
+                _obar = st.progress(0.0, text="裁切＋特徵…")
+                for _mi, model_name in enumerate(selected_models):
+                    orecs, oemb, _ = _crop_and_embed_objects(
+                        records, model_name, class_names, 0.12,
+                        base_token=base_token, session_key="_viz_obj",
+                        spinner=f"[{model_name}] 裁切＋特徵")
+                    if not orecs:
+                        st.error("此偵測資料集的 labels/ 找不到任何 bbox，無法做物件級。"
+                                 "請改『整張影像』或先補標註。")
+                        return
+                    if obj_records is None:
+                        obj_records = orecs
+                    o_raw[model_name] = oemb
+                    o_proj[model_name] = _project_object_embeddings(oemb, method_pairs)
+                    _obar.progress((_mi + 1) / max(len(selected_models), 1),
+                                   text=f"[{model_name}] 完成")
+                _status.update(label="完成", state="complete", expanded=False)
+            records = obj_records
+
+            outlier_scores: dict[str, np.ndarray] = {}
+            label_disagreement: dict[str, np.ndarray] = {}
+            if len(records) >= 3:
+                k_out = min(5, len(records) - 1)
+                rec_labels = [r["label"] for r in records]
+                for m, raw in o_raw.items():
+                    outlier_scores[m] = compute_outlier_scores(
+                        raw, raw, k=k_out, candidates_in_reference=True)
+                    label_disagreement[m] = compute_label_disagreement(
+                        raw, rec_labels, k=k_out)
+
+            data_token = uuid.uuid4().hex
+            st.session_state["viz_records"] = records
+            st.session_state["viz_embeddings"] = o_proj
+            st.session_state["viz_raw_embeddings"] = o_raw
+            st.session_state["viz_manifest"] = {}            # objects: no per-image manifest
+            st.session_state["viz_phashes"] = [None] * len(records)
+            st.session_state["viz_outlier_scores"] = outlier_scores
+            st.session_state["viz_label_disagreement"] = label_disagreement
+            st.session_state.pop("viz_dup_result", None)
+            st.session_state["viz_data_token"] = data_token
+            st.session_state["viz_nn_index"] = {}
+            st.session_state["viz_classes"] = class_names
+            st.session_state["viz_selection"] = {"token": data_token, "indices": []}
+            st.session_state["viz_active_image"] = None
+            st.session_state["viz_viewer_ctx"] = []
+            st.session_state["viz_query_chain"] = []
+            st.session_state["viz_grid_limit"] = _GRID_BATCH
+            st.session_state.pop("_viz_mode_snapshot", None)
+            st.session_state["viz_unit"] = "物件"
+            st.toast(f"完成：{len(records)} 物件 × {len(selected_models)} 模型", icon="✅")
+            st.rerun()
 
         def _thumb_lookup(p: Path) -> Path | None:
             try:
@@ -2224,7 +2388,7 @@ def _visualize_embeddings_ui() -> None:
         st.session_state.pop("viz_dup_result", None)
         st.session_state["viz_data_token"] = uuid.uuid4().hex
         st.session_state["viz_nn_index"] = {}
-        st.session_state["viz_class_names"] = class_names
+        st.session_state["viz_classes"] = class_names
         st.session_state["viz_selection"] = {
             "token": st.session_state["viz_data_token"], "indices": []
         }
@@ -2234,6 +2398,7 @@ def _visualize_embeddings_ui() -> None:
         st.session_state["viz_grid_limit"] = _GRID_BATCH
         st.session_state.pop("_viz_mode_snapshot", None)
         st.session_state.pop("_viz_umap_rebuild", None)
+        st.session_state["viz_unit"] = "張影像"
         # 匯出清單以 image path 為鍵，跨 Run 仍有效 — 刻意不清
         st.toast(f"完成：{len(records)} 張影像 × {len(selected_models)} 模型", icon="✅")
 
@@ -2252,7 +2417,8 @@ def _visualize_embeddings_ui() -> None:
 
     with col_plot:
         # 常駐資料規模摘要（G6）：不靠 Run 當下的 banner/toast，rerun 後仍可見
-        st.caption(f"{len(records)} 張影像 · {len(model_names)} 模型 · "
+        _unit = st.session_state.get("viz_unit", "張影像")
+        st.caption(f"{len(records)} {_unit} · {len(model_names)} 模型 · "
                    f"{len(unique_splits)} 個 split")
         c1, c2, c3, c4 = st.columns([2, 2, 2, 1.4])
         selected_model = c1.selectbox("Model", model_names, key="viz_model_select")
@@ -2504,6 +2670,7 @@ def _compare_distributions_ui() -> None:
         if not path_b.exists():
             st.error(f"找不到 Folder B：{path_b}")
             return
+        _collapse_sidebar()
 
         paths_a, note_a = _cmp_resolve_images(path_a)
         paths_b, note_b = _cmp_resolve_images(path_b)
@@ -2893,7 +3060,7 @@ _D_STAR_PRESET = {"寬鬆": 0.45, "標準": 0.6, "嚴格": 0.75}
 
 
 def _load_cov_demo() -> None:
-    st.session_state["cov_folder_text"] = _demo_classifier_dir()
+    st.session_state["cov_folder_list"] = [_demo_classifier_dir()]
     st.session_state["_cov_autorun"] = True
     _log_usage("cov_demo_load")
 
@@ -3139,11 +3306,16 @@ def _is_detection_dataset(records: list[dict], probe: int = 25) -> bool:
 def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
                             session_key="_cov_obj", crops_subdir="object_crops",
                             spinner="裁切物件"):
-    """把 records 裡每個 YOLO bbox 裁成 crop 存檔、各自算 embedding（一個物件
-    一個點）。以 (base_token, model, pad, n) 在 session 快取；crop 檔與 npz
-    皆落地，第二次極快。回傳 (object_records, object_emb, token)；object_records
-    的 path＝crop 檔、另帶 image_path / bbox / label(類別) / class_id。"""
-    seed = repr((base_token, model, round(pad, 3), len(records)))
+    """把 records 裡每個 YOLO bbox 各自算 embedding（一個物件一個點）。
+
+    embedding 取自「原圖即時裁切」的記憶體影像（不讀回 q88 JPEG，避免雙重壓縮傷
+    小物件）並以保長寬比、multiples-of-14 的方式 resize（不擠壓）；context 邊距隨
+    物件大小自適應（clamp 到 8–64px）。crop JPEG 仍會落地，但只供 UI 縮圖用。
+    以 (base_token, model, pad, n) 在 session 快取；crop 檔與 npz 皆落地、第二次
+    極快。回傳 (object_records, object_emb, token)；object_records 的 path＝crop 檔、
+    另帶 image_path / bbox / label(類別) / class_id。"""
+    # _arv1 = crop/resize policy version → 換策略即換目錄/npz，舊的擠壓版快取自然作廢
+    seed = repr((base_token, model, round(pad, 3), len(records), "arv1"))
     cached = st.session_state.get(session_key)
     if cached and cached.get("seed") == seed:
         return cached["records"], cached["emb"], cached["token"]
@@ -3155,37 +3327,62 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
         st.session_state[session_key] = empty
         return [], np.zeros((0, 1)), ""
     crops_dir = (_cov_object_root(records) / crops_subdir
-                 / f"pad{int(round(pad * 100))}")
+                 / f"pad{int(round(pad * 100))}_arv1")
     crops_dir.mkdir(parents=True, exist_ok=True)
+
+    def _adaptive_pad_px(bbox, iw, ih) -> int:
+        long_px = max(bbox[2] * iw, bbox[3] * ih)
+        return int(min(64, max(8, round(pad * long_px))))
+
+    # 1-image source cache: meta is image-then-box order, so consecutive objects
+    # share an original — open it once.
+    _src: dict[str, object] = {"ip": None, "img": None}
+
+    def _open(ip):
+        if str(ip) != _src["ip"]:
+            try:
+                _src["img"] = Image.open(ip).convert("RGB")
+            except OSError:
+                _src["img"] = None
+            _src["ip"] = str(ip)
+        return _src["img"]
+
     obj_records: list[dict] = []
     crop_paths: list[Path] = []
-    last_ip, last_img = None, None
+    spec_by_path: dict[Path, tuple] = {}  # crop_path -> (image_path, bbox)
     with st.spinner(f"{spinner}（{len(meta)} 個物件）…"):
         for o in meta:
             ip = o["image_path"]
             out = crops_dir / f"{ip.stem}__obj{o['obj_index']}.jpg"
             if not out.exists():
-                if str(ip) != last_ip:
-                    try:
-                        last_img = Image.open(ip).convert("RGB")
-                    except OSError:
-                        last_img = None
-                    last_ip = str(ip)
-                if last_img is None:
+                img = _open(ip)
+                if img is None:
                     continue
                 try:
-                    crop_bbox(last_img, *o["bbox"], pad=pad).save(out, quality=88)
+                    pad_px = _adaptive_pad_px(o["bbox"], *img.size)
+                    crop_bbox(img, *o["bbox"], pad_px=pad_px).save(out, quality=88)
                 except (OSError, ValueError):
                     continue
             crop_paths.append(out)
+            spec_by_path[out] = (ip, o["bbox"])
             obj_records.append({
                 "path": out, "image_path": ip, "split": split_by.get(str(ip), ""),
                 "label": o["label"], "class_id": o["class_id"],
                 "bbox": o["bbox"], "obj_index": o["obj_index"],
             })
-        embed_fn = load_model(model)
+        # Embed from the in-memory crop of the FULL-RES original (never the JPEG).
+        embed_fn = load_model(model, keep_aspect=True)
+
+        def _embed(crop_path):
+            ip, bbox = spec_by_path[crop_path]
+            img = _open(ip)
+            if img is None:
+                return np.zeros(384, dtype=np.float32)
+            crop = crop_bbox(img, *bbox, pad_px=_adaptive_pad_px(bbox, *img.size))
+            return embed_fn(crop)
+
         cache = crops_dir / f"embeddings_{model}.npz"
-        emb = extract_embeddings(crop_paths, embed_fn, cache_path=cache)
+        emb = extract_embeddings(crop_paths, _embed, cache_path=cache)
     token = uuid.uuid4().hex
     st.session_state[session_key] = {
         "seed": seed, "records": obj_records, "emb": emb, "token": token}
@@ -3493,13 +3690,8 @@ def _completeness_ui() -> None:
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
-        st.button("📁 選擇資料夾", key="cov_pick", use_container_width=True,
-                  on_click=_pick_folder_into_text, args=("cov_folder_text",))
-        st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="cov_folder_text",
-                     placeholder="例：demo/imagenette/train", height=68,
-                     label_visibility="collapsed",
-                     help="結構需為 資料夾／類別／影像。或按上方「📁 選擇資料夾」、"
-                          "或主畫面的「✨ 用範例資料試跑」。")
+        _folder_picker_list("cov_folder_list",
+                            add_help="結構需為 資料夾／類別／影像。")
         all_models = available_models()
         if not all_models:
             st.error("models/ 內找不到模型檔。")
@@ -3513,15 +3705,16 @@ def _completeness_ui() -> None:
     if st.session_state.pop("_cov_autorun", False):
         run = True
     if run:
-        folders = parse_folder_paths(st.session_state.get("cov_folder_text", ""))
+        folders = [Path(f) for f in st.session_state.get("cov_folder_list", [])]
         missing = [str(p) for p in folders if not p.exists()]
         if not folders:
-            st.error("請先輸入至少一個資料夾。"); return
+            st.error("請先選擇至少一個資料夾。"); return
         if missing:
             st.error(f"資料夾不存在：{', '.join(missing)}"); return
         records = discover_images_classifier(folders)
         if not records:
             st.error("找不到影像（需 資料夾／類別／影像 結構）。"); return
+        _collapse_sidebar()
 
         embed_fn = load_model(model)
         with st.status("計算中…", expanded=True) as _status:
@@ -3732,7 +3925,7 @@ _QUIZ_DEMO_DIR = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
 
 
 def _load_quiz_demo() -> None:
-    st.session_state["quiz_folder_text"] = _demo_classifier_dir()
+    st.session_state["quiz_folder_list"] = [_demo_classifier_dir()]
     st.session_state["_quiz_autorun"] = True
     _log_usage("quiz_demo_load")
 
@@ -3830,7 +4023,7 @@ def _quiz_handoff_root() -> Path:
 # ── Unified LV → Labeling hand-over (every feature rides this) ────────────────
 def _lv_class_opts() -> list[str]:
     """Label palette for the handoff: the dataset's classes."""
-    cn = st.session_state.get("viz_class_names")
+    cn = st.session_state.get("viz_classes")
     if cn:
         return list(cn)
     recs = st.session_state.get("viz_records") or st.session_state.get("quiz_records") or []
@@ -3904,11 +4097,8 @@ def _quiz_ui() -> None:
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
-        st.button("📁 選擇資料夾", key="quiz_pick", use_container_width=True,
-                  on_click=_pick_folder_into_text, args=("quiz_folder_text",))
-        st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="quiz_folder_text",
-                     placeholder="例：demo/imagenette/train", height=68,
-                     label_visibility="collapsed")
+        _folder_picker_list("quiz_folder_list",
+                            add_help="結構需為 資料夾／類別／影像。")
         all_models = available_models()
         if not all_models:
             st.error("models/ 內找不到模型檔。"); return
@@ -3921,15 +4111,16 @@ def _quiz_ui() -> None:
     if st.session_state.pop("_quiz_autorun", False):
         run = True
     if run:
-        folders = parse_folder_paths(st.session_state.get("quiz_folder_text", ""))
+        folders = [Path(f) for f in st.session_state.get("quiz_folder_list", [])]
         missing = [str(p) for p in folders if not p.exists()]
         if not folders:
-            st.error("請先輸入資料夾。"); return
+            st.error("請先選擇資料夾。"); return
         if missing:
             st.error(f"資料夾不存在：{', '.join(missing)}"); return
         records = discover_images_classifier(folders)
         if not records or len({r["label"] for r in records}) < 2:
             st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
+        _collapse_sidebar()
         embed_fn = load_model(model)
         with st.status("計算中…", expanded=True):
             paths = [r["path"] for r in records]
@@ -4127,7 +4318,7 @@ _GRAY_DEMO_DIR = Path(__file__).parent.parent / "demo" / "imagenette" / "train"
 
 
 def _load_gray_demo() -> None:
-    st.session_state["gray_folder_text"] = _demo_classifier_dir()
+    st.session_state["gray_folder_list"] = [_demo_classifier_dir()]
     st.session_state["_gray_autorun"] = True
     _log_usage("gray_demo_load")
 
@@ -4249,11 +4440,8 @@ def _gray_zone_ui() -> None:
 
     with st.sidebar:
         st.markdown("**① 資料夾**")
-        st.button("📁 選擇資料夾", key="gray_pick", use_container_width=True,
-                  on_click=_pick_folder_into_text, args=("gray_folder_text",))
-        st.text_area("含類別子資料夾的影像資料夾（每行一個）", key="gray_folder_text",
-                     placeholder="例：demo/imagenette/train", height=68,
-                     label_visibility="collapsed")
+        _folder_picker_list("gray_folder_list",
+                            add_help="結構需為 資料夾／類別／影像。")
         all_models = available_models()
         if not all_models:
             st.error("models/ 內找不到模型檔。"); return
@@ -4267,15 +4455,16 @@ def _gray_zone_ui() -> None:
     if st.session_state.pop("_gray_autorun", False):
         run = True
     if run:
-        folders = parse_folder_paths(st.session_state.get("gray_folder_text", ""))
+        folders = [Path(f) for f in st.session_state.get("gray_folder_list", [])]
         missing = [str(p) for p in folders if not p.exists()]
         if not folders:
-            st.error("請先輸入資料夾。"); return
+            st.error("請先選擇資料夾。"); return
         if missing:
             st.error(f"資料夾不存在：{', '.join(missing)}"); return
         records = discover_images_classifier(folders)
         if not records or len({r["label"] for r in records}) < 2:
             st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
+        _collapse_sidebar()
         embed_fn = load_model(model)
         with st.status("計算中…", expanded=True):
             paths = [r["path"] for r in records]
@@ -4557,6 +4746,7 @@ def _evaluation_ui() -> None:
         gt_by_image = _eval_gt_by_image(folder, names)
         if not gt_by_image:
             st.error("labels/ 裡找不到任何 GT 框。"); return
+        _collapse_sidebar()
         with tempfile.NamedTemporaryFile("wb", suffix=".csv", delete=False) as tf:
             tf.write(pred_file.getvalue()); pred_path = Path(tf.name)
         pred_by_image = load_predictions_csv(pred_path)
@@ -4668,6 +4858,7 @@ def main() -> None:
             "Tool", ["Visualize Embeddings", "Compare Distributions",
                      "完整度熱力圖", "組考卷", "灰帶覆核", "評估"],
             key="tool_switch", label_visibility="collapsed",
+            on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
     with help_col, st.popover("✨ 功能地圖", use_container_width=True):
         st.markdown(
@@ -4716,6 +4907,11 @@ def main() -> None:
     # 單向交棒：送出後顯示確認並自動切到 Labeling（不在 LV 端追蹤待標／讀回）
     _render_send_confirmation()
 
+    # 執行後左側設定列收起；點工具分頁(on_change)會展開，這顆是同分頁時的逃生口。
+    # 收合 flag 是在本輪 dispatch（Run）時才設好，所以這裡只佔位、dispatch 後再填入，
+    # 否則逃生鈕會慢一輪才出現（Run 當下沒鈕可按 → 收合後無法重開）。
+    reopen_slot = st.empty()
+
     if tool == "Visualize Embeddings":
         _visualize_embeddings_ui()
     elif tool == "Compare Distributions":
@@ -4728,6 +4924,12 @@ def main() -> None:
         _gray_zone_ui()
     else:
         _evaluation_ui()
+
+    # 收合 CSS 與逃生鈕都放在 dispatch 之後：本輪 Run 區塊已設好 flag，這裡即本輪生效
+    if st.session_state.get("_sidebar_collapsed"):
+        reopen_slot.button("☰ 顯示左側設定列", key="reopen_sidebar",
+                           on_click=_expand_sidebar)
+        st.markdown(_SIDEBAR_COLLAPSE_CSS, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

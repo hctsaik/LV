@@ -45,12 +45,17 @@ def supports_text_query(model_name: str) -> bool:
 
 
 def load_model(
-    model_name: str, models_dir: Path = _DEFAULT_MODELS_DIR
+    model_name: str, models_dir: Path = _DEFAULT_MODELS_DIR,
+    keep_aspect: bool = False,
 ) -> Callable[[Path], np.ndarray]:
-    """Load a model by name. Returns embed_fn(path) -> np.ndarray."""
+    """Load a model by name. Returns embed_fn(path_or_PIL) -> np.ndarray.
+
+    ``keep_aspect=True`` (object-crop path) preserves aspect ratio and resizes to
+    multiples of 14 instead of squashing to a square — see ImagePreprocessor.
+    The returned embed_fn accepts a path OR an in-memory PIL image."""
     from models import (ChineseClipExtractor, Dinov2Extractor,
                         ImagePreprocessor, ResNetExtractor)
-    preprocessor = ImagePreprocessor()
+    preprocessor = ImagePreprocessor(keep_aspect=keep_aspect)
 
     if supports_text_query(model_name):
         model_dir = models_dir / model_name

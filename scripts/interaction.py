@@ -1090,11 +1090,18 @@ def parse_yolo_boxes(
 def bbox_to_pixels(
     cx: float, cy: float, w: float, h: float,
     img_w: int, img_h: int, pad: float = 0.0,
+    pad_px: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Normalized YOLO bbox → integer pixel box ``(x0, y0, x1, y1)``, grown by
-    ``pad`` (fraction of each side) for context and clamped to the image. The
-    returned box always has positive area (≥1px) even for degenerate input."""
-    gw, gh = w * (1.0 + 2.0 * pad), h * (1.0 + 2.0 * pad)
+    """Normalized YOLO bbox → integer pixel box ``(x0, y0, x1, y1)``, grown for
+    context and clamped to the image. Context is ``pad_px`` absolute pixels per
+    side when given (size-adaptive callers), else ``pad`` as a fraction of each
+    side. The returned box always has positive area (≥1px) even for degenerate
+    input."""
+    if pad_px is not None:
+        gw = w + 2.0 * pad_px / img_w
+        gh = h + 2.0 * pad_px / img_h
+    else:
+        gw, gh = w * (1.0 + 2.0 * pad), h * (1.0 + 2.0 * pad)
     x0 = max(0, int(round((cx - gw / 2.0) * img_w)))
     y0 = max(0, int(round((cy - gh / 2.0) * img_h)))
     x1 = min(img_w, int(round((cx + gw / 2.0) * img_w)))
@@ -1108,10 +1115,12 @@ def bbox_to_pixels(
 
 def crop_bbox(
     img: Image.Image, cx: float, cy: float, w: float, h: float, pad: float = 0.0,
+    pad_px: int | None = None,
 ) -> Image.Image:
-    """Crop a normalized YOLO bbox out of a PIL image (padded, clamped)."""
+    """Crop a normalized YOLO bbox out of a PIL image (padded, clamped).
+    ``pad_px`` (absolute pixels/side) overrides ``pad`` (fraction) when given."""
     iw, ih = img.size
-    box = bbox_to_pixels(cx, cy, w, h, iw, ih, pad=pad)
+    box = bbox_to_pixels(cx, cy, w, h, iw, ih, pad=pad, pad_px=pad_px)
     return img.crop(box)
 
 
