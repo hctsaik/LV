@@ -39,3 +39,6 @@ object_policy_profiles.json
 # remembered UI selections (per-user; written by the app)
 .lv_ui_state.json
 output/curation_log.jsonl
+
+# throwaway prototypes
+scratch/
