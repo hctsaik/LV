@@ -4116,6 +4116,77 @@ def _is_detection_dataset(records: list[dict], probe: int = 25) -> bool:
                for r in records[:probe])
 
 
+def _cov_class_src(records: list[dict]) -> Path | None:
+    """classes.txt 實際命中的檔案路徑（摘要卡顯示「類別來源」用）。"""
+    root = _cov_object_root(records)
+    for folder in (root, root.parent):
+        if read_classes_txt(folder):
+            return folder.parent / "classes.txt"
+    return None
+
+
+def _cov_goto_reference() -> None:
+    """縫合『缺口→補』：一鍵切到 嵌入覆蓋圖・覆蓋散點＋參照分佈，待使用者載入候選。"""
+    st.session_state["cov_view_mode"] = "嵌入覆蓋圖"
+    st.session_state["cov_emb_submode"] = "覆蓋散點"
+    st.session_state["cov_b_role"] = "參照分佈"
+    st.toast("已切到『參照分佈』：請在右側載入候選資料夾（如 test）來量缺口", icon="🧭")
+
+
+def _cov_summary_card(records: list[dict]) -> None:
+    """資料集摘要卡——進完整度即見：張數／物件數／每類分佈／不均衡／整類缺失／類別來源。
+    整類缺失是自指稀疏度的盲區，這裡直接點名並縫到『參照分佈』去量／補。"""
+    import collections
+    n_img = len(records)
+    class_names = _cov_class_names(records)
+    with st.container(border=True):
+        if _is_detection_dataset(records) and class_names:
+            cnt: collections.Counter = collections.Counter()
+            for r in records:
+                lp = yolo_label_path_for(Path(r["path"]))
+                if not lp.exists():
+                    continue
+                for ln in lp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    ps = ln.split()
+                    if ps:
+                        try:
+                            cnt[int(float(ps[0]))] += 1
+                        except ValueError:
+                            pass
+            present = {i for i in cnt if cnt[i] > 0}
+            missing = [class_names[i] for i in range(len(class_names))
+                       if i not in present]
+            pc = [cnt[i] for i in present]
+            imbal = (max(pc) / max(min(pc), 1)) if pc else 0
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("影像", n_img)
+            c2.metric("物件", sum(cnt.values()))
+            c3.metric("類別 出現/全集", f"{len(present)}/{len(class_names)}")
+            c4.metric("最不均衡", f"{imbal:.0f}:1" if pc else "—")
+            if missing:
+                st.warning(
+                    f"⚠ **整類缺失**：classes.txt 有 {len(class_names)} 類，"
+                    f"本資料集 0 個的有 **{'、'.join(missing)}**。"
+                    "自指稀疏度看不到這種洞——要量／補它，需用候選資料夾＋『參照分佈』。")
+                st.button("➜ 用候選資料夾量這些缺口（切到參照分佈）",
+                          key="cov_sum_goto_ref", on_click=_cov_goto_reference)
+            with st.expander(f"每類物件數（出現 {len(present)} / 全集 {len(class_names)}）"):
+                ser = {class_names[i]: int(cnt.get(i, 0))
+                       for i in range(len(class_names))}
+                st.bar_chart(pd.Series(ser, name="物件數"))
+        else:
+            labs = collections.Counter(r.get("label", "") for r in records)
+            c1, c2 = st.columns(2)
+            c1.metric("影像", n_img)
+            c2.metric("類別", len(labs))
+            with st.expander(f"每類影像數（{len(labs)} 類）"):
+                st.bar_chart(pd.Series(dict(labs), name="影像數"))
+        src = _cov_class_src(records)
+        st.caption(
+            f"類別來源：`{src}`" if src else
+            "類別來源：未找到 classes.txt（類別以編號顯示）；可在側欄手動指定。")
+
+
 def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
                             session_key="_cov_obj", crops_subdir="object_crops",
                             spinner="裁切物件", policy=None, progress_cb=None):
@@ -5140,6 +5211,8 @@ def _completeness_ui() -> None:
 
     records = st.session_state["cov_records"]
     emb = st.session_state["cov_emb"]
+
+    _cov_summary_card(records)   # 進門即見的資料集摘要卡（含整類缺失→補洞縫合）
 
     if cov_view == "嵌入覆蓋圖":
         if cov_sub == "逐類別・區塊補洞":

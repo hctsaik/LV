@@ -21,6 +21,7 @@ Mirrors the calibration pattern in signal_strength.py / calibrate_signal_gate.py
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -37,6 +38,15 @@ _REPO = Path(__file__).resolve().parent.parent
 PROFILES_PATH = Path(
     os.environ.get("LV_OBJECT_PROFILES_CONFIG") or (_REPO / "object_policy_profiles.json")
 )
+
+
+def dataset_cache_dir(folder, kind: str) -> Path:
+    """App 端快取目錄（與 app.py._dataset_cache_dir 同雜湊規則 → CLI 與 app 共用）。
+    **絕不寫進使用者資料集**：可用 LV_CACHE_DIR 覆寫，預設 <repo>/.lv_cache/。"""
+    folder = Path(folder).resolve()
+    key = hashlib.sha1(str(folder).encode("utf-8")).hexdigest()[:10]
+    root = Path(os.environ.get("LV_CACHE_DIR") or (_REPO / ".lv_cache"))
+    return root / f"{folder.name}_{key}" / kind
 
 # short-side source pixels → bucket name (the regime where policy choice matters most)
 SIZE_BUCKETS = [(0, 32, "<32"), (32, 96, "32-96"), (96, 224, "96-224"), (224, 1 << 30, ">224")]
@@ -399,7 +409,7 @@ def main(argv=None) -> int:
     if args.match:
         return 0
 
-    cache_dir = root / "object_crops" / "_autotune"
+    cache_dir = dataset_cache_dir(root, "object_crops") / "_autotune"  # 不寫使用者資料集
     print(f"\nrunning autotune ({len(DEFAULT_CANDIDATES)} policies, cap {args.cap})…")
 
     def _prog(ci, n, pol, od, ot):
