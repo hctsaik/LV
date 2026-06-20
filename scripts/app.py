@@ -806,6 +806,16 @@ def _clear_selection(scatter_key: str) -> None:
     st.session_state["_viz_clear_nonce"] = st.session_state.get("_viz_clear_nonce", 0) + 1
     st.session_state["viz_active_image"] = None
     st.session_state["viz_viewer_ctx"] = []
+
+
+def _cov_clear_selection(scatter_key: str) -> None:
+    """完整度熱力圖的『取消框選』——對齊 Visualize 的 _clear_selection：
+    清空選取、丟掉 plotly widget 的舊事件、bump nonce 讓散點重新掛載
+    （否則同一個 key 會把舊框選再回報回來，按了等於沒清）。"""
+    cs = st.session_state.get("cov_sel") or {}
+    st.session_state["cov_sel"] = {"token": cs.get("token", ""), "indices": [], "cand": []}
+    st.session_state.pop(scatter_key, None)
+    st.session_state["_cov_clear_nonce"] = st.session_state.get("_cov_clear_nonce", 0) + 1
     st.session_state["viz_grid_limit"] = _GRID_BATCH
 
 
@@ -3609,12 +3619,22 @@ def _render_compare_by_class() -> None:
         for j, i in enumerate(ids[:60]):
             cols[j % 6].image(str(recs[i]["path"]), use_container_width=True)
 
+    # 左右各包一個外框，框色＝散點上該資料集的點色（A 藍／B 紅），框上標資料集名，
+    # 讓「左＝A、右＝B」一眼分群（先前兩欄無邊界，縮圖牆糊成一片）。
+    _CA, _CB = "#3498db", "#e74c3c"
+    st.markdown(
+        "<style>"
+        f".st-key-cmpc_grp_a{{border:2px solid {_CA};border-radius:8px;padding:6px 12px 10px;}}"
+        f".st-key-cmpc_grp_b{{border:2px solid {_CB};border-radius:8px;padding:6px 12px 10px;}}"
+        "</style>",
+        unsafe_allow_html=True)
+
     g1, g2 = st.columns(2)
-    with g1:
-        st.markdown(f"**{name_a}・{pick}**")
+    with g1, st.container(key="cmpc_grp_a"):
+        st.markdown(f"<b style='color:{_CA}'>{name_a}</b> ・ {pick}", unsafe_allow_html=True)
         _grid(oa, sa if sa else ia[:12])
-    with g2:
-        st.markdown(f"**{name_b}・{pick}**")
+    with g2, st.container(key="cmpc_grp_b"):
+        st.markdown(f"<b style='color:{_CB}'>{name_b}</b> ・ {pick}", unsafe_allow_html=True)
         _grid(ob, sb if sb else ib[:12])
 
 
@@ -4498,9 +4518,17 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
         if cov_sel.get("token") != active_token:
             cov_sel = {"token": active_token, "indices": [], "cand": []}
         cov_sel.setdefault("cand", [])
+
+        # 取消框選貼在散點正上方（對齊 Visualize／Compare）；用 placeholder 佔位，
+        # 等框選事件處理完、選取定案再填入 → 鈕上顯示正確張數＆啟用狀態。
+        _cov_cn = st.session_state.get("_cov_clear_nonce", 0)
+        _tb1, _tb2 = st.columns([5, 1])
+        _tb1.caption("💡 在散點上拖曳框選／套索／點一群點 → 下方看縮圖＋標籤。")
+        _clear_slot = _tb2.empty()
+
         if dim == 2:
             event = st.plotly_chart(
-                fig, use_container_width=True, key="cov_emb_scatter",
+                fig, use_container_width=True, key=f"cov_emb_scatter_{_cov_cn}",
                 on_select="rerun", selection_mode=("points", "box", "lasso"))
             sel_pts: list[dict] = []
             if event is not None:
@@ -4510,32 +4538,35 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
             _all = selection_points_to_indices(sel_pts)
             picked = [c for c in _all if c < _CMPC_BOFF]                       # 主資料
             picked_cand = sorted({c - _CMPC_BOFF for c in _all if c >= _CMPC_BOFF})  # 候選
-            if (picked, picked_cand) != (cov_sel.get("indices"), cov_sel.get("cand")):
+            # 單向資料流（對齊 Visualize）：只有「非空」框選事件能改寫選取；
+            # 清空一律走上方 ✕ 取消框選（空事件不得把既有選取洗掉）。
+            if (picked or picked_cand) and (picked, picked_cand) != (
+                    cov_sel.get("indices"), cov_sel.get("cand")):
                 cov_sel = {"token": active_token, "indices": picked, "cand": picked_cand}
                 _nt = len(picked) + len(picked_cand)
-                if _nt:
-                    st.toast(f"已框選 {_nt}（主 {len(picked)}／候選 {len(picked_cand)}）",
-                             icon="🖼")
+                st.toast(f"已框選 {_nt}（主 {len(picked)}／候選 {len(picked_cand)}）",
+                         icon="🖼")
         else:
             st.plotly_chart(fig, use_container_width=True, key="cov_emb_scatter_3d")
             st.caption(":orange[ℹ 3D 不支援框選；要拖框選一群看縮圖請切回 2D。]")
         st.session_state["cov_sel"] = cov_sel
         sel_idx = cov_sel["indices"]
         sel_cand = cov_sel.get("cand", [])
+        # 選取定案 → 填入上方佔位的「取消框選」鈕（顯示正確張數＆啟用狀態）。
+        _nsel = len(sel_idx) + len(sel_cand)
+        _clear_slot.button(
+            f"✕ 取消框選（{_nsel}）" if _nsel else "✕ 取消框選",
+            key="cov_sel_clear", use_container_width=True, disabled=not _nsel,
+            on_click=_cov_clear_selection, args=(f"cov_emb_scatter_{_cov_cn}",))
         st.caption(":gray[ℹ 2-D/3-D 佈局僅供定位、非密度量尺；換投影法或載入候選"
-                   "位置會變，但稀疏度數字不變（一律高維算）。"
-                   "在 2D 圖上拖曳框選／套索／點一群點 → 下方看縮圖＋標籤。]")
+                   "位置會變，但稀疏度數字不變（一律高維算）。]")
 
         # ── 看影像：左＝主資料、右＝候選資料夾（並排對照）──
         noun = "物件" if is_obj else "影像"
-        ghc = st.columns([3, 1, 1])
-        ghc[0].button("✕ 取消框選", key="cov_sel_clear", use_container_width=True,
-                      disabled=not (sel_idx or sel_cand),
-                      on_click=lambda: st.session_state.update(
-                          cov_sel={"token": "", "indices": [], "cand": []}))
-        gal_n = int(ghc[1].number_input("張數", 3, 60, 12, key="cov_gal_n",
+        ghc = st.columns([1, 1, 4])
+        gal_n = int(ghc[0].number_input("張數", 3, 60, 12, key="cov_gal_n",
                                         label_visibility="collapsed"))
-        full_ctx = is_obj and ghc[2].checkbox(
+        full_ctx = is_obj and ghc[1].checkbox(
             "原圖(含框)", key="cov_gal_fullimg",
             help="縮圖改顯示物件在整張圖的位置脈絡（紅框為該圖所有標註）。")
         _cmap = _viz_color_map(records)   # 類別→色，與散點同一套
