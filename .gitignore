@@ -46,3 +46,9 @@ output/curation_log.jsonl
 
 # throwaway prototypes
 scratch/
+
+# e2e debug run logs (ad-hoc harness/migration runs; regenerated)
+tests/e2e/_*.log
+
+# understand-anything tool cache
+.understand-anything/
