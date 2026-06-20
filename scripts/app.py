@@ -429,6 +429,17 @@ def read_classes_txt(folder: Path) -> list[str] | None:
     return lines if lines else None
 
 
+def _classes_txt_nested(folder: Path) -> list[str] | None:
+    """容忍巢狀佈局的 classes.txt 解析（如 …/[Small]/test → indoor/classes.txt）：
+    依序探 folder.parent/、folder/、folder.parent.parent/ 的 classes.txt。
+    全 app 的「資料夾→類別名」統一走這裡，避免各工具解析深度不一致。"""
+    for f in (folder, folder / "_", folder.parent):
+        names = read_classes_txt(f)
+        if names:
+            return names
+    return None
+
+
 
 _DISAGREE_SCALE = [[0.0, "#cfd8dc"], [0.5, "#ff9800"], [1.0, "#d32f2f"]]
 
@@ -2620,7 +2631,7 @@ def _visualize_embeddings_ui() -> None:
                 class_names = lines
                 st.success(f"使用選定的 classes.txt（{len(class_names)} 個類別）：{_fmt_classes(class_names)}")
             else:
-                detected = read_classes_txt(folders[0])
+                detected = _classes_txt_nested(folders[0])
                 if detected is not None:
                     class_names = detected
                     st.success(f"Auto-detected {len(class_names)} classes: {_fmt_classes(class_names)}")
@@ -3338,10 +3349,19 @@ def _compute_compare_by_class(paths_a, paths_b, name_a, name_b, model) -> bool:
         return False
     la = [r.get("label", "") for r in oa]
     lb = [r.get("label", "") for r in ob]
+    import collections as _co
+    _ca, _cb = _co.Counter(la), _co.Counter(lb)
+    # 整類差異：一邊有、另一邊完全沒有（逐類別交集漂移表看不到的最大差異，如 couch）
+    a_only = {c: _ca[c] for c in sorted(set(la) - set(lb))}
+    b_only = {c: _cb[c] for c in sorted(set(lb) - set(la))}
     classes = sorted(set(la) & set(lb))
     if not classes:
+        _extra = ""
+        if a_only or b_only:
+            _extra = (f"（只在 A：{'、'.join(a_only) or '—'}；"
+                      f"只在 B：{'、'.join(b_only) or '—'}）")
         st.error("A 與 B 沒有共同的 YOLO 類別,無法逐類別比較"
-                 "（兩邊 classes.txt 的類別名需一致）。")
+                 "（兩邊 classes.txt 的類別名需一致）。" + _extra)
         return False
     rows = []
     for c in classes:
@@ -3357,6 +3377,7 @@ def _compute_compare_by_class(paths_a, paths_b, name_a, name_b, model) -> bool:
     st.session_state.update({
         "cmpc_oa": oa, "cmpc_ea": ea, "cmpc_ob": ob, "cmpc_eb": eb,
         "cmpc_la": la, "cmpc_lb": lb, "cmpc_rows": rows,
+        "cmpc_aonly": a_only, "cmpc_bonly": b_only,
         "cmpc_names": (name_a, name_b), "cmpc_model": model,
         "cmpc_token": uuid.uuid4().hex, "cmp_result_kind": "byclass",
     })
@@ -3379,6 +3400,17 @@ def _render_compare_by_class() -> None:
                    "這類物件在兩份資料間長得越不一樣。")
     if not rows:
         st.warning("沒有可比較的共同類別。"); return
+    # 整類差異（一邊有、另一邊完全沒有）——逐類別交集漂移表結構上看不到，這裡補上
+    _aonly = st.session_state.get("cmpc_aonly") or {}
+    _bonly = st.session_state.get("cmpc_bonly") or {}
+    if _aonly or _bonly:
+        _seg = []
+        if _aonly:
+            _seg.append(f"**只在 {name_a}**：" + "、".join(f"{c}({n})" for c, n in _aonly.items()))
+        if _bonly:
+            _seg.append(f"**只在 {name_b}**：" + "、".join(f"{c}({n})" for c, n in _bonly.items()))
+        st.warning("⚠ 整類差異（一邊有、另一邊完全沒有——這是最大的分佈差異，"
+                   "但逐類別漂移表只比共同類、結構上看不到）：　" + "　｜　".join(_seg))
     _maxd = max(0.05, max(r["漂移↓"] for r in rows))
     st.dataframe(
         pd.DataFrame(rows), use_container_width=True, hide_index=True,
@@ -6193,7 +6225,7 @@ def _load_eval_demo() -> None:
     gray-band exclusion) is visible without any uploads."""
     from evaluation import consensus_flags, evaluate_detections
     folder = Path(_demo_detection_dir())
-    names = read_classes_txt(folder) or read_classes_txt(folder / "_") or []
+    names = _classes_txt_nested(folder) or []
     gt = _eval_gt_by_image(folder, names)
     if not gt:
         return
@@ -6264,7 +6296,9 @@ def _evaluation_ui() -> None:
             st.error("資料夾需含 images/（與 labels/）。"); return
         if pred_file is None:
             st.error("請上傳模型預測 CSV。"); return
-        names = read_classes_txt(folder) or read_classes_txt(folder / "_") or []
+        # 巢狀佈局也找得到 classes.txt（…/[Small]/test → indoor/classes.txt），否則
+        # names=[] → GT 類別退化成 id，class-aware 比對假性全漏(recall=0)
+        names = _classes_txt_nested(folder) or []
         gt_by_image = _eval_gt_by_image(folder, names)
         if not gt_by_image:
             st.error("labels/ 裡找不到任何 GT 框。"); return
