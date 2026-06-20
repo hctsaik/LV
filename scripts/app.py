@@ -4126,11 +4126,14 @@ def _cov_class_src(records: list[dict]) -> Path | None:
 
 
 def _cov_goto_reference() -> None:
-    """縫合『缺口→補』：一鍵切到 嵌入覆蓋圖・覆蓋散點＋參照分佈，待使用者載入候選。"""
+    """縫合『缺口→補』：一鍵切到 嵌入覆蓋圖・覆蓋散點＋物件級＋參照分佈，待使用者載入候選。
+    整類缺失補洞要在物件級才精準（候選帶 label、可按類聚合）。"""
     st.session_state["cov_view_mode"] = "嵌入覆蓋圖"
     st.session_state["cov_emb_submode"] = "覆蓋散點"
+    st.session_state["cov_granularity"] = "物件級（YOLO）"
     st.session_state["cov_b_role"] = "參照分佈"
-    st.toast("已切到『參照分佈』：請在右側載入候選資料夾（如 test）來量缺口", icon="🧭")
+    st.toast("已切到『物件級・參照分佈』：請在右側載入候選資料夾（如 test）來量／補缺口",
+             icon="🧭")
 
 
 def _cov_summary_card(records: list[dict]) -> None:
@@ -4639,6 +4642,46 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                        help="B 有、你半徑內沒覆蓋到的點＝你相對外部參照缺的區域。")
             st.caption(":gray[參照模式：B 當外部真值，量你相對 B 缺哪裡（補上"
                        "『稀疏＝自我參照、未校正真實分佈』的洞）。]")
+            if recall < 0.5:
+                st.warning(f"⚠ 你只覆蓋參照 B 的 {recall * 100:.0f}%——代表性嚴重不足，"
+                           "據此算的覆蓋率／跨版本比較不可信（你的資料可能太小或偏）。")
+            # ── 按候選類別聚合 uncovered → 類級補洞（物件級才有 label；R2 最後一哩）──
+            if is_obj and _cov_cls is None and cand_records and uncovered:
+                import collections
+                _main_cnt = collections.Counter(labels)
+                _cand_cnt = collections.Counter(
+                    r.get("label", "") for r in cand_records)
+                _unc_cnt = collections.Counter(
+                    cand_records[i].get("label", "") for i in uncovered)
+
+                def _gap_state(c: str) -> str:
+                    if _main_cnt.get(c, 0) == 0:
+                        return "🔴 整類缺失"
+                    frac = _unc_cnt.get(c, 0) / max(_cand_cnt.get(c, 1), 1)
+                    return "🟧 覆蓋稀疏" if frac > 0.6 else "🟩 尚可"
+                _rows = [{"類別": c, "valid 有": _main_cnt.get(c, 0),
+                          "B 總數": _cand_cnt[c], "未覆蓋": _unc_cnt.get(c, 0),
+                          "狀態": _gap_state(c)}
+                         for c in sorted(_cand_cnt, key=lambda c: (
+                             _main_cnt.get(c, 0) != 0, -_unc_cnt.get(c, 0)))]
+                st.markdown("**🎯 按類別補缺口（建議入口：把散亂候選收斂成「補哪一類」）**")
+                st.caption("🔴 整類缺失＝你完全沒有（自指稀疏看不到、只有參照量得到）；"
+                           "🟧 覆蓋稀疏＝有此類但 B 多數實例你沒覆蓋；🟩 尚可。")
+                st.dataframe(pd.DataFrame(_rows), hide_index=True,
+                             use_container_width=True)
+                _gap_cls = [r["類別"] for r in _rows if r["未覆蓋"] > 0]
+                if _gap_cls:
+                    _g1, _g2 = st.columns([2, 1])
+                    _pc = _g1.selectbox("選一類補（撈 B 的該類『未覆蓋』物件）",
+                                        _gap_cls, key="cov_ref_gap_cls")
+                    _cls_unc = [i for i in uncovered
+                                if cand_records[i].get("label", "") == _pc]
+                    _g2.button(f"🛒 加 {len(_cls_unc)} 個「{_pc}」入購物車",
+                               key="cov_ref_gap_cart", use_container_width=True,
+                               on_click=_batch_add,
+                               args=(cand_records, _cls_unc, "reference_class",
+                                     {i: float(d_b2a[i]) for i in _cls_unc}))
+                st.divider()
             work_idx = uncovered
             work_score = {i: float(d_b2a[i]) for i in uncovered}
             head, csv_name, send_key, cart_src = (
@@ -4876,6 +4919,13 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
 
     # ── 逐類別表（物件數／盲區塊數／最稀疏）──
     classes = sorted(set(olabels))
+    # R2-4：整類缺失（classes.txt 有、本資料集 0 個）→ 本模式按「現有類」分塊碰不到 → 指去參照
+    if class_names:
+        _absent = [c for c in class_names if c not in set(olabels)]
+        if _absent:
+            st.info(f"ℹ️ classes.txt 有、但本資料集 **0 個** 的類：**{'、'.join(_absent)}**。"
+                    "本模式按你『現有的類』分塊，補不到它們——整類缺失請到"
+                    "『覆蓋散點・參照分佈』補（摘要卡的「➜ 量缺口」按鈕會帶你過去）。")
     _trk = f"{main_token}|{int(_spk)}"   # 逐類別表快取(框選 rerun 不重算)
     _tc = st.session_state.get("_objcov_table")
     if _tc and _tc.get("key") == _trk:
