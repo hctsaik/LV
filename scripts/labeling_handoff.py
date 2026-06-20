@@ -206,10 +206,21 @@ def send_to_labeling(
     if not items:
         return None
 
-    # idempotency: an open handoff with the same source + content set → reuse it
+    # idempotency: reuse an open handoff only when BOTH the content set AND the
+    # spec (task/class/instructions/labels/payload) match — 同批圖但改了規格時
+    # 不可靜默重用舊資料夾、丟棄新 spec (B1)
     set_hash = _item_set_hash(items)
+    import hashlib as _hl
+    spec_sig = json.dumps({
+        "task": task, "class_options": list(class_options),
+        "instructions": instructions, "payload": payload or {},
+        "labels": [[it["item_id"], it.get("original_label"), it.get("golden_label"),
+                    it.get("candidate_labels")] for it in items],
+    }, ensure_ascii=False, sort_keys=True)
+    spec_hash = _hl.sha256(spec_sig.encode("utf-8")).hexdigest()[:16]
     for row in list_pending(log_dir):
         if (row.get("source") == source and row.get("set_hash") == set_hash
+                and row.get("spec_hash") == spec_hash
                 and row.get("status") != STATUS_READ and Path(row.get("dir", "")).exists()):
             return Path(row["dir"])
 
@@ -255,7 +266,7 @@ def send_to_labeling(
     update_pending(hid, log_dir=log_dir, source=source, task=task,
                    dir=str(out), images_dir=str(img_dir),
                    created_at=spec["created_at"], status=STATUS_SENT,
-                   n_total=len(items), set_hash=set_hash)
+                   n_total=len(items), set_hash=set_hash, spec_hash=spec_hash)
     return out
 
 

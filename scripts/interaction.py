@@ -638,16 +638,22 @@ def find_duplicate_pairs_phash(
     if len(idx) < 2:
         return []
     vals = np.array([np.uint64(int(phashes[i], 16)) for i in idx], dtype=np.uint64)
-    pairs: list[tuple[int, int, int]] = []
+    # 邊收邊用「大小受限的堆」只保留 max_pairs 個最近的對 → O(max_pairs) 記憶體；
+    # 近重複密集資料若把 O(N²) 候選對全 materialize 再截，會 OOM（只截回傳擋不住）。
+    import heapq
+    heap: list = []  # max-heap by distance（key 取負）：滿了就汰「最遠」的，留最近
     for a in range(len(idx) - 1):
         xor = (vals[a] ^ vals[a + 1:]).astype(np.uint64)
         dists = np.unpackbits(xor.view(np.uint8)).reshape(len(xor), -1).sum(axis=1)
         for off in np.nonzero(dists <= max_hamming)[0]:
             i, j = idx[a], idx[a + 1 + off]
             if _filter_pair(i, j, splits, cross_split_only):
-                pairs.append((i, j, int(dists[off])))
+                e = ((-int(dists[off]), -i, -j), (i, j, int(dists[off])))
+                (heapq.heappush(heap, e) if len(heap) < max_pairs
+                 else heapq.heappushpop(heap, e))
+    pairs = [e[1] for e in heap]
     pairs.sort(key=lambda p: (p[2], p[0], p[1]))
-    return pairs[:max_pairs]
+    return pairs
 
 
 def find_duplicate_pairs_embedding(
@@ -668,15 +674,20 @@ def find_duplicate_pairs_embedding(
     nn = NearestNeighbors(metric="cosine", radius=max_distance)
     nn.fit(embeddings)
     dists, idxs = nn.radius_neighbors(embeddings)
-    pairs: list[tuple[int, int, float]] = []
+    import heapq
+    heap: list = []  # size-bounded max-heap → 只保留 max_pairs 個最近的對
     for i, (ds, js) in enumerate(zip(dists, idxs)):
         for d, j in zip(ds, js):
+            j = int(j)
             if j <= i:
                 continue
-            if _filter_pair(i, int(j), splits, cross_split_only):
-                pairs.append((i, int(j), float(d)))
+            if _filter_pair(i, j, splits, cross_split_only):
+                e = ((-float(d), -i, -j), (i, j, float(d)))
+                (heapq.heappush(heap, e) if len(heap) < max_pairs
+                 else heapq.heappushpop(heap, e))
+    pairs = [e[1] for e in heap]
     pairs.sort(key=lambda p: (p[2], p[0], p[1]))
-    return pairs[:max_pairs]
+    return pairs
 
 
 def selection_points_to_indices(points: list[dict]) -> list[int]:
@@ -833,7 +844,7 @@ def ensure_thumbnails(
         try:
             make_thumbnail(Path(p), size)
             n_ok += 1
-        except OSError:
+        except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖皆跳過,不中斷整批
             pass
         if progress_cb is not None:
             progress_cb(i + 1, n_total)
@@ -1106,14 +1117,11 @@ def bbox_to_pixels(
         gh = h + 2.0 * pad_px / img_h
     else:
         gw, gh = w * (1.0 + 2.0 * pad), h * (1.0 + 2.0 * pad)
-    x0 = max(0, int(round((cx - gw / 2.0) * img_w)))
-    y0 = max(0, int(round((cy - gh / 2.0) * img_h)))
-    x1 = min(img_w, int(round((cx + gw / 2.0) * img_w)))
-    y1 = min(img_h, int(round((cy + gh / 2.0) * img_h)))
-    if x1 <= x0:
-        x1 = min(img_w, x0 + 1)
-    if y1 <= y0:
-        y1 = min(img_h, y0 + 1)
+    # 夾 x0/y0 上限到 img-1、並逼 x1>x0，確保即使 cx/cy 越界(>1)仍是 ≥1px 正面積(契約)
+    x0 = min(max(0, int(round((cx - gw / 2.0) * img_w))), max(0, img_w - 1))
+    y0 = min(max(0, int(round((cy - gh / 2.0) * img_h))), max(0, img_h - 1))
+    x1 = min(img_w, max(x0 + 1, int(round((cx + gw / 2.0) * img_w))))
+    y1 = min(img_h, max(y0 + 1, int(round((cy + gh / 2.0) * img_h))))
     return x0, y0, x1, y1
 
 

@@ -348,6 +348,8 @@ def _load_ui_state_once() -> None:
         data = json.loads(_ui_state_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
+    if not isinstance(data, dict):  # 合法 JSON 但非物件([]/null/數字)→ 降級不崩(B1)
+        return
     method_opts = set(_METHOD_KEY)
     try:
         model_opts = set(available_models())
@@ -498,6 +500,9 @@ def _viz_send_to_gray(indices: list[int], model: str) -> None:
     st.session_state.pop("gray_pos", None)
     st.session_state["gray_inbound"] = True
     st.session_state["tool_switch"] = "灰帶覆核"
+    # 此鈕在右欄 fragment 內：callback 只重跑 fragment，需設旗標讓 fragment 跳出做
+    # app 範圍 rerun 才會真的換到灰帶覆核分頁（與購物車分流鈕一致）
+    st.session_state["_cart_app_rerun"] = True
     _log_usage("viz_send_to_gray", n=len(queue))
 
 
@@ -947,7 +952,7 @@ def _current_selection() -> list[int]:
 def _thumb_or_none(path: Path) -> str | None:
     try:
         return str(make_thumbnail(path))
-    except OSError:
+    except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖→無縮圖
         return None
 
 
@@ -1277,7 +1282,7 @@ def _render_text_search(records: list[dict], model_name: str,
                           on_click=_pivot_to_image_query, args=(i,))
                 st.button("⬇ 加入清單", key=f"viz_textadd_{i}",
                           use_container_width=True,
-                          on_click=_add_one, args=(records, i, "search"))
+                          on_click=_add_one, args=(records, i, "search", float(d)))
     st.download_button(
         "⬇ 匯出此結果 CSV", data=records_to_csv(records, idxs),
         file_name="text_search.csv", mime="text/csv", key="viz_export_textsearch",
@@ -1340,7 +1345,7 @@ def _render_similar_view(records: list[dict], model_name: str) -> None:
                     st.button("↻ 以此為查詢", key=f"viz_requery_{i}", use_container_width=True,
                               on_click=_chain_query, args=(i,))
                     st.button("⬇ 加入清單", key=f"viz_simadd_{i}", use_container_width=True,
-                              on_click=_add_one, args=(records, i, "similar"))
+                              on_click=_add_one, args=(records, i, "similar", float(d)))
         st.download_button(
             "⬇ 匯出此相似群 CSV", data=records_to_csv(records, [q] + idxs),
             file_name="similar_group.csv", mime="text/csv", key="viz_export_similar",
@@ -3952,8 +3957,10 @@ def _cov_project5(emb, cand_emb, labels, cand_labels, mkey, dim, token, cand_tok
     combined = np.vstack([emb, cand_emb]) if has_c else np.asarray(emb)
     combined = _l2norm(combined)   # cosine 幾何
     ylabels = list(labels) + (list(cand_labels) if has_c else [])
-    sup = _supervised_projection(combined, ylabels, mkey, dim)
-    if sup is None:   # 類別 <2 等 → 退 PCA
+    # 監督UMAP spectral 初始化需 n_components+1 < N；樣本太少(如 3D+n=4)會崩 → 退 PCA
+    sup = (_supervised_projection(combined, ylabels, mkey, dim)
+           if len(combined) > dim + 1 else None)
+    if sup is None:   # 類別 <2 / 樣本過少 → 退 PCA
         return _cov_projection(emb, cand_emb, "pca", dim, token, cand_token)
     arr = _pad_cols(np.asarray(sup), dim)
     cd, cc = arr[:len(emb)], (arr[len(emb):] if has_c else None)
@@ -4277,7 +4284,7 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
         if str(ip) != _src["ip"]:
             try:
                 _src["img"] = Image.open(ip).convert("RGB")
-            except OSError:
+            except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖跳過
                 _src["img"] = None
             _src["ip"] = str(ip)
         return _src["img"]
@@ -4648,6 +4655,10 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                            + "其餘為定義/標籤/容量問題（補資料幫助有限）")
                 for c, v in cnt.most_common():
                     st.write(f"- {c}：{v} 點")
+                if "quiz_last_consistency" not in st.session_state:
+                    st.caption(":gray[註：未跑組考卷，S1 用預設 0.9（非實測人類一致性）"
+                               "→ H2 定義歧義無法觸發，以上為 S2/S3 兩訊號結論；"
+                               "S3 為鄰域標籤熵代理。跑組考卷可補回 S1。]")
 
     with col_side:
         st.markdown("**① 候選資料夾（選完自動投影）**")
@@ -4829,8 +4840,9 @@ def _objcov_project(memb, cmemb, mkey, dim, cache_key):
             return c["m"], c["c"]
         combined = np.vstack([memb, cmemb]) if has_c else np.asarray(memb)
         groups = [0] * len(memb) + ([1] * len(cmemb) if has_c else [])
+        # 樣本太少(如 3D+合併=4)監督UMAP spectral 會崩 → 退 PCA
         sup = (_supervised_projection(combined, groups, mkey, dim)
-               if len(set(groups)) > 1 else None)
+               if len(set(groups)) > 1 and len(combined) > dim + 1 else None)
         if sup is None:   # 無候選/只有一群 → 退 PCA
             arr = PCA(n_components=min(dim, max(1, len(combined) - 1)),
                       random_state=42).fit_transform(combined)
@@ -5285,7 +5297,7 @@ def _completeness_ui() -> None:
             for i, p in enumerate(paths):
                 try:
                     stats.append(image_stats(p))
-                except OSError:
+                except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖→中性屬性
                     stats.append({a: 0.0 for a in _AUTO_AXES})
                 if i % 20 == 0:
                     bar.progress(0.6 + 0.4 * (i + 1) / len(paths),
@@ -6328,9 +6340,14 @@ def _evaluation_ui() -> None:
         res = evaluate_detections(gt_by_image, pred_by_image, iou_thresh=iou,
                                   conf_thresh=conf, class_aware=class_aware,
                                   consensus_by_image=cons_by_image)
+        # class-aware 但 GT/pred 類別命名空間完全不重疊（常見：CSV 用 id、GT 用名）→
+        # 比對會假性全漏 recall≈0；偵測出來給使用者明確提示而非靜默
+        _gtc = {str(b["cls"]) for bs in gt_by_image.values() for b in bs}
+        _pdc = {str(b["cls"]) for bs in pred_by_image.values() for b in bs}
         st.session_state["_eval_result"] = {
             "res": res, "folder": str(folder), "used_consensus": cons_by_image is not None,
-            "n_cons_img": n_c, "n_gray_img": n_g, "n_pred_img": len(pred_by_image)}
+            "n_cons_img": n_c, "n_gray_img": n_g, "n_pred_img": len(pred_by_image),
+            "ns_mismatch": bool(class_aware and _gtc and _pdc and not (_gtc & _pdc))}
 
     data = st.session_state.get("_eval_result")
     if not data:
@@ -6342,6 +6359,10 @@ def _evaluation_ui() -> None:
                    "一張標為灰帶 → 看它被排除於 recall。換成你的資料夾＋預測 CSV 即真評估。]")
     if data["n_pred_img"] == 0:
         st.warning("預測 CSV 沒對到任何影像（檢查 filename 欄是否為影像檔名）。")
+    if data.get("ns_mismatch"):
+        st.warning("⚠ 預測 CSV 的 class 與 GT 類別**命名空間完全不重疊**（常見：CSV 用類別 "
+                   "id、GT 用類別名）→ class-aware 比對會假性全漏（recall≈0）。請把 CSV 的 "
+                   "class 改成類別名，或關閉上方『類別需相符（class-aware）』。")
     if not data["used_consensus"]:
         st.warning("未提供組考卷共識子集——尺未校時 recall 僅供參考（§5.3）。"
                    "建議先在『組考卷』產生共識子集再評估。")

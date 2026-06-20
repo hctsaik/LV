@@ -85,14 +85,15 @@ def list_images(root: Path) -> list[Path]:
 
 
 def classes_for(root: Path) -> list[str] | None:
-    """classes.txt (root or parent) → else data.yaml `names:` (parent)."""
-    for folder in (root, root.parent):
+    """classes.txt (root / parent / grandparent) → else data.yaml `names:`.
+    探到祖父層以容忍巢狀佈局（如 …/[Small]/valid → indoor/classes.txt）。"""
+    for folder in (root, root.parent, root.parent.parent):  # 容忍巢狀佈局(…/[Small]/split)
         f = folder / "classes.txt"
         if f.exists():
             lines = [ln.strip() for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
             if lines:
                 return lines
-    for folder in (root, root.parent):
+    for folder in (root, root.parent, root.parent.parent):  # 容忍巢狀佈局(…/[Small]/split)
         y = folder / "data.yaml"
         if y.exists():
             names, grab = [], False
@@ -240,7 +241,7 @@ def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
         if str(ip) != cur_ip:
             try:
                 cur = Image.open(ip).convert("RGB")
-            except OSError:
+            except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖跳過
                 cur = None
             cur_ip = str(ip)
         if cur is None:

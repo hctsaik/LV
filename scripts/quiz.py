@@ -171,23 +171,23 @@ def cohen_kappa(a: Sequence, b: Sequence) -> float:
 
 
 def fleiss_kappa(rating_counts: np.ndarray) -> float:
-    """Fleiss' kappa from an (items × categories) matrix of per-item rater
-    counts (each row sums to the number of raters). Measures agreement
-    among ≥2 raters; constant ratings → 1.0."""
+    """Generalized Fleiss' kappa from an (items × categories) matrix of per-item
+    rater counts. Handles **variable rater counts per item** (each row uses its
+    own n_i); reduces to standard Fleiss when all rows are equal. Items with <2
+    raters are undefined and dropped; constant ratings → 1.0; empty → 0.0."""
     m = np.asarray(rating_counts, dtype=float)
     if m.size == 0:
         return 0.0
-    n_raters = m.sum(axis=1)
-    if not np.allclose(n_raters, n_raters[0]) or n_raters[0] < 2:
-        # unequal rater counts or <2 raters — undefined; clamp gracefully
-        n = n_raters[0] if len(n_raters) else 0
-        if n < 2:
+    n_i = m.sum(axis=1)                       # raters per item (may differ)
+    if np.any(n_i < 2):                       # <2 raters per item is undefined → drop
+        keep = n_i >= 2
+        m, n_i = m[keep], n_i[keep]
+        if len(m) == 0:
             return 0.0
-    n = n_raters[0]
-    N = len(m)
-    p_j = m.sum(axis=0) / (N * n)
-    P_i = (np.sum(m * m, axis=1) - n) / (n * (n - 1))
-    P_bar = P_i.mean()
+    total = float(n_i.sum())
+    p_j = m.sum(axis=0) / total                                   # category marginals
+    P_i = (np.sum(m * m, axis=1) - n_i) / (n_i * (n_i - 1))       # per-item agreement
+    P_bar = float(P_i.mean())
     P_e = float(np.sum(p_j * p_j))
     return (P_bar - P_e) / (1 - P_e) if (1 - P_e) > 1e-12 else 1.0
 

@@ -339,8 +339,8 @@ def test_progress_cb_called_n_times(tmp_path):
     paths = _img_paths(tmp_path, 5)
     calls: list[tuple[int, int]] = []
     extract_embeddings(paths, _fake_embed, progress_cb=lambda d, t: calls.append((d, t)))
-    assert len(calls) == 5
-    assert [c[0] for c in calls] == [1, 2, 3, 4, 5]
+    assert len(calls) == 6  # 起始 (0,5) 初始化進度條 + 逐張完成 1..5
+    assert [c[0] for c in calls] == [0, 1, 2, 3, 4, 5]
     assert all(c[1] == 5 for c in calls)
 
 
@@ -392,7 +392,9 @@ def test_thumbnail_created_and_cached(tmp_path):
     src = _real_image(tmp_path)
     out1 = make_thumbnail(src, size=256)
     assert out1.exists() and out1.suffix == ".webp"
-    assert out1.parent == src.parent / ".thumbs" / "256"
+    # no-dataset-writes：縮圖在 app 端 .lv_cache，不寫進來源資料夾(.thumbs)
+    assert out1 == thumbnail_path_for(src)
+    assert ".thumbs" not in str(out1) and ".lv_cache" in str(out1).replace("\\", "/")
     with Image.open(out1) as im:
         assert max(im.size) <= 256
     mtime = out1.stat().st_mtime_ns
@@ -412,7 +414,8 @@ def test_thumbnail_key_changes_when_source_changes(tmp_path):
 def test_thumbnail_no_collision_same_name_different_dirs(tmp_path):
     a = _real_image(tmp_path / "a", "same.jpg")
     b = _real_image(tmp_path / "b", "same.jpg")
-    assert thumbnail_path_for(a).parent != thumbnail_path_for(b).parent
+    # 內容定址檔名 → 同名不同夾仍不碰撞（共用 .lv_cache 目錄、檔名相異）
+    assert thumbnail_path_for(a) != thumbnail_path_for(b)
 
 
 def test_thumbnail_missing_source_raises(tmp_path):

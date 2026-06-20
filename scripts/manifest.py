@@ -81,7 +81,7 @@ def compute_phash(path: Path, hash_size: int = 8) -> str | None:
     try:
         img = Image.open(path).convert("L").resize(
             (hash_size + 1, hash_size), Image.LANCZOS)
-    except OSError:
+    except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖(>179MP)皆跳過
         return None
     px = np.asarray(img, dtype=np.int16)
     bits = (px[:, 1:] > px[:, :-1]).flatten()
