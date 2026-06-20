@@ -50,27 +50,30 @@ def get_image_paths(folder: Path) -> list[Path]:
     )
 
 
-def compute_fid(folder_a: str, folder_b: str) -> float:
-    from cleanfid import fid as cleanfid_fid
+def _files_features(paths, device, feat_model):
+    """Inception features for an explicit image-path list (clean-fid). Using a
+    file list — not a folder glob — means we score EXACTLY the resolved images
+    (no recursing into object_crops/ caches or extra splits)."""
+    from cleanfid.fid import get_files_features
+    return get_files_features([str(p) for p in paths], feat_model, num_workers=0,
+                              device=device, mode="clean", verbose=False)
+
+
+def compute_fid(paths_a: list, paths_b: list) -> float:
+    from cleanfid.fid import fid_from_feats
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feat_model = _load_inception(device)
-    return float(cleanfid_fid.compute_fid(
-        folder_a, folder_b,
-        device=device, use_dataparallel=False, num_workers=0,
-        custom_feat_extractor=feat_model,
-    ))
+    return float(fid_from_feats(_files_features(paths_a, device, feat_model),
+                                _files_features(paths_b, device, feat_model)))
 
 
-def compute_kid(folder_a: str, folder_b: str) -> float:
+def compute_kid(paths_a: list, paths_b: list) -> float:
     """Kernel Inception Distance — MMD-based, more reliable than FID on small datasets. Lower = more similar."""
-    from cleanfid.fid import get_folder_features, kernel_distance
+    from cleanfid.fid import kernel_distance
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     feat_model = _load_inception(device)
-    feats1 = get_folder_features(folder_a, feat_model, num_workers=0,
-                                  device=device, mode="clean", verbose=False)
-    feats2 = get_folder_features(folder_b, feat_model, num_workers=0,
-                                  device=device, mode="clean", verbose=False)
-    return float(kernel_distance(feats1, feats2))
+    return float(kernel_distance(_files_features(paths_a, device, feat_model),
+                                 _files_features(paths_b, device, feat_model)))
 
 
 def compute_lpips_score(
@@ -146,9 +149,10 @@ def compute_psnr_score(
 
 
 def compute_inception_score(
-    folder: str, n_splits: int = 10, batch_size: int = 32
+    folder_or_paths, n_splits: int = 10, batch_size: int = 32
 ) -> tuple[float, float]:
-    """Inception Score for a single folder. Higher = better quality & diversity. Returns (mean, std)."""
+    """Inception Score for a folder OR an explicit list of image paths.
+    Higher = better quality & diversity. Returns (mean, std)."""
     import torch.nn.functional as F
     import torchvision.models as tvm
 
@@ -177,9 +181,10 @@ def compute_inception_score(
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    paths = get_image_paths(Path(folder))
+    paths = (list(folder_or_paths) if isinstance(folder_or_paths, (list, tuple))
+             else get_image_paths(Path(folder_or_paths)))
     if not paths:
-        raise ValueError(f"No images found in {folder}")
+        raise ValueError(f"No images found: {folder_or_paths}")
 
     preds = []
     with torch.no_grad():
@@ -311,10 +316,10 @@ def build_projection_figure(
     projections: dict[str, np.ndarray],
     name_a: str,
     name_b: str,
-    fid_score: float,
-    lpips_score: float,
-    kid_score: float = 0.0,
-    ssim_score: float = 0.0,
+    fid_score: float | None = None,
+    lpips_score: float | None = None,
+    kid_score: float | None = None,
+    ssim_score: float | None = None,
 ) -> go.Figure:
     """projections: {"pca": ndarray(N,2), "tsne": ndarray(N,2), "umap": ndarray(N,2)}"""
     n_a = len(paths_a)
@@ -347,11 +352,18 @@ def build_projection_figure(
         for key, proj in projections.items()
     ]
     fig = go.Figure(data=traces)
+    _m = []
     if fid_score is not None:
-        subtitle = f"FID: {fid_score:.2f} | KID: {kid_score:.6f} | LPIPS: {lpips_score:.4f} | SSIM: {ssim_score:.4f}"
-        title_str = f"Distribution Comparison: {name_a} vs {name_b}<br><sub>{subtitle}</sub>"
-    else:
-        title_str = f"Distribution Comparison: {name_a} vs {name_b}"
+        _m.append(f"FID: {fid_score:.2f}")
+    if kid_score is not None:
+        _m.append(f"KID: {kid_score:.6f}")
+    if lpips_score is not None:
+        _m.append(f"LPIPS: {lpips_score:.4f}")
+    if ssim_score is not None:
+        _m.append(f"SSIM: {ssim_score:.4f}")
+    title_str = f"Distribution Comparison: {name_a} vs {name_b}"
+    if _m:
+        title_str += f"<br><sub>{' | '.join(_m)}</sub>"
     fig.update_layout(
         title=title_str,
         xaxis_title="Component 1",

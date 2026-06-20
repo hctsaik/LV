@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import os
 import zipfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -783,9 +784,10 @@ def zip_selected_images(records: list[dict], indices: list[int]) -> bytes:
 def thumbnail_path_for(image_path: Path, size: int = 256) -> Path:
     """Deterministic cache location for an image's thumbnail.
 
-    Lives in ``<image_dir>/.thumbs/<size>/<sha1(abspath|mtime|fsize)>.webp``
-    so the key invalidates whenever the source file changes, and same-named
-    files in different directories can never collide (per-dir cache).
+    Lives in the **app-side cache** (LV_CACHE_DIR or <repo>/.lv_cache/thumbs/),
+    NOT inside the user's dataset — so analysing a dataset never dirties the
+    user's folder / their git check-in. The key hashes abspath|mtime|fsize, so
+    it invalidates when the source changes and same-named files never collide.
     Raises OSError if the source file is missing.
     """
     image_path = Path(image_path)
@@ -793,7 +795,9 @@ def thumbnail_path_for(image_path: Path, size: int = 256) -> Path:
     digest = hashlib.sha1(
         f"{image_path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}".encode()
     ).hexdigest()[:16]
-    return image_path.parent / ".thumbs" / str(size) / f"{digest}.webp"
+    base = Path(os.environ.get("LV_CACHE_DIR")
+                or (Path(__file__).resolve().parent.parent / ".lv_cache"))
+    return base / "thumbs" / str(size) / f"{digest}.webp"
 
 
 def make_thumbnail(image_path: Path, size: int = 256) -> Path:

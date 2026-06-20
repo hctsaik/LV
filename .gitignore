@@ -24,12 +24,16 @@ models/**
 dataset/
 goal/
 
+# App-side caches (object crops / embeddings / thumbnails) — kept OUT of user
+# datasets so analysing a dataset never dirties the user's folder. Regenerated.
+.lv_cache/
 # Embedding caches (regenerated on first run)
 **/embeddings_*/
 # Local data & generated artifacts (not for version control)
 datasets/
 demo/
 streamlit_log.txt
+streamlit_*.log
 **/.thumbs/
 tests/e2e/_server.log
 # 桶① gate calibration (modality-specific; written by calibrate_signal_gate.py --write)
