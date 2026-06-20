@@ -1,6 +1,7 @@
 """Dataset manifest — the single data contract for curation features (F1).
 
-One ``manifest.jsonl`` per dataset folder (the split folder users load).
+One ``manifest.jsonl`` per dataset folder, stored in the **app-side cache**
+(``.lv_cache/<name>_<hash>/``) — never inside the user's dataset folder.
 Each line describes one image:
 
     {
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -40,8 +42,18 @@ MANIFEST_NAME = "manifest.jsonl"
 MANIFEST_SOURCE_DISCOVERED = "discovered"
 
 
+def _lv_cache_root() -> Path:
+    """App 端快取根（與 app._lv_cache_dir 同規則）——**絕不寫進使用者資料集**。"""
+    return Path(os.environ.get("LV_CACHE_DIR")
+                or (Path(__file__).resolve().parent.parent / ".lv_cache"))
+
+
 def manifest_path_for(folder: Path) -> Path:
-    return Path(folder) / MANIFEST_NAME
+    """manifest 存在 app 端快取（不污染使用者資料集），以資料夾絕對路徑雜湊命名，
+    與 crops／embeddings 同一個 .lv_cache/<name>_<hash>/ 目錄（同 app._dataset_cache_dir）。"""
+    folder = Path(folder).resolve()
+    key = hashlib.sha1(str(folder).encode("utf-8")).hexdigest()[:10]
+    return _lv_cache_root() / f"{folder.name}_{key}" / MANIFEST_NAME
 
 
 def rel_key(folder: Path, path: Path) -> str:
@@ -104,6 +116,7 @@ def load_manifest(folder: Path) -> dict[str, dict]:
 def write_manifest(folder: Path, entries: dict[str, dict]) -> Path:
     """Write entries (sorted by path for stable diffs) atomically."""
     mpath = manifest_path_for(folder)
+    mpath.parent.mkdir(parents=True, exist_ok=True)  # .lv_cache/<name>_<hash>/ 可能尚未建
     tmp = mpath.with_suffix(".jsonl.tmp")
     lines = [json.dumps(entries[k], ensure_ascii=False, sort_keys=True)
              for k in sorted(entries)]

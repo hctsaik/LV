@@ -94,5 +94,8 @@ def test_corrupt_pickle_is_treated_as_missing(tmp_path):
 
 
 def test_ref_path_for_layout():
-    p = ref_path_for(Path("d/train"), "dinov2")
-    assert str(p).replace("\\", "/").endswith("d/train/embeddings_dinov2/umap_ref.pkl")
+    # no-dataset-writes: 參考系存 app 端 .lv_cache，不寫使用者資料集
+    p = str(ref_path_for(Path("d/train"), "dinov2")).replace("\\", "/")
+    assert "/.lv_cache/" in p
+    assert p.endswith("/embeddings_dinov2/umap_ref.pkl")
+    assert "/d/train/embeddings_dinov2" not in p

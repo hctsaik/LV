@@ -166,7 +166,9 @@ def test_thumb_lookup_recorded_relative(tmp_path):
 def test_load_skips_corrupt_lines(tmp_path):
     folder = tmp_path / "train"
     folder.mkdir(parents=True)
-    manifest_path_for(folder).write_text(
+    mp = manifest_path_for(folder)
+    mp.parent.mkdir(parents=True, exist_ok=True)  # manifest 現存 .lv_cache/<hash>/
+    mp.write_text(
         '{"path": "ok.jpg", "sha256": "x"}\nnot json\n{"no_path": 1}\n',
         encoding="utf-8")
     loaded = load_manifest(folder)
@@ -215,7 +217,9 @@ def test_cache_keys_treat_legacy_cache_as_stale(tmp_path):
     extract_embeddings([p], _fake_embed, cache_path=cache,
                        cache_keys=[file_sha256(p)],
                        progress_cb=lambda d, t: calls.append((d, t)))
-    assert calls == [(1, 1)]  # re-extracted (1 of 1), not a single-shot hit
+    # 重新擷取(非單發 cache 命中)：起始會先報 (0,1) 初始化進度條，再 (1,1) 完成
+    assert calls and calls[-1] == (1, 1)
+    assert (0, 1) in calls  # 起始進度，證明走了重算路徑而非整批命中捷徑
     data = np.load(cache)
     assert "keys" in data.files  # upgraded in place
 

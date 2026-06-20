@@ -440,6 +440,18 @@ def _classes_txt_nested(folder: Path) -> list[str] | None:
     return None
 
 
+def _rows_to_csv(header: list[str], rows) -> str:
+    """以標準 csv 模組序列化（正確處理逗號／引號／換行）——避免手寫 f-string CSV
+    在檔名或類別名含逗號/引號時損毀。"""
+    import csv as _csv
+    import io as _io
+    buf = _io.StringIO()
+    w = _csv.writer(buf, lineterminator="\n")
+    w.writerow(header)
+    w.writerows(rows)
+    return buf.getvalue()
+
+
 
 _DISAGREE_SCALE = [[0.0, "#cfd8dc"], [0.5, "#ff9800"], [1.0, "#d32f2f"]]
 
@@ -3831,8 +3843,8 @@ def _render_cov_candidates(cell: dict, records: list[dict]) -> None:
                              caption=f"d={it['d']:.3f}")
                 else:
                     st.warning("⚠ 缺檔")
-    csv = "path,distance\n" + "\n".join(
-        f'"{it["path"]}",{it["d"]:.6f}' for it in items)
+    csv = _rows_to_csv(["path", "distance"],
+                       [[it["path"], f'{it["d"]:.6f}'] for it in items])
     st.download_button("⬇ 匯出候選清單 CSV", data=csv,
                        file_name="cell_candidates.csv", mime="text/csv",
                        key="cov_cand_csv", use_container_width=True)
@@ -4768,9 +4780,10 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                                          f"→{provisional[i] or '?'}")
                     else:
                         st.warning("⚠ 缺檔")
-        csv = "rank,path,score,provisional_label\n" + "\n".join(
-            f'{r + 1},"{cand_records[i]["path"]}",{work_score[i]:.6f},{provisional[i]}'
-            for r, i in enumerate(picks))
+        csv = _rows_to_csv(
+            ["rank", "path", "score", "provisional_label"],
+            [[r + 1, cand_records[i]["path"], f'{work_score[i]:.6f}',
+              provisional[i] or ""] for r, i in enumerate(picks)])
         st.download_button("⬇ 匯出 CSV", data=csv,
                            file_name=csv_name, mime="text/csv",
                            key="cov_gap_csv", use_container_width=True)
@@ -5752,7 +5765,8 @@ def _quiz_ui() -> None:
     m3.metric("作答題數", f"{report['n_answered']}/{report['n_questions']}")
     if report["n_repeat_pairs"] == 0:
         st.caption(":gray[（本卷無換皮重測對，自我一致率以 0 計——增加題數可納入重測。）]")
-    csv = "qid,answer\n" + "\n".join(f"{q},{a}" for q, a in sorted(answers.items()))
+    csv = _rows_to_csv(["qid", "answer"],
+                       [[q, a] for q, a in sorted(answers.items())])
     st.download_button("⬇ 匯出作答 CSV（給多人一致性用）", data=csv,
                        file_name="quiz_answers.csv", mime="text/csv",
                        key="quiz_answers_csv")

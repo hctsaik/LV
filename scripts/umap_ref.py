@@ -19,6 +19,8 @@ Framework-free: no streamlit imports, unit-testable.
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import pickle
 from collections.abc import Sequence
 from pathlib import Path
@@ -30,7 +32,13 @@ _REF_VERSION = 1
 
 
 def ref_path_for(folder: Path, model_name: str) -> Path:
-    return Path(folder) / f"embeddings_{model_name}" / "umap_ref.pkl"
+    """UMAP 參考系存 app 端快取（**不寫使用者資料集**），與該資料夾的 embeddings 同目錄
+    （.lv_cache/<name>_<hash>/embeddings_<model>/，同 app._dataset_cache_dir 規則）。"""
+    folder = Path(folder).resolve()
+    key = hashlib.sha1(str(folder).encode("utf-8")).hexdigest()[:10]
+    root = Path(os.environ.get("LV_CACHE_DIR")
+                or (Path(__file__).resolve().parent.parent / ".lv_cache"))
+    return root / f"{folder.name}_{key}" / f"embeddings_{model_name}" / "umap_ref.pkl"
 
 
 def load_ref(path: Path) -> dict | None:
