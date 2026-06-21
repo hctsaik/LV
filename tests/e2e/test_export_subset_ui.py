@@ -41,7 +41,7 @@ def test_export_subset_page_renders_and_exports(tmp_path):
     assert not at.exception, [str(e.value) for e in at.exception]
     # 頁面有渲染購物車張數
     txt = " ".join(str(m.value) for m in (*at.markdown, *at.caption, *at.subheader))
-    assert "匯出子集" in txt and "購物車共" in txt
+    assert "購物車共" in txt and ("Export" in txt or "匯出" in txt)
 
     # 設目的地 → 按匯出
     dst = tmp_path / "subset"

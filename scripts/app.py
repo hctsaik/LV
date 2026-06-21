@@ -967,7 +967,7 @@ def _export_subset_ui() -> None:
     import export_subset as _es
     from collections import Counter
 
-    st.subheader("📦 匯出子集（Export Subset）")
+    st.subheader("📦 匯出（Export）")
     st.caption("把你在各工具加入『策展購物車／匯出清單』的影像，收成一個可用的子資料集。"
                "**寫到你指定的新資料夾，絕不碰原資料集。**")
 
@@ -998,12 +998,18 @@ def _export_subset_ui() -> None:
     st.markdown("### 匯出成資料夾（YOLO 子資料集）")
     dst_str = st.text_input("目的地資料夾（新的／空的；若落在來源資料集內會被擋下）",
                             key="exp_dst", placeholder=r"C:\out\my_subset")
+    _MODE_LBL = {"copy": "複製檔案（推薦）", "symlink": "建捷徑（省空間・進階）",
+                 "manifest-only": "只出清單（不搬影像）"}
+    _EXIST_LBL = {"skip": "略過同名（推薦）", "rename": "改名加序號", "overwrite": "覆寫"}
     c1, c2 = st.columns(2)
-    mode = c1.selectbox("模式", ["copy", "symlink", "manifest-only"], key="exp_mode",
-                        help="copy＝複製（預設、最安全）；symlink＝連結（Windows 需開發者模式，"
-                             "失敗會記進報告不靜默改 copy）；manifest-only＝只出清單 CSV，不搬影像。")
-    on_exists = c2.selectbox("同名衝突處置", ["skip", "rename", "overwrite"], key="exp_onexists",
-                             help="目的地已有同名檔時：略過／加序號改名／覆寫。預設略過。")
+    mode = c1.selectbox("怎麼搬影像", ["copy", "symlink", "manifest-only"], key="exp_mode",
+                        format_func=lambda m: _MODE_LBL[m],
+                        help="複製檔案＝把影像實際複製一份到新資料夾，最常用最安全（會佔空間）。"
+                             "建捷徑＝只放指向原檔的捷徑，省空間但原檔搬走就失效、Windows 常因權限失敗。"
+                             "只出清單＝不搬影像，只寫一份 CSV 列出你選了哪些。")
+    on_exists = c2.selectbox("目的地已有同名檔時", ["skip", "rename", "overwrite"],
+                             key="exp_onexists", format_func=lambda x: _EXIST_LBL[x],
+                             help="預設略過已存在的同名檔。")
 
     items = _export_items_from_cart(shown)
     uniq = len({(it.sha256 or str(it.image_path.resolve())) for it in items})
@@ -1229,22 +1235,14 @@ def _render_select_view(
                 _scores[str(i)] = s
         # 依排序語境推導任務：離群度排序＝多半是「這張對不對」(verify)，否則重標
         _sel_task = LH.TASK_VERIFY if sort == "離群度" else LH.TASK_RELABEL
-        # 兩個「送這批選取出去」的動作並排放在右上角選取區
-        g_col, l_col = st.columns(2)
-        g_col.button(
-            f"🌫 送 {len(sel_indices)} 張進灰帶覆核 →", key="viz_sel_to_gray",
-            use_container_width=True, on_click=_viz_send_to_gray,
-            args=(list(sel_indices), model_name),
-            help="把這批爭議樣本送進有紀錄的裁決流程（對照錨例→提議→品保雙簽→匯出）；"
-                 "散點只負責探索，改標籤這種決定留在灰帶覆核做。")
-        with l_col:
-            _send_to_labeling_ui(
-                records, sel_indices, source="selection", task=_sel_task,
-                label="📤 送到 Labeling 標註", key="viz_sel_to_labeling",
-                original_labels={i: records[i].get("label", "") for i in sel_indices},
-                payload={"scores": _scores} if _scores else None,
-                help="把框選的這批（分歧／離群／重複皆可）送到 Labeling 逐張標／改類別；"
-                     "分歧／離群分數隨件帶過。標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
+        # 把框選這批送到 Labeling 標註（灰帶覆核工具已隱藏，移除其 handoff）
+        _send_to_labeling_ui(
+            records, sel_indices, source="selection", task=_sel_task,
+            label="📤 送到 Labeling 標註", key="viz_sel_to_labeling",
+            original_labels={i: records[i].get("label", "") for i in sel_indices},
+            payload={"scores": _scores} if _scores else None,
+            help="把框選的這批（分歧／離群／重複皆可）送到 Labeling 逐張標／改類別；"
+                 "分歧／離群分數隨件帶過。標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
 
     outlier = st.session_state.get("viz_outlier_scores", {}).get(model_name)
     disagreement = st.session_state.get("viz_label_disagreement", {}).get(model_name)
@@ -1999,7 +1997,7 @@ def _render_bucket1_view(records: list[dict], model_name: str) -> None:
                  "動作：改善拍攝（打光／對比／解析度）重拍，或排除。"),
         "🟡疑似": st.column_config.NumberColumn(
             "🟡邊界", help="訊號在臨界，可能看得到也可能不行。"
-                          "動作：送體檢卡／組考卷判定。"),
+                          "動作：送體檢卡／加入清單。"),
         "🟢明顯": st.column_config.NumberColumn(
             "🟢清楚", help="訊號夠強、清楚可見 → 正常，不需處理。"),
         "⚪未知": st.column_config.NumberColumn(
@@ -2028,7 +2026,7 @@ def _render_bucket1_view(records: list[dict], model_name: str) -> None:
         st.caption(f"{sel_type} · {sel_lv}：{len(picks)} 個")
         if picks:
             if st.button(f"🎯 選取這 {len(picks)} 個"
-                         "（再用右上『送體檢卡／組考卷／灰帶／加入清單』）",
+                         "（再用右上『送體檢卡／加入清單』）",
                          key="bucket1_pick", use_container_width=True):
                 st.session_state["viz_selection"] = {
                     "token": st.session_state.get("viz_data_token"), "indices": picks}
@@ -2106,19 +2104,7 @@ def _render_export_view() -> None:
                           use_container_width=True,
                           on_click=_remove_from_export, args=(s["path"],))
 
-    # ── 分流：同一批樣本一鍵送下游（與覆蓋圖→考卷、散點→灰帶同語彙）──
-    st.markdown(f"**分流這 {len(snapshots)} 張：**")
-    h1, h2 = st.columns(2)
-    h1.button("📝 拿這批出考卷 →", key="cart_to_quiz_btn", use_container_width=True,
-              type="primary", on_click=_cart_to_quiz, args=(snapshots,),
-              help="把購物車當盲測考卷題庫，量標註者一致性（量測，不改資料）。")
-    models = available_models()
-    h2.button("🌫 送灰帶覆核 →", key="cart_to_gray_btn", use_container_width=True,
-              disabled=not models,
-              on_click=_cart_to_gray, args=(snapshots, models[0] if models else ""),
-              help="送進有紀錄的裁決流程（對照錨例→提議→雙簽→匯出）；"
-                   "會以模型即時重算清單特徵供錨例比對。")
-
+    # 組考卷／灰帶覆核工具已隱藏 → 移除購物車對它們的 handoff（出考卷／送灰帶覆核）。
     # 跨工具：把整車送到 Labeling 工具實際標註（單向交棒，標完在 Labeling 端匯出）
     _send_to_labeling_ui(
         pseudo_records, range(len(pseudo_records)), source="cart",
@@ -2621,7 +2607,7 @@ def _render_label_quality(records, raw, model, data_token) -> None:
             st.success("沒有明顯的疑似標錯 🎉")
             return
         topn = cand[:30]
-        if st.button(f"🎯 選取這 {len(topn)} 個可疑物件(再用右上『送灰帶覆核／加入清單』)",
+        if st.button(f"🎯 選取這 {len(topn)} 個可疑物件(再用右上『加入清單』)",
                      key=f"sel_bad_{model}", use_container_width=True):
             st.session_state["viz_selection"] = {
                 "token": data_token, "indices": [p["idx"] for p in topn]}
@@ -3799,6 +3785,18 @@ def _render_compare_by_class() -> None:
     if sa or sb:
         st.caption(f"框選：{name_a} {len(sa)} 個 · {name_b} {len(sb)} 個（下方為選到的物件；"
                    "用上方「✕ 取消框選」清除）")
+        # 加入清單：物件級框選 → 收原圖（cart 為 image-level，同圖多框去重成一張）
+        _picked: dict[str, dict] = {}
+        for _objs, _sel in ((oa, sa), (ob, sb)):
+            for _i in _sel:
+                _o = _objs[_i]
+                _ip = str(_o.get("image_path") or _o.get("path"))
+                _picked.setdefault(_ip, {"path": _ip, "label": _o.get("label", ""),
+                                         "split": _o.get("split", "")})
+        _crecs = list(_picked.values())
+        if st.button(f"🛒 把框選的物件加入清單（{len(_crecs)} 張原圖）",
+                     key="cmpc_add_cart", use_container_width=True):
+            _batch_add(_crecs, list(range(len(_crecs))), source="compare")
     else:
         st.caption(f"未框選 → 顯示前 12 個樣本（{name_a}：{n_a} · {name_b}：{len(ib)}）。")
 
@@ -5000,21 +4998,13 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
 
         st.markdown(f"**② {head}**")
         send_n = int(st.number_input(
-            "送前 N 名進組考卷標註", min_value=1, max_value=len(work_idx),
+            "前 N 名", min_value=1, max_value=len(work_idx),
             value=min(12, len(work_idx)), key="cov_send_n"))
         picks = work_idx[:send_n]
-        chosen = [cand_records[i] for i in picks]
-        chosen_labels = [provisional[i] for i in picks]
-        chosen_scores = [work_score[i] for i in picks]
-        quiz_records = candidates_to_quiz_records(chosen, chosen_labels, chosen_scores)
-        bq1, bq2 = st.columns(2)
-        bq1.button(f"📝 送前 {len(picks)} 名進組考卷 →", key=send_key,
-                   type="primary", use_container_width=True,
-                   on_click=_cov_send_to_quiz,
-                   args=(quiz_records, chosen_scores, class_opts))
-        bq2.button("🛒 加入策展購物車", key="cov_cand_cart", use_container_width=True,
-                   on_click=_batch_add,
-                   args=(cand_records, list(picks), cart_src, dict(work_score)))
+        # 組考卷已隱藏 → 移除「送組考卷」handoff，保留「加入購物車」與下方送 Labeling。
+        st.button(f"🛒 把前 {len(picks)} 名加入策展購物車", key="cov_cand_cart",
+                  use_container_width=True, type="primary", on_click=_batch_add,
+                  args=(cand_records, list(picks), cart_src, dict(work_score)))
         # 直接送 Labeling 從頭標註（fresh）；保住「補哪一格／相對外部 B 缺」語境
         _send_to_labeling_ui(
             cand_records, list(picks), source=cart_src, task=LH.TASK_FRESH,
@@ -5024,7 +5014,7 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                      "scores": {str(i): float(work_score[i]) for i in picks}},
             help="把補洞／未覆蓋候選送到 Labeling 從頭標註（fresh，未標新樣本）；"
                  "標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
-        st.caption(":gray[候選無標籤——暫定類別取自最近鄰，送考卷後盲標即為新標籤。]")
+        st.caption(":gray[候選無標籤——暫定類別取自最近鄰，到 Labeling 盲標即為新標籤。]")
         with st.container(height=280):
             cols = st.columns(3)
             for j, i in enumerate(picks):
@@ -6699,13 +6689,17 @@ def main() -> None:
     brand_col, switch_col, help_col = st.columns([2, 3, 1], gap="medium")
     brand_col.markdown("#### Dataset Analysis Tools")
     st.session_state.setdefault("tool_switch", "Visualize Embeddings")
+    # 隱藏的工具不進工具列；session 殘留指向它們（或舊名「匯出子集」）時先正規化，
+    # 否則 segmented_control 拿到非選項值會報錯。
+    if st.session_state.get("tool_switch") == "匯出子集":
+        st.session_state["tool_switch"] = "匯出"
+    if st.session_state.get("tool_switch") in {"組考卷", "灰帶覆核", "評估"}:
+        st.session_state["tool_switch"] = "Visualize Embeddings"
     with switch_col:
-        # 分組標示：左 3＝資料探索／覆蓋、右 3＝標註品質／評估（純視覺，工具列本體不動）
-        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　"
-                   "🏷 標註品質／評估： 組考卷 · 灰帶覆核 · 評估")
+        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　📦 匯出")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "組考卷", "灰帶覆核", "評估", "匯出子集"],
+                     "完整度熱力圖", "匯出"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"

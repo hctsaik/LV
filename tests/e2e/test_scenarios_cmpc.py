@@ -567,6 +567,38 @@ def scenario_11_per_dataset_framed_gallery() -> Steps:
 
 
 # ════════════════════════════════════════════════════════════════════════
+# Scenario 12 — 框選物件後可「加入清單」，把原圖收進策展購物車(viz_export_list)
+# → 讓 Compare 也接到『匯出』(先前只有 Visualize/完整度有加入鈕)。
+# 先 render(空選取)讀出實際 cmpc_sel token → 回填 a/b 選取 → 再 render → 點鈕 → 驗購物車。
+# ════════════════════════════════════════════════════════════════════════
+
+def scenario_12_linked_view_add_to_cart() -> Steps:
+    s = Steps("S12", "Linked-view 框選物件 → 加入清單(餵匯出)")
+    at = _new_at(_fixture()).run()
+    s.check("renders", not at.exception, f"exc={[e.value for e in at.exception]}")
+    tok = _ss_get(at, "cmpc_sel", {}).get("token")
+    s.check("有 cmpc_sel token", bool(tok), f"tok={tok}")
+    if not tok:
+        return s
+    at.session_state["cmpc_sel"] = {"token": tok, "a": [0], "b": [0]}
+    at.run()
+    btns = [b for b in at.button if b.key == "cmpc_add_cart"]
+    s.check("框選後出現『加入清單』鈕", bool(btns),
+            f"buttons={[b.key for b in at.button]}")
+    if not btns:
+        return s
+    btns[0].click().run()
+    s.check("點擊無例外", not at.exception, f"exc={[e.value for e in at.exception]}")
+    elist = _ss_get(at, "viz_export_list", {})
+    s.check("加入清單後購物車有 2 張(同圖去重後的原圖)", len(elist) == 2,
+            f"n={len(elist)}")
+    s.check("source 標為 compare",
+            bool(elist) and all(v.get("source") == "compare" for v in elist.values()),
+            f"sources={[v.get('source') for v in elist.values()]}")
+    return s
+
+
+# ════════════════════════════════════════════════════════════════════════
 # Collector: run all scenarios, score, report, assert average.
 # ════════════════════════════════════════════════════════════════════════
 
@@ -582,6 +614,7 @@ _SCENARIOS = [
     scenario_09_manual_tune_invalidates,
     scenario_10_edge_cases,
     scenario_11_per_dataset_framed_gallery,
+    scenario_12_linked_view_add_to_cart,
 ]
 
 
