@@ -1102,6 +1102,32 @@ def parse_yolo_boxes(
     return out
 
 
+def parse_yolo_boxes_conf(
+    label_path: Path,
+) -> list[tuple[int, float, float, float, float, float | None]]:
+    """同 :func:`parse_yolo_boxes`，但**保留可選的第 6 欄 confidence**（YOLO 以
+    ``--save-conf`` 輸出的預測 label：``class cx cy w h conf``）。GT label（5 欄）
+    的 score 回 ``None``。供「資料夾有 confidence 時」的即時信心過濾使用。"""
+    label_path = Path(label_path)
+    if not label_path.exists():
+        return []
+    out: list[tuple[int, float, float, float, float, float | None]] = []
+    for line in label_path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            cid = int(float(parts[0]))
+            cx, cy, w, h = (float(v) for v in parts[1:5])
+            score = float(parts[5]) if len(parts) >= 6 else None
+        except ValueError:
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        out.append((cid, cx, cy, w, h, score))
+    return out
+
+
 def bbox_to_pixels(
     cx: float, cy: float, w: float, h: float,
     img_w: int, img_h: int, pad: float = 0.0,
@@ -1155,12 +1181,13 @@ def discover_yolo_objects(
     out: list[dict] = []
     for ip in image_paths:
         ip = Path(ip)
-        for k, (cid, cx, cy, w, h) in enumerate(parse_yolo_boxes(resolve(ip))):
+        for k, (cid, cx, cy, w, h, score) in enumerate(
+                parse_yolo_boxes_conf(resolve(ip))):
             label = (names[cid] if names and 0 <= cid < len(names)
                      else f"class_{cid}")
             out.append({
                 "image_path": ip, "label": label, "class_id": cid,
-                "bbox": (cx, cy, w, h), "obj_index": k,
+                "bbox": (cx, cy, w, h), "obj_index": k, "score": score,
             })
     return out
 

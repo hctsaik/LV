@@ -937,6 +937,105 @@ def _cart_to_gray(snaps: list[dict], model: str) -> None:
     _log_usage("cart_to_gray", n=len(recs))
 
 
+def _export_items_from_cart(snaps: list[dict]) -> list:
+    """購物車快照 → export_subset.ExportItem 清單（image-level）。
+    label 走 yolo_label_path_for；類別名走 _classes_txt_nested（給 class_remap）。"""
+    import export_subset as _es
+    from interaction import yolo_label_path_for
+    items = []
+    for s in snaps:
+        ip = Path(s["path"])
+        lp = yolo_label_path_for(ip)
+        names = (_classes_txt_nested(ip.parent.parent)
+                 or _classes_txt_nested(ip.parent) or [])
+        items.append(_es.ExportItem(
+            image_path=ip,
+            label_path=(lp if lp and lp.exists() else None),
+            class_names=list(names),
+            split=(s.get("split") or None),
+            source_tool=s.get("source", ""),
+            source_tag=s.get("source", ""),
+            reason=s.get("reason", "") or "",
+            sha256=s.get("sha256"),
+        ))
+    return items
+
+
+def _export_subset_ui() -> None:
+    """📦 匯出子集：把跨工具加入『策展購物車／匯出清單』的影像，收成一個 YOLO 子資料集
+    （寫到使用者指定的新資料夾，絕不碰原資料集；dst-containment 由 export_subset 硬擋）。"""
+    import export_subset as _es
+    from collections import Counter
+
+    st.subheader("📦 匯出子集（Export Subset）")
+    st.caption("把你在各工具加入『策展購物車／匯出清單』的影像，收成一個可用的子資料集。"
+               "**寫到你指定的新資料夾，絕不碰原資料集。**")
+
+    snaps = _cart_snapshots()
+    if not snaps:
+        st.info("購物車目前是空的。到 Visualize 選取面板、完整度、物件覆蓋、灰帶覆核…，"
+                "用「加入清單／加入購物車」挑出影像，再回來這裡匯出。")
+        return
+
+    by_src = Counter(s.get("source", "?") for s in snaps)
+    st.markdown(f"購物車共 **{len(snaps)}** 張 · 跨 {len(by_src)} 個來源："
+                + "　".join(f"`{k}×{v}`" for k, v in sorted(by_src.items())))
+
+    pick = st.selectbox("依來源篩選", ["全部"] + sorted(by_src), key="exp_src_filter")
+    shown = _cart_snapshots(None if pick == "全部" else pick)
+    with st.container(height=280):
+        cols = st.columns(6)
+        for j, s in enumerate(shown[:60]):
+            with cols[j % 6]:
+                t = _thumb_or_none(Path(s["path"]))
+                if t is not None:
+                    st.image(t, use_container_width=True,
+                             caption=f'{s.get("source", "")}·{s.get("label", "") or "?"}')
+                else:
+                    st.caption("⚠ 缺檔")
+
+    st.divider()
+    st.markdown("### 匯出成資料夾（YOLO 子資料集）")
+    dst_str = st.text_input("目的地資料夾（新的／空的；若落在來源資料集內會被擋下）",
+                            key="exp_dst", placeholder=r"C:\out\my_subset")
+    c1, c2 = st.columns(2)
+    mode = c1.selectbox("模式", ["copy", "symlink", "manifest-only"], key="exp_mode",
+                        help="copy＝複製（預設、最安全）；symlink＝連結（Windows 需開發者模式，"
+                             "失敗會記進報告不靜默改 copy）；manifest-only＝只出清單 CSV，不搬影像。")
+    on_exists = c2.selectbox("同名衝突處置", ["skip", "rename", "overwrite"], key="exp_onexists",
+                             help="目的地已有同名檔時：略過／加序號改名／覆寫。預設略過。")
+
+    items = _export_items_from_cart(shown)
+    uniq = len({(it.sha256 or str(it.image_path.resolve())) for it in items})
+    n_lab = sum(1 for it in items if it.label_path)
+    st.caption(f":gray[將處理 {len(items)} 筆 → sha256 去重後約 **{uniq}** 張影像、{n_lab} 個 label 檔。"
+               "輸出含 images/＋labels/＋classes.txt＋data.yaml＋manifest.csv＋lineage.json。]")
+    st.caption(":orange[⚠ 這是你刻意挑出的偏斜子集（多為難／稀疏／離群樣本），非隨機抽樣；"
+               "直接拿去訓練或當 benchmark 會誤導，評估請用獨立 hold-out。]")
+
+    if st.button(f"▶ 匯出到「{dst_str.strip() or '…'}」", type="primary",
+                 disabled=not dst_str.strip(), key="exp_run", use_container_width=True):
+        try:
+            rep = _es.export_subset(items, Path(dst_str.strip()),
+                                    mode=mode, layout="yolo", on_exists=on_exists)
+        except ValueError as e:
+            st.error(f"❌ 匯出被擋下：{e}")
+            return
+        st.success(f"✅ 完成 → `{rep.dst}`")
+        m = st.columns(4)
+        m[0].metric("已匯出", rep.exported)
+        m[1].metric("略過", len(rep.skipped))
+        m[2].metric("去重", rep.deduped)
+        m[3].metric("未解析", len(rep.unresolved))
+        if rep.warnings:
+            with st.expander(f"⚠ 警告（{len(rep.warnings)}）"):
+                for w in rep.warnings[:50]:
+                    st.caption(f"· {w}")
+        if rep.errors:
+            st.error("錯誤：" + "；".join(map(str, rep.errors[:10])))
+        _log_usage("export_subset", n=rep.exported, source="yolo")
+
+
 def _nn_index_for(model_name: str):
     """Lazy, per-session NN index over the raw embeddings (cleared at Run)."""
     store = st.session_state.setdefault("viz_nn_index", {})
@@ -2290,6 +2389,78 @@ def _active_object_policy() -> dict:
     return st.session_state.get("viz_object_policy", oe.DEFAULT_POLICY)
 
 
+def _obj_keep(rec) -> bool:
+    """渲染時的物件過濾判斷：confidence 不在所選『信心區間』內、或源像素短邊太小
+    （DINO 對極小框的嵌入不可靠）→ 丟。門檻取自共用 session key
+    （obj_conf_range 預設 (0,1)＝全留；obj_min_short_px 預設 0＝不過濾）。
+    score=None（GT/無信心）不受信心區間影響。"""
+    rng = st.session_state.get("obj_conf_range")
+    sc = rec.get("score")
+    if rng is not None and sc is not None:
+        lo, hi = rng
+        if not (float(lo) <= float(sc) <= float(hi)):
+            return False
+    msp = int(st.session_state.get("obj_min_short_px", 0) or 0)
+    if msp > 0 and int(rec.get("short_px", 1 << 30)) < msp:
+        return False
+    return True
+
+
+def _obj_filter_tag() -> str:
+    """目前物件過濾狀態的字串指紋。**必須併進散點 widget 的 key**——這些 on_select
+    散點『點集一變就得換 key 重掛』才會反映新點集（同 split 的道理）；只改 figure、key
+    不變，畫面會停在舊點集，拖過濾滑桿像沒反應。"""
+    return (f"{st.session_state.get('obj_conf_range')}"
+            f"_{st.session_state.get('obj_min_short_px', 0)}")
+
+
+def _obj_view_indices(records, base_indices=None) -> list[int]:
+    """套 _obj_keep 後保留的 index 清單（不動 records/coords → 即時、可回復）。
+    給 Visualize/Compare 用：它們對『index 子集』畫散點。"""
+    idx = range(len(records)) if base_indices is None else base_indices
+    return [i for i in idx if _obj_keep(records[i])]
+
+
+def _obj_filter_view(records, emb, token):
+    """對 (records, emb) 直接套 _obj_keep（給 coverage/objcov 用：它們要對 emb 算
+    sparsity）。回 (records', emb', token')；門檻併入 token 供下游快取正確失效。"""
+    keep = _obj_view_indices(records)
+    if len(keep) == len(records):
+        return records, emb, token
+    e2 = np.asarray(emb)[keep] if len(emb) else emb
+    msp = int(st.session_state.get("obj_min_short_px", 0) or 0)
+    rng = st.session_state.get("obj_conf_range") or (0.0, 1.0)
+    return [records[i] for i in keep], e2, f"{token}|f{msp}_{rng[0]}_{rng[1]}"
+
+
+def _obj_has_conf(records) -> bool:
+    return bool(records) and any(r.get("score") is not None for r in records)
+
+
+def _obj_filter_controls(prefix: str, records, *, size_hint: float | None = None) -> None:
+    """右側即時過濾控制：**信心區間**（雙把手；資料含 score 才顯示）＋源短邊。共寫
+    session key obj_conf_range / obj_min_short_px（只渲染一個工具/次，故各用各自 widget
+    key、回填共用值）。放散點旁 → 改動即時重濾、不需重 Run；調寬區間物件會回來
+    （渲染時過濾、不丟資料）。"""
+    if _obj_has_conf(records):
+        cur = tuple(st.session_state.get("obj_conf_range", (0.0, 1.0)))
+        rng = st.slider("信心區間（只顯示 conf 落在此區間的物件）", 0.0, 1.0, cur, 0.05,
+                        key=f"obj_conf_range_{prefix}",
+                        help="拖兩端 → 只顯示偵測 confidence 落在此區間的物件（即時）。"
+                             "全範圍 0.00–1.00＝全顯示。")
+        if tuple(rng) != cur:
+            st.session_state["obj_conf_range"] = tuple(rng)
+    # size 滑桿只在「物件級」（record 帶 short_px）時顯示，整圖模式不顯示（避免空操作）
+    if records and "short_px" in records[0]:
+        cur_px = int(st.session_state.get("obj_min_short_px", 0) or 0)
+        hint = f"（短邊中位 ≈ {int(round(size_hint))}px）" if size_hint else ""
+        px = st.slider("隱藏小物件（源短邊 < px）", 0, 64, cur_px, 4,
+                       key=f"obj_min_short_px_{prefix}",
+                       help="源像素短邊小於此值就隱藏（DINO 對極小框不可靠）。0＝不過濾。" + hint)
+        if px != cur_px:
+            st.session_state["obj_min_short_px"] = px
+
+
 def _render_object_policy_ui(folders: list[Path]) -> None:
     """物件 embedding 設定:資料指紋→建議設定檔(套用需確認)+ 🔬 自動找最佳設定。"""
     import object_eval as oe
@@ -3005,6 +3176,11 @@ def _visualize_embeddings_ui() -> None:
         else:
             indices = [i for i, r in enumerate(records) if r["split"] == selected_split]
 
+        # 右側即時過濾：信心（資料含 score 才出現）／源短邊 → 直接濾 indices
+        # （不動 records/coords → 即時生效、調低門檻物件即回復；物件級才有意義）。
+        _obj_filter_controls("viz", records)
+        indices = _obj_view_indices(records, indices)
+
         # ── 選取生命週期（UX 評審 W2）──
         # 選取只掛 data token：換 model/method/split/dim 一律保留，
         # 只有重新 Run（資料變更）才清空。
@@ -3017,8 +3193,10 @@ def _visualize_embeddings_ui() -> None:
         # _clear_nonce 只在按「取消框選」時 +1 → key 改變 → 散點 widget 重新掛載、
         # 瀏覽器端的框真正被丟掉(否則同一個 key 會把舊選取再回報回來,等於沒清掉)。
         _clear_nonce = st.session_state.get("_viz_clear_nonce", 0)
+        # 物件過濾會改變顯示點集 → 進 key（同 split 的道理），否則 widget 不重掛、停舊點集。
         scatter_key = (f"viz_scatter_{data_token[:8]}_{selected_model}"
-                       f"_{method_key}_{selected_split}_{color_by}_{_clear_nonce}")
+                       f"_{method_key}_{selected_split}_{color_by}_{_clear_nonce}"
+                       f"_{_obj_filter_tag()}")
 
         # NOTE: the 2D interactive chart must keep a STABLE figure spec across
         # reruns — mutating it (e.g. adding a highlight trace) makes Streamlit
@@ -3462,11 +3640,21 @@ def _render_compare_by_class() -> None:
 
     ia = [i for i, l in enumerate(la) if l == pick]
     ib = [i for i, l in enumerate(lb) if l == pick]
+    # 即時過濾（信心／源短邊）：直接縮 ia/ib —— n_a/combined/coords/code/gallery 全由
+    # ia/ib 衍生 → 自動一致；filter 狀態入投影快取 key，改門檻才重投影。
+    _obj_filter_controls("cmpc", oa)
+    ia = [i for i in ia if _obj_keep(oa[i])]
+    ib = [i for i in ib if _obj_keep(ob[i])]
     n_a = len(ia)
+    if not (ia or ib):
+        st.info("目前的信心／大小門檻把這一類的物件全濾掉了——把門檻調低看看。")
+        return
     combined = np.vstack([ea[ia], eb[ib]])
     _nc = 3 if _dim == 3 else 2
+    _ff = (f"{int(st.session_state.get('obj_min_short_px', 0) or 0)}"
+           f"_{st.session_state.get('obj_conf_range') or (0.0, 1.0)}")
     # 投影快取:UMAP/t-SNE 很慢,**每次框選都會 rerun**,不快取就會「畫面當掉」。
-    _proj_key = f"{st.session_state.get('cmpc_token','')}_{pick}_{_pm}_{_dim}"
+    _proj_key = f"{st.session_state.get('cmpc_token','')}_{pick}_{_pm}_{_dim}_{_ff}"
     _pcache = st.session_state.get("_cmpc_proj_cache") or {}
     if _pcache.get("key") == _proj_key:
         coords = _pcache["coords"]
@@ -3539,7 +3727,7 @@ def _render_compare_by_class() -> None:
                           dragmode="select", legend=dict(orientation="h"),
                           updatemenus=_legend_toggle_buttons())
         ev = st.plotly_chart(
-            fig, use_container_width=True, key=f"cmpc2d_{_sel_tok}_{_cn}",
+            fig, use_container_width=True, key=f"cmpc2d_{_sel_tok}_{_cn}_{_obj_filter_tag()}",
             on_select="rerun", selection_mode=("points", "box", "lasso"))
         if ev is not None:
             _so = ev.get("selection") if hasattr(ev, "get") else None
@@ -4279,6 +4467,10 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
     head = str(policy.get("head", "cls"))
     ptag = f"pad{int(round(pad * 100))}_r{target_res}_{head}_arv2"
     seed = repr((base_token, model, round(pad, 3), target_res, head, len(records)))
+    # NOTE: 物件大小/信心過濾**不在這裡**做——改在各工具「渲染散點時」用 _obj_keep
+    # 過濾（見 _obj_keep / _obj_view_indices）。理由：Visualize/Compare 把整批結果存進
+    # session（Run-gated），若在此先濾，調低門檻時被丟掉的物件無法回來；渲染時過濾才能
+    # 即時、可回復。本函式一律回傳「完整集合」（每個 record 帶 short_px 與 score）。
     cached = st.session_state.get(session_key)
     if cached and cached.get("seed") == seed:
         return cached["records"], cached["emb"], cached["token"]
@@ -4309,6 +4501,19 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
             _src["ip"] = str(ip)
         return _src["img"]
 
+    _imwh: dict[str, tuple[int, int]] = {}
+
+    def _img_wh(ip) -> tuple[int, int]:
+        """源圖寬高（只讀 header、不解碼）→ 供算物件源像素短邊（裁切可靠度）。"""
+        k = str(ip)
+        if k not in _imwh:
+            try:
+                with Image.open(ip) as _im:
+                    _imwh[k] = _im.size
+            except (OSError, Image.DecompressionBombError):
+                _imwh[k] = (0, 0)
+        return _imwh[k]
+
     obj_records: list[dict] = []
     crop_paths: list[Path] = []
     spec_by_path: dict[Path, tuple] = {}  # crop_path -> (image_path, bbox)
@@ -4329,10 +4534,13 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
                     continue
             crop_paths.append(out)
             spec_by_path[out] = (ip, o["bbox"])
+            _iw, _ih = _img_wh(ip)
             obj_records.append({
                 "path": out, "image_path": ip, "split": split_by.get(str(ip), ""),
                 "label": o["label"], "class_id": o["class_id"],
                 "bbox": o["bbox"], "obj_index": o["obj_index"],
+                "short_px": int(round(min(o["bbox"][2] * _iw, o["bbox"][3] * _ih))),
+                "score": o.get("score"),   # 6 欄 label 的 conf；GT(5 欄)為 None
             })
         # Embed from the in-memory crop of the FULL-RES original (never the JPEG).
         embed_fn = load_model(model, keep_aspect=True,
@@ -4468,6 +4676,12 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
     k = c3.number_input("稀疏度 k", min_value=1, max_value=max(1, n - 1),
                         value=min(10, max(1, n - 1)), key="cov_sparsity_k",
                         help="到 k 個最近鄰的平均 cosine 距離＝稀疏度（高維算）。")
+    if is_obj:
+        _obj_filter_controls("cov", records)
+        records, emb, active_token = _obj_filter_view(records, emb, active_token)
+        labels = [r.get("label", "") for r in records]  # 濾後 labels 要跟 emb 同步！
+        n = len(emb)
+    k = min(int(k), max(1, n - 1))
 
     sparsity = _cov_sparsity(emb, int(k), active_token)
     cand_emb = st.session_state.get("cov_cand_emb")
@@ -4528,7 +4742,8 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
 
         if dim == 2:
             event = st.plotly_chart(
-                fig, use_container_width=True, key=f"cov_emb_scatter_{_cov_cn}",
+                fig, use_container_width=True,
+                key=f"cov_emb_scatter_{_cov_cn}_{_obj_filter_tag()}",
                 on_select="rerun", selection_mode=("points", "box", "lasso"))
             sel_pts: list[dict] = []
             if event is not None:
@@ -4998,6 +5213,14 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
         st.session_state["_objcov_main"] = cache
     orecs, oemb, olabels = cache["recs"], cache["emb"], cache["labels"]
 
+    # 即時過濾：信心（資料含 score 才出現）／源短邊 → 同步濾 orecs/oemb/olabels。
+    _obj_filter_controls("objcov", orecs)
+    _keep = _obj_view_indices(orecs)
+    if len(_keep) < len(orecs):
+        orecs = [orecs[i] for i in _keep]
+        oemb = np.asarray(oemb)[_keep]
+        olabels = [olabels[i] for i in _keep]
+
     # ── 右半部即時調整（不需重跑）：維度 / 區塊數 K / 稀疏度 k ──
     _vc = st.columns([1, 1, 1])
     _dim = 3 if _vc[0].radio("維度", ["2D", "3D"], horizontal=True,
@@ -5145,7 +5368,8 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
                               margin=dict(l=0, r=0, t=0, b=0),
                               legend=dict(orientation="h"))
             ev = st.plotly_chart(
-                fig, use_container_width=True, key=f"objcov2d_{_otok}_{_ocn}",
+                fig, use_container_width=True,
+                key=f"objcov2d_{_otok}_{_ocn}_{_obj_filter_tag()}",
                 on_select="rerun", selection_mode=("points", "box", "lasso"))
             if ev is not None:
                 _so = ev.get("selection") if hasattr(ev, "get") else None
@@ -6481,7 +6705,7 @@ def main() -> None:
                    "🏷 標註品質／評估： 組考卷 · 灰帶覆核 · 評估")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "組考卷", "灰帶覆核", "評估"],
+                     "完整度熱力圖", "組考卷", "灰帶覆核", "評估", "匯出子集"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
@@ -6548,8 +6772,10 @@ def main() -> None:
         _quiz_ui()
     elif tool == "灰帶覆核":
         _gray_zone_ui()
-    else:
+    elif tool == "評估":
         _evaluation_ui()
+    else:
+        _export_subset_ui()
 
     # 收合 CSS 與逃生鈕都放在 dispatch 之後：本輪 Run 區塊已設好 flag，這裡即本輪生效
     if st.session_state.get("_sidebar_collapsed"):

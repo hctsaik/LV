@@ -491,7 +491,8 @@ def test_s13_clear_button_aligned_with_visualize_pattern():
     import inspect
     src = inspect.getsource(app._render_coverage_view)
     assert "_cov_clear_nonce" in src, "clear nonce not read in the coverage view"
-    assert 'key=f"cov_emb_scatter_{_cov_cn}"' in src, \
+    # key 仍須帶 clear nonce（之後可再接物件過濾 tag，故只比對前綴）
+    assert 'key=f"cov_emb_scatter_{_cov_cn}' in src, \
         "scatter key no longer carries the clear nonce → clear cannot remount it"
     assert "_clear_slot = _tb2.empty()" in src, \
         "✕ button is not the placeholder placed ABOVE the scatter"
@@ -499,6 +500,19 @@ def test_s13_clear_button_aligned_with_visualize_pattern():
         "✕ button not wired to _cov_clear_selection"
     assert 'cov_sel={"token": "", "indices": [], "cand": []}' not in src, \
         "old no-op bottom clear button (token reset, no nonce) still present"
+
+
+# ════════════════════════ SCENARIO 14 ════════════════════════
+# REGRESSION: 物件即時過濾（信心區間／源短邊）會縮短 records/emb；當時 labels 沒跟著
+# 縮，監督投影 _supervised_projection(embeddings, y=labels) 就 ValueError（len(x)≠len(y)，
+# 例如 emb=28 / labels=504）。物件級 + 監督UMAP + 源短邊過濾掉一部分物件，必須不崩。
+def test_s14_object_filter_keeps_labels_aligned_for_supervised_proj():
+    at = run_harness({"main_dir": str(COCO8), "cov_token": "s14",
+                      "granularity": "物件級（YOLO）", "proj_method": "監督UMAP",
+                      "obj_min_short_px": 12})
+    assert not at.exception, f"S14 crashed (labels/emb 過濾後不同步?): {exc_summary(at)}"
+    txt = all_text(at)
+    print("S14 rendered ok | 監督 caption:", "監督投影" in txt)
 
 
 if __name__ == "__main__":

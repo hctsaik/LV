@@ -119,6 +119,11 @@ def _seed() -> None:
     if spec.get("granularity"):
         st.session_state["cov_granularity"] = spec["granularity"]
     st.session_state["cov_proj_method"] = spec.get("proj_method", "PCA")
+    # 物件即時過濾門檻（測 labels/emb 過濾後是否同步）
+    if spec.get("obj_min_short_px"):
+        st.session_state["obj_min_short_px"] = int(spec["obj_min_short_px"])
+    if spec.get("obj_conf_range"):
+        st.session_state["obj_conf_range"] = tuple(spec["obj_conf_range"])
     if spec.get("proj_dim"):
         st.session_state["cov_proj_dim"] = spec["proj_dim"]
     if spec.get("color_mode"):
