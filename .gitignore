@@ -52,3 +52,6 @@ tests/e2e/_*.log
 
 # understand-anything tool cache
 .understand-anything/
+
+# U-Net workflow runtime state (contract-hash baseline + active-role marker)
+.unet/

@@ -829,12 +829,21 @@ def _export_entry(records: list[dict], i: int, source: str = "manual",
     r = records[i]
     p = Path(r["path"])
     man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
-    return {"index": i, "filename": p.name, "path": str(p),
+    snap = {"index": i, "filename": p.name, "path": str(p),
             "label": r.get("label", ""), "split": r.get("split", ""),
             "sha256": man.get("sha256") if man else None,
             "source": source,
             "score": (round(float(score), 4) if score is not None else None),
             "reason": reason}
+    # 物件級紀錄：path 是裁切快取圖（供檢視/相似度），但匯出要回到「原圖＋標記」。
+    # 額外記下原圖路徑、bbox、框 index，並標記 level=object；path 維持裁切圖不動。
+    ip = r.get("image_path")
+    if ip is not None and str(ip) != str(p):
+        snap["level"] = "object"
+        snap["image_path"] = str(ip)
+        snap["bbox"] = list(r.get("bbox")) if r.get("bbox") is not None else None
+        snap["obj_index"] = r.get("obj_index")
+    return snap
 
 
 def _add_to_export(records: list[dict], indices: list[int], source: str = "manual",
@@ -938,16 +947,22 @@ def _cart_to_gray(snaps: list[dict], model: str) -> None:
 
 
 def _export_items_from_cart(snaps: list[dict]) -> list:
-    """購物車快照 → export_subset.ExportItem 清單（image-level）。
-    label 走 yolo_label_path_for；類別名走 _classes_txt_nested（給 class_remap）。"""
+    """購物車快照 → export_subset.ExportItem 清單。
+    image-level 用 path；物件級（level=object）改用原圖 image_path＋obj_index，
+    匯出成「原圖＋整份標記」。label 走 yolo_label_path_for；類別名走
+    _classes_txt_nested（給 class_remap）。"""
     import export_subset as _es
     from interaction import yolo_label_path_for
     items = []
     for s in snaps:
-        ip = Path(s["path"])
+        # 物件級快照：image_path 指向原圖（path 是裁切圖，僅供檢視）。匯出要的是
+        # 原圖＋整份標記＋被挑中的框 index，類別名也要從「原圖的資料集」推。
+        is_obj = s.get("level") == "object" and s.get("image_path")
+        ip = Path(s["image_path"]) if is_obj else Path(s["path"])
         lp = yolo_label_path_for(ip)
         names = (_classes_txt_nested(ip.parent.parent)
                  or _classes_txt_nested(ip.parent) or [])
+        obj_index = s.get("obj_index")
         items.append(_es.ExportItem(
             image_path=ip,
             label_path=(lp if lp and lp.exists() else None),
@@ -956,7 +971,12 @@ def _export_items_from_cart(snaps: list[dict]) -> list:
             source_tool=s.get("source", ""),
             source_tag=s.get("source", ""),
             reason=s.get("reason", "") or "",
-            sha256=s.get("sha256"),
+            level=("object" if is_obj else "image"),
+            object_ids=([int(obj_index)] if is_obj and obj_index is not None
+                        else None),
+            # 物件級的 sha 必須是「原圖」的；傳 None 讓 export_subset 從原圖
+            # bytes 重算，絕不沿用裁切圖的 sha 當原圖身分。
+            sha256=(None if is_obj else s.get("sha256")),
         ))
     return items
 
@@ -996,8 +1016,17 @@ def _export_subset_ui() -> None:
 
     st.divider()
     st.markdown("### 匯出成資料夾（YOLO 子資料集）")
-    dst_str = st.text_input("目的地資料夾（新的／空的；若落在來源資料集內會被擋下）",
-                            key="exp_dst", placeholder=r"C:\out\my_subset")
+    _dc1, _dc2 = st.columns([5, 1], vertical_alignment="bottom")
+    with _dc1:
+        dst_str = st.text_input("目的地資料夾（新的／空的；若落在來源資料集內會被擋下）",
+                                key="exp_dst", placeholder=r"C:\out\my_subset")
+    with _dc2:
+        # on_click 回呼在 rerun 開始、widget 實例化「之前」就跑完，因此可以安全寫回
+        # 同名 widget key（exp_dst）；用 if st.button()+st.rerun() 反而會在本輪
+        # text_input 已實例化後才寫，Streamlit 會丟例外。
+        st.button("📁 選資料夾", key="exp_dst_pick", use_container_width=True,
+                  on_click=_pick_folder, args=("exp_dst",),
+                  help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
     _MODE_LBL = {"copy": "複製檔案（推薦）", "symlink": "建捷徑（省空間・進階）",
                  "manifest-only": "只出清單（不搬影像）"}
     _EXIST_LBL = {"skip": "略過同名（推薦）", "rename": "改名加序號", "overwrite": "覆寫"}
@@ -1040,6 +1069,227 @@ def _export_subset_ui() -> None:
         if rep.errors:
             st.error("錯誤：" + "；".join(map(str, rep.errors[:10])))
         _log_usage("export_subset", n=rep.exported, source="yolo")
+
+
+def _anomaly_add_to_cart(records: list[dict], indices: list[int]) -> None:
+    """把選定的物件(原圖)加入策展購物車,來源標 anomaly,分數帶上。"""
+    scores = {i: records[i].get("score") for i in indices}
+    _add_to_export(records, indices, source="anomaly", scores=scores)
+
+
+def _anomaly_mark(records: list[dict], indices: list[int], verdict: str) -> None:
+    """把框選的物件標為正常(good)/瑕疵(bad)範例 → 寫入 anomaly_confirmed。
+    下次「執行偵測」會用『確認為 good』建乾淨 few-shot memory bank(細微瑕疵主路徑);
+    『確認為 bad』用來校準門檻並算 AUROC。index 為全域物件索引,跨重跑於同資料集穩定。"""
+    conf = st.session_state.setdefault("anomaly_confirmed", {})
+    for i in indices:
+        conf[int(i)] = verdict
+    kind = "正常" if verdict == "good" else "瑕疵"
+    st.toast(f"已標記 {len(indices)} 個為{kind}範例;按「執行偵測」重跑套用。", icon="✅")
+
+
+def _anomaly_autoseed_normal(n: int = 12) -> None:
+    """免框選的快速 few-shot 種子:把『最不可疑』的 n 個物件標為正常範例。"""
+    res = st.session_state.get("anomaly_result") or {}
+    ranking = list(res.get("ranking") or [])
+    seed = ranking[-n:] if len(ranking) >= n else ranking
+    conf = st.session_state.setdefault("anomaly_confirmed", {})
+    for i in seed:
+        conf[int(i)] = "good"
+    st.toast(f"已把最不可疑的 {len(seed)} 個標為正常範例;按「執行偵測」重跑。", icon="✅")
+
+
+def _anomaly_clear_confirmed() -> None:
+    st.session_state["anomaly_confirmed"] = {}
+
+
+def _anomaly_ui() -> None:
+    """🔧 瑕疵偵測(AnomalyDINO 風格):載入 YOLO 資料夾 → 物件級 patch 異常分數 →
+    排序 + 散點圖框選/購物車 + 熱力圖 + 匯出原圖。實作委派 anomaly_tool.run_pipeline。"""
+    import plotly.graph_objects as go
+    from PIL import Image
+
+    from anomaly_heatmap import render_heatmap
+    from anomaly_score import score_object
+    from anomaly_tool import run_pipeline
+    from interaction import (crop_bbox, discover_yolo_objects,
+                             selection_points_to_indices, zip_selected_images)
+    from object_eval import (_adaptive_pad_px, classes_for, dataset_cache_dir,
+                             list_images)
+    from patch_features import embed_objects_patch
+
+    st.subheader("🔧 瑕疵偵測(Anomaly Detection)")
+    st.caption("多數良品當『正常參考』,把偏離的物件挑出來。基於凍結 DINOv2 patch 特徵 + "
+               "最近鄰距離(AnomalyDINO, WACV 2025);**不需瑕疵樣本訓練、不寫你的資料集**。")
+    st.caption("**細微瑕疵主路徑(2-stage)**:先「執行偵測」看分布 → 框選你**確定正常**的點按"
+               "「✅ 框選標為正常範例」(或用自動種子)→ 再「執行偵測」即用乾淨 few-shot bank,"
+               "專抓物件級會被平均掉的細微瑕疵。")
+
+    with st.sidebar:
+        st.markdown("### 🔧 瑕疵偵測設定")
+        folders = _folder_picker_list("anomaly_folder",
+                                      add_help="YOLO 偵測資料集:含 images/ 與 labels/")
+        _folder_add_input("anomaly_folder")
+        mode = st.radio("流程", ["two_stage", "one_stage"], key="anomaly_mode",
+                        format_func=lambda m: {"two_stage": "2-stage(抽樣→確認→整批)",
+                                               "one_stage": "1-stage(直接整批)"}[m],
+                        help="2-stage:先抽樣分群、你確認少數正常,再整批。1-stage:直接用最大群當正常。")
+        score_mode = st.radio("分數依據", ["patch", "object"], key="anomaly_score_mode",
+                              format_func=lambda m: {"patch": "patch 級(抓細微瑕疵,較準)",
+                                                     "object": "物件級(快,粗)"}[m])
+        sample_n = st.slider("2-stage 抽樣數", 16, 256, 64, key="anomaly_sample_n")
+        run = st.button("▶ 執行偵測", key="anomaly_run", type="primary",
+                        use_container_width=True)
+
+    if run:
+        roots = [Path(f) for f in folders]
+        image_paths: list[Path] = []
+        class_names = None
+        for r in roots:
+            image_paths.extend(list_images(r))
+            class_names = class_names or classes_for(r)
+        if not image_paths:
+            st.session_state["anomaly_result"] = {"records": [], "_err": "no_images"}
+        else:
+            cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}")
+            with st.spinner(f"偵測中…({len(image_paths)} 張圖,首跑含模型載入較久)"):
+                result = run_pipeline(
+                    image_paths, class_names, mode=mode, score_mode=score_mode,
+                    sample_n=sample_n,
+                    confirmed=st.session_state.get("anomaly_confirmed", {}),
+                    cache_dir=cache)
+            result["_image_paths"] = [str(p) for p in image_paths]
+            result["_class_names"] = list(class_names) if class_names else None
+            result["_cache"] = str(cache)
+            st.session_state["anomaly_result"] = result
+            _collapse_sidebar()
+            _log_usage("anomaly_run", n=len(result["records"]), source=score_mode)
+
+    result = st.session_state.get("anomaly_result")
+    if not result:
+        st.info("在左側選一個 YOLO 偵測資料夾(images/+labels/)後按「執行偵測」。")
+        return
+    if not result.get("records"):
+        st.error("找不到 YOLO 標註:此工具需要偵測資料集(資料夾內要有 **images/** 與 "
+                 "**labels/**,labels 為 YOLO 格式 .txt)。請確認後重選資料夾。")
+        return
+
+    records = result["records"]
+    scores = np.asarray(result["scores"], dtype=float)
+    ranking = result["ranking"]
+    n_bad = result["n_bad"]
+    auroc = result.get("auroc")
+
+    msg = f"共 **{len(records)}** 個物件 · 判為可疑(bad)**{n_bad}** 個 · 門檻 {result['threshold']:.3f}"
+    if auroc is not None:
+        msg += f" · 對照確認標籤 AUROC **{auroc:.3f}**"
+    st.markdown(msg)
+
+    left, right = st.columns([3, 2], gap="medium")
+
+    # ── 左:分布散點圖(物件級 embedding 投影,以異常分數上色;框選→購物車)──
+    with left:
+        emb = np.asarray(result["obj_emb"], dtype=float)
+        sel_idx: list[int] = []
+        if emb.shape[0] >= 2 and emb.shape[1] >= 2:
+            c = emb - emb.mean(axis=0, keepdims=True)
+            try:
+                _u, _s, _vt = np.linalg.svd(c, full_matrices=False)
+                coords = (_u[:, :2] * _s[:2])
+            except np.linalg.LinAlgError:
+                coords = c[:, :2]
+            fig = go.Figure(go.Scattergl(
+                x=coords[:, 0], y=coords[:, 1], mode="markers",
+                marker=dict(size=7, color=scores, colorscale="Turbo",
+                            showscale=True, colorbar=dict(title="異常")),
+                customdata=list(range(len(records))),
+                text=[f"{Path(r['image_path']).name}<br>score={r['score']:.3f}·{r['verdict']}"
+                      for r in records],
+                hovertemplate="%{text}<extra></extra>"))
+            fig.update_layout(height=440, margin=dict(l=0, r=0, t=10, b=0),
+                              dragmode="lasso")
+            ev = st.plotly_chart(fig, key="anomaly_scatter", on_select="rerun",
+                                 selection_mode=("box", "lasso"))
+            if ev and getattr(ev, "selection", None):
+                sel_idx = selection_points_to_indices(ev.selection.get("points", []))
+            st.caption(f"散點圖:點越紅越可疑。框選/套索離群點 → 加入購物車。已框選 {len(sel_idx)} 個。")
+            st.button("🛒 加入購物車(框選)", key="anomaly_cart_selected",
+                      disabled=not sel_idx, use_container_width=True,
+                      on_click=_anomaly_add_to_cart, args=(records, sel_idx))
+            mc1, mc2 = st.columns(2)
+            mc1.button("✅ 框選標為正常範例", key="anomaly_mark_normal",
+                       disabled=not sel_idx, use_container_width=True,
+                       on_click=_anomaly_mark, args=(records, sel_idx, "good"),
+                       help="2-stage:把你確定正常的點標起來 → 「執行偵測」用這些建乾淨 "
+                            "few-shot bank,專抓細微瑕疵。")
+            mc2.button("🔴 框選標為瑕疵範例", key="anomaly_mark_bad",
+                       disabled=not sel_idx, use_container_width=True,
+                       on_click=_anomaly_mark, args=(records, sel_idx, "bad"),
+                       help="把已知瑕疵標起來校準門檻(會算出 AUROC)。")
+        _outliers = sorted(set(result.get("candidates") or [])
+                           | {i for i in range(len(records))
+                              if records[i]["verdict"] == "bad"})
+        # 不加 help:Streamlit 的 help tooltip 會多渲染一個 <button>,使 e2e 的
+        # `.st-key-anomaly_select_outliers button` 命中 2 個元素(strict mode 違規)。
+        st.button("🛒 把離群/可疑物件加入購物車(分群離群候選 + 判為 bad)",
+                  key="anomaly_select_outliers", use_container_width=True,
+                  on_click=_anomaly_add_to_cart, args=(records, _outliers))
+        st.button("✅ 自動把最不可疑的 12 個標為正常範例(few-shot 種子)",
+                  key="anomaly_autoseed_normal", use_container_width=True,
+                  on_click=_anomaly_autoseed_normal)
+        _conf = st.session_state.get("anomaly_confirmed", {})
+        _ng = sum(1 for v in _conf.values() if v == "good")
+        _nb = sum(1 for v in _conf.values() if v == "bad")
+        if _conf:
+            sc1, sc2 = st.columns([3, 1])
+            sc1.caption(f"📌 已標記正常 **{_ng}** · 瑕疵 **{_nb}** —— 按「執行偵測」用乾淨 "
+                        "few-shot bank 重跑(抓細微瑕疵)。")
+            sc2.button("清除標記", key="anomaly_clear_confirmed",
+                       on_click=_anomaly_clear_confirmed, use_container_width=True)
+        cart_n = len(_cart_snapshots("anomaly"))
+        with st.container(key="anomaly_cart_count"):
+            st.caption(f"購物車(瑕疵)目前 {cart_n} 個物件(原圖)。")
+        cart = _cart_snapshots("anomaly")
+        recs = [{"path": s["path"], "split": s.get("split", ""),
+                 "label": s.get("label", "")} for s in cart]
+        st.download_button(
+            "⬇ 匯出選取原圖 ZIP", key="anomaly_export",
+            data=(zip_selected_images(recs, list(range(len(recs)))) if recs else b""),
+            file_name="anomaly_subset.zip", mime="application/zip",
+            disabled=not recs, use_container_width=True)
+
+    # ── 右:排序清單(最可疑在前)+ 熱力圖 ──
+    with right:
+        st.markdown("**最可疑 → 最不可疑**")
+        with st.container(height=300, key="anomaly_ranked"):
+            for rank, i in enumerate(ranking[:60]):
+                r = records[i]
+                flag = "🔴" if r["verdict"] == "bad" else "⚪"
+                st.write(f"{rank + 1}. {flag} `{Path(r['image_path']).name}` "
+                         f"#{r['obj_index']} — {r['score']:.3f}")
+
+        if result.get("bank") is not None and result.get("_image_paths"):
+            st.markdown("**看哪裡怪(熱力圖)**")
+            top = ranking[:30]
+            pick = st.selectbox(
+                "選一個可疑物件", top, key="anomaly_heat_pick",
+                format_func=lambda i: f"{Path(records[i]['image_path']).name} #{records[i]['obj_index']}"
+                f" ({records[i]['score']:.3f})")
+            try:
+                meta = discover_yolo_objects([Path(p) for p in result["_image_paths"]],
+                                             result.get("_class_names"))
+                pf = embed_objects_patch([meta[pick]], cache_dir=Path(result["_cache"]))[0]
+                _, pmap = score_object(pf["feats"], pf["grid"], result["bank"])
+                img = Image.open(records[pick]["image_path"]).convert("RGB")
+                iw, ih = img.size
+                b = records[pick]["bbox"]
+                crop = crop_bbox(img, *b, pad_px=_adaptive_pad_px(b, iw, ih, 0.12))
+                st.image(render_heatmap(pmap, crop), use_container_width=True,
+                         caption="紅=該局部與正常差最大(可疑缺陷位置)")
+            except Exception as e:  # noqa: BLE001 — 熱力圖失敗不應拖垮整頁
+                st.caption(f":gray[熱力圖無法產生:{e}]")
+        elif result.get("score_mode") == "object":
+            st.caption(":gray[物件級模式不產生熱力圖;改用 patch 級可看『哪裡怪』。]")
 
 
 def _nn_index_for(model_name: str):
@@ -6696,10 +6946,10 @@ def main() -> None:
     if st.session_state.get("tool_switch") in {"組考卷", "灰帶覆核", "評估"}:
         st.session_state["tool_switch"] = "Visualize Embeddings"
     with switch_col:
-        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　📦 匯出")
+        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🔧 瑕疵偵測　　📦 匯出")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "匯出"],
+                     "完整度熱力圖", "瑕疵偵測", "匯出"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
@@ -6762,6 +7012,8 @@ def main() -> None:
         _compare_distributions_ui()
     elif tool == "完整度熱力圖":
         _completeness_ui()
+    elif tool == "瑕疵偵測":
+        _anomaly_ui()
     elif tool == "組考卷":
         _quiz_ui()
     elif tool == "灰帶覆核":
