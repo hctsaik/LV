@@ -766,6 +766,10 @@ def test_u_completeness_heatmap(app_page, tmp_path):
     wait_idle(page)
     _add_folder(page, "cov_folder_list", str(root))
     # X = label, Y = brightness (default index 2 already = brightness)
+    # 預設檢視是「嵌入覆蓋圖」(不渲染 cov_heatmap);跑前先在(仍展開的)sidebar 切到
+    # 「屬性棋盤」,跑完該檢視直接出熱力圖,免處理跑後 sidebar 自動收合的時序。
+    page.locator('.st-key-cov_view_mode').get_by_text("屬性棋盤", exact=True).click()
+    wait_idle(page)
     page.locator('.st-key-run_cov button').click()
     page.wait_for_selector('.st-key-cov_heatmap', timeout=300000)
     wait_idle(page, timeout=120000)
@@ -839,6 +843,10 @@ def test_w_completeness_calibration_and_mining(app_page, tmp_path):
     wait_idle(page)
     # Run-time sidebar is just folder + model + run; tuning lives post-Run
     _add_folder(page, "cov_folder_list", str(root))
+    # 預設檢視是「嵌入覆蓋圖」(不渲染 cov_heatmap);跑前先在(仍展開的)sidebar 切到
+    # 「屬性棋盤」,跑完該檢視直接出熱力圖,免處理跑後 sidebar 自動收合的時序。
+    page.locator('.st-key-cov_view_mode').get_by_text("屬性棋盤", exact=True).click()
+    wait_idle(page)
     page.locator('.st-key-run_cov button').click()
     page.wait_for_selector('.st-key-cov_heatmap', timeout=300000)
     wait_idle(page, timeout=120000)

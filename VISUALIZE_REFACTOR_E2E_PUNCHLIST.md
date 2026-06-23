@@ -31,8 +31,8 @@
 | `test_o_projection_method_skip` | `viz_methods` multiselect 用 Backspace 移除到剩 PCA → tags 數不收斂 | multiselect 互動脆弱,改穩定移除法 |
 | `test_q_text_to_image_search` | CLIP 文搜面板 | 查 viz 文搜 UI(需 CLIP 模型) |
 | `test_t_umap_reference_frame` | `ref_path_for` 持久化驗證(移除 cache 隔離後仍紅) | 查 umap_ref 寫入路徑/時序 |
-| `test_u_completeness_heatmap` | 完整度工具 `cov_heatmap` 跑後不渲染 | 查 `run_cov`→`cov_heatmap` 路徑 |
-| `test_w_completeness_calibration_and_mining` | 同 cov 工具校準/採礦 | 隨 test_u |
+| ~~`test_u_completeness_heatmap`~~ | **✅ 已修(綠)**:檢視預設改成「嵌入覆蓋圖」(app.py:5910/4804),`cov_heatmap`(6070)只在「屬性棋盤」渲染 | 已改:run_cov **前**先切 `cov_view_mode`→「屬性棋盤」(sidebar 仍展開時),跑完直接出熱力圖 |
+| `test_w_completeness_calibration_and_mining` | 熱力圖部分已隨 test_u 修法修好;**剩下更深的一段**:挖候選 mining(`🔎 撈候選補此格` popover → `cov_mine_btn` → `cov_cand_csv`)在 mining 後 `cov_cand_csv` 不顯示(無 server crash,line 876) | 查 `_render_cov_candidates`(app.py:4455)/`_mine_cell_candidates`(4412):候選是否為空、CSV 是否在 popover 內(關閉後看不到)。屬獨立問題,非預設檢視 |
 
 ## 怎麼跑
 ```
