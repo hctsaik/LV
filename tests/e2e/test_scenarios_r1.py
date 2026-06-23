@@ -19,7 +19,7 @@ import pytest
 from PIL import Image
 from playwright.sync_api import expect
 
-from .conftest import load_app, wait_idle
+from .conftest import _add_folder, _ensure_sidebar, load_app, wait_idle
 
 pytestmark = pytest.mark.e2e
 
@@ -146,7 +146,7 @@ def _switch_panel(page, label: str) -> None:
 
 def test_s01_detector_multimodel_cold_run(det_page, detector_dataset):
     page = det_page
-    page.locator('.st-key-viz_folder_text textarea').fill(
+    _add_folder(page, "viz_folder_list",
         str(detector_dataset / "train") + "\n" + str(detector_dataset / "val"))
     texts = _run_and_collect_progress(page, timeout_s=400)
     assert page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0
@@ -173,7 +173,7 @@ def test_s10_empty_selection_export_honesty(det_page):
     # batch-add is disabled with nothing selected — no way to crash it
     expect(page.locator('.st-key-viz_add_btn button')).to_be_disabled()
     _switch_panel(page, "匯出清單")
-    expect(page.get_by_text("清單是空的。", exact=False)).to_be_visible()
+    expect(page.get_by_text("購物車是空的。", exact=False)).to_be_visible()
     assert page.locator('.st-key-viz_export_csv').count() == 0  # honest empty state
     _switch_panel(page, "選取")
     _no_exception(page)
@@ -288,6 +288,8 @@ def test_s04_outlier_ranking_and_export(det_page):
 
 # ── S5: Compare Distributions full metrics + coverage gap + JSON ────────
 
+@pytest.mark.skip(reason="Compare 改為物件級・按類別(YOLO)；FID/KID/IS 與影像級流程已移除，"
+                         "資料夾改 📁 原生選擇(非 headless 可填)。新流程見 test_compare_by_class.py。")
 def test_s05_compare_distributions_metrics(fresh_page, tmp_path):
     page = fresh_page
     a, b = tmp_path / "gen", tmp_path / "real"
@@ -326,7 +328,7 @@ def test_s06_minimal_dataset_single_image(fresh_page, tmp_path):
     _img(tmp_path / "mini" / "train" / "classA", "dog.jpg", seed=7)
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    page.locator('.st-key-viz_folder_text textarea').fill(
+    _add_folder(page, "viz_folder_list",
         str(tmp_path / "mini" / "train"))
     _run_and_collect_progress(page, timeout_s=300)
     _no_exception(page)
@@ -366,7 +368,7 @@ def test_s07_unicode_paths_round_trip(fresh_page, tmp_path):
                 _img(root / split / cls, names[i % 3], seed, bias=0 if cls == "類別A" else 1)
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    page.locator('.st-key-viz_folder_text textarea').fill(
+    _add_folder(page, "viz_folder_list",
         str(root / "train") + "\n" + str(root / "val"))
     _run_and_collect_progress(page, timeout_s=400)
     _no_exception(page)
@@ -391,6 +393,7 @@ def test_s07_unicode_paths_round_trip(fresh_page, tmp_path):
     _no_exception(page)
 
     # ── S8(edge): mode switch fully isolates state (no silent carryover) ─
+    _ensure_sidebar(page)  # the cold Run above auto-collapsed the sidebar
     page.locator('.st-key-viz_mode').get_by_text("Object Detector").click()
     wait_idle(page)
     expect(page.get_by_text("已切換模式", exact=False)).to_be_visible()
@@ -420,10 +423,10 @@ def test_s09_detector_missing_classes_error(fresh_page, tmp_path):
         p = _img(img_dir, f"x{i}.jpg", seed=i)
         (lbl_dir / f"{p.stem}.txt").write_text("0 0.5 0.5 0.4 0.4\n", encoding="utf-8")
     # default mode is Object Detector; no classes.txt anywhere
-    page.locator('.st-key-viz_folder_text textarea').fill(str(root / "train"))
+    _add_folder(page, "viz_folder_list", str(root / "train"))
     page.get_by_text("類別來源", exact=False).click()  # open the expander
     wait_idle(page)
-    class_input = page.locator('[data-testid="stSidebar"] [data-testid="stTextInput"] input')
+    class_input = page.locator('.st-key-viz_class_names input')
     class_input.fill("")
     page.keyboard.press("Tab")
     wait_idle(page)

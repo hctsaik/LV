@@ -10,6 +10,16 @@ from pathlib import Path
 import numpy as np
 
 
+# DINOv2 變體的輸出維度(vits=384、vitb=768…)。壞圖 fallback 用它,才不會在
+# vstack 不同模型維度時炸(vitb=768 與寫死的 384 不相容)。未知名稱退 384。
+_DINOV2_DIM = {"dinov2_vits14": 384, "dinov2_vitb14": 768,
+               "dinov2_vitl14": 1024, "dinov2_vitg14": 1536}
+
+
+def model_dim(model: str) -> int:
+    return _DINOV2_DIM.get(model, 384)
+
+
 def _l2n_rows(feats: np.ndarray) -> np.ndarray:
     feats = np.asarray(feats, dtype=np.float32)
     return feats / np.clip(np.linalg.norm(feats, axis=1, keepdims=True), 1e-12, None)
@@ -54,10 +64,9 @@ def embed_objects_patch(meta, model: str = "dinov2_vits14", *, target_res: int =
                         pad: float = 0.12, cache_dir=None, extractor=None,
                         progress=None) -> list[dict]:
     """逐物件回傳 PatchFeat(順序同 meta)。cache_dir 給定時逐物件 .npz(float16)快取。"""
-    from PIL import Image
-
     from interaction import crop_bbox
     from object_eval import _adaptive_pad_px
+    from safe_io import safe_open_image
 
     cache_dir = Path(cache_dir) if cache_dir else None
     if cache_dir:
@@ -83,14 +92,12 @@ def embed_objects_patch(meta, model: str = "dinov2_vits14", *, target_res: int =
 
         ip = str(m["image_path"])
         if ip != cur_ip:
-            try:
-                cur = Image.open(ip).convert("RGB")
-            except (OSError, Image.DecompressionBombError):
-                cur = None
+            cur = safe_open_image(ip)   # 壞圖回 None → 補零保索引對齊(out[i] 仍填)
             cur_ip = ip
 
         if cur is None:
-            pf = {"feats": np.zeros((1, 384), dtype=np.float32), "grid": (1, 1)}
+            pf = {"feats": np.zeros((1, model_dim(model)), dtype=np.float32),
+                  "grid": (1, 1)}
         else:
             iw, ih = cur.size
             b = m["bbox"]

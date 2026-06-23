@@ -24,8 +24,8 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 
+from safe_io import safe_open_image, safe_read_text
 from interaction import bbox_to_pixels, parse_yolo_boxes, yolo_label_path_for
 from signal_strength import (
     calibrate_thresholds,
@@ -54,7 +54,7 @@ def _load_class_names(start: Path) -> list[str] | None:
     for d in [start, *start.parents][:6]:
         f = d / "classes.txt"
         if f.exists():
-            return [ln.strip() for ln in f.read_text(encoding="utf-8").splitlines()
+            return [ln.strip() for ln in safe_read_text(f).splitlines()
                     if ln.strip()]
     return None
 
@@ -70,11 +70,10 @@ def collect_snr(images_dir: Path, labels_dir: Path | None, type_from: str):
         if not boxes:
             continue
         n_imgs += 1
-        try:
-            with Image.open(img_path) as im:
-                g = np.asarray(im.convert("L"), dtype=np.float64) / 255.0
-        except (OSError, ValueError):
+        im = safe_open_image(img_path, mode="L")
+        if im is None:  # 壞檔/截斷 → 跳過此圖,不計入校準
             continue
+        g = np.asarray(im, dtype=np.float64) / 255.0
         h, w = g.shape
         for cid, cx, cy, bw, bh in boxes:
             m = roi_background_metrics(g, bbox_to_pixels(cx, cy, bw, bh, w, h))

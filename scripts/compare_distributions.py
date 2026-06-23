@@ -15,6 +15,7 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from _utils import available_models, extract_embeddings, load_model
+from safe_io import safe_open_image, safe_read_text
 
 # Compare-metric weights live under the single models/ root, each in its own
 # same-named folder (see MODELS.md). LV_MODELS_DIR relocates the whole root.
@@ -105,12 +106,18 @@ def compute_lpips_score(
     ])
 
     total = 0.0
+    scored = 0
     with torch.no_grad():
         for pa, pb in zip(sampled_a, sampled_b):
-            ia = transform(Image.open(pa).convert("RGB")).unsqueeze(0)
-            ib = transform(Image.open(pb).convert("RGB")).unsqueeze(0)
+            im_a = safe_open_image(pa)
+            im_b = safe_open_image(pb)
+            if im_a is None or im_b is None:  # 壞檔 → 整對跳出比較,保持配對對齊
+                continue
+            ia = transform(im_a).unsqueeze(0)
+            ib = transform(im_b).unsqueeze(0)
             total += loss_fn(ia, ib).item()
-    return total / n
+            scored += 1
+    return total / scored if scored else float("nan")
 
 
 def compute_ssim_score(
@@ -125,11 +132,17 @@ def compute_ssim_score(
     sampled_b = random.sample(paths_b, n)
 
     total = 0.0
+    scored = 0
     for pa, pb in zip(sampled_a, sampled_b):
-        ia = np.array(Image.open(pa).convert("RGB").resize((256, 256)))
-        ib = np.array(Image.open(pb).convert("RGB").resize((256, 256)))
+        im_a = safe_open_image(pa)
+        im_b = safe_open_image(pb)
+        if im_a is None or im_b is None:  # 壞檔 → 整對跳出比較,保持配對對齊
+            continue
+        ia = np.array(im_a.resize((256, 256)))
+        ib = np.array(im_b.resize((256, 256)))
         total += ssim(ia, ib, channel_axis=2, data_range=255)
-    return total / n
+        scored += 1
+    return total / scored if scored else float("nan")
 
 
 def compute_psnr_score(
@@ -140,12 +153,18 @@ def compute_psnr_score(
     sampled_a = random.sample(paths_a, n)
     sampled_b = random.sample(paths_b, n)
     total = 0.0
+    scored = 0
     for pa, pb in zip(sampled_a, sampled_b):
-        ia = np.array(Image.open(pa).convert("RGB").resize((256, 256)), dtype=np.float64)
-        ib = np.array(Image.open(pb).convert("RGB").resize((256, 256)), dtype=np.float64)
+        im_a = safe_open_image(pa)
+        im_b = safe_open_image(pb)
+        if im_a is None or im_b is None:  # 壞檔 → 整對跳出比較,保持配對對齊
+            continue
+        ia = np.array(im_a.resize((256, 256)), dtype=np.float64)
+        ib = np.array(im_b.resize((256, 256)), dtype=np.float64)
         mse = np.mean((ia - ib) ** 2)
         total += 100.0 if mse == 0 else 20 * np.log10(255.0) - 10 * np.log10(mse)
-    return total / n
+        scored += 1
+    return total / scored if scored else float("nan")
 
 
 def compute_inception_score(
@@ -189,12 +208,20 @@ def compute_inception_score(
     preds = []
     with torch.no_grad():
         for i in range(0, len(paths), batch_size):
-            batch = torch.stack([
-                transform(Image.open(p).convert("RGB")) for p in paths[i: i + batch_size]
-            ]).to(device)
+            tensors = []
+            for p in paths[i: i + batch_size]:
+                im = safe_open_image(p)
+                if im is None:        # 壞檔 → 跳出本批(不佔一列),不崩潰
+                    continue
+                tensors.append(transform(im))
+            if not tensors:           # 整批皆壞 → 此批無可評分影像
+                continue
+            batch = torch.stack(tensors).to(device)
             probs = F.softmax(model(batch), dim=1)
             preds.append(probs.cpu().numpy())
 
+    if not preds:
+        raise ValueError(f"No readable images found: {folder_or_paths}")
     preds = np.concatenate(preds, axis=0)  # (N, 1000)
     n = len(preds)
     n_splits = min(n_splits, n)

@@ -9,6 +9,7 @@ from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
 from _utils import available_models, extract_embeddings, load_model
+from safe_io import safe_read_text
 
 _COLORS = ["#e74c3c", "#f39c12", "#2ecc71", "#9b59b6", "#3498db", "#1abc9c", "#95a5a6"]
 _SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
@@ -18,8 +19,8 @@ def parse_label_file(label_path: Path, class_names: list[str]) -> str:
     """YOLO label → class name | 'mix' | 'unknown'."""
     if not label_path.exists():
         return "unknown"
-    lines = [ln.strip() for ln in label_path.read_text().splitlines() if ln.strip()]
-    if not lines:
+    lines = [ln.strip() for ln in safe_read_text(label_path).splitlines() if ln.strip()]
+    if not lines:  # 壞 label(讀不到/空)→ unknown,不崩潰
         return "unknown"
     class_ids = {int(ln.split()[0]) for ln in lines}
     if len(class_ids) > 1:

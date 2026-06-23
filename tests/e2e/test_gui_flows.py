@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import expect
 
-from .conftest import load_app, wait_idle
+from .conftest import _add_folder, _ensure_sidebar, load_app, wait_idle
 
 pytestmark = pytest.mark.e2e
 
@@ -137,7 +137,7 @@ def test_b_run_with_streaming_progress(flow_page, synthetic_dataset):
     page = flow_page
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    page.locator('.st-key-viz_folder_text textarea').fill(str(synthetic_dataset))
+    _add_folder(page, "viz_folder_list", str(synthetic_dataset))
     page.locator('.st-key-run_viz button').click()
 
     progress_texts: set[str] = set()
@@ -163,11 +163,16 @@ def test_b_run_with_streaming_progress(flow_page, synthetic_dataset):
     _no_exception(page)
     expect(page.get_by_text(re.compile("自動偵測到 2 個類別"))).to_be_visible()
 
-    # F1 data contract: Run writes/updates manifest.jsonl in the dataset
-    # folder — one line per image, content-hashed, with embedding refs
+    # F1 data contract: Run writes/updates manifest.jsonl in the APP CACHE
+    # (.lv_cache, NOT the user's dataset) — one line per image, content-hashed
     import json
-    mpath = synthetic_dataset / "manifest.jsonl"
-    assert mpath.exists(), "Run must write manifest.jsonl"
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+    from manifest import manifest_path_for
+    assert not (synthetic_dataset / "manifest.jsonl").exists(), \
+        "no-dataset-writes: manifest must NOT land in the dataset folder"
+    mpath = manifest_path_for(synthetic_dataset)
+    assert mpath.exists(), "Run must write manifest.jsonl (to .lv_cache)"
     entries = [json.loads(ln) for ln in
                mpath.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(entries) == 24
@@ -405,6 +410,7 @@ def test_l_rerun_resets_selection_keeps_export_list(flow_page):
     page = flow_page
     _click_marker(page, 0, 1)
     assert _selected_count(page) >= 1
+    _ensure_sidebar(page)  # test_b's Run auto-collapsed the sidebar
     page.locator('.st-key-run_viz button').click()
     # the warm re-Run can finish before wait_idle even sees the runner —
     # wait directly for the reset status text instead
@@ -460,7 +466,7 @@ def test_n_invalid_folder_error(app_page):
     page = app_page
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    page.locator('.st-key-viz_folder_text textarea').fill(r"C:\does\not\exist\nope")
+    _add_folder(page, "viz_folder_list", r"C:\does\not\exist\nope")
     page.locator('.st-key-run_viz button').click()
     wait_idle(page, timeout=30000)
     expect(page.get_by_text(re.compile("資料夾不存在"))).to_be_visible()
@@ -473,7 +479,7 @@ def test_o_projection_method_skip(app_page, synthetic_dataset):
     page = app_page
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    page.locator('.st-key-viz_folder_text textarea').fill(str(synthetic_dataset))
+    _add_folder(page, "viz_folder_list", str(synthetic_dataset))
     # drop t-SNE and UMAP from the 投影方法 multiselect. Each removal
     # triggers a rerun that can swallow the next keypress — retry until
     # only PCA's tag remains.
@@ -547,7 +553,7 @@ def test_p_duplicate_leakage_scan(app_page, leakage_dataset):
     page = app_page
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    page.locator('.st-key-viz_folder_text textarea').fill(
+    _add_folder(page, "viz_folder_list",
         str(leakage_dataset / "train") + "\n" + str(leakage_dataset / "val"))
     # PCA only — the dup scan does not depend on projections, keep it fast
     ms_input = page.locator('.st-key-viz_methods input')
@@ -644,6 +650,8 @@ def test_r_quick_start_demo(app_page):
 
 # ── (s) Compare Distributions linked view: click → thumbnails → viewer ──
 
+@pytest.mark.skip(reason="Compare 改為物件級・按類別(YOLO)；舊影像級 linked-view 散點已移除，"
+                         "資料夾改 📁 原生選擇(非 headless 可填)。新散點(框選/3D)見 test_compare_by_class.py。")
 def test_s_compare_linked_view(app_page, tmp_path):
     import numpy as np
     from PIL import Image
@@ -708,17 +716,24 @@ def test_t_umap_reference_frame(app_page, tmp_path):
 
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    page.locator('.st-key-viz_folder_text textarea').fill(str(train))
+    _add_folder(page, "viz_folder_list", str(train))
     page.locator('.st-key-viz_umap_ref label').first.click()
     wait_idle(page)
     page.locator('.st-key-run_viz button').click()
     page.wait_for_selector('.st-key-viz_scatter_wrap g.points path', timeout=300000)
     wait_idle(page, timeout=120000)
     _no_exception(page)
-    refs = list(train.glob("embeddings_*/umap_ref.pkl"))
-    assert refs, "the fitted UMAP reference frame must be persisted to disk"
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
+    from umap_ref import ref_path_for
+    # no-dataset-writes: frame persists to .lv_cache, NOT the dataset folder
+    assert not list(train.glob("embeddings_*/umap_ref.pkl")), \
+        "umap_ref must NOT be written into the dataset folder"
+    refs = ref_path_for(train, "dinov2_vits14")
+    assert refs.exists(), "the fitted UMAP reference frame must be persisted (to .lv_cache)"
 
     # second Run reuses the frozen frame without refitting or crashing
+    _ensure_sidebar(page)  # the first Run auto-collapsed the sidebar
     page.locator('.st-key-run_viz button').click()
     page.wait_for_function(
         """() => {
@@ -727,7 +742,7 @@ def test_t_umap_reference_frame(app_page, tmp_path):
         }""", timeout=300000)
     wait_idle(page, timeout=120000)
     _no_exception(page)
-    assert list(train.glob("embeddings_*/umap_ref.pkl")), "frame must survive re-Run"
+    assert ref_path_for(train, "dinov2_vits14").exists(), "frame must survive re-Run"
 
 
 # ── (u) completeness heatmap tool (defect-mechanisms v2 §5) ─────────────
@@ -749,7 +764,7 @@ def test_u_completeness_heatmap(app_page, tmp_path):
 
     page.locator('.st-key-tool_switch').get_by_text("完整度熱力圖").click()
     wait_idle(page)
-    page.locator('.st-key-cov_folder_text textarea').fill(str(root))
+    _add_folder(page, "cov_folder_list", str(root))
     # X = label, Y = brightness (default index 2 already = brightness)
     page.locator('.st-key-run_cov button').click()
     page.wait_for_selector('.st-key-cov_heatmap', timeout=300000)
@@ -823,7 +838,7 @@ def test_w_completeness_calibration_and_mining(app_page, tmp_path):
     page.locator('.st-key-tool_switch').get_by_text("完整度熱力圖").click()
     wait_idle(page)
     # Run-time sidebar is just folder + model + run; tuning lives post-Run
-    page.locator('.st-key-cov_folder_text textarea').fill(str(root))
+    _add_folder(page, "cov_folder_list", str(root))
     page.locator('.st-key-run_cov button').click()
     page.wait_for_selector('.st-key-cov_heatmap', timeout=300000)
     wait_idle(page, timeout=120000)
@@ -889,6 +904,8 @@ def test_x_diversity_sampling(flow_page):
 
 # ── (y) §1 annotator-agreement quiz tool ────────────────────────────────
 
+@pytest.mark.skip(reason="工具列精簡:組考卷/灰帶/評估已自 tool_switch 隱藏(commit 319dd80),"
+                         "改由購物車 handoff 進入;toolbar 驅動的 E2E 不再適用。")
 def test_y_quiz_tool(app_page, tmp_path):
     import numpy as np
     from PIL import Image
@@ -904,7 +921,7 @@ def test_y_quiz_tool(app_page, tmp_path):
 
     page.locator('.st-key-tool_switch').get_by_text("組考卷", exact=True).click()
     wait_idle(page)
-    page.locator('.st-key-quiz_folder_text textarea').fill(str(root))
+    _add_folder(page, "quiz_folder_list", str(root))
     page.locator('.st-key-run_quiz button').click()
     wait_idle(page, timeout=300000)
     _no_exception(page)
@@ -930,6 +947,8 @@ def test_y_quiz_tool(app_page, tmp_path):
 
 # ── (z) §3 gray-zone review (propose → approve double sign-off) ─────────
 
+@pytest.mark.skip(reason="工具列精簡:組考卷/灰帶/評估已自 tool_switch 隱藏(commit 319dd80),"
+                         "改由購物車 handoff 進入;toolbar 驅動的 E2E 不再適用。")
 def test_z_gray_zone_review(app_page, tmp_path):
     import numpy as np
     from PIL import Image
@@ -945,7 +964,7 @@ def test_z_gray_zone_review(app_page, tmp_path):
 
     page.locator('.st-key-tool_switch').get_by_text("灰帶覆核", exact=True).click()
     wait_idle(page)
-    page.locator('.st-key-gray_folder_text textarea').fill(str(root))
+    _add_folder(page, "gray_folder_list", str(root))
     page.locator('.st-key-run_gray button').click()
     wait_idle(page, timeout=300000)
     _no_exception(page)
@@ -1028,6 +1047,8 @@ def test_ab_legend_toggle_buttons(flow_page):
 
 # ── (ac) evaluation tool — one-click demo renders recall + escape gallery ─
 
+@pytest.mark.skip(reason="工具列精簡:組考卷/灰帶/評估已自 tool_switch 隱藏(commit 319dd80),"
+                         "改由購物車 handoff 進入;toolbar 驅動的 E2E 不再適用。")
 def test_ac_evaluation_demo(app_page):
     page = app_page
     page.locator('.st-key-tool_switch').get_by_text("評估", exact=True).click()

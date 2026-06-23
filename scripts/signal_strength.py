@@ -48,7 +48,8 @@ import os
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+
+from safe_io import safe_open_image
 
 SIGNAL_OBVIOUS = "明顯"
 SIGNAL_SUSPECT = "疑似"
@@ -295,11 +296,10 @@ def signal_level_for_image(
         thr = effective_thresholds(image_type=image_type, cfg_path=cfg_path)
         snr_none = thr["snr_none"] if snr_none is None else snr_none
         snr_obvious = thr["snr_obvious"] if snr_obvious is None else snr_obvious
-    try:
-        with Image.open(image_path) as im:
-            g = np.asarray(im.convert("L"), dtype=np.float64) / 255.0
-    except (OSError, ValueError):
+    im = safe_open_image(image_path, mode="L")
+    if im is None:  # 壞檔/截斷 → 不臆測,回 SIGNAL_UNKNOWN
         return SIGNAL_UNKNOWN
+    g = np.asarray(im, dtype=np.float64) / 255.0
     return classify_signal(roi_background_metrics(g, bbox),
                            snr_none=snr_none, snr_obvious=snr_obvious,
                            **classify_kwargs)

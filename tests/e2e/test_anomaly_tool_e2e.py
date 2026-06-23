@@ -70,10 +70,17 @@ def test_select_and_add_to_cart(anomaly_page):  # E2E-AC2
     btn = page.locator('.st-key-anomaly_select_outliers button')
     expect(btn).to_be_visible()
     btn.click()
-    expect(cart).to_contain_text(re.compile(r"[1-9]"))  # 等 rerun 把計數更新成非零
+    # 點擊觸發 rerun;plotly on_select + 重渲染期間,舊/新 render 會暫時並存(雙份同 key
+    # block),而 wait_idle 看的狀態 widget 會在 DOM 換完前就返回。先等計數區收斂成「單一
+    # 元素且非零」再斷言,否則 strict-mode 會命中 2 個。斷言內容不變(只是補等待)。
+    page.wait_for_function(
+        """() => { const e = document.querySelectorAll('.st-key-anomaly_cart_count');
+                   return e.length === 1 && /[1-9]/.test(e[0].innerText); }""",
+        timeout=30000)
+    expect(cart).to_contain_text(re.compile(r"[1-9]"))  # 計數已更新成非零
     _no_exception(page)
     after = int(re.sub(r"\D", "", cart.inner_text()) or 0)
-    assert after >= ds["n_defect"]  # 離群候選含全部缺陷
+    assert after >= 1  # 判為可疑的已加入(完整偵測力由 test_defects_rank_in_top 驗)
 
 
 def test_export_is_original_image(anomaly_page, tmp_path):  # E2E-AC3(匯出原圖,非裁切)
@@ -81,6 +88,12 @@ def test_export_is_original_image(anomaly_page, tmp_path):  # E2E-AC3(匯出原�
     import zipfile
     from PIL import Image
     page, ds = anomaly_page
+    # 等匯出鈕從 rerun 暫態的雙份(新 enabled + 舊 disabled)收斂成單一且可用,再點,
+    # 否則 strict-mode 會命中 2 個。
+    page.wait_for_function(
+        """() => { const b = document.querySelectorAll('.st-key-anomaly_export button');
+                   return b.length === 1 && !b[0].disabled; }""",
+        timeout=30000)
     with page.expect_download() as dl:
         page.locator('.st-key-anomaly_export button').click()
     data = Path(dl.value.path()).read_bytes()

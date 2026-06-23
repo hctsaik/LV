@@ -73,9 +73,9 @@ def test_yolo_layout_basic(tmp_path):
 
     imgs = list((dst / "images").glob("*.png"))
     assert len(imgs) == 1
-    sha = imgs[0].stem
-    assert len(sha) == 64  # filename == sha256
-    lbl = (dst / "labels" / f"{sha}.txt")
+    # 檔名 = 原圖 basename（不再是 sha256）
+    assert imgs[0].stem == ds["image"].stem  # "img"
+    lbl = (dst / "labels" / f"{imgs[0].stem}.txt")
     assert lbl.exists()
     # subset classes are name-sorted: cat=0, dog=1 → same order here
     classes = (dst / "classes.txt").read_text(encoding="utf-8").split()
@@ -173,12 +173,13 @@ def test_multi_source_class_remap_union(tmp_path):
     classes = (dst / "classes.txt").read_text(encoding="utf-8").split()
     assert classes == ["bird", "cat", "dog"]
 
-    # map each exported label back to its source by sha256
+    # map each exported label back to its source via the manifest "dst" column
+    # (檔名不再是 sha；用 dst 寫出的相對路徑回推 label 檔名)
     man = {r["sha256"]: r for r in _read_csv(dst / "manifest.csv")}
-    sha_a = next(s for s, r in man.items() if Path(r["source_path"]) == a["image"])
-    sha_b = next(s for s, r in man.items() if Path(r["source_path"]) == b["image"])
-    lbl_a = (dst / "labels" / f"{sha_a}.txt").read_text(encoding="utf-8")
-    lbl_b = (dst / "labels" / f"{sha_b}.txt").read_text(encoding="utf-8")
+    row_a = next(r for r in man.values() if Path(r["source_path"]) == a["image"])
+    row_b = next(r for r in man.values() if Path(r["source_path"]) == b["image"])
+    lbl_a = (dst / "labels" / f"{Path(row_a['dst']).stem}.txt").read_text(encoding="utf-8")
+    lbl_b = (dst / "labels" / f"{Path(row_b['dst']).stem}.txt").read_text(encoding="utf-8")
     assert lbl_a.strip().startswith("2 ")  # dsA dog(1) → subset dog(2)
     assert lbl_b.strip().startswith("0 ")  # dsB bird(0) → subset bird(0)
 
@@ -212,6 +213,94 @@ def test_crop_out_object_level(tmp_path):
     assert "task: classification" in yaml
     # no detection label files written in crop-out
     assert not (dst / "labels").exists()
+
+
+# ── 5b. yolo object-level → 原圖 + 整份標記（非裁切圖） ───────────────────────
+def test_yolo_object_level_exports_full_image(tmp_path):
+    """level=object 的 ExportItem 在 yolo layout 應匯出「整張原圖 + 整份標記」，
+    manifest level=object 且記下被挑中的 object_ids（不是裁切小圖）。"""
+    ds = _make_dataset(tmp_path / "src",
+                       labels=["0 0.5 0.5 0.4 0.4", "1 0.25 0.25 0.2 0.2"])
+    item = ExportItem(image_path=ds["image"], label_path=ds["label"],
+                      class_names=ds["classes"], level="object",
+                      object_ids=[1], source_tool="objcov",
+                      source_tag="rare", dataset_id="ds1")
+    dst = tmp_path / "out"
+    rep = export_subset([item], dst, layout="yolo")
+
+    assert rep.exported == 1
+    # 整張原圖（檔名 = 原 basename），而非裁切小圖
+    imgs = list((dst / "images").glob("*.png"))
+    assert len(imgs) == 1
+    assert imgs[0].stem == ds["image"].stem
+    # 整份標記（兩個框都在，未被裁成單框）
+    lbl = (dst / "labels" / f"{imgs[0].stem}.txt")
+    assert lbl.exists()
+    rows = [r for r in lbl.read_text(encoding="utf-8").split("\n") if r.strip()]
+    assert len(rows) == 2
+    # manifest level=object，object_ids 記下被挑中的框
+    man = _read_csv(dst / "manifest.csv")
+    assert len(man) == 1
+    assert man[0]["level"] == "object"
+    assert man[0]["object_ids"] == "1"
+    # crop-out 才有 objects.csv；yolo layout 不應產生
+    assert not (dst / "objects.csv").exists()
+
+
+# ── 5c. 同 basename、不同內容 → 兩張都保留（消歧義，不漏資料） ────────────────
+def test_yolo_basename_collision_keeps_both(tmp_path):
+    """兩個來源各有同名 img.png 但內容不同（不同 sha）→ 不可互相覆蓋/略過；
+    應以 __N 後綴消歧義，兩張都匯出，且與 on_exists 無關。"""
+    a = _make_dataset(tmp_path / "a", name="dsA", seed=1)
+    b = _make_dataset(tmp_path / "b", name="dsB", seed=2)
+    assert a["image"].name == b["image"].name  # 同 basename
+    ia = ExportItem(image_path=a["image"], label_path=a["label"],
+                    class_names=a["classes"], dataset_id="A")
+    ib = ExportItem(image_path=b["image"], label_path=b["label"],
+                    class_names=b["classes"], dataset_id="B")
+    dst = tmp_path / "out"
+    rep = export_subset([ia, ib], dst, layout="yolo", on_exists="skip")
+
+    assert rep.exported == 2
+    assert rep.skipped == []  # 撞名消歧義，沒有任何一張被略過
+    pngs = sorted(p.name for p in (dst / "images").glob("*.png"))
+    assert len(pngs) == 2
+    assert "img.png" in pngs
+    assert any("__1" in n for n in pngs)
+    # 每張都各自有 label
+    assert len(list((dst / "labels").glob("*.txt"))) == 2
+
+
+def test_yolo_same_stem_diff_ext_keeps_both_labels(tmp_path):
+    """同 stem、不同副檔名、不同內容（000001.png vs 000001.jpg）→ 影像本就不同名
+    不會互蓋，但 label 都跟 stem 命名（000001.txt）會互蓋漏標。消歧義須以 stem 為單位：
+    兩張影像各自配對到正確的 label，無一被覆蓋。"""
+    a = _make_dataset(tmp_path / "a", name="dsA", seed=1,
+                      labels=["0 0.5 0.5 0.4 0.4"])            # 1 box
+    # 第二張：同 stem(img) 但 .jpg、不同內容、2 個框
+    img_b = _img(tmp_path / "b" / "img.jpg", seed=2)
+    lbl_b = tmp_path / "b" / "img.txt"
+    lbl_b.write_text("0 0.5 0.5 0.4 0.4\n1 0.25 0.25 0.2 0.2\n", encoding="utf-8")
+    ia = ExportItem(image_path=a["image"], label_path=a["label"],
+                    class_names=["cat", "dog"], dataset_id="A")
+    ib = ExportItem(image_path=img_b, label_path=lbl_b,
+                    class_names=["cat", "dog"], dataset_id="B")
+    dst = tmp_path / "out"
+    rep = export_subset([ia, ib], dst, layout="yolo", on_exists="skip")
+
+    assert rep.exported == 2
+    imgs = sorted(p.name for p in (dst / "images").glob("*"))
+    assert len(imgs) == 2                                       # 兩張影像都在
+    lbls = sorted(p.name for p in (dst / "labels").glob("*.txt"))
+    assert len(lbls) == 2, f"label 互蓋漏標：{lbls}"            # 兩個 label 都在、沒互蓋
+    # 每張影像都有與它 stem 配對的 label
+    for img_name in imgs:
+        assert (dst / "labels" / f"{Path(img_name).stem}.txt").exists()
+    # 行數對得上：一個 label 1 行、另一個 2 行（內容沒被另一張覆蓋）
+    line_counts = sorted(
+        len([ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()])
+        for p in (dst / "labels").glob("*.txt"))
+    assert line_counts == [1, 2], f"label 內容被覆蓋：{line_counts}"
 
 
 # ── 6. on_exists=skip ────────────────────────────────────────────────────────

@@ -32,6 +32,7 @@ import numpy as np
 from PIL import Image
 
 from interaction import crop_bbox, discover_yolo_objects, yolo_label_path_for
+from safe_io import safe_open_image, safe_read_text
 from _utils import load_model
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -90,14 +91,14 @@ def classes_for(root: Path) -> list[str] | None:
     for folder in (root, root.parent, root.parent.parent):  # 容忍巢狀佈局(…/[Small]/split)
         f = folder / "classes.txt"
         if f.exists():
-            lines = [ln.strip() for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            lines = [ln.strip() for ln in safe_read_text(f).splitlines() if ln.strip()]
             if lines:
                 return lines
     for folder in (root, root.parent, root.parent.parent):  # 容忍巢狀佈局(…/[Small]/split)
         y = folder / "data.yaml"
         if y.exists():
             names, grab = [], False
-            for ln in y.read_text(encoding="utf-8").splitlines():
+            for ln in safe_read_text(y).splitlines():
                 s = ln.strip()
                 if s.startswith("names:"):
                     grab = True
@@ -121,11 +122,8 @@ def dataset_fingerprint(image_paths, class_names=None) -> dict:
     for m in meta:
         ip = m["image_path"]
         if ip not in sizes:
-            try:
-                with Image.open(ip) as im:
-                    sizes[ip] = im.size
-            except OSError:
-                sizes[ip] = None
+            im = safe_open_image(ip, mode=None)   # 壞圖回 None → 該圖物件被略過
+            sizes[ip] = im.size if im is not None else None
         if not sizes[ip]:
             continue
         iw, ih = sizes[ip]
@@ -239,10 +237,7 @@ def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
                                   target_res=policy["target_res"], head=policy["head"])
         ip = m["image_path"]
         if str(ip) != cur_ip:
-            try:
-                cur = Image.open(ip).convert("RGB")
-            except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖跳過
-                cur = None
+            cur = safe_open_image(ip)   # 壞圖/超大圖回 None → 該物件補零保索引對齊
             cur_ip = str(ip)
         if cur is None:
             cached_emb[k] = np.zeros(384, dtype=np.float32)

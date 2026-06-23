@@ -107,6 +107,7 @@ def compute_psnr_score(*a, **k): return _cmp().compute_psnr_score(*a, **k)
 def compute_ssim_score(*a, **k): return _cmp().compute_ssim_score(*a, **k)
 def get_image_paths(*a, **k): return _cmp().get_image_paths(*a, **k)
 from visualize_embeddings import build_plotly_figure, discover_images, discover_images_classifier
+from safe_io import safe_open_image, safe_read_text, partition_readable
 
 
 # umap-learn costs ~22s to import (numba JIT) — by far LV's biggest startup cost.
@@ -204,6 +205,7 @@ def _folder_picker_list(list_key: str, *, add_help: str | None = None) -> list:
     if st.button("📁 新增資料夾", use_container_width=True, key=f"add_{list_key}"):
         _pick_folder_append(list_key)
         st.rerun()
+    _folder_add_input(list_key, help=add_help)  # headless/E2E-driveable 文字加入（📁 為原生對話框）
     for i, folder in enumerate(st.session_state[list_key]):
         c1, c2 = st.columns([5, 1])
         c1.caption(folder)
@@ -304,16 +306,16 @@ def _viz_deck_thumbs(records: list[dict], data_token: str) -> list[str]:
     out: list[str] = []
     for r in records:
         uri = ""
-        try:
-            src = _thumb_or_none(Path(r["path"])) or str(r["path"])
-            with Image.open(src) as im:
-                im = im.convert("RGB")
+        src = _thumb_or_none(Path(r["path"])) or str(r["path"])
+        im = safe_open_image(src)            # 壞檔/格式錯回 None → 略過該縮圖
+        if im is not None:
+            try:
                 im.thumbnail((56, 56))
                 buf = io.BytesIO()
                 im.save(buf, format="JPEG", quality=70)
-            uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-        except (OSError, ValueError):
-            uri = ""
+                uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+            except (OSError, ValueError):
+                uri = ""
         out.append(uri)
     st.session_state[ck] = out
     return out
@@ -427,7 +429,7 @@ def read_classes_txt(folder: Path) -> list[str] | None:
     classes_file = folder.parent / "classes.txt"
     if not classes_file.exists():
         return None
-    lines = [ln.strip() for ln in classes_file.read_text().splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in safe_read_text(classes_file).splitlines() if ln.strip()]
     return lines if lines else None
 
 
@@ -440,6 +442,60 @@ def _classes_txt_nested(folder: Path) -> list[str] | None:
         if names:
             return names
     return None
+
+
+# ── 壞檔防呆:統一前置過濾 + 「已略過 N 個壞檔」提示 ─────────────────────────
+_SKIP_WARN = ("⚠️ 已略過 {n} 個無法讀取的檔案"
+              "（壞檔/格式錯誤，已跳過，不影響其餘）")
+
+
+def _partition_cache_key(image_paths) -> str:
+    """以「資料夾集合 + 每檔 mtime」為鍵；同一輪載入不重複解碼整個資料夾。
+    mtime 變了（換檔/覆寫）就重算，壞→好或好→壞都會反映。"""
+    sig: list[str] = []
+    for p in image_paths:
+        p = Path(p)
+        try:
+            sig.append(f"{p}|{p.stat().st_mtime_ns}")
+        except OSError:
+            sig.append(f"{p}|missing")
+    return hashlib.md5("\n".join(sorted(sig)).encode("utf-8")).hexdigest()
+
+
+def _partition_image_paths(image_paths, scope: str) -> tuple[list[Path], list[Path]]:
+    """把影像清單分成 (可讀, 壞檔)，依 scope+mtime 在 session_state 內快取，
+    避免每次 rerun 都重解碼整個資料夾。回傳 (good, bad)。"""
+    image_paths = [Path(p) for p in image_paths]
+    key = f"_bad_partition_{scope}"
+    ck = _partition_cache_key(image_paths)
+    cached = st.session_state.get(key)
+    if cached is not None and cached.get("ck") == ck:
+        return list(cached["good"]), list(cached["bad"])
+    good, bad = partition_readable(image_paths)
+    st.session_state[key] = {"ck": ck, "good": good, "bad": bad}
+    return good, bad
+
+
+def _warn_skipped(bad) -> None:
+    """壞檔非空時，用全 app 統一字串顯示「已略過」提示（E2E 斷言此字串）。"""
+    if bad:
+        st.warning(_SKIP_WARN.format(n=len(bad)))
+
+
+def _filter_records_readable(records: list[dict], scope: str) -> list[dict]:
+    """以 record 的來源影像（物件級用 image_path、整圖用 path）做前置壞檔過濾。
+    壞檔連同其對應 label 自然被排除（下游一律以路徑為鍵），並顯示統一略過提示。"""
+    def _src(r):
+        return r.get("image_path") or r.get("path")
+    paths = [_src(r) for r in records if _src(r)]
+    if not paths:
+        return records
+    good, bad = _partition_image_paths(paths, scope)
+    _warn_skipped(bad)
+    if not bad:
+        return records
+    bad_set = {str(Path(p)) for p in bad}
+    return [r for r in records if str(Path(_src(r))) not in bad_set]
 
 
 def _rows_to_csv(header: list[str], rows) -> str:
@@ -1001,6 +1057,10 @@ def _export_subset_ui() -> None:
     st.markdown(f"購物車共 **{len(snaps)}** 張 · 跨 {len(by_src)} 個來源："
                 + "　".join(f"`{k}×{v}`" for k, v in sorted(by_src.items())))
 
+    # 壞檔防呆:購物車內若有無法讀取的影像，匯出前先提示（不影響其餘可匯出者）
+    _, _exp_bad = _partition_image_paths([s["path"] for s in snaps if s.get("path")], "export")
+    _warn_skipped(_exp_bad)
+
     pick = st.selectbox("依來源篩選", ["全部"] + sorted(by_src), key="exp_src_filter")
     shown = _cart_snapshots(None if pick == "全部" else pick)
     with st.container(height=280):
@@ -1103,12 +1163,25 @@ def _anomaly_clear_confirmed() -> None:
     st.session_state["anomaly_confirmed"] = {}
 
 
+def _anomaly_clear_sel(scatter_key: str) -> None:
+    """取消框選(對齊 Visualize):丟掉 plotly widget 的舊事件 + bump nonce 讓散點重新掛載,
+    否則同一個 key 會把舊框選再回報回來,按了等於沒清。"""
+    st.session_state.pop(scatter_key, None)
+    st.session_state["_anomaly_clear_nonce"] = st.session_state.get("_anomaly_clear_nonce", 0) + 1
+
+
+def _anomaly_trigger_rerun() -> None:
+    """主畫面「重新偵測」:設旗標,下一輪走 run 路徑(套用最新標記)。"""
+    st.session_state["_anomaly_rerun"] = True
+
+
 def _anomaly_ui() -> None:
     """🔧 瑕疵偵測(AnomalyDINO 風格):載入 YOLO 資料夾 → 物件級 patch 異常分數 →
     排序 + 散點圖框選/購物車 + 熱力圖 + 匯出原圖。實作委派 anomaly_tool.run_pipeline。"""
     import plotly.graph_objects as go
     from PIL import Image
 
+    from _utils import available_models
     from anomaly_heatmap import render_heatmap
     from anomaly_score import score_object
     from anomaly_tool import run_pipeline
@@ -1121,26 +1194,45 @@ def _anomaly_ui() -> None:
     st.subheader("🔧 瑕疵偵測(Anomaly Detection)")
     st.caption("多數良品當『正常參考』,把偏離的物件挑出來。基於凍結 DINOv2 patch 特徵 + "
                "最近鄰距離(AnomalyDINO, WACV 2025);**不需瑕疵樣本訓練、不寫你的資料集**。")
-    st.caption("**細微瑕疵主路徑(2-stage)**:先「執行偵測」看分布 → 框選你**確定正常**的點按"
-               "「✅ 框選標為正常範例」(或用自動種子)→ 再「執行偵測」即用乾淨 few-shot bank,"
-               "專抓物件級會被平均掉的細微瑕疵。")
+    st.caption("**沒確認正常時 = 無監督模式**:對整個資料夾做 leave-one-out 離群偵測,把「跟其他物件都不像」的"
+               "**少見/離群類別**排前面(適合多類別、找稀有類)。**確認正常後 = 對照模式**:只跟你確認的正常比,專抓細微瑕疵。")
+    st.caption("**細微瑕疵流程(2-stage)**:先「執行偵測」看分布 → 框選你**確定正常**的點按"
+               "「✅ 框選標為正常範例」(或用自動種子)→ 再「執行偵測」即用乾淨 few-shot bank。")
 
     with st.sidebar:
         st.markdown("### 🔧 瑕疵偵測設定")
         folders = _folder_picker_list("anomaly_folder",
                                       add_help="YOLO 偵測資料集:含 images/ 與 labels/")
-        _folder_add_input("anomaly_folder")
+        _dino = [m for m in available_models() if m.startswith("dinov2")] or ["dinov2_vits14"]
+        model = st.selectbox(
+            "DINOv2 模型", _dino,
+            index=(_dino.index("dinov2_vits14") if "dinov2_vits14" in _dino else 0),
+            key="anomaly_model_sel",
+            help="vits14=快、輕(D=384);vitb14=較準、較重(D=768)。換模型用各自獨立快取。")
         mode = st.radio("流程", ["two_stage", "one_stage"], key="anomaly_mode",
                         format_func=lambda m: {"two_stage": "2-stage(抽樣→確認→整批)",
                                                "one_stage": "1-stage(直接整批)"}[m],
-                        help="2-stage:先抽樣分群、你確認少數正常,再整批。1-stage:直接用最大群當正常。")
+                        help="2-stage:先看分布、框選確認少數正常 → 對照模式抓細微瑕疵。"
+                             "1-stage:直接整批(沒確認時=無監督 leave-one-out,找少見/離群類別)。")
         score_mode = st.radio("分數依據", ["patch", "object"], key="anomaly_score_mode",
                               format_func=lambda m: {"patch": "patch 級(抓細微瑕疵,較準)",
                                                      "object": "物件級(快,粗)"}[m])
-        sample_n = st.slider("2-stage 抽樣數", 16, 256, 64, key="anomaly_sample_n")
+        # DINOv2 patch size 固定 14px;真正可調的是「物件裁切縮放到的解析度」=每物件 patch 細緻度。
+        # 解析度高→每 patch 覆蓋的實際區域小→能抓更小瑕疵,但更慢、bank 更大。都是 14 的倍數。
+        _RES = {224: "224(16×16 patch,快)", 336: "336(24×24,較細)",
+                448: "448(32×32,更細)", 560: "560(40×40,最細,慢)"}
+        target_res = (st.selectbox("解析度(每物件 patch 細緻度)", list(_RES),
+                                   format_func=lambda r: _RES[r], key="anomaly_res",
+                                   help="DINOv2 patch=14px 固定;這裡調物件裁切的縮放解析度,"
+                                        "等效於 patch 細緻度。瑕疵越小選越高。")
+                      if score_mode == "patch" else 224)
+        sample_n = (st.slider("2-stage 抽樣數", 16, 256, 64, key="anomaly_sample_n")
+                    if mode == "two_stage" else 64)  # 抽樣數只跟 2-stage 有關
         run = st.button("▶ 執行偵測", key="anomaly_run", type="primary",
                         use_container_width=True)
 
+    # 主畫面「🔁 重新偵測」(標記正常/瑕疵後就地重跑)也走同一條 run 路徑
+    run = run or st.session_state.pop("_anomaly_rerun", False)
     if run:
         roots = [Path(f) for f in folders]
         image_paths: list[Path] = []
@@ -1151,16 +1243,20 @@ def _anomaly_ui() -> None:
         if not image_paths:
             st.session_state["anomaly_result"] = {"records": [], "_err": "no_images"}
         else:
-            cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}")
-            with st.spinner(f"偵測中…({len(image_paths)} 張圖,首跑含模型載入較久)"):
-                result = run_pipeline(
-                    image_paths, class_names, mode=mode, score_mode=score_mode,
-                    sample_n=sample_n,
-                    confirmed=st.session_state.get("anomaly_confirmed", {}),
-                    cache_dir=cache)
+            cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{model}_r{target_res}")
+            _bar = st.progress(0.0, text=f"準備中…({len(image_paths)} 張圖,{model}@{target_res};首跑載入模型較久)")
+            result = run_pipeline(
+                image_paths, class_names, mode=mode, score_mode=score_mode,
+                sample_n=sample_n, model=model, target_res=target_res,
+                confirmed=st.session_state.get("anomaly_confirmed", {}),
+                cache_dir=cache,
+                progress=lambda f, t: _bar.progress(f, text=t))
+            _bar.empty()
             result["_image_paths"] = [str(p) for p in image_paths]
             result["_class_names"] = list(class_names) if class_names else None
             result["_cache"] = str(cache)
+            result["_model"] = model
+            result["_target_res"] = target_res
             st.session_state["anomaly_result"] = result
             _collapse_sidebar()
             _log_usage("anomaly_run", n=len(result["records"]), source=score_mode)
@@ -1169,6 +1265,8 @@ def _anomaly_ui() -> None:
     if not result:
         st.info("在左側選一個 YOLO 偵測資料夾(images/+labels/)後按「執行偵測」。")
         return
+    # 壞檔防呆:run_pipeline 已自行過濾並回傳 skipped(壞檔路徑清單)→ 同款略過提示
+    _warn_skipped(result.get("skipped") or [])
     if not result.get("records"):
         st.error("找不到 YOLO 標註:此工具需要偵測資料集(資料夾內要有 **images/** 與 "
                  "**labels/**,labels 為 YOLO 格式 .txt)。請確認後重選資料夾。")
@@ -1184,6 +1282,10 @@ def _anomaly_ui() -> None:
     if auroc is not None:
         msg += f" · 對照確認標籤 AUROC **{auroc:.3f}**"
     st.markdown(msg)
+    if n_bad == len(records) and not st.session_state.get("anomaly_confirmed"):
+        st.warning("⚠ 全部被判為可疑 = 門檻無法校準(第一次跑、還沒有『正常參考』)。"
+                   "請走 **2-stage**:在下方散點圖**框選你確定正常的那一團點 →「✅ 框選標為正常範例」**"
+                   "(或用「自動把最不可疑的 N 個標為正常範例」),再按「執行偵測」即用乾淨參考重新評分。")
 
     left, right = st.columns([3, 2], gap="medium")
 
@@ -1208,14 +1310,21 @@ def _anomaly_ui() -> None:
                 hovertemplate="%{text}<extra></extra>"))
             fig.update_layout(height=440, margin=dict(l=0, r=0, t=10, b=0),
                               dragmode="lasso")
-            ev = st.plotly_chart(fig, key="anomaly_scatter", on_select="rerun",
+            _nonce = st.session_state.get("_anomaly_clear_nonce", 0)
+            _skey = f"anomaly_scatter_{_nonce}"  # bump nonce → 重新掛載清空框選
+            ev = st.plotly_chart(fig, key=_skey, on_select="rerun",
                                  selection_mode=("box", "lasso"))
             if ev and getattr(ev, "selection", None):
                 sel_idx = selection_points_to_indices(ev.selection.get("points", []))
-            st.caption(f"散點圖:點越紅越可疑。框選/套索離群點 → 加入購物車。已框選 {len(sel_idx)} 個。")
-            st.button("🛒 加入購物車(框選)", key="anomaly_cart_selected",
-                      disabled=not sel_idx, use_container_width=True,
-                      on_click=_anomaly_add_to_cart, args=(records, sel_idx))
+            st.caption(f"散點圖:點越紅越可疑。框選/套索離群點。已框選 {len(sel_idx)} 個。")
+            _b1, _b2 = st.columns(2)
+            _b1.button("🛒 加入購物車(框選)", key="anomaly_cart_selected",
+                       disabled=not sel_idx, use_container_width=True,
+                       on_click=_anomaly_add_to_cart, args=(records, sel_idx))
+            _b2.button(f"✕ 取消框選({len(sel_idx)})" if sel_idx else "✕ 取消框選",
+                       key="anomaly_clear_sel", disabled=not sel_idx,
+                       use_container_width=True,
+                       on_click=_anomaly_clear_sel, args=(_skey,))
             mc1, mc2 = st.columns(2)
             mc1.button("✅ 框選標為正常範例", key="anomaly_mark_normal",
                        disabled=not sel_idx, use_container_width=True,
@@ -1226,13 +1335,30 @@ def _anomaly_ui() -> None:
                        disabled=not sel_idx, use_container_width=True,
                        on_click=_anomaly_mark, args=(records, sel_idx, "bad"),
                        help="把已知瑕疵標起來校準門檻(會算出 AUROC)。")
-        _outliers = sorted(set(result.get("candidates") or [])
-                           | {i for i in range(len(records))
-                              if records[i]["verdict"] == "bad"})
-        # 不加 help:Streamlit 的 help tooltip 會多渲染一個 <button>,使 e2e 的
-        # `.st-key-anomaly_select_outliers button` 命中 2 個元素(strict mode 違規)。
-        st.button("🛒 把離群/可疑物件加入購物車(分群離群候選 + 判為 bad)",
+            st.button("🔁 重新偵測(套用上面標記的正常/瑕疵)", key="anomaly_rerun_btn",
+                      type="primary", use_container_width=True,
+                      on_click=_anomaly_trigger_rerun,
+                      help="標好正常/瑕疵範例後按這裡就地重跑;不用回左側「執行偵測」。")
+            # 框選物件縮圖預覽:看清楚裁切的物件本身再判斷標正常/瑕疵(最多 24 個)
+            if sel_idx:
+                st.caption(f"框選 {len(sel_idx)} 個 — 預覽(看清楚再標;最多 24):")
+                with st.container(height=240, key="anomaly_sel_preview"):
+                    _pc = st.columns(6)
+                    for _j, _i in enumerate(sel_idx[:24]):
+                        _r = records[_i]
+                        with _pc[_j % 6]:
+                            _im = safe_open_image(_r["image_path"])  # 壞圖回 None → 略過
+                            if _im is None:
+                                st.caption("⚠ 缺圖")
+                            else:
+                                st.image(crop_bbox(_im, *_r["bbox"], pad=0.1),
+                                         use_container_width=True,
+                                         caption=f'{_r["score"]:.2f}·{_r["verdict"]}')
+        _outliers = [i for i in range(len(records)) if records[i]["verdict"] == "bad"]
+        # 不加 help:Streamlit help tooltip 會多渲染一個 <button> → e2e strict-mode 命中 2 個。
+        st.button(f"🛒 把判為可疑(bad)的 {len(_outliers)} 個加入購物車",
                   key="anomaly_select_outliers", use_container_width=True,
+                  disabled=not _outliers,
                   on_click=_anomaly_add_to_cart, args=(records, _outliers))
         st.button("✅ 自動把最不可疑的 12 個標為正常範例(few-shot 種子)",
                   key="anomaly_autoseed_normal", use_container_width=True,
@@ -1258,38 +1384,52 @@ def _anomaly_ui() -> None:
             file_name="anomaly_subset.zip", mime="application/zip",
             disabled=not recs, use_container_width=True)
 
-    # ── 右:排序清單(最可疑在前)+ 熱力圖 ──
+    # ── 右:🔥 熱度篩選 + 排序清單 + 點選看圖(LOO/物件級→裁切圖;patch bank→熱力圖)──
     with right:
-        st.markdown("**最可疑 → 最不可疑**")
-        with st.container(height=300, key="anomaly_ranked"):
-            for rank, i in enumerate(ranking[:60]):
-                r = records[i]
-                flag = "🔴" if r["verdict"] == "bad" else "⚪"
-                st.write(f"{rank + 1}. {flag} `{Path(r['image_path']).name}` "
-                         f"#{r['obj_index']} — {r['score']:.3f}")
-
-        if result.get("bank") is not None and result.get("_image_paths"):
-            st.markdown("**看哪裡怪(熱力圖)**")
-            top = ranking[:30]
+        st.markdown("**🔥 最可疑物件(篩選 + 點選看圖)**")
+        smin, smax = float(scores.min()), float(scores.max())
+        if smax > smin:
+            thr = st.slider("篩選:只看異常分數 ≥", round(smin, 3), round(smax, 3),
+                            round(smin, 3), key="anomaly_heat_filter",
+                            help="往右拖只看更可疑的。")
+        else:
+            thr = smin
+        shown = [i for i in ranking if scores[i] >= thr]
+        st.caption(f"符合 {len(shown)} / {len(records)} 個(由最可疑排到最不可疑)")
+        if shown:
             pick = st.selectbox(
-                "選一個可疑物件", top, key="anomaly_heat_pick",
-                format_func=lambda i: f"{Path(records[i]['image_path']).name} #{records[i]['obj_index']}"
-                f" ({records[i]['score']:.3f})")
+                "選一個看圖", shown, key="anomaly_inspect",
+                format_func=lambda i: f"{scores[i]:.3f} · {Path(records[i]['image_path']).name}"
+                f" #{records[i]['obj_index']} · {records[i]['label']}")
+            with st.container(height=200, key="anomaly_ranked"):
+                for rank, i in enumerate(shown[:80]):
+                    flag = "🔴" if records[i]["verdict"] == "bad" else "⚪"
+                    st.write(f"{rank + 1}. {flag} `{Path(records[i]['image_path']).name}`"
+                             f" #{records[i]['obj_index']} — {scores[i]:.3f}")
+            r = records[pick]
+            img = safe_open_image(r["image_path"])  # 壞圖回 None → 不當 Image 用
             try:
-                meta = discover_yolo_objects([Path(p) for p in result["_image_paths"]],
-                                             result.get("_class_names"))
-                pf = embed_objects_patch([meta[pick]], cache_dir=Path(result["_cache"]))[0]
-                _, pmap = score_object(pf["feats"], pf["grid"], result["bank"])
-                img = Image.open(records[pick]["image_path"]).convert("RGB")
+                if img is None:
+                    raise OSError("來源影像損壞或格式錯誤")
                 iw, ih = img.size
-                b = records[pick]["bbox"]
-                crop = crop_bbox(img, *b, pad_px=_adaptive_pad_px(b, iw, ih, 0.12))
-                st.image(render_heatmap(pmap, crop), use_container_width=True,
-                         caption="紅=該局部與正常差最大(可疑缺陷位置)")
-            except Exception as e:  # noqa: BLE001 — 熱力圖失敗不應拖垮整頁
-                st.caption(f":gray[熱力圖無法產生:{e}]")
-        elif result.get("score_mode") == "object":
-            st.caption(":gray[物件級模式不產生熱力圖;改用 patch 級可看『哪裡怪』。]")
+                crop = crop_bbox(img, *r["bbox"],
+                                 pad_px=_adaptive_pad_px(r["bbox"], iw, ih, 0.15))
+                if result.get("bank") is not None and result.get("_image_paths"):
+                    meta = discover_yolo_objects([Path(p) for p in result["_image_paths"]],
+                                                 result.get("_class_names"))
+                    pf = embed_objects_patch(
+                        [meta[pick]], model=result.get("_model", "dinov2_vits14"),
+                        target_res=result.get("_target_res", 224),
+                        cache_dir=Path(result["_cache"]))[0]
+                    _, pmap = score_object(pf["feats"], pf["grid"], result["bank"])
+                    st.image(render_heatmap(pmap, crop), use_container_width=True,
+                             caption=f"{r['label']} · {r['score']:.3f} · 紅=最不像正常")
+                else:
+                    st.image(crop, use_container_width=True,
+                             caption=f"{r['label']} · {r['score']:.3f}"
+                             " ·(無監督模式;確認正常範例後可看熱力圖)")
+            except (OSError, Image.DecompressionBombError, IndexError) as e:
+                st.caption(f":gray[無法顯示:{e}]")
 
 
 def _nn_index_for(model_name: str):
@@ -1329,6 +1469,8 @@ def _zoom_image_dialog(path: Path, show_boxes: bool, class_names, caption: str) 
     try:
         src = (draw_yolo_boxes(path, yolo_label_path_for(path), class_names)
                if (show_boxes and class_names) else str(path))
+        if src is None:  # draw_yolo_boxes 遇壞圖回 None → 退回原圖路徑（仍可能壞）
+            src = str(path)
         st.image(src, use_container_width=True)
     except OSError as exc:
         st.warning(f"無法讀取影像：{exc}")
@@ -1382,7 +1524,11 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
             try:
                 src = (draw_yolo_boxes(disp, yolo_label_path_for(disp), class_names)
                        if show_boxes else str(disp))
-                st.image(src, use_container_width=True)
+                if src is None:  # 壞圖 → draw 回 None；改顯示「已略過」而非崩潰
+                    st.warning("⚠️ 已略過 1 個無法讀取的檔案"
+                               "（壞檔/格式錯誤，已跳過，不影響其餘）")
+                else:
+                    st.image(src, use_container_width=True)
             except OSError as exc:
                 st.warning(f"無法讀取影像：{exc}")
         a, b, c = st.columns(3)
@@ -1928,13 +2074,17 @@ def _resolve_record_roi(r: dict):
         bbox_norm = r.get("bbox")  # object mode: (cx, cy, w, h) normalized
         if bbox_norm is not None:
             img_path = r.get("image_path") or r["path"]
-            with Image.open(img_path) as im:
-                iw, ih = im.size
+            im = safe_open_image(img_path, mode=None)  # 只取 .size;壞檔 None → 略過
+            if im is None:
+                return None
+            iw, ih = im.size
             return img_path, bbox_to_pixels(*bbox_norm, iw, ih), "YOLO 物件框"
         boxes = parse_yolo_boxes(yolo_label_path_for(Path(r["path"])))
         if len(boxes) == 1:  # one reported defect location → use it as the ROI
-            with Image.open(r["path"]) as im:
-                iw, ih = im.size
+            im = safe_open_image(r["path"], mode=None)  # 只取 .size;壞檔 None → 略過
+            if im is None:
+                return None
+            iw, ih = im.size
             _, cx, cy, w, h = boxes[0]
             return r["path"], bbox_to_pixels(cx, cy, w, h, iw, ih), "YOLO 標註框（單框）"
     except (OSError, ValueError, KeyError):
@@ -2126,11 +2276,10 @@ def _bucket1_record_metrics(records: list[dict]):
         if roi is None:
             continue
         img_path, px, _src = roi
-        try:
-            with Image.open(img_path) as im:
-                g = np.asarray(im.convert("L"), dtype=np.float64) / 255.0
-        except (OSError, ValueError):
+        im = safe_open_image(img_path, mode="L")  # 灰階流程;壞檔 None → 跳過該筆
+        if im is None:
             continue
+        g = np.asarray(im, dtype=np.float64) / 255.0
         m = roi_background_metrics(g, px)
         if not m:
             continue
@@ -2928,6 +3077,7 @@ def _visualize_embeddings_ui() -> None:
         if st.button("📁 新增資料夾", use_container_width=True, key="add_viz_folder"):
             _pick_folder_append("viz_folder_list")
             st.rerun()
+        _folder_add_input("viz_folder_list")  # headless/E2E-driveable 文字加入（📁 為原生對話框）
 
         for i, folder in enumerate(st.session_state["viz_folder_list"]):
             c1, c2 = st.columns([5, 1])
@@ -3061,14 +3211,15 @@ def _visualize_embeddings_ui() -> None:
             # classes.txt 優先級：手動選擇 > 自動偵測 > 文字輸入
             classes_path = st.session_state.get("viz_classes_file", "")
             if classes_path and Path(classes_path).exists():
-                lines = [ln.strip() for ln in Path(classes_path).read_text().splitlines() if ln.strip()]
+                lines = [ln.strip() for ln in safe_read_text(classes_path).splitlines() if ln.strip()]
                 class_names = lines
                 st.success(f"使用選定的 classes.txt（{len(class_names)} 個類別）：{_fmt_classes(class_names)}")
             else:
                 detected = _classes_txt_nested(folders[0])
                 if detected is not None:
                     class_names = detected
-                    st.success(f"Auto-detected {len(class_names)} classes: {_fmt_classes(class_names)}")
+                    st.session_state["viz_class_msg"] = (
+                        f"Auto-detected {len(class_names)} classes: {_fmt_classes(class_names)}")
                 else:
                     class_names = [c.strip() for c in class_input.split(",") if c.strip()]
                     if not class_names:
@@ -3081,8 +3232,15 @@ def _visualize_embeddings_ui() -> None:
             records = discover_images_classifier(folders)
             if records:
                 detected_classes = sorted({r["label"] for r in records})
-                st.success(f"自動偵測到 {len(detected_classes)} 個類別：{_fmt_classes(detected_classes)}")
+                st.session_state["viz_class_msg"] = (
+                    f"自動偵測到 {len(detected_classes)} 個類別：{_fmt_classes(detected_classes)}")
 
+        if not records:
+            st.error("No images found in the specified folders.")
+            return
+
+        # 壞檔防呆:把無法解碼的影像（連同其 label）先剔除，並顯示統一略過提示
+        records = _filter_records_readable(records, "viz")
         if not records:
             st.error("No images found in the specified folders.")
             return
@@ -3377,6 +3535,9 @@ def _visualize_embeddings_ui() -> None:
         _unit = st.session_state.get("viz_unit", "張影像")
         st.caption(f"{len(records)} {_unit} · {len(model_names)} 模型 · "
                    f"{len(unique_splits)} 個 split")
+        _cmsg = st.session_state.get("viz_class_msg")  # 常駐重現 Run 當下的類別偵測訊息(G6)
+        if _cmsg:
+            st.caption(_cmsg)
         c1, c2, c3, c4 = st.columns([2, 2, 2, 1.4])
         _md = model_names.index("dinov2_vitb14") if "dinov2_vitb14" in model_names else 0
         selected_model = c1.selectbox("Model", model_names, index=_md,
@@ -4178,6 +4339,11 @@ def _compare_distributions_ui() -> None:
         paths_a, note_a = _cmp_resolve_images(path_a)
         paths_b, note_b = _cmp_resolve_images(path_b)
 
+        # 壞檔防呆:兩邊各自前置過濾，壞檔（連同其 label）排除在逐類別比較外
+        paths_a, _bad_a = _partition_image_paths(paths_a, "cmp_a")
+        paths_b, _bad_b = _partition_image_paths(paths_b, "cmp_b")
+        _warn_skipped(list(_bad_a) + list(_bad_b))
+
         _no_img = ("Folder {f} 找不到影像：{p}\n"
                    "物件級・按類別需要 **YOLO 偵測資料夾**（含 images/ 與 labels/）。"
                    "請選資料集根目錄（或其 images/ 子夾），例如 …/train、…/valid。")
@@ -4656,7 +4822,7 @@ def _cov_summary_card(records: list[dict]) -> None:
                 lp = yolo_label_path_for(Path(r["path"]))
                 if not lp.exists():
                     continue
-                for ln in lp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                for ln in safe_read_text(lp).splitlines():
                     ps = ln.split()
                     if ps:
                         try:
@@ -4742,24 +4908,18 @@ def _crop_and_embed_objects(records, model, class_names, pad, *, base_token,
 
     def _open(ip):
         if str(ip) != _src["ip"]:
-            try:
-                _src["img"] = Image.open(ip).convert("RGB")
-            except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖跳過
-                _src["img"] = None
+            _src["img"] = safe_open_image(ip)  # 壞圖/超大圖回 None → 下游跳過該物件
             _src["ip"] = str(ip)
         return _src["img"]
 
     _imwh: dict[str, tuple[int, int]] = {}
 
     def _img_wh(ip) -> tuple[int, int]:
-        """源圖寬高（只讀 header、不解碼）→ 供算物件源像素短邊（裁切可靠度）。"""
+        """源圖寬高 → 供算物件源像素短邊（裁切可靠度）；壞圖回 (0, 0)。"""
         k = str(ip)
         if k not in _imwh:
-            try:
-                with Image.open(ip) as _im:
-                    _imwh[k] = _im.size
-            except (OSError, Image.DecompressionBombError):
-                _imwh[k] = (0, 0)
+            _im = safe_open_image(ip, mode=None)
+            _imwh[k] = _im.size if _im is not None else (0, 0)
         return _imwh[k]
 
     obj_records: list[dict] = []
@@ -5063,8 +5223,11 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                                 ip = Path(rec["image_path"])
                                 img = draw_yolo_boxes(ip, yolo_label_path_for(ip),
                                                       class_names)
-                                img.thumbnail((240, 240))
-                                st.image(img, use_container_width=True)
+                                if img is None:  # 壞圖 → 略過，不可把 None 當 Image
+                                    st.warning("⚠ 壞檔")
+                                else:
+                                    img.thumbnail((240, 240))
+                                    st.image(img, use_container_width=True)
                             else:
                                 thumb = _thumb_or_none(Path(rec["path"]))
                                 if thumb:
@@ -5101,8 +5264,11 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                             if full_ctx and _cr.get("image_path"):
                                 _ip = Path(_cr["image_path"])
                                 _img = draw_yolo_boxes(_ip, yolo_label_path_for(_ip), _ccn)
-                                _img.thumbnail((240, 240))
-                                st.image(_img, use_container_width=True)
+                                if _img is None:  # 壞圖 → 略過，不可把 None 當 Image
+                                    st.warning("⚠ 壞檔")
+                                else:
+                                    _img.thumbnail((240, 240))
+                                    st.image(_img, use_container_width=True)
                             else:
                                 _th = _thumb_or_none(Path(_cr["path"]))
                                 if _th:
@@ -5775,6 +5941,9 @@ def _completeness_ui() -> None:
         records = discover_images_classifier(folders)
         if not records:
             st.error("找不到影像（需 資料夾／類別／影像 結構）。"); return
+        records = _filter_records_readable(records, "cov")  # 壞檔防呆:剔除無法解碼者
+        if not records:
+            st.error("找不到影像（需 資料夾／類別／影像 結構）。"); return
         _collapse_sidebar()
 
         embed_fn = load_model(model)
@@ -6183,6 +6352,9 @@ def _quiz_ui() -> None:
         records = discover_images_classifier(folders)
         if not records or len({r["label"] for r in records}) < 2:
             st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
+        records = _filter_records_readable(records, "quiz")  # 壞檔防呆
+        if not records or len({r["label"] for r in records}) < 2:
+            st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
         _collapse_sidebar()
         embed_fn = load_model(model)
         with st.status("計算中…", expanded=True):
@@ -6238,13 +6410,13 @@ def _quiz_ui() -> None:
         col_img, col_ans = st.columns([3, 2], gap="medium")
         with col_img:
             p = Path(records[q["record_idx"]]["path"])
-            try:
-                img = Image.open(p).convert("RGB")
+            img = safe_open_image(p)  # 壞檔回 None → 不當 Image 用
+            if img is None:
+                st.warning(f"無法讀取：{p}")
+            else:
                 if q["skin"]:
                     img = geometric_skin(img, q["skin"])
                 st.image(img, use_container_width=True)
-            except OSError:
-                st.warning(f"無法讀取：{p}")
         with col_ans:
             st.markdown("**這張屬於哪一類？**")
             st.caption("（盲測：不顯示原標籤；憑你的判斷選。）")
@@ -6535,6 +6707,9 @@ def _gray_zone_ui() -> None:
         if missing:
             st.error(f"資料夾不存在：{', '.join(missing)}"); return
         records = discover_images_classifier(folders)
+        if not records or len({r["label"] for r in records}) < 2:
+            st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
+        records = _filter_records_readable(records, "gray")  # 壞檔防呆
         if not records or len({r["label"] for r in records}) < 2:
             st.error("需至少 2 個類別、folder/類別/影像 結構。"); return
         _collapse_sidebar()
@@ -6887,14 +7062,17 @@ def _evaluation_ui() -> None:
             cols = st.columns(4)
             for j, fn in enumerate(fns[:40]):
                 with cols[j % 4]:
+                    im = safe_open_image(folder / "images" / fn["filename"])  # 壞檔 None → 略過
+                    if im is None:
+                        st.warning(f'⚠ {fn["filename"]}')
+                        continue
                     try:
-                        with Image.open(folder / "images" / fn["filename"]) as im:
-                            b = fn["box"]
-                            crop = crop_bbox(im.convert("RGB"), b["cx"], b["cy"],
-                                             b["w"], b["h"], pad=0.4)
-                            crop.thumbnail((180, 180))
-                            st.image(crop, use_container_width=True,
-                                     caption=f'{fn["cls"]}·{fn["filename"]}')
+                        b = fn["box"]
+                        crop = crop_bbox(im, b["cx"], b["cy"],
+                                         b["w"], b["h"], pad=0.4)
+                        crop.thumbnail((180, 180))
+                        st.image(crop, use_container_width=True,
+                                 caption=f'{fn["cls"]}·{fn["filename"]}')
                     except (OSError, ValueError):
                         st.warning(f'⚠ {fn["filename"]}')
         import csv as _csv

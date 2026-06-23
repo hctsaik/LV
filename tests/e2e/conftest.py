@@ -39,12 +39,21 @@ def synthetic_dataset(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="session")
-def app_server(synthetic_dataset) -> str:
+def app_server(synthetic_dataset, tmp_path_factory) -> str:
     port = _free_port()
+    # 隔離持久化狀態:E2E 用乾淨的 UI-state 檔與 cache 目錄,不共用/不殘留開發者本機狀態,
+    # 也避免 pytest 保留前幾次 tmp 目錄導致「上輪殘留資料夾」被還原而污染本輪(跨 run 汙染)。
+    _state = tmp_path_factory.mktemp("lv_state")
     env = {
         **os.environ,
         "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
         "STREAMLIT_SERVER_HEADLESS": "true",
+        # 父目錄 no_persist/ 刻意不建立 → _ui_state_path 的讀(load)寫(save)皆 OSError→no-op,
+        # 等於 E2E 關閉「記住上次資料夾/選項」的持久化:每個測試(獨立 browser context)從乾淨
+        # session_state 起跑,folder list 不會經由磁碟檔在測試之間殘留(跨測試/跨 run 汙染根因)。
+        # 註:不隔離 LV_CACHE_DIR —— 有測試(test_b/test_t)在「測試行程」用 manifest_path_for/
+        # ref_path_for(無此 env)直接驗證 .lv_cache 內容,隔離只會讓測試與 server 看不同目錄。
+        "LV_UI_STATE": str(_state / "no_persist" / "ui_state.json"),
     }
     log = open(REPO_ROOT / "tests" / "e2e" / "_server.log", "w", encoding="utf-8")
     proc = subprocess.Popen(
@@ -87,6 +96,45 @@ def wait_idle(page, timeout: int = 30000) -> None:
         }""",
         timeout=timeout,
     )
+
+
+def _add_folder(page, list_key, *paths):
+    """Add folder(s) via the small '輸入路徑→Enter' field (replaces the old paste
+    textarea). Accepts multiple path args, or a single newline-joined string
+    (legacy paste form); each non-empty line is added with fill + Enter, which
+    fires the on_change that appends it to the managed folder list."""
+    items: list[str] = []
+    for p in paths:
+        items.extend(str(p).splitlines() or [str(p)])
+    sel = f'.st-key-{list_key}_add input'
+    inp = page.locator(sel)
+    for it in items:
+        it = it.strip()
+        if not it:
+            continue
+        inp.fill(it)
+        inp.press("Enter")
+        # The on_change appends the path and clears the field. Wait for that
+        # clear before typing the next path: wait_idle can return in the gap
+        # between Enter and the rerun starting, letting the next fill clobber
+        # this value before on_change reads it (dropping a folder).
+        page.wait_for_function(
+            "(s) => { const el = document.querySelector(s); return el && el.value === ''; }",
+            arg=sel, timeout=15000)
+        wait_idle(page)
+
+
+def _ensure_sidebar(page) -> None:
+    """Re-expand the left settings sidebar if a prior Run auto-collapsed it.
+
+    The Run button lives inside the sidebar, so a second Run in the same
+    session must first click the '☰ 顯示左側設定列' reopen button (a no-op
+    when the sidebar is already open — the button only renders while
+    collapsed)."""
+    btn = page.locator('.st-key-reopen_sidebar button')
+    if btn.count() and btn.first.is_visible():
+        btn.first.click()
+        wait_idle(page)
 
 
 def load_app(page, base_url: str) -> None:

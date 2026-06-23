@@ -23,7 +23,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+
+from safe_io import safe_open_image
 
 # ── cell states ─────────────────────────────────────────────────────────
 STATE_MISSING = "缺"        # n < 0.5t
@@ -51,9 +52,11 @@ def image_stats(path: Path) -> dict[str, float]:
     (Laplacian variance, unbounded ≥0) and aspect (w/h). Raises OSError on
     unreadable sources so the caller can skip them.
     """
-    with Image.open(path) as im:
-        w, h = im.size
-        g = np.asarray(im.convert("L").resize((128, 128)), dtype=np.float64) / 255.0
+    im = safe_open_image(path, mode="L")
+    if im is None:  # 壞檔 → 維持原契約丟 OSError,讓呼叫端略過此圖
+        raise OSError(f"unreadable image: {path}")
+    w, h = im.size
+    g = np.asarray(im.resize((128, 128)), dtype=np.float64) / 255.0
     # discrete Laplacian variance ≈ focus / edge energy
     lap = (-4 * g
            + np.roll(g, 1, 0) + np.roll(g, -1, 0)

@@ -38,6 +38,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from safe_io import safe_open_image
+
 MANIFEST_NAME = "manifest.jsonl"
 MANIFEST_SOURCE_DISCOVERED = "discovered"
 
@@ -78,11 +80,10 @@ def compute_phash(path: Path, hash_size: int = 8) -> str | None:
     Near-duplicate images yield small Hamming distances — good enough for
     duplicate candidate generation without an extra dependency.
     """
-    try:
-        img = Image.open(path).convert("L").resize(
-            (hash_size + 1, hash_size), Image.LANCZOS)
-    except (OSError, Image.DecompressionBombError):  # 壞圖/超大圖(>179MP)皆跳過
+    img = safe_open_image(path, mode="L")
+    if img is None:  # 壞圖/超大圖(>179MP)/截斷檔皆跳過 → phash 為 None
         return None
+    img = img.resize((hash_size + 1, hash_size), Image.LANCZOS)
     px = np.asarray(img, dtype=np.int16)
     bits = (px[:, 1:] > px[:, :-1]).flatten()
     value = 0
@@ -145,7 +146,10 @@ def update_manifest(
     n_total = len(records)
     for i, r in enumerate(records):
         p = Path(r["path"])
-        key = rel_key(folder, p)
+        try:
+            key = rel_key(folder, p)
+        except ValueError:
+            continue  # record 不在本 folder 下(同名資料夾/殘留路徑)→ 不屬此 folder,跳過不炸
         stat = p.stat()
         prev = old.get(key)
         if prev is not None and prev.get("size") == stat.st_size \
@@ -168,8 +172,16 @@ def update_manifest(
         entry["labels"] = [label] if label else []
         if thumb_lookup is not None:
             thumb = thumb_lookup(p)
-            entry["thumb_ref"] = (
-                rel_key(folder, thumb) if thumb is not None else None)
+            if thumb is None:
+                entry["thumb_ref"] = None
+            else:
+                try:
+                    entry["thumb_ref"] = rel_key(folder, thumb)
+                except ValueError:
+                    # 縮圖在全域 .lv_cache 快取(內容定址,不在資料夾下)→ 存絕對 POSIX
+                    # 路徑。否則 rel_key 的 relative_to 會對「不在 folder 下」的縮圖丟
+                    # ValueError,暖快取時必中,整個 viz 工具會崩潰。
+                    entry["thumb_ref"] = Path(thumb).resolve().as_posix()
         else:
             entry.setdefault("thumb_ref", None)
         entries[key] = entry

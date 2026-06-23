@@ -174,7 +174,7 @@ def send_to_labeling(
     if not idxs:
         return None
 
-    from PIL import Image  # local: only needed when actually exporting
+    from safe_io import safe_open_image  # local: only needed when actually exporting
 
     original_labels = original_labels or {}
     golden_labels = golden_labels or {}
@@ -236,12 +236,17 @@ def send_to_labeling(
         dst = img_dir / f"{it['sha256']}{ext}"
         try:
             if it.get("skin") and skin_fn is not None:
-                img = Image.open(src).convert("RGB")
+                img = safe_open_image(src)
+                if img is None:  # 壞檔 → 不複製此圖,讓它落入下方「未產出 image」過濾
+                    continue
                 skin_fn(img, it["skin"]).save(dst, quality=92)
             elif ext in (".jpg", ".jpeg"):
                 shutil.copyfile(src, dst)
             else:
-                Image.open(src).convert("RGB").save(dst)
+                img = safe_open_image(src)
+                if img is None:  # 壞檔 → 跳過,不寫半張圖
+                    continue
+                img.save(dst)
         except Exception:  # noqa: BLE001  skip one bad image; never orphan a half-folder
             continue
         it["image"] = f"images/{dst.name}"

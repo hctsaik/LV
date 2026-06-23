@@ -43,6 +43,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from safe_io import safe_open_image, safe_read_text
+
 # ── constants ────────────────────────────────────────────────────────────────
 LV_VERSION = "0.0.0-dev"  # placeholder until a real release stamp exists
 MANIFEST_NAME = "manifest.csv"
@@ -90,6 +92,9 @@ class ExportReport:
     deduped: int = 0
     warnings: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    # 損壞/格式錯而被「略過」的匯出項（圖檔解不開）。屬設計行為:跳過該項
+    # (不寫圖與其 label),整個匯出不崩潰;每筆留底供上層顯示。
+    corrupt: list = field(default_factory=list)
     dst: str = ""
 
 
@@ -363,7 +368,7 @@ def _crop_box(img_w: int, img_h: int, box: list[float], pad: float
 # ── lineage / manifest ───────────────────────────────────────────────────────
 def _write_manifest_csv(dst: Path, rows: list[dict]) -> None:
     cols = ["dst", "sha256", "source_path", "source_tool", "source_tag",
-            "reason", "split", "level"]
+            "reason", "split", "level", "object_ids"]
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore",
                        lineterminator="\n")
@@ -410,6 +415,7 @@ def _write_lineage(dst: Path, *, mode: str, layout: str, on_exists: str,
             "unresolved": len(report.unresolved),
             "warnings": len(report.warnings),
             "errors": len(report.errors),
+            "corrupt": len(report.corrupt),
         },
     }
     # self-hash over the canonical content (excluding the field itself)
@@ -504,6 +510,14 @@ def _export_yolo(merged, dst, mode, on_exists, class_remap, report,
     """yolo layout: whole image + FULL (remapped) label file (§6 path ①)."""
     img_root = dst / "images"
     lbl_root = dst / "labels"
+    # 檔名改用「原圖檔名」（使用者明確選用，取代 sha256）。同一次匯出內，
+    # 不同 sha 但同 basename 會撞名（如兩個來源各有 000001.jpg）；以 __N
+    # 後綴消歧義，兩張都保留。此消歧義與 on_exists（針對既有 dst 檔）無關。
+    # 消歧義以「stem」為單位（不含副檔名）：label .txt 只跟 image 的 stem 命名，
+    # 若只看完整檔名，000001.png 與 000001.jpg（不同 sha）不算撞名→兩張影像都留，
+    # 但兩者的 label 都叫 000001.txt 會互蓋、漏標。改追蹤 stem 即可保證
+    # image 與 label 都唯一且配對。used_names 以「輸出目錄」(含 split) 為範圍。
+    used_stems: dict[Path, set[str]] = {}
     for sha, m in merged.items():
         it = m.item
         src_img = Path(it.image_path)
@@ -511,7 +525,15 @@ def _export_yolo(merged, dst, mode, on_exists, class_remap, report,
         split = it.split
         img_dir = img_root / split if split else img_root
         lbl_dir = lbl_root / split if split else lbl_root
-        target_img = img_dir / f"{sha}{ext}"
+        claimed = used_stems.setdefault(img_dir, set())
+        stem = src_img.stem
+        if stem in claimed:
+            i = 1
+            while f"{stem}__{i}" in claimed:
+                i += 1
+            stem = f"{stem}__{i}"
+        claimed.add(stem)
+        target_img = img_dir / f"{stem}{ext}"
 
         man_row = _manifest_row(sha, m, level=("object" if "object" in m.levels
                                                else "image"))
@@ -531,7 +553,7 @@ def _export_yolo(merged, dst, mode, on_exists, class_remap, report,
         # FULL label, class ids remapped — never subset/rewrite boxes (§6).
         if it.label_path and Path(it.label_path).exists():
             rows, warns = _parse_label_lines(
-                Path(it.label_path).read_text(encoding="utf-8"))
+                safe_read_text(it.label_path))
             for w in warns:
                 report.warnings.append({"sha256": sha, "kind": "label-parse",
                                         "detail": w})
@@ -546,8 +568,6 @@ def _export_yolo(merged, dst, mode, on_exists, class_remap, report,
 def _export_crop_out(merged, dst, mode, pad, report, manifest_rows,
                      object_rows) -> None:
     """crop-out layout: one ImageFolder JPG per picked box (§6 path ②)."""
-    from PIL import Image
-
     img_root = dst / "images"
     for sha, m in merged.items():
         it = m.item
@@ -563,15 +583,16 @@ def _export_crop_out(merged, dst, mode, pad, report, manifest_rows,
                                     "detail": "no object_ids/label for crop-out"})
             continue
         rows, warns = _parse_label_lines(
-            Path(it.label_path).read_text(encoding="utf-8"))
+            safe_read_text(it.label_path))
         for w in warns:
             report.warnings.append({"sha256": sha, "kind": "label-parse",
                                     "detail": w})
-        try:
-            img = Image.open(src_img).convert("RGB")
-        except OSError as e:
-            report.errors.append({"sha256": sha, "src": str(src_img),
-                                  "reason": f"crop open failed: {e}"})
+        img = safe_open_image(src_img)
+        if img is None:
+            # 圖檔損壞/格式錯 → 略過這個匯出項(不寫該圖與其 label),記入
+            # corrupt 清單,整個匯出不崩潰(設計行為,非吞錯)。
+            report.corrupt.append({"sha256": sha, "src": str(src_img),
+                                   "reason": "image corrupt/unreadable — skipped"})
             continue
         iw, ih = img.size
         names = it.class_names or []
@@ -614,4 +635,7 @@ def _manifest_row(sha: str, m: _Merged, level: str) -> dict:
         "reason": "|".join(m.reasons),
         "split": m.item.split or "",
         "level": level,
+        # 物件級匯出記錄被挑中的框 index（0-based YOLO 行號），供回溯哪些框被選。
+        "object_ids": (" ".join(str(o) for o in m.object_ids)
+                       if level == "object" and m.object_ids else ""),
     }

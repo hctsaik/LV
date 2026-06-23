@@ -18,6 +18,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from sklearn.neighbors import NearestNeighbors
 
+from safe_io import safe_open_image, safe_read_text
 from signal_strength import SIGNAL_NONE, SIGNAL_OBVIOUS
 
 
@@ -822,7 +823,9 @@ def make_thumbnail(image_path: Path, size: int = 256) -> Path:
     if out.exists():
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
-    img = Image.open(image_path).convert("RGB")
+    img = safe_open_image(image_path)
+    if img is None:  # 壞檔/格式錯:維持 docstring「unreadable → OSError」契約,讓 ensure_thumbnails 跳過
+        raise OSError(f"unreadable image: {image_path}")
     img.thumbnail((size, size))
     img.save(out, "WEBP", quality=80)
     return out
@@ -885,19 +888,24 @@ def draw_yolo_boxes(
     image_path: Path,
     label_path: Path,
     class_names: list[str] | None = None,
-) -> Image.Image:
+) -> Image.Image | None:
     """Return the image with its YOLO boxes drawn (red, 2px, class tag).
 
     A missing/empty label file yields the unmodified image. Lines that fail
     to parse are skipped.
+
+    Returns ``None`` if the image itself is corrupt/undecodable (can't draw on
+    a broken image) — callers must guard the ``None`` and render a placeholder.
     """
-    img = Image.open(image_path).convert("RGB")
+    img = safe_open_image(image_path)
+    if img is None:  # 影像壞了無法畫框 → 由呼叫端守 None
+        return None
     label_path = Path(label_path)
     if not label_path.exists():
         return img
     draw = ImageDraw.Draw(img)
     w, h = img.size
-    for line in label_path.read_text().splitlines():
+    for line in safe_read_text(label_path).splitlines():
         parts = line.split()
         if len(parts) < 5:
             continue
@@ -1087,7 +1095,7 @@ def parse_yolo_boxes(
     if not label_path.exists():
         return []
     out: list[tuple[int, float, float, float, float]] = []
-    for line in label_path.read_text().splitlines():
+    for line in safe_read_text(label_path).splitlines():
         parts = line.split()
         if len(parts) < 5:
             continue
@@ -1112,7 +1120,7 @@ def parse_yolo_boxes_conf(
     if not label_path.exists():
         return []
     out: list[tuple[int, float, float, float, float, float | None]] = []
-    for line in label_path.read_text().splitlines():
+    for line in safe_read_text(label_path).splitlines():
         parts = line.split()
         if len(parts) < 5:
             continue
