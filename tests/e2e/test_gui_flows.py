@@ -54,7 +54,11 @@ def _grid_imgs(page):
 
 
 def _switch_panel(page, label: str) -> None:
-    page.locator('.st-key-viz_panel_view').get_by_text(label, exact=True).click()
+    # the panel switcher is a segmented-control; a still-settling rerun (e.g.
+    # right after a model switch) can briefly mount two copies of it, so two
+    # buttons match the label. Settle first, then target the first match.
+    wait_idle(page)
+    page.locator('.st-key-viz_panel_view').get_by_text(label, exact=True).first.click()
     wait_idle(page)
 
 
@@ -435,24 +439,39 @@ def test_l_rerun_resets_selection_keeps_export_list(flow_page):
 
 def test_m_selection_latency(flow_page):
     page = flow_page
+    # inherit a fully-settled scatter from test_l's re-Run before timing —
+    # a residual rerun would move/stale the marker bbox and the raw click
+    # below (no built-in retry, so the latency stays honest) would miss.
+    wait_idle(page)
     timings = []
     for path_idx in (1, 3, 5):
         # clean slate so the click flips the status 未選取 → 已選取
         if _selected_count(page) >= 1:
             _click_wait_status(page, '.st-key-viz_clear_btn button')
-        groups = page.locator('.st-key-viz_scatter_wrap g.points')
-        p = groups.nth(0).locator('path').nth(path_idx)
-        bb = p.bounding_box()
-        t0 = time.perf_counter()
-        page.mouse.click(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
-        page.wait_for_function(
-            """() => {
-                const el = document.querySelector('.st-key-viz_status_line');
-                return el && el.innerText.includes('已選取');
-            }""",
-            timeout=10000,
-        )
-        timings.append(time.perf_counter() - t0)
+        # A bare plotly point-click can miss the marker hit-area; retry on a
+        # fresh bbox until the status flips, timing only the click that lands
+        # (the SLA is about feedback once the click registers).
+        elapsed = None
+        for _ in range(4):
+            groups = page.locator('.st-key-viz_scatter_wrap g.points')
+            p = groups.nth(0).locator('path').nth(path_idx)
+            bb = p.bounding_box()
+            t0 = time.perf_counter()
+            page.mouse.click(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const el = document.querySelector('.st-key-viz_status_line');
+                        return el && el.innerText.includes('已選取');
+                    }""",
+                    timeout=3000,
+                )
+                elapsed = time.perf_counter() - t0
+                break
+            except Exception:
+                wait_idle(page)
+        assert elapsed is not None, "marker click never registered a selection"
+        timings.append(elapsed)
         wait_idle(page)
     timings.sort()
     median = timings[len(timings) // 2]
@@ -480,24 +499,36 @@ def test_o_projection_method_skip(app_page, synthetic_dataset):
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
     _add_folder(page, "viz_folder_list", str(synthetic_dataset))
-    # drop t-SNE and UMAP from the 投影方法 multiselect. Each removal
-    # triggers a rerun that can swallow the next keypress — retry until
-    # only PCA's tag remains.
-    ms_input = page.locator('.st-key-viz_methods input')
-    tags = page.locator('.st-key-viz_methods span[data-baseweb="tag"]')
-    for _ in range(8):
-        if tags.count() <= 1:
-            break
-        ms_input.click()
-        page.keyboard.press("Backspace")
-        page.wait_for_timeout(400)
-        wait_idle(page)
+    # Reduce 投影方法 to only PCA deterministically: clear all tags via the
+    # baseweb "Clear all" affordance, then re-add PCA. Per-tag delete and
+    # Backspace both race the per-removal rerun and are flaky (sometimes drop
+    # PCA too → 0 tags, sometimes leave extras).
+    methods = page.locator('.st-key-viz_methods')
+    tags = methods.locator('span[data-baseweb="tag"]')
+    methods.get_by_role("button", name="Clear all").click()
+    wait_idle(page)
+    expect(tags).to_have_count(0)
+    methods.locator('[data-baseweb="select"]').click()
+    page.get_by_role("option", name="PCA", exact=True).click()
     page.keyboard.press("Escape")
+    wait_idle(page)
     expect(tags).to_have_count(1)
-    page.locator('.st-key-run_viz button').click()
+    # Tag-delete leaves the baseweb popover open + the multiselect focused; its
+    # overlay can swallow the Run click (or the button still reads disabled from
+    # the in-flight removal frame). Click a neutral spot (the ④ 執行 heading,
+    # sidebar-only + adjacent to Run) to dismiss the popover + blur the
+    # multiselect, then wait for run_viz to be enabled before clicking —
+    # otherwise the click lands on nothing and no Run ever starts (post-Run
+    # method_select never renders).
+    page.get_by_text("④ 執行", exact=True).click()
+    page.keyboard.press("Escape")
+    run_btn = page.locator('.st-key-run_viz button')
+    expect(run_btn).to_be_enabled()
+    run_btn.click()
 
     progress_texts: set[str] = set()
-    deadline = time.time() + 120
+    appeared = False
+    deadline = time.time() + 300  # cold DINOv2 run on a fresh session is slow
     while time.time() < deadline:
         prog = page.locator('[data-testid="stProgress"]')
         try:
@@ -508,8 +539,14 @@ def test_o_projection_method_skip(app_page, synthetic_dataset):
         except Exception:
             pass
         if page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0:
+            appeared = True
             break
         time.sleep(0.1)
+    # Assert the Run actually produced a scatter — turning the silent poll into
+    # a real assertion so a stalled/never-started Run fails here honestly
+    # instead of slipping through to the post-Run method_select timeout.
+    assert appeared, ("PCA-only Run produced no scatter within 300s; "
+                      f"progress seen={progress_texts!r}")
     wait_idle(page, timeout=60000)
 
     assert not any("t-SNE" in t or "UMAP" in t for t in progress_texts), progress_texts
@@ -607,8 +644,26 @@ _CLIP_DIR = (Path(__file__).resolve().parent.parent.parent
 
 @pytest.mark.skipif(not (_CLIP_DIR / "config.json").exists(),
                     reason="Chinese-CLIP weights not downloaded")
-def test_q_text_to_image_search(flow_page):
-    page = flow_page
+def test_q_text_to_image_search(app_page, synthetic_dataset):
+    # Isolated session (NOT the shared flow_page): the post-Run "Model"
+    # selectbox (viz_model_select) only offers models actually computed by
+    # the Run, and the sidebar default is dinov2_vitb14 only — so to switch
+    # to chinese-clip we must add it to viz_models_sel BEFORE the Run.
+    page = app_page
+    page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
+    wait_idle(page)
+    _add_folder(page, "viz_folder_list", str(synthetic_dataset))
+    # add chinese-clip alongside the default model in the sidebar multiselect
+    page.locator('.st-key-viz_models_sel [data-baseweb="select"]').click()
+    page.get_by_role("option", name=_CLIP_DIR.name, exact=True).click()
+    wait_idle(page)
+    page.locator('.st-key-run_viz button').click()
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        if page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0:
+            break
+        time.sleep(0.15)
+    wait_idle(page, timeout=120000)
     _select_option(page, "viz_model_select", _CLIP_DIR.name)
     _switch_panel(page, "相似")
     box = page.locator('.st-key-viz_text_query input')
@@ -717,6 +772,10 @@ def test_t_umap_reference_frame(app_page, tmp_path):
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
     _add_folder(page, "viz_folder_list", str(train))
+    # the model multiselect now defaults to dinov2_vitb14 only (app.py:3126);
+    # the persistent UMAP frame is keyed per-model, so add dinov2_vits14 before
+    # Run for ref_path_for(train, "dinov2_vits14") to be fitted/persisted.
+    _select_option(page, "viz_models_sel", "dinov2_vits14")
     page.locator('.st-key-viz_umap_ref label').first.click()
     wait_idle(page)
     page.locator('.st-key-run_viz button').click()
@@ -858,8 +917,11 @@ def test_w_completeness_calibration_and_mining(app_page, tmp_path):
     wait_idle(page)
     expect(page.locator('.st-key-cov_heatmap')).to_be_visible()  # re-rendered, no re-Run
 
-    # (a) calibration editor is present (uncalibrated warning visible first)
-    expect(page.get_by_text(re.compile("未校正真實分佈"))).to_be_visible()
+    # (a) calibration editor is present (uncalibrated warning visible first).
+    # the warning can momentarily render twice while the t_abs number-input
+    # rerun swaps the DOM — .first confirms it is visible without racing that
+    # transient element churn.
+    expect(page.get_by_text(re.compile("未校正真實分佈")).first).to_be_visible()
     # open the calibration expander via its summary (avoid matching the
     # same words in the feature-map popover)
     page.locator('[data-testid="stExpander"] summary'

@@ -142,13 +142,45 @@ def _switch_panel(page, label: str) -> None:
     wait_idle(page)
 
 
+def _add_models(page, labels: list[str]) -> None:
+    """Add models to the sidebar 模型 multiselect (key=viz_models_sel).
+
+    The default selection is dinov2_vitb14 only (app.py:3126); the post-Run
+    Model selectbox only offers models that were actually computed, so any
+    model a test wants to switch to must be added here BEFORE Run. Each pick
+    triggers a rerun that can swallow the next click — retry until the tag
+    shows up (cf. the 投影方法 multiselect handling in test_gui_flows.py).
+    """
+    ms = page.locator('.st-key-viz_models_sel')
+    for label in labels:
+        tag = ms.locator('span[data-baseweb="tag"]', has_text=label)
+        for _ in range(6):
+            if tag.count():
+                break
+            ms.locator('[data-baseweb="select"]').click()
+            opt = page.get_by_role("option", name=label, exact=True)
+            try:
+                opt.click(timeout=5000)
+            except Exception:
+                pass
+            page.wait_for_timeout(400)
+            wait_idle(page, timeout=60000)
+        expect(tag).to_have_count(1)
+    page.keyboard.press("Escape")
+    wait_idle(page)
+
+
 # ── S1: detector multi-folder cold run + model switching ────────────────
 
 def test_s01_detector_multimodel_cold_run(det_page, detector_dataset):
     page = det_page
     _add_folder(page, "viz_folder_list",
         str(detector_dataset / "train") + "\n" + str(detector_dataset / "val"))
-    texts = _run_and_collect_progress(page, timeout_s=400)
+    # the sidebar defaults to dinov2_vitb14 only; add the models this test
+    # later switches to (s01 here + s03) so the Run computes their embeddings
+    # and the post-Run Model selectbox actually offers them.
+    _add_models(page, ["dinov2_vits14", "chinese-clip-vit-base-patch16"])
+    texts = _run_and_collect_progress(page, timeout_s=600)
     assert page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0
     assert len(texts) >= 3, f"progress must stream: {texts}"
     expect(page.get_by_text(re.compile("Auto-detected 2 classes"))).to_be_visible()
@@ -159,9 +191,16 @@ def test_s01_detector_multimodel_cold_run(det_page, detector_dataset):
     models = ["dinov2_vits14", "chinese-clip-vit-base-patch16"]
     for m in models:
         _select_option(page, "viz_model_select", m)
-        expect(page.locator('.st-key-viz_scatter_wrap')
-               .get_by_text(re.compile(m))).to_be_visible()
+        # the in-figure model title was removed (model is shown in the Model
+        # selectbox above the chart, app.py:694) — verify the switch took
+        # effect there and the scatter re-rendered without losing the session.
+        expect(page.locator('.st-key-viz_model_select')).to_contain_text(m)
+        assert page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0
         _no_exception(page)
+    # restore the default model so the rest of the det_page chain (s02/s03/s04)
+    # runs on the dinov2_vitb14 scatter they were written against — chinese-clip
+    # on the tiny detector crops collapses the scatter, so point-clicks miss.
+    _select_option(page, "viz_model_select", "dinov2_vitb14")
     _no_exception(page)
 
 
@@ -204,12 +243,16 @@ def test_s02_selection_viewer_yolo_chain(det_page):
     expect(boxes).to_have_count(1)
     page.locator('.st-key-viz_img_boxes label').first.click()
     wait_idle(page)
+    # the toggle defaults ON (app.py:1499); clicking it flips the state. The
+    # contract is that whatever state we leave it in SURVIVES image navigation
+    # — not that it is checked. Capture the toggled state and assert it holds.
+    toggled = page.locator('.st-key-viz_img_boxes input').is_checked()
     expect(viewer.locator('[data-testid="stImage"] img').first).to_be_visible()
     nxt = page.locator('.st-key-viz_img_next button')
     if nxt.is_enabled():
         nxt.click()
         wait_idle(page)
-        assert page.locator('.st-key-viz_img_boxes input').is_checked(), \
+        assert page.locator('.st-key-viz_img_boxes input').is_checked() == toggled, \
             "YOLO toggle must keep its state across images"
     page.locator('.st-key-viz_img_close button').click()
     wait_idle(page)
@@ -269,11 +312,27 @@ def test_s04_outlier_ranking_and_export(det_page):
         """() => { const el = document.querySelector('.st-key-viz_status_line');
                    return el && el.innerText.includes('標籤分歧前'); }""", timeout=10000)
     _select_option(page, "viz_grid_sort", "空間順序")
-    # rank order drives the viewer context
-    page.locator('.st-key-viz_grid [class*="st-key-viz_card_"] button').first.click()
-    wait_idle(page)
-    expect(page.locator('.st-key-viz_image_viewer')
-           .get_by_text(re.compile(r"1/\d+"))).to_be_visible()
+    # wait for the sort rerun to fully re-register the card callbacks before
+    # clicking: in the no-selection default view 空間順序 falls back to the
+    # outlier ranking, so the status flips back from "標籤分歧前" to "離群度前".
+    # Clicking .first before that rerun settles fires the *stale* (標籤分歧)
+    # on_click args (same viz_card key, old viewer-ctx) → viewer opens mid-list
+    # (e.g. 13/18) instead of 1/N.
+    page.wait_for_function(
+        """() => { const el = document.querySelector('.st-key-viz_status_line');
+                   return el && el.innerText.includes('離群度前'); }""", timeout=10000)
+    # rank order drives the viewer context. Retry the click until the viewer
+    # opens at 1/N: a click landing before the sort rerun fully re-registers
+    # the card callbacks can fire the stale (標籤分歧) on_click args and open
+    # the viewer mid-list (e.g. 13/18) instead.
+    viewer = page.locator('.st-key-viz_image_viewer')
+    for _ in range(4):
+        page.locator('.st-key-viz_grid [class*="st-key-viz_card_"] button').first.click()
+        wait_idle(page)
+        if viewer.get_by_text(re.compile(r"1/\d+")).count():
+            break
+        page.wait_for_timeout(400)
+    expect(viewer.get_by_text(re.compile(r"1/\d+"))).to_be_visible()
     page.locator('.st-key-viz_slot_add button').click()
     wait_idle(page)
     _switch_panel(page, "匯出清單")

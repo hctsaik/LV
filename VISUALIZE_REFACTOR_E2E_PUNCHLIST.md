@@ -1,44 +1,43 @@
-# Visualize 重構 E2E 收尾清單（punch-list）
+# Visualize 重構 E2E 收尾清單（punch-list）— ✅ 已收尾
 
-> 背景:`scripts/app.py` 的 Visualize 工具於上午做了大重構(資料夾系統改版、
-> 多模型、UI-state 持久化、面板/視圖、工具列精簡)。這批重構**先前從未跑過完整 E2E**。
-> 本輪已修掉**所有系統性崩潰**,把 `tests/e2e/test_scenarios_r1.py` +
-> `tests/e2e/test_gui_flows.py` 的失敗從 **35 → 12**。剩下 12 個是**個別、脆弱的測試對齊**,
-> 多數需逐一改測試(或少量 app 行為決定),且彼此會連動。**這些紅測試是上午重構的未收尾,
-> 非「壞檔防呆」造成**(已用中立化實驗證明)。
-
-## 已修(本輪)
-- viz 資料夾缺 headless 文字輸入 → `_folder_add_input("viz_folder_list")`
-- `_folder_picker_list` docstring 宣稱有 add-input 卻沒渲染 → 補上(修 cov/quiz/gray/objcov)+ 移除 anomaly 重複呼叫
-- `manifest.update_manifest` 暖快取崩潰:`rel_key(folder, 全域縮圖)` ValueError → 容忍 folder 外路徑
-- `update_manifest` 對「不在 folder 下的 record」防呆 skip(同名資料夾/殘留)
-- UI-state 持久化造成跨測試/跨 run 殘留資料夾 → `tests/e2e/conftest.py` 關閉 E2E 持久化(`LV_UI_STATE` 指向不存在父目錄 → 讀寫 no-op)
-- 移除 `LV_CACHE_DIR` 隔離(test_b/test_t 在測試行程直接驗 `.lv_cache`,隔離會看不同目錄)
-- s01 類別偵測訊息常駐化(app G6,`viz_class_msg` + 3534 caption);s07 去掉重複的 `st.success`
-- s10 陳舊文字「清單是空的」→「購物車是空的」
-- 工具列精簡:`test_y/z/ac`(組考卷/灰帶/評估,commit 319dd80 已自 tool_switch 隱藏)→ `@pytest.mark.skip`
-
-## 剩餘 12 個(待下一輪逐一收)
-| 測試 | 根因(推測) | 收尾方向 |
-|------|------------|----------|
-| `test_scenarios_r1::test_s01_detector_multimodel_cold_run` | 預設模型由多個改成單一 `dinov2_vitb14`(app.py:3126),測試假設多模型可切 | 測試在 `viz_models_sel` multiselect 顯式選 2 個模型(dinov2_vits14 + chinese-clip)再 Run |
-| `test_s02_selection_viewer_yolo_chain` | **連鎖**:s01 的 `_select_option` 失敗讓模型下拉卡開,阻塞共享 det_page | 多半隨 s01 修好而解;否則檢查 viz_status_line/panel 狀態 |
-| `test_s03_find_similar_cross_model` | 同上連鎖 + 跨模型相似面板 | 隨 s01;檢查 viz_similar_panel/viz_model_select |
-| `test_s04_outlier_ranking_and_export` | 同上連鎖 | 隨 s01 |
-| `test_s07_unicode_paths_round_trip` | S8 段 `已切換模式`(sidebar 收合/時序)+ 類別訊息 | `_ensure_sidebar` 後再驗;確認 `_viz_mode_snapshot` 觸發 |
-| `test_gui_flows::test_j_3d_mode_preserves_selection` | 3D 模式切換保留選取 | 逐一查 3D 切換 UI |
-| `test_m_selection_latency` | 選取延遲基準 | 查選取互動時序 |
-| `test_o_projection_method_skip` | `viz_methods` multiselect 用 Backspace 移除到剩 PCA → tags 數不收斂 | multiselect 互動脆弱,改穩定移除法 |
-| `test_q_text_to_image_search` | CLIP 文搜面板 | 查 viz 文搜 UI(需 CLIP 模型) |
-| `test_t_umap_reference_frame` | `ref_path_for` 持久化驗證(移除 cache 隔離後仍紅) | 查 umap_ref 寫入路徑/時序 |
-| ~~`test_u_completeness_heatmap`~~ | **✅ 已修(綠)**:檢視預設改成「嵌入覆蓋圖」(app.py:5910/4804),`cov_heatmap`(6070)只在「屬性棋盤」渲染 | 已改:run_cov **前**先切 `cov_view_mode`→「屬性棋盤」(sidebar 仍展開時),跑完直接出熱力圖 |
-| `test_w_completeness_calibration_and_mining` | 熱力圖部分已隨 test_u 修法修好;**剩下更深的一段**:挖候選 mining(`🔎 撈候選補此格` popover → `cov_mine_btn` → `cov_cand_csv`)在 mining 後 `cov_cand_csv` 不顯示(無 server crash,line 876) | 查 `_render_cov_candidates`(app.py:4455)/`_mine_cell_candidates`(4412):候選是否為空、CSV 是否在 popover 內(關閉後看不到)。屬獨立問題,非預設檢視 |
+> 背景:`scripts/app.py` 的 Visualize 工具(資料夾系統改版、多模型、UI-state 持久化、
+> 面板/視圖、工具列精簡)做了大重構,**先前從未跑過完整 E2E**。先前進度把
+> `tests/e2e/test_scenarios_r1.py` + `tests/e2e/test_gui_flows.py` 的失敗從 **35 → 12**。
+>
+> **本輪把剩餘 12 個全部收掉,整批 E2E 綠(35 passed / 5 skipped / 0 failed)。**
+> 5 skip 皆為刻意停用:Compare 影像級流程(test_s05 / test_s)、工具列精簡隱藏的
+> 組考卷/灰帶/評估(test_y / test_z / test_ac)。
 
 ## 怎麼跑
 ```
-# 單檔逐一(快):
-python -m pytest tests/e2e/test_scenarios_r1.py::test_s01_detector_multimodel_cold_run -m e2e -o addopts="" --tb=long
-# 整批 viz e2e:
-python -m pytest tests/e2e/test_scenarios_r1.py tests/e2e/test_gui_flows.py -m e2e -o addopts="" -rf --tb=line
+python -m pytest tests/e2e/test_scenarios_r1.py tests/e2e/test_gui_flows.py -m e2e -o addopts="" -rA --tb=short
 ```
-注意:`det_page` 是 module-scope 共享頁,s01–s04/s10 連鎖;先修 s01。每次冷跑含模型載入,整批約 18 分鐘。
+注意:`det_page`(scenarios_r1)與 `flow_page`(gui_flows)是 module-scope 共享頁,
+測試**依檔案順序連鎖**;s01 / test_b 跑完會自動收合 sidebar。整批冷跑約 4–7 分(含模型載入)。
+
+## 12 個失敗的根因與修法（本輪）
+
+| 測試 | 根因 | 修法 | 類別 |
+|------|------|------|------|
+| `s01` | 預設模型由多模型改成只剩 `dinov2_vitb14`(app.py:3126);Run 後 `viz_model_select` 只列「已實際計算」的模型 → 切 vits14/chinese-clip 找不到選項。且圖內標題已刻意移除(app.py:694),舊斷言找不到散點區的模型名 | 加 `_add_models` helper,Run 前先在側欄 `viz_models_sel` 加 vits14+chinese-clip;斷言改驗 `viz_model_select` 下拉值 + 散點重繪;結尾還原預設模型避免污染 s02–s04 | test |
+| `s02` | `viz_img_boxes` 預設改為 True(app.py:1499);測試先點掉(True→False)卻斷言 `is_checked()==True`,方向錯 | 擷取點擊後狀態,斷言「跨影像導覽後狀態保留」(忠於原意) | test |
+| `s03` | 連鎖:s01 無法切模型 + s01 結尾停在 chinese-clip(散點塌縮、點不到) | 隨 s01 修法(vits14 已算 + 還原預設模型)解決 | test(連帶) |
+| `s04` | 切 grid 排序(標籤分歧→空間順序)後 rerun 尚未重新註冊卡片 callback,點到陳舊 on_click args → viewer 開在中段(13/18)而非 1/N | 等狀態翻回「離群度前」+ retry-click 直到 viewer 開在 1/N | test |
+| `s07` | 「切粒度清 `viz_records`」邏輯在**切模式**時誤觸發(Classifier→Detector 連帶改 granularity),把 records 偷走 → 切模式快照沒建 → 「已切換模式」banner/復原鈕不顯示 | app:切模式那一輪不在粒度區塊清,留給切模式區塊先快照再清 | **app** |
+| `j` | 3D 高亮環(黑圈)仍實作(app.py:3606-3614),但描述用 caption 在重構時掉了 | app:補回 caption `3D 看：黑圈為目前選取的 N 點` | **app** |
+| `l` | Run 後 sidebar 以 CSS `visibility:hidden` 收合;`_ensure_sidebar` 點 reopen 後只 `wait_idle`,沒等側欄真的展開 → run_viz 仍隱藏、點擊 20s timeout | conftest:`_ensure_sidebar` 改為「等側欄真的可見 + 重試 reopen」(共享 harness 強化) | conftest |
+| `m` | 裸 `page.mouse.click` 點 plotly marker 偶爾 miss,狀態不翻「已選取」 | test:retry 點擊(只計成功命中那次延遲,SLA 意圖不變) | test |
+| `o` | 把 `viz_methods` multiselect 縮到只剩 PCA:Backspace 與逐 tag 刪除都會被 rerun 吞掉/誤刪(時而剩 2、時而連 PCA 都刪光) | test:改用 baseweb「Clear all」清空 + 重新加 PCA(確定性) | test |
+| `q` | 用共享 `flow_page`,但 test_b 的 Run 只算 vitb14 → 切 chinese-clip 找不到選項;且切模型 rerun 期間 panel segmented-control 暫態渲染兩份 | test:改用獨立 `app_page` + 自帶 Run 並預選 chinese-clip;`_switch_panel` 先沉澱再取 `.first` | test |
+| `t` | umap 參考系是 **per-model**;預設只跑 vitb14,但測試查 `ref_path_for(train,"dinov2_vits14")` | test:Run 前加選 `dinov2_vits14` | test |
+| `w` | 候選池 popover 只剩原生 📁 picker,**沒有 headless 可填的 `cov_pool_text`**;另校正警告在 t_abs rerun 時暫態渲染兩份 | app:popover 補回 `st.text_area(key="cov_pool_text")`;test:校正警告斷言加 `.first` | **app**+test |
+
+## app.py 真實行為修復(4 處,非僅測試對齊)
+- `s07`:切模式不再被「切粒度清除」偷走 `viz_records`(banner/一鍵復原恢復)。
+- `j`:補回 3D 高亮環的 caption(行為一直在,描述掉了)。
+- `w`:候選池補回 headless 文字輸入(原生 picker 在 headless/E2E 不可填)。
+
+> 其餘多為**測試對齊重構**(預設模型、移除圖內標題、UI 時序)或 **E2E harness 強化**
+> (`_ensure_sidebar` 等待側欄真的展開、面板切換沉澱 + `.first`、互動 retry)。
+> **無任何 skip/xfail/放寬斷言來假綠**;app 改動只動 Visualize/Completeness UI,
+> 不影響單元 gate。

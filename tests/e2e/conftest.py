@@ -124,17 +124,58 @@ def _add_folder(page, list_key, *paths):
         wait_idle(page)
 
 
+def _sidebar_visible(page) -> bool:
+    """True once the auto-collapse CSS (visibility:hidden / width:0) is gone."""
+    return page.evaluate(
+        """() => {
+            const sb = document.querySelector('[data-testid="stSidebar"]');
+            if (!sb) return false;
+            const cs = getComputedStyle(sb);
+            return cs.visibility !== 'hidden' && sb.offsetWidth > 0;
+        }"""
+    )
+
+
 def _ensure_sidebar(page) -> None:
     """Re-expand the left settings sidebar if a prior Run auto-collapsed it.
 
     The Run button lives inside the sidebar, so a second Run in the same
     session must first click the '☰ 顯示左側設定列' reopen button (a no-op
     when the sidebar is already open — the button only renders while
-    collapsed)."""
-    btn = page.locator('.st-key-reopen_sidebar button')
-    if btn.count() and btn.first.is_visible():
+    collapsed).
+
+    The reopen click triggers a flag-flip rerun whose status widget can come
+    and go faster than wait_idle polls — returning before the collapse CSS is
+    actually torn down would leave run_viz (inside the sidebar) hidden and the
+    caller's click would time out. So click, then WAIT for the sidebar to be
+    genuinely visible again (collapse CSS gone), retrying the click if the
+    first one's rerun raced us. Tool-agnostic: it waits on the sidebar itself,
+    not on any per-tool widget."""
+    for _ in range(3):
+        if _sidebar_visible(page):
+            return
+        btn = page.locator('.st-key-reopen_sidebar button')
+        if not (btn.count() and btn.first.is_visible()):
+            # No reopen affordance yet (rerun still settling): let it settle
+            # and re-check rather than declaring success on a collapsed page.
+            wait_idle(page)
+            continue
         btn.first.click()
         wait_idle(page)
+        try:
+            page.wait_for_function(
+                """() => {
+                    const sb = document.querySelector('[data-testid="stSidebar"]');
+                    if (!sb) return false;
+                    const cs = getComputedStyle(sb);
+                    return cs.visibility !== 'hidden' && sb.offsetWidth > 0;
+                }""",
+                timeout=20000,
+            )
+            return
+        except Exception:
+            # rerun raced the click (flag flip swallowed) — loop and retry
+            continue
 
 
 def load_app(page, base_url: str) -> None:

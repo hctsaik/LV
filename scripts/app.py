@@ -3046,8 +3046,12 @@ def _visualize_embeddings_ui() -> None:
             granularity = "整張影像"
         is_object_level = (mode == "Object Detector"
                            and granularity == "物件級（YOLO）")
-        # 切粒度→清舊結果，避免散點圖混到另一種粒度的點
-        if st.session_state.get("_viz_gran_prev") not in (None, granularity):
+        # 切粒度→清舊結果，避免散點圖混到另一種粒度的點。但「切模式」也會連帶改變
+        # granularity（Classifier 強制整張影像、Detector 預設物件級），那種情況不在這裡清，
+        # 留給下方切模式區塊先快照再清（否則 viz_records 會被偷走、無法留一鍵復原）。
+        _mode_changing = st.session_state.get("_viz_mode_prev") != mode
+        if (not _mode_changing
+                and st.session_state.get("_viz_gran_prev") not in (None, granularity)):
             st.session_state.pop("viz_records", None)
         st.session_state["_viz_gran_prev"] = granularity
 
@@ -3613,6 +3617,8 @@ def _visualize_embeddings_ui() -> None:
                                 dim=dim, highlight=highlight,
                                 color_by=color_by, disagreement=disagreement, pairs=pairs)
 
+        if dim == 3 and highlight:
+            st.caption(f"3D 看：黑圈為目前選取的 {len(highlight)} 點（2D 選、3D 看）。")
         if color_by == "disagreement":
             st.caption(":gray[🔴 紅＝k 近鄰多為異類（最該複查標註）；紅線＝最近鄰卻異類的點對。"
                        "框選爭議點 → 下方一鍵送灰帶覆核。]")
@@ -6143,7 +6149,9 @@ def _completeness_ui() -> None:
                 st.button("📁 選候選池資料夾", key="cov_pool_pick",
                           use_container_width=True,
                           on_click=_pick_folder_into_text, args=("cov_pool_text",))
-                _picked_paths_display("cov_pool_text")
+                st.text_area("或貼上候選池路徑（一行一個）", key="cov_pool_text",
+                             height=80, label_visibility="collapsed",
+                             placeholder="例：demo/pool 或 C:/data/unlabeled")
                 if st.button("開始撈候選", key="cov_mine_btn",
                              use_container_width=True,
                              disabled=not st.session_state.get("cov_pool_text", "").strip()):
