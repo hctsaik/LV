@@ -193,10 +193,12 @@ def test_anomaly_gui_skips_corrupt(app_server, browser, corrupt_yolo_dataset):
     page.locator('.st-key-anomaly_run button').click()
 
     container = page.locator('[data-testid="stAppViewContainer"]')
-    # 1) 好檔仍算出排序(缺陷檔名出現)——直接長 timeout 等真實模型跑完,
-    #    不依賴 wait_idle 的精確返回時機(冷啟動模型載入較久)。
-    expect(page.locator('.st-key-anomaly_ranked')).to_contain_text(
-        "defect_", timeout=180000)
+    # 1) 好檔仍算出排序:8 normal + 3 defect = 11 個好物件全部進管線(corrupt_bytes / truncated
+    #    兩張壞影像被略過、badlabel 的壞 label 0 框)。原可見排序清單已移除 → 改驗「共 N 個物件」
+    #    摘要:N==11 ⟹ 缺陷檔也被正常處理、沒被當壞檔丟掉。長 timeout 等冷啟動模型載入。
+    page.wait_for_function(
+        r"() => { const m = document.body.innerText.match(/共\s*(\d+)\s*個物件/);"
+        r" return m && +m[1] === 11; }", timeout=180000)
     # 2) 壞檔沒讓工具崩潰:無原始 traceback
     expect(page.locator('[data-testid="stException"]')).to_have_count(0)
     # 3) 顯示略過提示(2 個壞影像被跳過並告知使用者)

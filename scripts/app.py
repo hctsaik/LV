@@ -1178,9 +1178,8 @@ def _anomaly_trigger_rerun() -> None:
 def _anomaly_ui() -> None:
     """🔧 瑕疵偵測(AnomalyDINO 風格):載入 YOLO 資料夾 → 物件級 patch 異常分數 →
     排序 + 散點圖框選/購物車 + 熱力圖 + 匯出原圖。實作委派 anomaly_tool.run_pipeline。"""
-    import plotly.colors as pcolors
     import plotly.graph_objects as go
-    from PIL import Image, ImageOps
+    from PIL import Image
 
     from _utils import available_models
     from anomaly_heatmap import render_heatmap
@@ -1192,13 +1191,16 @@ def _anomaly_ui() -> None:
                              list_images)
     from patch_features import embed_objects_patch
 
-    st.subheader("🔧 瑕疵偵測(Anomaly Detection)")
-    st.caption("多數良品當『正常參考』,把偏離的物件挑出來。基於凍結 DINOv2 patch 特徵 + "
-               "最近鄰距離(AnomalyDINO, WACV 2025);**不需瑕疵樣本訓練、不寫你的資料集**。")
-    st.caption("**沒確認正常時 = 無監督模式**:對整個資料夾做 leave-one-out 離群偵測,把「跟其他物件都不像」的"
-               "**少見/離群類別**排前面(適合多類別、找稀有類)。**確認正常後 = 對照模式**:只跟你確認的正常比,專抓細微瑕疵。")
-    st.caption("**細微瑕疵流程(2-stage)**:先「執行偵測」看分布 → 框選你**確定正常**的點按"
-               "「✅ 框選標為正常範例」(或用自動種子)→ 再「執行偵測」即用乾淨 few-shot bank。")
+    # 標題旁放一個 ❓ 當 manual:平常不佔版面,點開才看說明(對齊一般工具的「?」慣例)。
+    _hc1, _hc2 = st.columns([0.8, 0.2], vertical_alignment="bottom")
+    _hc1.subheader("🔧 瑕疵偵測(Anomaly Detection)")
+    with _hc2.popover("❓ 說明", use_container_width=True):
+        st.markdown("**多數良品當『正常參考』**,把偏離的物件挑出來。基於凍結 DINOv2 patch 特徵 + "
+                    "最近鄰距離(AnomalyDINO, WACV 2025);**不需瑕疵樣本訓練、不寫你的資料集**。")
+        st.markdown("**沒確認正常時 = 無監督模式**:對整個資料夾做 leave-one-out 離群偵測,把「跟其他物件都不像」的"
+                    "**少見/離群類別**排前面(適合多類別、找稀有類)。**確認正常後 = 對照模式**:只跟你確認的正常比,專抓細微瑕疵。")
+        st.markdown("**細微瑕疵流程(2-stage)**:先「執行偵測」看分布 → 框選你**確定正常**的點按"
+                    "「✅ 框選標為正常範例」(或用自動種子)→ 再「執行偵測」即用乾淨 few-shot bank。")
 
     with st.sidebar:
         st.markdown("### 🔧 瑕疵偵測設定")
@@ -1289,13 +1291,6 @@ def _anomaly_ui() -> None:
                    "(或用「自動把最不可疑的 N 個標為正常範例」),再按「執行偵測」即用乾淨參考重新評分。")
 
     smin, smax = float(scores.min()), float(scores.max())
-
-    def _score_rgb(s: float) -> tuple:
-        """異常分數 → 散點圖同款 Turbo 顏色(rgb tuple);供框選預覽縮圖加「對應色框」。"""
-        t = 0.0 if smax <= smin else max(0.0, min(1.0, (s - smin) / (smax - smin)))
-        c = pcolors.sample_colorscale("Turbo", [t])[0]  # "rgb(r, g, b)"
-        return tuple(int(round(float(x))) for x in c[c.find("(") + 1:c.find(")")].split(","))
-
     left, right = st.columns([3, 2], gap="medium")
 
     # ── 左:分布散點圖(物件級 embedding 投影,以異常分數上色;框選→購物車)──
@@ -1351,6 +1346,9 @@ def _anomaly_ui() -> None:
                                  selection_mode=("box", "lasso"))
             if ev and getattr(ev, "selection", None):
                 sel_idx = selection_points_to_indices(ev.selection.get("points", []))
+                # 已套用篩選時:框到的「變淡(灰)點」=不符合篩選 → 不納入框選,
+                # 只選符合(實色)的點。沒篩選時 _passes 全 True、不影響。
+                sel_idx = [i for i in sel_idx if _passes[i]]
             _clear_slot.button(
                 f"✕ 取消框選({len(sel_idx)})" if sel_idx else "✕ 取消框選",
                 key="anomaly_clear_sel", use_container_width=True,
@@ -1375,8 +1373,11 @@ def _anomaly_ui() -> None:
                       help="標好正常/瑕疵範例後按這裡就地重跑;不用回左側「執行偵測」。")
             # 框選物件縮圖預覽:看清楚裁切的物件本身再判斷標正常/瑕疵(最多 24 個)
             if sel_idx:
+                _ph = st.slider("預覽高度(px)", 200, 1000, 400, 40,
+                                key="anomaly_preview_h",
+                                help="拖動調整下方框選預覽區的高度(看大圖)。")
                 st.caption(f"框選 {len(sel_idx)} 個 — 預覽(看清楚再標;最多 24):")
-                with st.container(height=240, key="anomaly_sel_preview"):
+                with st.container(height=_ph, key="anomaly_sel_preview"):
                     _pc = st.columns(6)
                     for _j, _i in enumerate(sel_idx[:24]):
                         _r = records[_i]
@@ -1385,12 +1386,17 @@ def _anomaly_ui() -> None:
                             if _im is None:
                                 st.caption("⚠ 缺圖")
                             else:
-                                # 加「對應色框」:同散點圖 Turbo 色階(以異常分數上色),
-                                # 讓預覽縮圖一眼對上散點圖上那顆點的顏色。
-                                _cp = ImageOps.expand(crop_bbox(_im, *_r["bbox"], pad=0.1),
-                                                      border=6, fill=_score_rgb(_r["score"]))
-                                st.image(_cp, use_container_width=True,
-                                         caption=f'{_r["score"]:.2f}·{_r["verdict"]}')
+                                # 影像不加框;底下標籤寫「分數·類別名稱」,字色依判定:
+                                # good=黑、bad=紅(不再用 Turbo 底色,讓深色字在白底上清楚)。
+                                st.image(crop_bbox(_im, *_r["bbox"], pad=0.1),
+                                         use_container_width=True)
+                                _fg = "#cc0000" if _r["verdict"] == "bad" else "#000000"
+                                _lab = _r.get("label") or _r["verdict"]
+                                st.markdown(
+                                    f"<div style='color:{_fg};text-align:center;"
+                                    f"font-size:0.82em;line-height:1.5;font-weight:600'>"
+                                    f"{_r['score']:.2f}·{_lab}</div>",
+                                    unsafe_allow_html=True)
         _outliers = [i for i in range(len(records)) if records[i]["verdict"] == "bad"]
         # 不加 help:Streamlit help tooltip 會多渲染一個 <button> → e2e strict-mode 命中 2 個。
         st.button(f"🛒 把判為可疑(bad)的 {len(_outliers)} 個加入購物車",
@@ -1460,11 +1466,6 @@ def _anomaly_ui() -> None:
                 "選一個看圖", shown, key="anomaly_inspect",
                 format_func=lambda i: f"{scores[i]:.3f} · {Path(records[i]['image_path']).name}"
                 f" #{records[i]['obj_index']} · {records[i]['label']}")
-            with st.container(height=200, key="anomaly_ranked"):
-                for rank, i in enumerate(shown[:80]):
-                    flag = "🔴" if records[i]["verdict"] == "bad" else "⚪"
-                    st.write(f"{rank + 1}. {flag} `{Path(records[i]['image_path']).name}`"
-                             f" #{records[i]['obj_index']} — {scores[i]:.3f}")
             r = records[pick]
             img = safe_open_image(r["image_path"])  # 壞圖回 None → 不當 Image 用
             try:

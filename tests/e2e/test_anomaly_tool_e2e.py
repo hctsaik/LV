@@ -8,7 +8,8 @@ PG 實作 GUI 時需對齊以下契約鍵(目前 UI 未建,故本檔在 UI 完�
   - 工具入口:可由文字「瑕疵偵測」進入該工具分頁。
   - 資料夾輸入:沿用既有 `_add_folder(page, "anomaly_folder", <root>)` 模式(list_key=anomaly_folder)。
   - 執行鈕:`.st-key-anomaly_run button`。
-  - 排序結果區:`.st-key-anomaly_ranked`(內含每個物件來源檔名文字,順序=由最可疑到最不可疑)。
+  - 排序挑選器:`.st-key-anomaly_inspect` selectbox(選項由最可疑→最不可疑;原可見排序清單已移除,
+    E2E 改用 `_ranked_stems()` 讀 selectbox 選項)。
   - 錯誤訊息區:無 `labels/` 時顯示中文指引(含「YOLO」「標註」字樣),不得出現 stException。
 """
 from __future__ import annotations
@@ -48,18 +49,52 @@ def _run(page, root: Path):
     wait_idle(page, timeout=180000)  # 首跑含模型載入,給足時間
 
 
+def _ranked_stems(page, want: int = 14) -> list[str]:
+    """讀「選一個看圖」selectbox 的選項(= shown,由最可疑→最不可疑)作為來源檔 stem 順序。
+    取代已移除的可見排序清單(selectbox 現為唯一的排序挑選器)。BaseWeb 下拉會虛擬化,故開啟後
+    用 JS 對可捲容器逐步下捲、累積去重(保留出現順序)直到收集到 want 個或到底,再關閉。"""
+    sb = page.locator('.st-key-anomaly_inspect [data-baseweb="select"]')
+    for _ in range(3):                       # 偶有下拉沒開 → 重試
+        sb.click()
+        try:
+            page.wait_for_selector('[role="option"]', timeout=6000)
+            break
+        except Exception:
+            page.keyboard.press("Escape")
+            wait_idle(page)
+    seen: list[str] = []
+    for _ in range(8):
+        for t in page.get_by_role("option").all_inner_texts():
+            if t not in seen:
+                seen.append(t)
+        if len(seen) >= want:
+            break
+        moved = page.evaluate("""() => {
+            const o = document.querySelector('[role="option"]');
+            const lb = o && o.closest('ul,[role="listbox"],[data-baseweb="menu"]');
+            if (!lb) return false;
+            const before = lb.scrollTop; lb.scrollTop += 250; return lb.scrollTop !== before;
+        }""")
+        page.wait_for_timeout(220)
+        if not moved:
+            break
+    page.keyboard.press("Escape")
+    wait_idle(page)
+    return [m.group(1) for t in seen
+            if (m := re.search(r'(normal_\d+|defect_\d+)', t))]
+
+
 def test_defects_rank_in_top(anomaly_page):  # E2E-AC1(真實行為,非 element 存在)
     page, ds = anomaly_page
     _run(page, ds["root"])
     _no_exception(page)
-    ranked_text = page.locator('.st-key-anomaly_ranked').inner_text()
-    # 取出排序清單中出現的來源檔 stem,前段(前 2*K 名)應涵蓋全部缺陷檔
-    order = re.findall(r'(normal_\d+|defect_\d+)', ranked_text)
-    assert order, "排序結果區應列出物件來源檔名"
+    # 排序挑選器(selectbox)的選項順序=由最可疑到最不可疑;前段(前 2*K 名)應涵蓋全部缺陷檔
+    order = _ranked_stems(page)
+    assert order, "看圖選單應列出物件來源檔名"
     k = ds["n_defect"]
     top = order[: 2 * k]
     defect_stems = {s for s, _ in ds["defect_keys"]}
-    assert defect_stems.issubset(set(top)), f"缺陷應集中在前段;實際前段={top}"
+    assert defect_stems.issubset(set(top)), f"缺陷應集中在前段(選單頂端);實際前段={top}"
 
 
 def test_select_and_add_to_cart(anomaly_page):  # E2E-AC2
@@ -118,8 +153,7 @@ def test_score_and_class_filters(anomaly_page):  # 篩選真的會篩(真實行�
         return int(re.search(r"符合 (\d+) /", el.inner_text()).group(1))
 
     def _stems() -> set[str]:
-        return set(re.findall(r'(normal_\d+|defect_\d+)',
-                              page.locator('.st-key-anomaly_ranked').inner_text()))
+        return set(_ranked_stems(page))  # 排序清單已移除 → 讀 selectbox 選項(= shown)
 
     # 雙邊範圍 slider → 有兩個 thumb;取「低界」(.first)。拉高低界即排除低分(正常),
     # 集合縮小,沿用原本「分數 filter 真的會篩」的真實行為斷言。
@@ -163,18 +197,15 @@ def test_score_and_class_filters(anomaly_page):  # 篩選真的會篩(真實行�
         wait_idle(page)
 
     def _assert_class(prefix: str, n: int) -> None:
-        # 選類別後 rerun 期間 caption 與排序清單可能短暫不同步(舊/新 render 並存)→
-        # 等排序清單收斂成「只剩該類」再斷言數量,避免抓到過渡態。
+        # 選類別後 rerun 期間 caption 可能短暫不同步(舊/新 render 並存)→ 等「符合數」收斂成 n
+        # 再斷言,避開過渡態。(排序清單已移除,改以 caption 計數判收斂。)
         page.wait_for_function(
-            """(p) => {
-                const r = document.querySelectorAll('.st-key-anomaly_ranked');
-                if (r.length !== 1) return false;
-                const s = r[0].innerText.match(/(normal_\\d+|defect_\\d+)/g) || [];
-                return s.length > 0 && s.every(x => x.startsWith(p));
-            }""", arg=prefix, timeout=15000)
+            f"() => {{ const m = document.body.innerText.match(/符合 (\\d+) \\/ {total}/);"
+            f" return m && +m[1] === {n}; }}", timeout=15000)
         wait_idle(page)
         assert _count() == n, f"類別篩選後應只剩 {n} 個({prefix})"
-        assert all(x.startswith(prefix) for x in _stems())
+        assert all(x.startswith(prefix) for x in _stems()), \
+            f"篩選後選單應只剩 {prefix} 類"
 
     _pick_class("bad")                   # 只看 bad → 5 個缺陷
     _assert_class("defect_", ds["n_defect"])
@@ -198,7 +229,7 @@ def test_confirm_normal_fewshot_rerun(app_server, browser, synthetic_yolo_datase
     wait_idle(page)
     page.locator('.st-key-anomaly_run button').click()
     wait_idle(page, timeout=180000)
-    expect(page.locator('.st-key-anomaly_ranked')).to_contain_text("defect_")
+    assert any(s.startswith("defect_") for s in _ranked_stems(page)), "首跑應在排序挑選器列出缺陷"
     # 把最不可疑的標為正常範例(few-shot 種子)→ 應出現「已標記正常」狀態
     seed = page.locator('.st-key-anomaly_autoseed_normal button')
     expect(seed).to_be_visible()
@@ -214,9 +245,8 @@ def test_confirm_normal_fewshot_rerun(app_server, browser, synthetic_yolo_datase
     run2.click()
     wait_idle(page, timeout=180000)
     _no_exception(page)
-    expect(page.locator('.st-key-anomaly_ranked')).to_contain_text("defect_")
-    ranked = page.locator('.st-key-anomaly_ranked').inner_text()
-    order = re.findall(r'(normal_\d+|defect_\d+)', ranked)
+    order = _ranked_stems(page)  # 排序挑選器(selectbox)選項,由最可疑→最不可疑
+    assert any(s.startswith("defect_") for s in order), "乾淨 bank 重跑後仍應列出缺陷"
     defect_stems = {s for s, _ in ds["defect_keys"]}
     assert defect_stems.issubset(set(order[: 2 * ds["n_defect"]]))  # 乾淨 bank 仍抓到缺陷
     ctx.close()
