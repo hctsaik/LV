@@ -1342,19 +1342,23 @@ def _anomaly_ui() -> None:
                               dragmode="lasso")
             _nonce = st.session_state.get("_anomaly_clear_nonce", 0)
             _skey = f"anomaly_scatter_{_nonce}"  # bump nonce → 重新掛載清空框選
+            # 取消框選貼在散點正上方(對齊 Visualize/Compare/完整度其它工具):placeholder
+            # 佔位,等框選事件處理完、sel_idx 定案再填入 → 鈕上顯示正確張數&啟用狀態。
+            _tb1, _tb2 = st.columns([5, 1])
+            _tb1.caption("💡 在散點上拖曳框選/套索離群點 → 下方可加購物車或標正常/瑕疵。")
+            _clear_slot = _tb2.empty()
             ev = st.plotly_chart(fig, key=_skey, on_select="rerun",
                                  selection_mode=("box", "lasso"))
             if ev and getattr(ev, "selection", None):
                 sel_idx = selection_points_to_indices(ev.selection.get("points", []))
+            _clear_slot.button(
+                f"✕ 取消框選({len(sel_idx)})" if sel_idx else "✕ 取消框選",
+                key="anomaly_clear_sel", use_container_width=True,
+                disabled=not sel_idx, on_click=_anomaly_clear_sel, args=(_skey,))
             st.caption(f"散點圖:點越紅越可疑。框選/套索離群點。已框選 {len(sel_idx)} 個。")
-            _b1, _b2 = st.columns(2)
-            _b1.button("🛒 加入購物車(框選)", key="anomaly_cart_selected",
-                       disabled=not sel_idx, use_container_width=True,
-                       on_click=_anomaly_add_to_cart, args=(records, sel_idx))
-            _b2.button(f"✕ 取消框選({len(sel_idx)})" if sel_idx else "✕ 取消框選",
-                       key="anomaly_clear_sel", disabled=not sel_idx,
-                       use_container_width=True,
-                       on_click=_anomaly_clear_sel, args=(_skey,))
+            st.button("🛒 加入購物車(框選)", key="anomaly_cart_selected",
+                      disabled=not sel_idx, use_container_width=True,
+                      on_click=_anomaly_add_to_cart, args=(records, sel_idx))
             mc1, mc2 = st.columns(2)
             mc1.button("✅ 框選標為正常範例", key="anomaly_mark_normal",
                        disabled=not sel_idx, use_container_width=True,
