@@ -121,10 +121,12 @@ def test_score_and_class_filters(anomaly_page):  # 篩選真的會篩(真實行�
         return set(re.findall(r'(normal_\d+|defect_\d+)',
                               page.locator('.st-key-anomaly_ranked').inner_text()))
 
-    thumb = page.locator('.st-key-anomaly_heat_filter [role="slider"]')
+    # 雙邊範圍 slider → 有兩個 thumb;取「低界」(.first)。拉高低界即排除低分(正常),
+    # 集合縮小,沿用原本「分數 filter 真的會篩」的真實行為斷言。
+    thumb = page.locator('.st-key-anomaly_heat_filter [role="slider"]').first
 
     def _slider(n_pageup: int) -> None:
-        """調分數門檻:n>0 往高(PageUp)、n<0 往低(PageDown)。Streamlit slider 認
+        """調分數低界:n>0 往高(PageUp)、n<0 往低(PageDown)。Streamlit slider 認
         PageUp/PageDown(End/Home 不動;未聚焦的裸 track-click 也不動),故先 focus 再按。"""
         thumb.focus()
         key = "PageUp" if n_pageup > 0 else "PageDown"

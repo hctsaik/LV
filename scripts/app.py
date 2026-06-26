@@ -1178,8 +1178,9 @@ def _anomaly_trigger_rerun() -> None:
 def _anomaly_ui() -> None:
     """🔧 瑕疵偵測(AnomalyDINO 風格):載入 YOLO 資料夾 → 物件級 patch 異常分數 →
     排序 + 散點圖框選/購物車 + 熱力圖 + 匯出原圖。實作委派 anomaly_tool.run_pipeline。"""
+    import plotly.colors as pcolors
     import plotly.graph_objects as go
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     from _utils import available_models
     from anomaly_heatmap import render_heatmap
@@ -1287,6 +1288,14 @@ def _anomaly_ui() -> None:
                    "請走 **2-stage**:在下方散點圖**框選你確定正常的那一團點 →「✅ 框選標為正常範例」**"
                    "(或用「自動把最不可疑的 N 個標為正常範例」),再按「執行偵測」即用乾淨參考重新評分。")
 
+    smin, smax = float(scores.min()), float(scores.max())
+
+    def _score_rgb(s: float) -> tuple:
+        """異常分數 → 散點圖同款 Turbo 顏色(rgb tuple);供框選預覽縮圖加「對應色框」。"""
+        t = 0.0 if smax <= smin else max(0.0, min(1.0, (s - smin) / (smax - smin)))
+        c = pcolors.sample_colorscale("Turbo", [t])[0]  # "rgb(r, g, b)"
+        return tuple(int(round(float(x))) for x in c[c.find("(") + 1:c.find(")")].split(","))
+
     left, right = st.columns([3, 2], gap="medium")
 
     # ── 左:分布散點圖(物件級 embedding 投影,以異常分數上色;框選→購物車)──
@@ -1300,14 +1309,35 @@ def _anomaly_ui() -> None:
                 coords = (_u[:, :2] * _s[:2])
             except np.linalg.LinAlgError:
                 coords = c[:, :2]
-            fig = go.Figure(go.Scattergl(
-                x=coords[:, 0], y=coords[:, 1], mode="markers",
-                marker=dict(size=7, color=scores, colorscale="Turbo",
-                            showscale=True, colorbar=dict(title="異常")),
-                customdata=list(range(len(records))),
-                text=[f"{Path(r['image_path']).name}<br>score={r['score']:.3f}·{r['verdict']}"
-                      for r in records],
-                hovertemplate="%{text}<extra></extra>"))
+            # 與右側「分數/類別篩選」連動:未達門檻或非選定類別的點 → 變淡(灰、半透明),
+            # 但仍留在圖上、可框選(標正常/瑕疵的套索流程不受影響)。篩選的 widget 在右欄
+            # 稍後才建立,這裡用同一組 key 從 session_state 讀「已提交」的值;首次無值時退回
+            # smin/空集 = 不篩選(全部實色)。
+            _band = st.session_state.get("anomaly_heat_filter", (smin, smax))
+            _lo, _hi = (_band if isinstance(_band, (tuple, list)) else (_band, smax))
+            _cls = st.session_state.get("anomaly_class_filter") or []
+            _passes = [(_lo <= scores[i] <= _hi)
+                       and (not _cls or records[i].get("label", "") in _cls)
+                       for i in range(len(records))]
+            _txt = [f"{Path(records[i]['image_path']).name}"
+                    f"<br>score={records[i]['score']:.3f}·{records[i]['verdict']}"
+                    for i in range(len(records))]
+            _dim = [i for i in range(len(records)) if not _passes[i]]
+            _hot = [i for i in range(len(records)) if _passes[i]]
+            fig = go.Figure()
+            if _dim:  # 變淡的背景點(灰、半透明)——仍帶 customdata,可被套索框選
+                fig.add_trace(go.Scattergl(
+                    x=coords[_dim, 0], y=coords[_dim, 1], mode="markers",
+                    marker=dict(size=6, color="rgba(150,150,150,0.25)"),
+                    customdata=_dim, text=[_txt[i] for i in _dim],
+                    hovertemplate="%{text}<extra></extra>", showlegend=False))
+            fig.add_trace(go.Scattergl(  # 符合篩選的點:實色(異常分數上色,色階固定於全距)
+                x=coords[_hot, 0], y=coords[_hot, 1], mode="markers",
+                marker=dict(size=7, color=[scores[i] for i in _hot], colorscale="Turbo",
+                            cmin=smin, cmax=smax, showscale=True,
+                            colorbar=dict(title="異常")),
+                customdata=_hot, text=[_txt[i] for i in _hot],
+                hovertemplate="%{text}<extra></extra>", showlegend=False))
             fig.update_layout(height=440, margin=dict(l=0, r=0, t=10, b=0),
                               dragmode="lasso")
             _nonce = st.session_state.get("_anomaly_clear_nonce", 0)
@@ -1351,8 +1381,11 @@ def _anomaly_ui() -> None:
                             if _im is None:
                                 st.caption("⚠ 缺圖")
                             else:
-                                st.image(crop_bbox(_im, *_r["bbox"], pad=0.1),
-                                         use_container_width=True,
+                                # 加「對應色框」:同散點圖 Turbo 色階(以異常分數上色),
+                                # 讓預覽縮圖一眼對上散點圖上那顆點的顏色。
+                                _cp = ImageOps.expand(crop_bbox(_im, *_r["bbox"], pad=0.1),
+                                                      border=6, fill=_score_rgb(_r["score"]))
+                                st.image(_cp, use_container_width=True,
                                          caption=f'{_r["score"]:.2f}·{_r["verdict"]}')
         _outliers = [i for i in range(len(records)) if records[i]["verdict"] == "bad"]
         # 不加 help:Streamlit help tooltip 會多渲染一個 <button> → e2e strict-mode 命中 2 個。
@@ -1387,13 +1420,15 @@ def _anomaly_ui() -> None:
     # ── 右:🔥 熱度篩選 + 排序清單 + 點選看圖(LOO/物件級→裁切圖;patch bank→熱力圖)──
     with right:
         st.markdown("**🔥 最可疑物件(篩選 + 點選看圖)**")
-        smin, smax = float(scores.min()), float(scores.max())
         if smax > smin:
-            thr = st.slider("篩選:只看異常分數 ≥", round(smin, 3), round(smax, 3),
-                            round(smin, 3), key="anomaly_heat_filter",
-                            help="往右拖只看更可疑的。")
+            lo, hi = st.slider("篩選:異常分數範圍 [低–高]",
+                               round(smin, 3), round(smax, 3),
+                               (round(smin, 3), round(smax, 3)),
+                               key="anomaly_heat_filter",
+                               help="雙邊範圍:只看分數落在區間內的物件。"
+                                    "拉高『低』界=濾掉低分(正常);拉低『高』界=排除最極端、只看中低段。")
         else:
-            thr = smin
+            lo, hi = smin, smax
         # 類別篩選:只看某一/某幾類物件——針對「某一類資料有漏」去挑該類的異常。
         # 留空=全部;只有多類別時才顯示(單類別這欄無意義)。
         labels_present = sorted({records[i].get("label", "") for i in ranking
@@ -1405,10 +1440,18 @@ def _anomaly_ui() -> None:
                 key="anomaly_class_filter",
                 help="只看選定類別的物件(留空=全部)。針對某一類找漏 / 挑該類的異常。")
         shown = [i for i in ranking
-                 if scores[i] >= thr
+                 if lo <= scores[i] <= hi
                  and (not cls_sel or records[i].get("label", "") in cls_sel)]
         st.caption(f"符合 {len(shown)} / {len(records)} 個(由最可疑排到最不可疑)")
         if shown:
+            # 篩選(分數門檻/類別)一改變 → 看圖自動跳到「符合清單中最可疑的那張」
+            # (shown 由最可疑排序,shown[0] 即最可疑)。篩選沒變時保留使用者手動選的那張;
+            # 同時防止舊 pick 被篩掉後 selectbox 撞上「session 值不在選項」而出錯。
+            _sig = (round(float(lo), 6), round(float(hi), 6), tuple(sorted(cls_sel)))
+            if (st.session_state.get("_anomaly_filt_sig") != _sig
+                    or st.session_state.get("anomaly_inspect") not in shown):
+                st.session_state["anomaly_inspect"] = shown[0]
+            st.session_state["_anomaly_filt_sig"] = _sig
             pick = st.selectbox(
                 "選一個看圖", shown, key="anomaly_inspect",
                 format_func=lambda i: f"{scores[i]:.3f} · {Path(records[i]['image_path']).name}"
