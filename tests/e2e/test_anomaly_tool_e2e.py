@@ -105,6 +105,84 @@ def test_export_is_original_image(anomaly_page, tmp_path):  # E2E-AC3(匯出原�
     assert "manifest.csv" in zf.namelist()
 
 
+def test_score_and_class_filters(anomaly_page):  # 篩選真的會篩(真實行為,非 element 存在)
+    page, ds = anomaly_page
+    # pipeline 已於 test_defects_rank_in_top 跑過(共享 module-scope anomaly_page)
+    wait_idle(page)
+    total = ds["n_normal"] + ds["n_defect"]  # 25 個物件(20 good + 5 bad)
+
+    def _count() -> int:
+        page.wait_for_function(
+            r"() => /符合 \d+ \/ \d+ 個/.test(document.body.innerText)", timeout=15000)
+        el = page.get_by_text(re.compile(r"符合 \d+ / \d+ 個")).first
+        return int(re.search(r"符合 (\d+) /", el.inner_text()).group(1))
+
+    def _stems() -> set[str]:
+        return set(re.findall(r'(normal_\d+|defect_\d+)',
+                              page.locator('.st-key-anomaly_ranked').inner_text()))
+
+    thumb = page.locator('.st-key-anomaly_heat_filter [role="slider"]')
+
+    def _slider(n_pageup: int) -> None:
+        """調分數門檻:n>0 往高(PageUp)、n<0 往低(PageDown)。Streamlit slider 認
+        PageUp/PageDown(End/Home 不動;未聚焦的裸 track-click 也不動),故先 focus 再按。"""
+        thumb.focus()
+        key = "PageUp" if n_pageup > 0 else "PageDown"
+        for _ in range(abs(n_pageup)):
+            page.keyboard.press(key)
+        wait_idle(page)
+
+    # ── (a) 分數門檻 slider 真的會縮小集合(回應「filter 好像沒作用」)──
+    base = _count()                      # 預設在最小門檻 → 全部通過
+    assert base >= total - 1, f"最小門檻時應幾乎全通過:{base}/{total}"
+    _slider(6)                           # 門檻拉高 → 排除低分(正常),只剩可疑
+    page.wait_for_function(              # 等符合數真的下降(避開 rerun 過渡態)
+        f"() => {{ const m = document.body.innerText.match(/符合 (\\d+) \\/ {total}/);"
+        f" return m && +m[1] < {total}; }}", timeout=15000)
+    hi = _count()
+    assert hi < base, f"分數 slider 沒有篩選作用:{base} -> {hi}"
+    _slider(-10)                         # 回到最小門檻,單獨驗下面的類別篩選
+
+    # ── (b) 類別篩選:選 bad 只剩 5 個缺陷、選 good 只剩 20 個正常 ──
+    ms = page.locator('.st-key-anomaly_class_filter')
+
+    def _pick_class(name: str) -> None:
+        # multiselect 選完選項後下拉仍開著(可連選特性)→ 會蓋住 Clear all/其他控制項,
+        # 按 Escape 關掉再繼續,否則後續的 Clear all/選取會點到空白。
+        ms.locator('[data-baseweb="select"]').click()
+        page.get_by_role("option", name=name, exact=True).click()
+        page.keyboard.press("Escape")
+        wait_idle(page)
+
+    def _clear_class() -> None:
+        ms.get_by_role("button", name="Clear all").click()
+        page.wait_for_function(                      # 等回 25/25 確認清空真的生效
+            rf"() => /符合 {total} \/ {total} /.test(document.body.innerText)", timeout=15000)
+        wait_idle(page)
+
+    def _assert_class(prefix: str, n: int) -> None:
+        # 選類別後 rerun 期間 caption 與排序清單可能短暫不同步(舊/新 render 並存)→
+        # 等排序清單收斂成「只剩該類」再斷言數量,避免抓到過渡態。
+        page.wait_for_function(
+            """(p) => {
+                const r = document.querySelectorAll('.st-key-anomaly_ranked');
+                if (r.length !== 1) return false;
+                const s = r[0].innerText.match(/(normal_\\d+|defect_\\d+)/g) || [];
+                return s.length > 0 && s.every(x => x.startsWith(p));
+            }""", arg=prefix, timeout=15000)
+        wait_idle(page)
+        assert _count() == n, f"類別篩選後應只剩 {n} 個({prefix})"
+        assert all(x.startswith(prefix) for x in _stems())
+
+    _pick_class("bad")                   # 只看 bad → 5 個缺陷
+    _assert_class("defect_", ds["n_defect"])
+    _clear_class()
+    _pick_class("good")                  # 只看 good → 20 個正常
+    _assert_class("normal_", ds["n_normal"])
+    _no_exception(page)
+    _clear_class()                       # 還原篩選,不污染後續
+
+
 def test_confirm_normal_fewshot_rerun(app_server, browser, synthetic_yolo_dataset):
     """2-stage few-shot 確認流程:執行→把最不可疑標為正常範例→用乾淨 bank 重跑(真實行為)。"""
     ds = synthetic_yolo_dataset

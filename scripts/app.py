@@ -1394,7 +1394,19 @@ def _anomaly_ui() -> None:
                             help="往右拖只看更可疑的。")
         else:
             thr = smin
-        shown = [i for i in ranking if scores[i] >= thr]
+        # 類別篩選:只看某一/某幾類物件——針對「某一類資料有漏」去挑該類的異常。
+        # 留空=全部;只有多類別時才顯示(單類別這欄無意義)。
+        labels_present = sorted({records[i].get("label", "") for i in ranking
+                                 if records[i].get("label", "")})
+        cls_sel: list[str] = []
+        if len(labels_present) > 1:
+            cls_sel = st.multiselect(
+                "篩選:只看類別", labels_present, default=[],
+                key="anomaly_class_filter",
+                help="只看選定類別的物件(留空=全部)。針對某一類找漏 / 挑該類的異常。")
+        shown = [i for i in ranking
+                 if scores[i] >= thr
+                 and (not cls_sel or records[i].get("label", "") in cls_sel)]
         st.caption(f"符合 {len(shown)} / {len(records)} 個(由最可疑排到最不可疑)")
         if shown:
             pick = st.selectbox(
