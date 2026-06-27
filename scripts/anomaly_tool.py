@@ -46,7 +46,8 @@ def run_pipeline(image_paths, class_names, *, mode: str = "two_stage",
                  score_mode: str = "patch", sample_n: int = 64,
                  confirmed: dict | None = None, contamination: float = 0.05,
                  cache_dir=None, model: str = "dinov2_vits14", target_res: int = 224,
-                 extractor=None, embed_fn=None, progress=None) -> dict:
+                 extractor=None, embed_fn=None, progress=None,
+                 external_bank=None, external_ref=None) -> dict:
     from anomaly_classify import classify
     from bootstrap_cluster import cluster_objects
     from interaction import compute_outlier_scores, discover_yolo_objects
@@ -93,7 +94,30 @@ def run_pipeline(image_paths, class_names, *, mode: str = "two_stage",
         normal_set = [i for i in range(N) if cl["normal_mask"][i] and i not in bad_idx]
 
     bank = None
-    if not normal_set:
+    if external_bank is not None and score_mode != "object":
+        # 掛載外部 bank(patch 級):跳過 normal_set/建 bank,直接用外部 bank 對所有物件評分。
+        # 新資料夾 patch 特徵用「傳入的 model/target_res」(= bank meta 的鎖死值,非 GUI 現值)。
+        from anomaly_score import MemoryBank, score_object
+        from patch_features import embed_objects_patch
+        bank = (external_bank if isinstance(external_bank, MemoryBank)
+                else MemoryBank(external_bank))
+        _p(0.46, "patch 特徵…(對照已掛載 bank;首次載入模型較久)")
+        all_pf = embed_objects_patch(
+            meta, model, target_res=target_res, cache_dir=cache_dir, extractor=extractor,
+            progress=lambda d, t: _p(0.46 + 0.4 * d / max(t, 1), f"patch 特徵 {d}/{t}"))
+        scores = np.empty(N, dtype=float)
+        for i in range(N):
+            scores[i] = score_object(all_pf[i]["feats"], all_pf[i]["grid"], bank)[0]
+            if i % 8 == 0 or i == N - 1:
+                _p(0.86 + 0.12 * (i + 1) / N, f"評分 {i + 1}/{N}")
+    elif external_ref is not None and score_mode == "object":
+        # 掛載外部 ref(物件級):對舊 good 的 obj_emb 算離群(對照已掛載參照,非自身)。
+        _p(0.6, "評分(物件級,對照已掛載參照)…")
+        ref = np.asarray(external_ref, dtype=np.float32)
+        scores = (compute_outlier_scores(obj_emb, ref, k=min(5, max(1, len(ref))),
+                                         candidates_in_reference=False)
+                  if len(ref) > 0 else np.zeros(N, dtype=float))
+    elif not normal_set:
         # 沒有正常參考(無確認、且分群找不到正常密群 → 高維/diffuse 多類別資料常 0 群)。
         # 退回「無監督 leave-one-out 物件級離群」:每個物件對『其他物件』算 k 近鄰距離,
         # 鄰居少的(少見/離群類別)分數自然高。不靠分群、不會 self-match 歸零。

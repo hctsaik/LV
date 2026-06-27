@@ -1175,6 +1175,68 @@ def _anomaly_trigger_rerun() -> None:
     st.session_state["_anomaly_rerun"] = True
 
 
+def _anomaly_bank_default_dir(folder: str, name: str = "bank1") -> str:
+    """bank profile 預設落點 .lv_cache/<dataset>_<sha>/anomaly_bank/<name>(守 no-dataset-writes)。"""
+    if not folder:
+        return ""
+    from object_eval import dataset_cache_dir
+    return str(dataset_cache_dir(Path(folder), f"anomaly_bank/{name}"))
+
+
+def _anomaly_load_bank(bank_dir: str) -> None:
+    """讀入硬碟 bank profile → 掛載到 session(清舊結果逼重跑,讓新資料夾投影回舊 bank)。"""
+    from anomaly_bank_store import load_bank
+    try:
+        b = load_bank(bank_dir)
+        b["_dir"] = str(bank_dir)
+        st.session_state["anomaly_loaded_bank"] = b
+        st.session_state["anomaly_result"] = None
+        st.session_state.pop("_anomaly_bank_err", None)
+    except Exception as exc:                      # 壞檔/不完整/缺 meta → 明確訊息,不靜默
+        st.session_state["_anomaly_bank_err"] = f"載入失敗:{exc}"
+
+
+def _anomaly_unload_bank() -> None:
+    st.session_state.pop("anomaly_loaded_bank", None)
+    st.session_state["anomaly_result"] = None
+
+
+def _anomaly_save_bank(bank_dir: str, folders: list) -> None:
+    """把本次偵測結果凍結成可攜 bank profile(向量 + 投影基底 + few-shot),供下次跨資料夾重用。"""
+    import numpy as _np
+
+    from anomaly_bank_store import (assert_safe_bank_dir, confirmed_to_fewshot,
+                                    save_bank)
+    from anomaly_project import fit_projector
+    res = st.session_state.get("anomaly_result") or {}
+    if not res.get("records") or res.get("obj_emb") is None:
+        st.session_state["_anomaly_bank_err"] = "請先執行偵測產生結果,再存 bank。"
+        return
+    try:
+        assert_safe_bank_dir(bank_dir, folders)               # 白名單防呆:絕不寫資料集
+        obj_emb = _np.asarray(res["obj_emb"], dtype=_np.float32)
+        normal_set = res.get("normal_set") or []
+        good_mask = _np.zeros(len(obj_emb), dtype=bool)
+        if normal_set:
+            good_mask[_np.asarray(normal_set, dtype=int)] = True
+        basis = fit_projector(obj_emb, good_mask if good_mask.any() else None)
+        bank = res.get("bank")
+        vectors = getattr(bank, "vectors", None)
+        confirmed = st.session_state.get("anomaly_confirmed", {})
+        fewshot = confirmed_to_fewshot(confirmed, res["records"]) if confirmed else None
+        meta = {
+            "model": res.get("_model"), "target_res": res.get("_target_res"),
+            "patch_dim": int(vectors.shape[1]) if vectors is not None else None,
+            "obj_dim": int(obj_emb.shape[1]), "score_mode": res.get("score_mode"),
+            "n_objects": len(res["records"]),
+        }
+        save_bank(bank_dir, vectors=vectors, projection=basis, meta=meta, fewshot=fewshot)
+        st.session_state["_anomaly_bank_saved"] = str(bank_dir)
+        st.session_state.pop("_anomaly_bank_err", None)
+    except Exception as exc:
+        st.session_state["_anomaly_bank_err"] = f"存檔失敗:{exc}"
+
+
 def _anomaly_ui() -> None:
     """🔧 瑕疵偵測(AnomalyDINO 風格):載入 YOLO 資料夾 → 物件級 patch 異常分數 →
     排序 + 散點圖框選/購物車 + 熱力圖 + 匯出原圖。實作委派 anomaly_tool.run_pipeline。"""
@@ -1246,13 +1308,30 @@ def _anomaly_ui() -> None:
         if not image_paths:
             st.session_state["anomaly_result"] = {"records": [], "_err": "no_images"}
         else:
+            # 掛載 bank → 用 bank 鎖死的 model/target_res/score_mode(非 GUI 現值,擋 silent-wrong)
+            # + 外部 bank(patch)/外部 ref(object)評分。
+            _lb_run = st.session_state.get("anomaly_loaded_bank")
+            _ext_bank = _ext_ref = None
+            if _lb_run:
+                from anomaly_score import MemoryBank
+                _bm = _lb_run.get("meta", {})
+                model = _bm.get("model") or model
+                target_res = int(_bm.get("target_res") or target_res)
+                if _lb_run.get("vectors") is not None:
+                    _ext_bank = MemoryBank(np.asarray(_lb_run["vectors"], dtype=np.float32))
+                    score_mode = "patch"                       # 有 patch bank → patch 級評分
+                elif _lb_run.get("projection") is not None:
+                    _ext_ref = np.asarray(_lb_run["projection"]["good_obj_emb"], dtype=np.float32)
+                    score_mode = "object"                      # 無 patch bank → 對舊 good 物件級離群
+                else:
+                    score_mode = _bm.get("score_mode") or score_mode
             cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{model}_r{target_res}")
             _bar = st.progress(0.0, text=f"準備中…({len(image_paths)} 張圖,{model}@{target_res};首跑載入模型較久)")
             result = run_pipeline(
                 image_paths, class_names, mode=mode, score_mode=score_mode,
                 sample_n=sample_n, model=model, target_res=target_res,
                 confirmed=st.session_state.get("anomaly_confirmed", {}),
-                cache_dir=cache,
+                cache_dir=cache, external_bank=_ext_bank, external_ref=_ext_ref,
                 progress=lambda f, t: _bar.progress(f, text=t))
             _bar.empty()
             result["_image_paths"] = [str(p) for p in image_paths]
@@ -1260,13 +1339,40 @@ def _anomaly_ui() -> None:
             result["_cache"] = str(cache)
             result["_model"] = model
             result["_target_res"] = target_res
+            result["_loaded_bank"] = bool(_lb_run)
+            # 跨資料夾沿用 few-shot:把舊標記用內容定址對齊到新資料夾的物件索引
+            if _lb_run and _lb_run.get("fewshot"):
+                from anomaly_bank_store import match_fewshot_to_indices
+                _aligned, _un = match_fewshot_to_indices(_lb_run["fewshot"], result["records"])
+                result["_fewshot_aligned"] = _aligned
+                result["_fewshot_unmatched"] = int(_un)
             st.session_state["anomaly_result"] = result
             _collapse_sidebar()
             _log_usage("anomaly_run", n=len(result["records"]), source=score_mode)
 
     result = st.session_state.get("anomaly_result")
+    # ── Memory Bank 面板(主畫面 always 顯示;不受 run 後側欄收合影響,跨資料夾載入隨時可達)──
+    _lb = st.session_state.get("anomaly_loaded_bank")
+    with st.container(border=True, key="anomaly_bank_panel"):
+        if _lb:
+            _bm = _lb.get("meta", {})
+            _bc1, _bc2 = st.columns([6, 1], vertical_alignment="center")
+            _bc1.markdown(f"🔗 **已掛載 bank** `{Path(_lb.get('_dir', '')).name}` · "
+                          f"{_bm.get('model')}@{_bm.get('target_res')} · {_bm.get('score_mode')} —— "
+                          f"「執行偵測」用它對新資料夾評分 + 投影回舊分佈")
+            _bc2.button("✕ 卸載", key="anomaly_unload_btn", on_click=_anomaly_unload_bank,
+                        use_container_width=True)
+        else:
+            _bc1, _bc2 = st.columns([5, 1], vertical_alignment="bottom")
+            _bp = _bc1.text_input("💾 讀入既有 Memory Bank 目錄(跨資料夾重用;含 meta.json)",
+                                  key="anomaly_bank_load_path", placeholder="bank profile 目錄")
+            _bc2.button("📂 載入", key="anomaly_load_btn", use_container_width=True,
+                        disabled=not _bp, on_click=_anomaly_load_bank, args=(_bp,))
+        if st.session_state.get("_anomaly_bank_err"):
+            st.error(st.session_state["_anomaly_bank_err"])
     if not result:
-        st.info("在左側選一個 YOLO 偵測資料夾(images/+labels/)後按「執行偵測」。")
+        st.info("在左側選一個 YOLO 偵測資料夾(images/+labels/)後按「執行偵測」。"
+                "(或在上方載入既有 bank,把新資料夾投影回舊分佈。)")
         return
     # 壞檔防呆:run_pipeline 已自行過濾並回傳 skipped(壞檔路徑清單)→ 同款略過提示
     _warn_skipped(result.get("skipped") or [])
@@ -1285,12 +1391,31 @@ def _anomaly_ui() -> None:
     if auroc is not None:
         msg += f" · 對照確認標籤 AUROC **{auroc:.3f}**"
     st.markdown(msg)
+    if result.get("_loaded_bank"):
+        _al = result.get("_fewshot_aligned") or {}
+        _extra = (f" · 對齊 {len(_al)} 個舊 few-shot 標記(對不到 {result.get('_fewshot_unmatched', 0)})"
+                  if (_al or result.get("_fewshot_unmatched")) else "")
+        st.caption(f":violet[🔗 對照已掛載 bank;新資料已投影回舊分佈(灰底=舊資料)]{_extra}")
     if n_bad == len(records) and not st.session_state.get("anomaly_confirmed"):
         st.warning("⚠ 全部被判為可疑 = 門檻無法校準(第一次跑、還沒有『正常參考』)。"
                    "請走 **2-stage**:在下方散點圖**框選你確定正常的那一團點 →「✅ 框選標為正常範例」**"
                    "(或用「自動把最不可疑的 N 個標為正常範例」),再按「執行偵測」即用乾淨參考重新評分。")
 
     smin, smax = float(scores.min()), float(scores.max())
+    # 把本次結果存成可攜 bank(放主畫面 result 區 → 一定看得到本輪 result;掛載模式不重複存)
+    if records and not result.get("_loaded_bank"):
+        with st.expander("💾 把本次結果存成 Memory Bank(供下次選新資料夾重用 + 投影回此分佈)"):
+            _sp = st.text_input("存成 bank 目錄(預設 .lv_cache,不寫你的資料集)",
+                                key="anomaly_bank_save_path",
+                                value=_anomaly_bank_default_dir(folders[0] if folders else ""))
+            st.button("💾 存成 bank", key="anomaly_save_btn", disabled=not _sp,
+                      on_click=_anomaly_save_bank, args=(_sp, folders))
+            if st.session_state.get("_anomaly_bank_err"):
+                st.error(st.session_state["_anomaly_bank_err"])
+            _saved2 = st.session_state.pop("_anomaly_bank_saved", None)
+            if _saved2:
+                st.success(f"✅ 已存:`{_saved2}` —— 側欄「載入 bank」填這路徑即可在新資料夾重用。")
+
     left, right = st.columns([3, 2], gap="medium")
 
     # ── 左:分布散點圖(物件級 embedding 投影,以異常分數上色;框選→購物車)──
@@ -1298,12 +1423,20 @@ def _anomaly_ui() -> None:
         emb = np.asarray(result["obj_emb"], dtype=float)
         sel_idx: list[int] = []
         if emb.shape[0] >= 2 and emb.shape[1] >= 2:
-            c = emb - emb.mean(axis=0, keepdims=True)
-            try:
-                _u, _s, _vt = np.linalg.svd(c, full_matrices=False)
-                coords = (_u[:, :2] * _s[:2])
-            except np.linalg.LinAlgError:
-                coords = c[:, :2]
+            # 掛載 bank 且維度相容 → 投到「舊基底」(映射回舊分佈);否則維持當資料夾即時 SVD。
+            _lbp = (st.session_state.get("anomaly_loaded_bank") or {}).get("projection")
+            _ref_bg = None
+            if _lbp is not None and emb.shape[1] == np.asarray(_lbp["mean"]).shape[0]:
+                from anomaly_project import transform_new
+                coords = transform_new(_lbp, emb)
+                _ref_bg = np.asarray(_lbp["ref_coords"], dtype=float)
+            else:
+                c = emb - emb.mean(axis=0, keepdims=True)
+                try:
+                    _u, _s, _vt = np.linalg.svd(c, full_matrices=False)
+                    coords = (_u[:, :2] * _s[:2])
+                except np.linalg.LinAlgError:
+                    coords = c[:, :2]
             # 與右側「分數/類別篩選」連動:未達門檻或非選定類別的點 → 變淡(灰、半透明),
             # 但仍留在圖上、可框選(標正常/瑕疵的套索流程不受影響)。篩選的 widget 在右欄
             # 稍後才建立,這裡用同一組 key 從 session_state 讀「已提交」的值;首次無值時退回
@@ -1320,6 +1453,13 @@ def _anomaly_ui() -> None:
             _dim = [i for i in range(len(records)) if not _passes[i]]
             _hot = [i for i in range(len(records)) if _passes[i]]
             fig = go.Figure()
+            if _ref_bg is not None and len(_ref_bg):
+                # 掛載 bank:舊資料分佈當灰底底圖(不帶 customdata + hoverinfo=skip → 不污染框選),
+                # 新點疊上去 → 一眼看出新資料落在舊 good 密集區(正常)或離群(可疑)。
+                fig.add_trace(go.Scattergl(
+                    x=_ref_bg[:, 0], y=_ref_bg[:, 1], mode="markers",
+                    marker=dict(size=5, color="rgba(140,140,140,0.28)"),
+                    hoverinfo="skip", showlegend=False, name="舊分佈"))
             if _dim:  # 變淡的背景點(灰、半透明)——仍帶 customdata,可被套索框選
                 fig.add_trace(go.Scattergl(
                     x=coords[_dim, 0], y=coords[_dim, 1], mode="markers",

@@ -45,14 +45,22 @@ class MemoryBank:
 
 
 def build_memory_bank(normal_patch_feats, *, budget: int = 100_000,
-                      seed: int = 42) -> MemoryBank:
+                      seed: int = 42, method: str = "greedy") -> MemoryBank:
+    """正常 patch → memory bank。超過 budget 時抽 coreset:
+    method='greedy'(預設,更準的 k-center 代表性子集,以更準為原則)或 'random'(純隨機)。
+    greedy 對「非常大量 good」靠 oversample_cap 先降規模(見 anomaly_coreset);CPU 上極大規模
+    會 graceful 退化成隨機子抽樣。"""
     feats = np.asarray(normal_patch_feats, dtype=np.float32)
     if feats.ndim != 2 or feats.shape[0] == 0:
         raise ValueError("empty memory bank")
     feats = _l2n(feats)
     if feats.shape[0] > budget:
-        idx = np.random.default_rng(seed).choice(feats.shape[0], size=budget,
-                                                  replace=False)
+        if method == "greedy":
+            from anomaly_coreset import greedy_coreset
+            idx = greedy_coreset(feats, budget, seed=seed)
+        else:
+            idx = np.random.default_rng(seed).choice(feats.shape[0], size=budget,
+                                                      replace=False)
         feats = feats[idx]
     return MemoryBank(feats)
 
