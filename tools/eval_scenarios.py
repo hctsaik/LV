@@ -62,8 +62,8 @@ def _run(folder, model, res, external_ref=None):
                         target_res=res, cache_dir=cache, external_ref=external_ref)
 
 
-def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14", res=224):
-    train, valid = dataset / "train", dataset / "valid"
+def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14", res=224, eval_split="valid"):
+    train, valid = dataset / "train", dataset / eval_split
     rep = {"data": {}, "scenarios": {}}
 
     t0 = time.time()
@@ -238,7 +238,8 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
 
 def main():
     ap = argparse.ArgumentParser(description="瑕疵偵測全功能真實資料情境驗證")
-    ap.add_argument("--dataset", required=True, help="YOLO 根目錄(含 train/ valid/)")
+    ap.add_argument("--dataset", required=True, help="YOLO 根目錄(含 train/ 與評估 split)")
+    ap.add_argument("--eval-split", default="valid", help="held-out 評估 split 資料夾名(valid/test)")
     ap.add_argument("--out", default="eval_report.json")
     ap.add_argument("--good", nargs="+", default=["cabinetDoor", "refrigeratorDoor", "door", "window"])
     ap.add_argument("--bad", nargs="+", default=["pole", "couch", "openedDoor"])
@@ -246,7 +247,7 @@ def main():
     ap.add_argument("--model", default="dinov2_vits14")
     ap.add_argument("--res", type=int, default=224)
     a = ap.parse_args()
-    rep = evaluate(Path(a.dataset), set(a.good), set(a.bad), set(a.rare), a.model, a.res)
+    rep = evaluate(Path(a.dataset), set(a.good), set(a.bad), set(a.rare), a.model, a.res, a.eval_split)
     Path(a.out).write_text(json.dumps(rep, ensure_ascii=False, indent=2), encoding="utf-8")
     # cp950 安全:不直印含 unicode 的 JSON,只印路徑
     print("WROTE", a.out)
