@@ -1503,6 +1503,45 @@ def _anomaly_ui() -> None:
                 if _hsaved:
                     st.success(f"✅ 分類頭已存:`{_hsaved}`")
 
+    # ── 🎯 主動學習取樣佇列:挑「最值得送人工標註」的物件 ──
+    with st.expander("🎯 主動學習取樣佇列(挑最值得送人工標註的物件)"):
+        st.caption("優先分數 = **Novelty**(Normal Bank 異常分數)+ **近決策邊界** + **Model Disagreement**"
+                   "(異常高但分類沒把握=Unknown),選樣再加 **Cluster Diversity**(每群代表,不挑一堆雷同的)。"
+                   "距離訊號比 softmax entropy 可靠(對未知 softmax 常過度自信)→ novelty 一定納入。")
+        _alk = st.slider("挑幾個送標註", 1, min(48, len(records)), min(12, len(records)),
+                         key="anomaly_al_k")
+        _almpc = st.slider("每群上限(diversity)", 1, 5, 2, key="anomaly_al_mpc")
+        from active_learning import priority_score, select_for_labeling
+        _proba = None
+        _head_al = st.session_state.get("anomaly_head")
+        if _head_al:
+            from dino_head import predict_head
+            try:
+                _, _, _proba = predict_head(_head_al, np.asarray(result["obj_emb"], dtype=float))
+            except Exception:
+                _proba = None
+        _pri = priority_score(scores, head_proba=_proba,
+                              anomaly_threshold=float(result["threshold"]))
+        _cl_labels = (result.get("cluster") or {}).get("labels")
+        _sel_al = select_for_labeling(_pri, k=_alk, cluster_labels=_cl_labels,
+                                      max_per_cluster=_almpc)
+        st.caption(f"取樣佇列(優先序,共 {len(_sel_al)} 個"
+                   + ("" if _head_al else ";分類頭未訓練 → 目前只用 novelty,訓練後加 disagreement/邊界") + "):")
+        with st.container(height=240, key="anomaly_al_queue"):
+            _qc = st.columns(6)
+            for _j, _i in enumerate(_sel_al[:24]):
+                _rr = records[_i]
+                with _qc[_j % 6]:
+                    _im = safe_open_image(_rr["image_path"])
+                    if _im is None:
+                        st.caption("⚠ 缺圖")
+                    else:
+                        st.image(crop_bbox(_im, *_rr["bbox"], pad=0.1), use_container_width=True,
+                                 caption=f'P={_pri[_i]:.2f}·{_rr["verdict"]}')
+        st.button(f"🛒 把取樣佇列 {len(_sel_al)} 個加入購物車(送標註)", key="anomaly_al_cart",
+                  disabled=not _sel_al, use_container_width=True,
+                  on_click=_anomaly_add_to_cart, args=(records, _sel_al))
+
     left, right = st.columns([3, 2], gap="medium")
 
     # ── 左:分布散點圖(物件級 embedding 投影,以異常分數上色;框選→購物車)──
