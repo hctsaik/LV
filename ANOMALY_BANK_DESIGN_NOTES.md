@@ -49,7 +49,15 @@ umap 進 backlog) ④ stale 警告 backlog ⑤ 移除 patch_grid 硬鍵、meta �
 絕不寫使用者資料集(.lv_cache 或 User 指定 + 白名單);硬鍵 model/target_res/dim 不符拒載(擋 silent-wrong);
 fp32 評分;transform-into-fixed-basis(非 re-fit);D 維密度判定。
 
-## 已整合 / Backlog
-- greedy coreset **已接進 `build_memory_bank`(預設 `method='greedy'`)**,建 bank 即用更準的代表性子集;
-  CPU 上超大量 good 會 graceful 退化成隨機子抽樣(GPU/近似加速為 backlog)。
-- Backlog(未進首版):umap 第二視角(合併重投影)、stale 過期警告、few-shot 對齊的散點視覺強化、最近鄰連線。
+## 對抗 review 修正(2026-06-28,7 個確認 bug 全修 + 測試保護)
+多 agent 對抗 review 揪出並修:#1 greedy 在正式路徑 no-op、#2 重複向量選到重複索引、#3 單物件
+ref_coords 形狀 (1,1) 致掛載畫灰底 IndexError、#4 重存同目錄殘留舊 .npz 被新 meta 收編、#5 save_projector
+非 atomic、#6 白名單漏扁平 YOLO、#7 check_compat 從未被呼叫(載入無維度守門)。每項都補了單元測試。
+
+**greedy coreset 的誠實結論(重要)**:對抗 review + 效能實測揭露 —— CPU 上 FPS k-center 對大 M 不可行
+(實測 40k→12k 約 10 分),且強行小 budget(~2500 點)的覆蓋**反不如大 budget 隨機**(最近鄰評分靠 bank
+覆蓋密度,點多更穩)。故 `build_memory_bank` **預設改回 `method='random'`**(對「非常大量 good」才是真的更準);
+greedy 修好留作中小規模/k-center 代表用(`method='greedy'`,pool=5000/bank≈2500);GPU 加速為 backlog。
+
+## Backlog(未進首版)
+umap 第二視角(合併重投影)、stale 過期警告、few-shot 對齊的散點視覺強化、最近鄰連線、greedy coreset GPU 加速。

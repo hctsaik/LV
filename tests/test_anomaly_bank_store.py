@@ -109,6 +109,35 @@ def test_match_rejects_bbox_mismatch():  # AC8:同 stem 同 label 但 bbox 差�
     assert unmatched == 1 and back == {}
 
 
+def test_resave_clears_stale_files(tmp_path):  # AC10(對抗 review):重存清舊檔,不殘留被新 meta 收編
+    import anomaly_project
+    d = tmp_path / "bk"
+    save_bank(d, vectors=_unit(10, 384), meta=META)            # 先 patch 模式(有 bank.npz)
+    assert (d / "bank.npz").exists()
+    basis = anomaly_project.fit_projector(_unit(50, 384))
+    save_bank(d, projection=basis, meta={**META, "patch_dim": None, "score_mode": "object"})  # object 重存
+    assert not (d / "bank.npz").exists(), "object 重存應清掉舊 bank.npz(否則被新 meta 收編 → mismatch)"
+    loaded = load_bank(d)
+    assert loaded["vectors"] is None and loaded["meta"].get("score_mode") == "object"
+
+
+def test_no_tmp_leftover(tmp_path):  # AC11(對抗 review):atomic 寫不留 _tmp_ 殘檔
+    import anomaly_project
+    save_bank(tmp_path / "bk", vectors=_unit(10, 384),
+              projection=anomaly_project.fit_projector(_unit(50, 384)), meta=META, fewshot=[])
+    assert not any(p.name.startswith("_tmp_") for p in (tmp_path / "bk").iterdir())
+
+
+def test_safe_dir_rejects_flat_yolo(tmp_path, monkeypatch):  # AC12(對抗 review):扁平 YOLO 也擋
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    flat = tmp_path / "flat_ds"
+    flat.mkdir()
+    (flat / "a.jpg").write_bytes(b"x")
+    (flat / "a.txt").write_text("0 0.5 0.5 0.1 0.1", encoding="utf-8")
+    with pytest.raises(ValueError):
+        assert_safe_bank_dir(flat)                              # 同層影像+.txt → 拒(即使 selected_folders 空)
+
+
 def test_safe_bank_dir_whitelist(tmp_path, monkeypatch):  # AC9:白名單防呆
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
     assert_safe_bank_dir(tmp_path / "cache" / "anomaly_bank" / "x")      # .lv_cache 下 → 安全

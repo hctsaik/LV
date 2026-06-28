@@ -45,9 +45,13 @@ def greedy_coreset(vectors, budget: int, *, seed: int = 42,
     selected = np.empty(k, dtype=np.int64)
     first = int(rng.integers(M))
     selected[0] = first
+    n_sel = 1
     min_d = _sqdist(X, X[first])              # 各點到已選集的最近距離(平方)
     for i in range(1, k):
         nxt = int(np.argmax(min_d))           # 離已選集最遠者
+        if min_d[nxt] <= 0.0:                 # 剩餘點都與已選重合(相異點 < k)→ 停,不選到重複索引
+            break
         selected[i] = nxt
+        n_sel = i + 1
         np.minimum(min_d, _sqdist(X, X[nxt]), out=min_d)
-    return np.sort(pool[selected])
+    return np.sort(pool[selected[:n_sel]])

@@ -29,10 +29,21 @@ def save_bank(bank_dir, *, vectors=None, projection=None, meta: dict,
     d = Path(bank_dir)
     d.mkdir(parents=True, exist_ok=True)
 
+    # 空 bank 早擋(在清舊檔前,避免清掉舊 profile 卻沒寫新的)
     if vectors is not None:
         v = np.ascontiguousarray(vectors, dtype=np.float32)
         if v.ndim != 2 or v.shape[0] == 0:
             raise ValueError("空 bank 拒存(0 列向量)")
+
+    # 重存先清舊 profile:先移除 meta.json(哨兵失效 → 期間視為不完整),再清舊 data 檔。
+    # 否則上一版殘留檔(例如 patch→object 重存後殘留的 bank.npz)會被新 meta 收編 → silent mismatch。
+    for _fn in ("meta.json", "bank.npz", "projection.npz", "fewshot.json"):
+        try:
+            (d / _fn).unlink()
+        except FileNotFoundError:
+            pass
+
+    if vectors is not None:
         _atomic_npz(d / "bank.npz", vectors=v)
 
     if projection is not None:
@@ -155,6 +166,10 @@ def assert_safe_bank_dir(bank_dir, selected_folders=()) -> bool:
         return True
     if (p / "images").exists() or (p / "labels").exists():
         raise ValueError(f"目標看起來是資料集(含 images//labels/),拒寫:{p}")
+    # 扁平 YOLO 佈局(影像 + .txt 標籤同層,無 images//labels/ 子目錄)也是資料集 → 拒寫
+    if p.exists() and any(p.glob("*.txt")) and any(
+            p.glob(e) for e in ("*.jpg", "*.jpeg", "*.png", "*.bmp")):
+        raise ValueError(f"目標看起來是扁平 YOLO 資料集(同層有影像+標籤 .txt),拒寫:{p}")
     for f in selected_folders:
         fp = Path(f).resolve()
         if p == fp or _under(p, fp) or _under(fp, p):

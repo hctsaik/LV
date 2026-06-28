@@ -93,3 +93,9 @@ def test_outlier_projects_without_crash():  # AC8:新離群 transform 不炸、�
     c = transform_new(b, _outliers(7))
     assert c.shape == (7, 2)
     assert np.isfinite(c).all()
+
+
+def test_single_object_ref_coords_2col():  # AC9(對抗 review):N==1 的 ref_coords 仍 (N, dim_out)
+    b = fit_projector(np.random.default_rng(0).normal(size=(1, D)).astype(np.float32))
+    assert b["ref_coords"].shape == (1, 2)      # 不是 (1,1) → 掛載畫灰底 ref_coords[:,1] 不會 IndexError
+    assert b["ref_coords"][:, 1].shape == (1,)

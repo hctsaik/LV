@@ -1188,11 +1188,19 @@ def _anomaly_load_bank(bank_dir: str) -> None:
     from anomaly_bank_store import load_bank
     try:
         b = load_bank(bank_dir)
+        _m = b.get("meta", {})
+        # 硬鍵守門(對齊 check_compat 精神):缺 model/target_res → 掛載會回退 GUI 現值 → silent-wrong;
+        # bank.npz 維度要與 meta.patch_dim 一致(否則評分 q@vectors.T 維度不符直接炸)。
+        if not _m.get("model") or _m.get("target_res") in (None, ""):
+            raise ValueError("bank meta 缺 model/target_res,無法安全掛載(會回退到當前設定 → 分數錯)")
+        _v = b.get("vectors")
+        if _v is not None and _m.get("patch_dim") not in (None, int(_v.shape[1])):
+            raise ValueError(f"bank.npz 維度 {int(_v.shape[1])} 與 meta.patch_dim {_m.get('patch_dim')} 不符")
         b["_dir"] = str(bank_dir)
         st.session_state["anomaly_loaded_bank"] = b
         st.session_state["anomaly_result"] = None
         st.session_state.pop("_anomaly_bank_err", None)
-    except Exception as exc:                      # 壞檔/不完整/缺 meta → 明確訊息,不靜默
+    except Exception as exc:                      # 壞檔/不完整/缺 meta/維度不符 → 明確訊息,不靜默
         st.session_state["_anomaly_bank_err"] = f"載入失敗:{exc}"
 
 

@@ -69,6 +69,13 @@ def test_oversample_cap_handles_large():  # AC6:N 超過 cap → 先抽樣再 gr
     assert len(set(idx.tolist())) == 20
 
 
+def test_duplicate_vectors_unique_indices():  # AC8(對抗 review):重複向量不選到重複索引
+    X = np.repeat(np.eye(1, 8, dtype=np.float32), 1000, axis=0)  # 1000 個完全相同向量
+    idx = greedy_coreset(X, 50)
+    assert len(set(idx.tolist())) == len(idx), "回傳索引應唯一(相異點<budget 時不重複)"
+    assert len(idx) <= 50
+
+
 def test_empty_raises():  # AC7:空輸入 → ValueError
     with pytest.raises(ValueError):
         greedy_coreset(np.zeros((0, 8), dtype=np.float32), 5)

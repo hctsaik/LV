@@ -45,11 +45,14 @@ class MemoryBank:
 
 
 def build_memory_bank(normal_patch_feats, *, budget: int = 100_000,
-                      seed: int = 42, method: str = "greedy") -> MemoryBank:
-    """正常 patch → memory bank。超過 budget 時抽 coreset:
-    method='greedy'(預設,更準的 k-center 代表性子集,以更準為原則)或 'random'(純隨機)。
-    greedy 對「非常大量 good」靠 oversample_cap 先降規模(見 anomaly_coreset);CPU 上極大規模
-    會 graceful 退化成隨機子抽樣。"""
+                      seed: int = 42, method: str = "random") -> MemoryBank:
+    """正常 patch → memory bank。超過 budget 時抽 coreset。
+
+    method='random'(**預設**):純隨機保留大 budget → 覆蓋廣。對「非常大量 good」,最近鄰評分
+      靠 bank 覆蓋密度,點多(budget≈10萬)實際比小 greedy 子集更穩 → 對大量場景才是真的更準。
+    method='greedy':k-center 代表性子集。CPU 上 farthest-point 對大 M 極慢(實測 40k→12k 要 ~10 分),
+      故只在受控候選池 pool=5000、bank≈2500 內跑;適合中小規模或想要分散代表,極大量時點數太少反不如
+      大 budget 隨機。GPU/近似加速為 backlog。"""
     feats = np.asarray(normal_patch_feats, dtype=np.float32)
     if feats.ndim != 2 or feats.shape[0] == 0:
         raise ValueError("empty memory bank")
@@ -57,7 +60,12 @@ def build_memory_bank(normal_patch_feats, *, budget: int = 100_000,
     if feats.shape[0] > budget:
         if method == "greedy":
             from anomaly_coreset import greedy_coreset
-            idx = greedy_coreset(feats, budget, seed=seed)
+            # FPS k-center 純 CPU 對大 M 慢 → 用受控候選池 pool 讓建 bank 在可接受時間完成,
+            # 且 eff_budget < pool 確保 FPS 真的執行(否則 k>=M 早退 = 退化純隨機,greedy 形同 no-op)。
+            # 極大量 good:在代表性候選池內 greedy 選最分散子集,仍優於純隨機(CPU 規模上限,GPU 加速為 backlog)。
+            pool = 5_000
+            eff_budget = min(int(budget), pool // 2)
+            idx = greedy_coreset(feats, eff_budget, seed=seed, oversample_cap=pool)
         else:
             idx = np.random.default_rng(seed).choice(feats.shape[0], size=budget,
                                                       replace=False)

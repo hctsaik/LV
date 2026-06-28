@@ -53,6 +53,8 @@ def fit_projector(obj_emb, good_mask=None, *, l2norm: bool = False, dim_out: int
     tau = compute_tau(good, k=tau_k, percentile=tau_percentile)
 
     rc = np.ascontiguousarray(ref_coords[:, :dim_out], dtype=np.float32)
+    if rc.shape[1] < dim_out:          # N==1 / SVD 退化 → 補零欄,ref_coords 恆 (N, dim_out)
+        rc = np.hstack([rc, np.zeros((len(rc), dim_out - rc.shape[1]), np.float32)])
     if len(rc) > max_ref:
         rc = rc[np.sort(rng.choice(len(rc), max_ref, replace=False))]
 
@@ -117,8 +119,12 @@ def nearest_ref(emb_new, ref_emb):
 
 
 def save_projector(path, basis: dict) -> None:
+    import os
+    from pathlib import Path as _Path
+    final = _Path(str(path))
+    tmp = final.parent / ("_tmp_" + final.name)        # 以 .npz 結尾 → savez 不再加副檔
     np.savez_compressed(
-        str(path),
+        str(tmp),
         mean=np.asarray(basis["mean"], np.float32),
         components=np.asarray(basis["components"], np.float32),
         ref_coords=np.asarray(basis["ref_coords"], np.float32),
@@ -126,6 +132,7 @@ def save_projector(path, basis: dict) -> None:
         tau=np.float32(basis["tau"]),
         l2norm=np.array(bool(basis["l2norm"])),
     )
+    os.replace(tmp, final)                              # atomic:與 bank.npz 一致,維持「meta 最後寫」哨兵保證
 
 
 def load_projector(path) -> dict:
