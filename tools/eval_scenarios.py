@@ -41,6 +41,20 @@ def _ci95(vals):
     return [round(float(np.percentile(vals, 2.5)), 3), round(float(np.percentile(vals, 97.5)), 3)]
 
 
+def escape_overkill_curve(dist, bad_mask, good_mask, good_self, percentiles=(70, 80, 90, 95, 99)):
+    """純函數契約(供 S6 與契約測試共用):給距離分數 + good/bad mask + good 自身分布,
+    回各 good 百分位門檻下的 (pct, thr, escape, over_kill)。
+    契約:percentile↑ → 門檻↑ → escape(bad<門檻=漏檢)單調不減、over_kill(good≥門檻)單調不增。"""
+    bd, gd = dist[bad_mask], dist[good_mask]
+    out = []
+    for pct in percentiles:
+        thr = float(np.percentile(good_self, pct))
+        out.append((pct, thr,
+                    float((bd < thr).mean()) if len(bd) else None,
+                    float((gd >= thr).mean()) if len(gd) else None))
+    return out
+
+
 def _run(folder, model, res, external_ref=None):
     ip, cn = list_images(folder), classes_for(folder)
     cache = dataset_cache_dir(folder, f"anomaly_patch_object_{model}_r{res}")
@@ -199,14 +213,24 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
     np.fill_diagonal(gg, -np.inf)
     good_self = 1.0 - gg.max(axis=1)
     vbd = dist_va[vb]
+    vgd = dist_va[vg]
+    # AUROC + bootstrap CI(valid_bad_n 小 → 標頭也附 CI,對齊 S1/S3)
+    _yb, _db = vb[vg | vb], dist_va[vg | vb]
+    _ab = []
+    for i in range(500):
+        ix = np.random.default_rng(i).integers(0, len(_yb), len(_yb))
+        if 0 < _yb[ix].sum() < len(ix):
+            _ab.append(float(roc_auc_score(_yb[ix], _db[ix])))
     s6 = {"valid_good_n": int(vg.sum()), "valid_bad_n": int(vb.sum()),
-          "auroc_good_vs_bad": round(float(roc_auc_score(vb[vg | vb], dist_va[vg | vb])), 3), "tradeoff": {}}
-    for pct in (70, 80, 90, 95, 99):
-        thr = float(np.percentile(good_self, pct))
+          "auroc_good_vs_bad": round(float(roc_auc_score(_yb, _db)), 3),
+          "auroc_good_vs_bad_ci95": _ci95(_ab) if _ab else None, "tradeoff": {}}
+    for pct, thr, esc_pt, ovk_pt in escape_overkill_curve(dist_va, vb, vg, good_self):
         esc = (vbd < thr).astype(float)
+        ovk = (vgd >= thr).astype(float)
         eb = [float(esc[np.random.default_rng(pct * 1000 + b).integers(0, len(esc), len(esc))].mean()) for b in range(1000)]
-        s6["tradeoff"][f"p{pct}"] = {"escape_rate": round(float(esc.mean()), 3), "escape_ci95": _ci95(eb),
-                                     "over_kill": round(float((dist_va[vg] >= thr).mean()), 3)}
+        ob = [float(ovk[np.random.default_rng(pct * 1000 + 7 + b).integers(0, len(ovk), len(ovk))].mean()) for b in range(1000)]
+        s6["tradeoff"][f"p{pct}"] = {"escape_rate": round(float(esc_pt), 3), "escape_ci95": _ci95(eb),
+                                     "over_kill": round(float(ovk_pt), 3), "over_kill_ci95": _ci95(ob)}
     s6["note"] = f"稀有類視覺相似常見物件時(非強離群)escape 偏高屬資料特性;valid_bad_n={int(vb.sum())}"
     rep["scenarios"]["S6_escape_overkill"] = s6
     return rep

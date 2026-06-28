@@ -1,7 +1,7 @@
 {
   "data": {
     "train_objects": 5490,
-    "train_secs": 80.6,
+    "train_secs": 63.0,
     "class_counts": {
       "cabinet": 179,
       "cabinetDoor": 3177,
@@ -175,6 +175,10 @@
       "valid_good_n": 1145,
       "valid_bad_n": 23,
       "auroc_good_vs_bad": 0.886,
+      "auroc_good_vs_bad_ci95": [
+        0.828,
+        0.934
+      ],
       "tradeoff": {
         "p70": {
           "escape_rate": 0.0,
@@ -182,7 +186,11 @@
             0.0,
             0.0
           ],
-          "over_kill": 0.564
+          "over_kill": 0.564,
+          "over_kill_ci95": [
+            0.534,
+            0.591
+          ]
         },
         "p80": {
           "escape_rate": 0.043,
@@ -190,7 +198,11 @@
             0.0,
             0.13
           ],
-          "over_kill": 0.396
+          "over_kill": 0.396,
+          "over_kill_ci95": [
+            0.368,
+            0.424
+          ]
         },
         "p90": {
           "escape_rate": 0.217,
@@ -198,7 +210,11 @@
             0.087,
             0.391
           ],
-          "over_kill": 0.176
+          "over_kill": 0.176,
+          "over_kill_ci95": [
+            0.154,
+            0.198
+          ]
         },
         "p95": {
           "escape_rate": 0.391,
@@ -206,7 +222,11 @@
             0.217,
             0.609
           ],
-          "over_kill": 0.097
+          "over_kill": 0.097,
+          "over_kill_ci95": [
+            0.08,
+            0.113
+          ]
         },
         "p99": {
           "escape_rate": 0.826,
@@ -214,7 +234,11 @@
             0.652,
             0.957
           ],
-          "over_kill": 0.017
+          "over_kill": 0.017,
+          "over_kill_ci95": [
+            0.01,
+            0.024
+          ]
         }
       },
       "note": "稀有類視覺相似常見物件時(非強離群)escape 偏高屬資料特性;valid_bad_n=23"
