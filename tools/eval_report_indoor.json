@@ -1,7 +1,7 @@
 {
   "data": {
     "train_objects": 5490,
-    "train_secs": 60.1,
+    "train_secs": 59.1,
     "class_counts": {
       "cabinet": 179,
       "cabinetDoor": 3177,
@@ -257,7 +257,7 @@
           ]
         }
       },
-      "note": "稀有類視覺相似常見物件時(非強離群)escape 偏高屬資料特性;valid_bad_n=23"
+      "note": "稀有類視覺相似常見物件(非強離群)→ escape 偏高屬資料特性;valid_bad_n=23。注意:固定 train-good 門檻下 over_kill 操作成本跨 split 不轉移(test good 群更小 → over_kill 偏高);S9 confirmed 良品分布校準可緩解此漂移,固定 train 門檻非最佳操作點。"
     },
     "S7_active_learning_curve": {
       "strategy": "uncertainty_sampling vs random",
@@ -366,15 +366,23 @@
       "quantile": {
         "calibrated": false,
         "escape": 0.783,
-        "over_kill": 0.019
+        "escape_ci95": [
+          0.609,
+          0.957
+        ],
+        "over_kill": 0.03
       },
       "confirmed": {
         "calibrated": true,
-        "escape": 0.783,
-        "over_kill": 0.019
+        "escape": 0.739,
+        "escape_ci95": [
+          0.565,
+          0.913
+        ],
+        "over_kill": 0.03
       },
-      "escape_reduced_by_calibration": true,
-      "note": "真實瑕疵率 > contamination 時相對(quantile)門檻漏檢;良品分布校準(confirmed)壓低漏檢=recall-first。"
+      "calibration_effect": "improved",
+      "note": "真實瑕疵率 > contamination 時相對門檻漏檢;良品分布校準壓低漏檢(recall-first)。overkill 量在『獨立 held-out good 集』(非校準集)→ 無樂觀洩漏。"
     }
   }
 }

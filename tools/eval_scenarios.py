@@ -251,7 +251,9 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
         ob = [float(ovk[np.random.default_rng(pct * 1000 + 7 + b).integers(0, len(ovk), len(ovk))].mean()) for b in range(1000)]
         s6["tradeoff"][f"p{pct}"] = {"escape_rate": round(float(esc_pt), 3), "escape_ci95": _ci95(eb),
                                      "over_kill": round(float(ovk_pt), 3), "over_kill_ci95": _ci95(ob)}
-    s6["note"] = f"稀有類視覺相似常見物件時(非強離群)escape 偏高屬資料特性;valid_bad_n={int(vb.sum())}"
+    s6["note"] = (f"稀有類視覺相似常見物件(非強離群)→ escape 偏高屬資料特性;valid_bad_n={int(vb.sum())}。"
+                  "注意:固定 train-good 門檻下 over_kill 操作成本跨 split 不轉移(test good 群更小 → over_kill 偏高);"
+                  "S9 confirmed 良品分布校準可緩解此漂移,固定 train 門檻非最佳操作點。")
     rep["scenarios"]["S6_escape_overkill"] = s6
 
     # S7:主動學習學習曲線(uncertainty sampling vs random)—— 量化「主動選樣比隨機省多少標註」。
@@ -309,18 +311,38 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
 
     # S9:閘門校準(解分位數漂移)—— 真實瑕疵率 > contamination 時 quantile 漏檢,良品校準門檻(confirmed)救
     _sc = dist_va                                          # train-good 參照的 Normal Bank 距離分數
-    _conf = {int(i): "good" for i in np.where(vg)[0][:50]}  # 模擬 50 個人工確認良品
+    _good_i = np.where(vg)[0]
+    _perm9 = np.random.default_rng(0).permutation(len(_good_i))
+    _calib_i = _good_i[_perm9[:len(_good_i) // 2]]         # 校準集(獨立)
+    _meas_i = _good_i[_perm9[len(_good_i) // 2:]]          # overkill 量測集(獨立、不與校準集重疊,免樂觀洩漏)
+    _conf = {int(i): "good" for i in _calib_i[:50]}
     _gq = gate_threshold(_sc, contamination=0.05, mode="quantile")
     _gc = gate_threshold(_sc, contamination=0.05, confirmed=_conf, mode="confirmed")
-    _eq = float((_sc[vb] < _gq["threshold"]).mean()) if vb.any() else None
-    _ec = float((_sc[vb] < _gc["threshold"]).mean()) if vb.any() else None
+
+    def _esc_ci(thr):
+        if not vb.any():
+            return None
+        b = (_sc[vb] < thr).astype(float)
+        return _ci95([float(b[np.random.default_rng(k).integers(0, len(b), len(b))].mean()) for k in range(1000)])
+
+    def _eo(thr):
+        esc = float((_sc[vb] < thr).mean()) if vb.any() else None
+        ovk = float((_sc[_meas_i] >= thr).mean()) if len(_meas_i) else None  # 用獨立量測集量 overkill
+        return esc, ovk
+    _eq, _oq = _eo(_gq["threshold"])
+    _ec, _oc = _eo(_gc["threshold"])
+    _flag = ("improved" if (_ec is not None and _ec < _eq - 1e-9)
+             else ("worse" if (_ec is not None and _ec > _eq + 1e-9) else "no_op"))
     s9 = {"defect_rate": round(float(vb.mean()), 3), "contamination": 0.05, "n_confirmed_good": len(_conf),
           "quantile": {"calibrated": _gq["calibrated"], "escape": round(_eq, 3) if _eq is not None else None,
-                       "over_kill": round(float((_sc[vg] >= _gq["threshold"]).mean()), 3) if vg.any() else None},
+                       "escape_ci95": _esc_ci(_gq["threshold"]),
+                       "over_kill": round(_oq, 3) if _oq is not None else None},
           "confirmed": {"calibrated": _gc["calibrated"], "escape": round(_ec, 3) if _ec is not None else None,
-                        "over_kill": round(float((_sc[vg] >= _gc["threshold"]).mean()), 3) if vg.any() else None},
-          "escape_reduced_by_calibration": bool(_ec <= _eq) if (_ec is not None and _eq is not None) else None,
-          "note": "真實瑕疵率 > contamination 時相對(quantile)門檻漏檢;良品分布校準(confirmed)壓低漏檢=recall-first。"}
+                        "escape_ci95": _esc_ci(_gc["threshold"]),
+                        "over_kill": round(_oc, 3) if _oc is not None else None},
+          "calibration_effect": _flag,    # improved / no_op(不需要時不假裝) / worse
+          "note": "真實瑕疵率 > contamination 時相對門檻漏檢;良品分布校準壓低漏檢(recall-first)。"
+                  "overkill 量在『獨立 held-out good 集』(非校準集)→ 無樂觀洩漏。"}
     rep["scenarios"]["S9_gate_calibration"] = s9
     return rep
 
