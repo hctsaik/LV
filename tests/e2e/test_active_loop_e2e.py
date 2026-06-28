@@ -64,5 +64,7 @@ def test_active_loop_curve(app_server, browser, synthetic_yolo_dataset):
     page.wait_for_timeout(400)
     main = page.locator('[data-testid="stMain"]').text_content()
     assert "最終(標" in main, f"學習曲線應算出主動 vs 隨機結果,得到:{main[-300:]}"
-    assert "領先" in main, "應顯示主動相對隨機的領先幅度"
+    # 真實行為斷言:停止/繼續建議文字必反映實際曲線(走平/領先/無差異)三者之一(非恆真字串)
+    assert any(h in main for h in ["值得繼續標", "建議停止標註", "無明顯差異"]), \
+        f"應顯示反映實際曲線的停止/繼續建議,得到:{main[-300:]}"
     ctx.close()

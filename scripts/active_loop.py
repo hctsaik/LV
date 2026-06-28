@@ -1,10 +1,12 @@
 """active_loop:主動學習標註迴圈(設計 3_Architect_Design/M5_active_loop.md)。
 
-把 M2 Normal Bank + M3 分類頭 + M4 取樣佇列 從「開迴圈組件」串成**閉迴圈**:
-佇列選樣 → 人工標 → 回流(擴 Normal Bank + 重訓 head)→ 量測學習曲線 → 重複,
-並提供「弱類定向優先(分類頭最混淆者最該標)」與「曲線走平就停」的可量測準則。
+把 M2 Normal Bank + M3 分類頭 + M4 取樣佇列 串起來的主動學習工具:
+- **真閉環**:人工 confirm 的 good/bad 回流擴 Normal Bank(走既有 confirm/rerun);分類頭由「訓練分類頭」按鈕重訓。
+- **本模組提供**:弱類定向優先(分類頭最混淆者最該標)、標註效益學習曲線(主動 vs 隨機,**回顧模擬**:
+  以資料集既有 label 當 oracle,展示「主動選樣省多少標註」,不消費人工 confirm 標籤)、曲線走平的停止準則。
 
-實證(雙-split 完整測試 S7):uncertainty sampling 比隨機省 ~60-75% 標註(跨 valid/test 都成立)。
+實證(雙-split 完整測試 S7):uncertainty sampling 比隨機省 ~60-75% 標註(跨 valid/test 都成立;
+幅度視類別不均衡/可分性而定,合成易分資料上近零)。
 """
 from __future__ import annotations
 
@@ -31,10 +33,32 @@ def confusion_targeted_priority(anomaly_scores, head_proba, *, anomaly_threshold
     """弱類定向主動學習優先 = w_novelty·Novelty(離正常,minmax)+ w_entropy·Entropy(分類頭最混淆)。
     對齊「最該標的是分類頭最不確定/混淆 + 離正常遠的未知」。head_proba=None → 熵項為 0(純 novelty)。"""
     a = np.asarray(anomaly_scores, dtype=float)
+    if a.size == 0:                                       # 空輸入短路(對齊 entropy_score)
+        return np.zeros(0, dtype=np.float32)
     nov = _minmax(a)
+    if head_proba is not None and len(head_proba) != len(a):
+        raise ValueError(f"anomaly_scores({len(a)}) 與 head_proba({len(head_proba)}) 列數不一致")
     ent = (entropy_score(head_proba) if head_proba is not None
            else np.zeros(len(a), dtype=np.float32))
     return (float(w_novelty) * nov + float(w_entropy) * ent).astype(np.float32)
+
+
+def stratified_pool_eval_split(labels, *, eval_frac: float = 0.3, seed: int = 0):
+    """分層切 pool/eval:每類(樣本 ≥2)在兩側各至少 1 個,避免少數類全進一側使 eval 退化成單類
+    (那會讓 balanced_accuracy 恆 1.0、學習曲線變假平圖)。回 (pool_idx, eval_idx) 皆排序。"""
+    rng = np.random.default_rng(seed)
+    labels = np.asarray(labels)
+    pool, ev = [], []
+    for c in sorted(set(labels.tolist())):
+        ci = np.where(labels == c)[0]
+        rng.shuffle(ci)
+        if len(ci) < 2:                                  # 該類太少 → 只能進 pool
+            pool.extend(int(i) for i in ci)
+            continue
+        n_ev = min(max(1, int(round(len(ci) * float(eval_frac)))), len(ci) - 1)  # 至少各留 1
+        ev.extend(int(i) for i in ci[:n_ev])
+        pool.extend(int(i) for i in ci[n_ev:])
+    return np.array(sorted(pool)), np.array(sorted(ev))
 
 
 def label_efficiency_curve(pool_emb, pool_labels, eval_emb, eval_labels, *,
@@ -63,7 +87,11 @@ def label_efficiency_curve(pool_emb, pool_labels, eval_emb, eval_labels, *,
             break
         h = train_head(pe[ls], pl[ls])
         pa, _, _ = predict_head(h, ee)
-        curve.append([len(labeled), round(float(balanced_accuracy_score(eval_labels, pa)), 4)])
+        import warnings
+        with warnings.catch_warnings():                   # eval 單類時 sklearn 的雜訊警告(值仍正確)
+            warnings.simplefilter("ignore")
+            _acc = float(balanced_accuracy_score(eval_labels, pa))
+        curve.append([len(labeled), round(_acc, 4)])
         unl = np.array([i for i in range(len(pl)) if i not in labeled])
         if len(unl) == 0:
             break

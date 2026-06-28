@@ -6,7 +6,7 @@ import pytest
 
 from active_loop import (confusion_targeted_priority, entropy_score,
                          label_efficiency_curve, round_summary,
-                         should_stop_labeling)
+                         should_stop_labeling, stratified_pool_eval_split)
 
 
 def test_entropy_score():  # AC1:歸一化熵 one-hot→0、均勻→1
@@ -77,3 +77,18 @@ def test_round_summary():  # AC7:每類已標數 + 總數;接受 list 或 dict
     assert s_list["total"] == 4 and s_list["per_class"]["good"] == 3 and s_list["per_class"]["bad"] == 1
     s_dict = round_summary({0: "good", 5: "bad", 9: "bad"})
     assert s_dict["total"] == 3 and s_dict["per_class"]["bad"] == 2
+
+
+def test_stratified_split_keeps_minority_in_eval():  # AC8:不均資料下少數類仍進 eval(防 eval 退化單類)
+    labels = np.array(["good"] * 20 + ["bad"] * 5)        # task 指定的 25 物件/2類 20:5
+    pool_i, eval_i = stratified_pool_eval_split(labels, eval_frac=0.3, seed=0)
+    assert len(set(labels[eval_i].tolist())) == 2         # eval 兩類都在(關鍵:不退化成單類)
+    assert len(set(labels[pool_i].tolist())) == 2
+    assert set(pool_i.tolist()) | set(eval_i.tolist()) == set(range(25))   # 不重不漏
+    assert not (set(pool_i.tolist()) & set(eval_i.tolist()))
+
+
+def test_confusion_priority_guards():  # AC9:空輸入短路、列數不一致明確 raise
+    assert confusion_targeted_priority(np.array([]), None).shape == (0,)
+    with pytest.raises(ValueError):
+        confusion_targeted_priority(np.array([0.1, 0.2, 0.3]), np.eye(2))   # 3 vs 2 列

@@ -1246,7 +1246,7 @@ def _anomaly_save_bank(bank_dir: str, folders: list) -> None:
 
 
 def _anomaly_run_loop_curve(emb, lab, pool_i, eval_i, batch) -> None:
-    """M5 主動學習迴圈:在現有物件上跑 active(uncertainty)vs random 標註效益曲線(回流→重訓→量測)。"""
+    """M5:在現有物件上跑 active(uncertainty)vs random 標註效益曲線(回顧模擬,展示主動選樣省標註)。"""
     from active_loop import label_efficiency_curve
     try:
         eff = max(4, min(int(batch), max(2, len(pool_i) // 3)))   # 依池大小縮放,小資料也能跑多輪
@@ -1590,48 +1590,58 @@ def _anomaly_ui() -> None:
                   disabled=not _sel_al, use_container_width=True,
                   on_click=_anomaly_add_to_cart, args=(records, _sel_al))
 
-    # ── 🔁 主動學習迴圈(M5):標→回流→重訓→量測,證明標註值得 ──
+    # ── 🔁 主動學習迴圈(M5):選樣→標→量測,展示主動選樣比隨機省標註 ──
     _loop_labels = [r.get("label", "") for r in records]
     _loop_uniq = sorted({l for l in _loop_labels if l})
     if len(_loop_uniq) >= 2 and len(records) >= 20:
         with st.expander("🔁 主動學習迴圈(標註效益:主動選樣 vs 隨機 — 看標註是否值得)"):
-            st.caption("把『佇列→人工標→回流(擴 Normal Bank + 重訓分類頭)→量測』串成閉迴圈。"
-                       "學習曲線比較 uncertainty sampling 與隨機:同樣準度,主動選樣通常省 50-70% 標註"
-                       "(雙-split 完整測試實證)。曲線是決策輔助,真實標註仍走上方 confirm。")
-            from active_loop import (label_efficiency_curve, round_summary,
-                                     should_stop_labeling)
+            st.caption("比較 uncertainty sampling 與隨機的學習曲線:同樣準度,主動選樣在**類別不均衡的真實"
+                       "資料**上省標註(本資料集雙-split 實證約 60-75%,幅度視不均衡/可分性而定)。"
+                       "⚠ 此曲線是**以資料集既有 label 當 oracle 的回顧模擬**(不消費你在上方 confirm 的 good/bad);"
+                       "用途是決策輔助(值不值得標、何時停),真實標註與 Normal Bank 回流仍走上方 confirm。")
+            from active_loop import (round_summary, should_stop_labeling,
+                                     stratified_pool_eval_split)
             _emb_l = np.asarray(result["obj_emb"], dtype=float)
             _lab_l = np.array(_loop_labels)
-            _rng_l = np.random.default_rng(0)
-            _perm = _rng_l.permutation(len(_lab_l))
-            _cut = int(len(_lab_l) * 0.7)
-            _pool_i, _eval_i = _perm[:_cut], _perm[_cut:]
-            _bsz = st.slider("每輪標註數", 10, 60, 30, key="anomaly_loop_batch")
-            st.button("▶ 跑標註效益曲線(主動 vs 隨機)", key="anomaly_loop_run",
-                      use_container_width=True, on_click=_anomaly_run_loop_curve,
-                      args=(_emb_l, _lab_l, _pool_i, _eval_i, _bsz))
-            _cv = st.session_state.get("anomaly_loop_curves")
-            if _cv and "_err" not in _cv:
-                import pandas as pd
-                _ca, _cr = _cv["active"], _cv["random"]
-                _n = min(len(_ca), len(_cr))
-                _df = pd.DataFrame({"標註數": [x[0] for x in _ca[:_n]],
-                                    "主動選樣(active)": [x[1] for x in _ca[:_n]],
-                                    "隨機(random)": [x[1] for x in _cr[:_n]]}).set_index("標註數")
-                st.line_chart(_df)
-                _fa, _fr = _ca[-1][1], _cr[-1][1]
-                _stop = should_stop_labeling(_ca)
-                st.markdown(
-                    f"**最終(標 {_ca[-1][0]} 個):主動 `{_fa:.3f}` vs 隨機 `{_fr:.3f}`** "
-                    f"(主動領先 `{_fa - _fr:+.3f}`)。"
-                    + (" ⏹ 曲線走平 → **建議停止標註**(再標效益遞減)。" if _stop
-                       else " ↗ 仍上升 → **值得繼續標**。"))
-            elif _cv and "_err" in _cv:
-                st.info(f"資料不足以跑迴圈:{_cv['_err']}")
+            # 分層切 pool/eval(每類兩側各 ≥1,避免少數類全進一側使 eval 退化單類、曲線變假平圖)
+            _pool_i, _eval_i = stratified_pool_eval_split(_lab_l, eval_frac=0.3, seed=0)
+            _eval_ok = len(set(_lab_l[_eval_i].tolist())) >= 2 if len(_eval_i) else False
+            if not _eval_ok:
+                st.info("少數類樣本太少,held-out 評估集無法涵蓋 ≥2 類 → 學習曲線無意義,已跳過"
+                        "(這是資料限制:請增加少數類樣本或合併資料夾)。")
+            else:
+                _bsz = st.slider("每輪標註數", 10, 60, 30, key="anomaly_loop_batch")
+                st.button("▶ 跑標註效益曲線(主動 vs 隨機)", key="anomaly_loop_run",
+                          use_container_width=True, on_click=_anomaly_run_loop_curve,
+                          args=(_emb_l, _lab_l, _pool_i, _eval_i, _bsz))
+                _cv = st.session_state.get("anomaly_loop_curves")
+                if _cv and "_err" not in _cv:
+                    import pandas as pd
+                    _ca, _cr = _cv["active"], _cv["random"]
+                    _n = min(len(_ca), len(_cr))
+                    _ca, _cr = _ca[:_n], _cr[:_n]
+                    _df = pd.DataFrame({"標註數": [x[0] for x in _ca],
+                                        "主動選樣(active)": [x[1] for x in _ca],
+                                        "隨機(random)": [x[1] for x in _cr]}).set_index("標註數")
+                    st.line_chart(_df)
+                    _fa, _fr = _ca[-1][1], _cr[-1][1]
+                    _lead = _fa - _fr
+                    _stop = should_stop_labeling(_ca)
+                    # 停止建議同時看「走平」與「主動是否仍領先」
+                    if _lead <= 0.005:
+                        _hint = " ≈ 主動與隨機此資料上無明顯差異(可分性高/已飽和 → 標註策略影響小)。"
+                    elif _stop:
+                        _hint = " ⏹ 曲線走平 → **建議停止標註**(再標效益遞減)。"
+                    else:
+                        _hint = " ↗ 仍上升且主動領先 → **值得繼續標(優先用主動選樣)**。"
+                    st.markdown(f"**最終(標 {_ca[-1][0]} 個):主動 `{_fa:.3f}` vs 隨機 `{_fr:.3f}`** "
+                                f"(主動領先 `{_lead:+.3f}`)。" + _hint)
+                elif _cv and "_err" in _cv:
+                    st.info(f"資料不足以跑迴圈:{_cv['_err']}")
             _conf_l = st.session_state.get("anomaly_confirmed", {})
             if _conf_l:
                 _rs = round_summary(_conf_l)
-                st.caption(f"已人工確認 {_rs['total']} 個:"
+                st.caption(f"已人工確認(回流 Normal Bank){_rs['total']} 個:"
                            + " · ".join(f"`{k}` {v}" for k, v in _rs["per_class"].items()))
 
     left, right = st.columns([3, 2], gap="medium")

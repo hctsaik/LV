@@ -3,9 +3,9 @@
 ## 動機(來自雙-split 完整測試)
 M2 Normal Bank + M3 分類頭 + M4 取樣佇列是「組件」,目前**開迴圈**(一次性評分)。
 完整測試的 S7 學習曲線實證:**uncertainty sampling 比隨機省 ~60-75% 標註**(valid 480 標註
-active 0.76 vs random 0.60;test 0.61 vs 0.50,跨兩 held-out 都成立)。M5 把三件串成**閉迴圈**:
-佇列選樣 → 人工標 → 回流(擴 Normal Bank + 重訓 head)→ 量測 → 重複,並把「最該標的是分類頭
-最混淆/最離正常的樣本」(weak-class targeting)與「曲線走平就停」做成可量測準則。
+active 0.76 vs random 0.60;test 0.61 vs 0.50,跨兩 held-out 都成立;幅度視不均衡/可分性而定)。
+M5 工具:佇列選樣(弱類定向)→ 人工 confirm 回流 Normal Bank → 標註效益學習曲線(主動 vs 隨機,
+回顧模擬展示省標註)→ 曲線走平就停。詳見文末「誠實界定」對「真閉環 vs 模擬」的劃分。
 
 ## 模組:`scripts/active_loop.py`(純邏輯,Tier A 偏;但被 GUI 依賴 → 升 Tier B,需 E2E)
 
@@ -24,6 +24,15 @@ active 0.76 vs random 0.60;test 0.61 vs 0.50,跨兩 held-out 都成立)。M5 把
   - **AC6**:連續 patience 輪 acc 提升 < min_delta(曲線走平)→ True;持續上升 → False。
 - `round_summary(confirmed_labels) -> dict`
   - **AC7**:回每類已標數 + 總數(給迴圈面板);接受 list 或 dict(value 為 label)。
+- `stratified_pool_eval_split(labels, *, eval_frac=0.3, seed=0) -> (pool_idx, eval_idx)`
+  - **AC8**:分層切分,每類(樣本 ≥2)在 pool 與 eval 兩側各至少 1 個 → 防少數類全進一側使 eval 退化
+    成單類(那會讓 balanced_accuracy 恆 1.0、學習曲線變假平圖)。不重不漏。
+- `confusion_targeted_priority` 防呆
+  - **AC9**:空 anomaly_scores → 回 shape (0,);scores 與 head_proba 列數不一致 → 明確 ValueError。
+
+> **誠實界定(名實相符)**:本迴圈對 **Normal Bank 是真閉環**(人工 confirm 的 good/bad 回流擴 bank,
+> 走既有 confirm/rerun);**分類頭重訓走「訓練分類頭」按鈕**(在物件 label 上)。**學習曲線是回顧模擬**
+> (以資料集既有 label 當 oracle,展示主動選樣省標註的價值),**不消費**人工 confirm 標籤 —— 面板已明示。
 
 ## GUI 整合(`scripts/app.py` 的瑕疵偵測工具)
 「🔁 主動學習迴圈」expander(在分類頭 + 取樣佇列之後):
