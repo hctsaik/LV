@@ -1,7 +1,7 @@
 {
   "data": {
     "train_objects": 5490,
-    "train_secs": 81.3,
+    "train_secs": 59.0,
     "class_counts": {
       "cabinet": 179,
       "cabinetDoor": 3177,
@@ -80,7 +80,12 @@
         0.463,
         0.621
       ],
-      "rare_class_recall_weighted": 0.616
+      "rare_class_recall_weighted": 0.616,
+      "temperature": 0.768,
+      "mean_conf_wrong_raw": 0.502,
+      "mean_conf_wrong_calibrated": 0.584,
+      "mean_conf_correct_calibrated": 0.841,
+      "calibration_note": "T 在 eval split 標定(production 應用 confirmed/校準集);校準不改預測只縮放信心"
     },
     "S4_gated_cascade": {
       "contamination_scan": {
@@ -150,7 +155,18 @@
           ]
         }
       },
-      "normal_share_note": "正常占比 ≈ 1-contamination 為門檻設計恆等,非偵測訊號"
+      "normal_share_note": "正常占比 ≈ 1-contamination 為門檻設計恆等,非偵測訊號",
+      "human_queue": {
+        "at": {
+          "contamination": 0.1,
+          "min_conf": 0.5,
+          "head": "calibrated"
+        },
+        "unknown_queue_rate": 0.029,
+        "defect_caught_not_normal": 0.128,
+        "defect_to_unknown_queue": 0.093,
+        "good_to_unknown_overkill": 0.007
+      }
     },
     "S5_active_learning": {
       "k": 30,
@@ -242,6 +258,81 @@
         }
       },
       "note": "稀有類視覺相似常見物件時(非強離群)escape 偏高屬資料特性;valid_bad_n=86"
+    },
+    "S7_active_learning_curve": {
+      "strategy": "uncertainty_sampling vs random",
+      "pool": "train",
+      "eval_on": "held-out split",
+      "seed_n": 60,
+      "batch": 60,
+      "active_curve": [
+        [
+          60,
+          0.39
+        ],
+        [
+          120,
+          0.546
+        ],
+        [
+          180,
+          0.601
+        ],
+        [
+          240,
+          0.57
+        ],
+        [
+          300,
+          0.584
+        ],
+        [
+          360,
+          0.602
+        ],
+        [
+          420,
+          0.61
+        ],
+        [
+          480,
+          0.61
+        ]
+      ],
+      "random_curve": [
+        [
+          60,
+          0.39
+        ],
+        [
+          120,
+          0.439
+        ],
+        [
+          180,
+          0.432
+        ],
+        [
+          240,
+          0.452
+        ],
+        [
+          300,
+          0.457
+        ],
+        [
+          360,
+          0.49
+        ],
+        [
+          420,
+          0.51
+        ],
+        [
+          480,
+          0.498
+        ]
+      ]
     }
   }
 }

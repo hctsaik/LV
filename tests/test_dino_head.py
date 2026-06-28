@@ -7,8 +7,8 @@
 import numpy as np
 import pytest
 
-from dino_head import (gated_predict, load_head, predict_head, save_head,
-                       train_head)
+from dino_head import (fit_temperature, gated_predict, load_head,
+                       predict_head, save_head, train_head)
 
 D = 16
 CLASSES = ["bubble", "reflection", "particle"]
@@ -78,3 +78,29 @@ def test_predict_dim_mismatch_raises():  # AC6:特徵維度不符 → 明確 rai
     head = train_head(*_data())
     with pytest.raises((ValueError, Exception)):
         predict_head(head, np.zeros((3, D + 5), dtype=np.float32))
+
+
+def test_temperature_calibration():  # AC7:溫度校準不改預測、降低 NLL(修正過度自信)
+    X, y = _data()
+    head = train_head(X, y)
+    cal = fit_temperature(head, X, y)
+    assert "temperature" in cal and cal["temperature"] > 0
+    p0, c0, pr0 = predict_head(head, X)
+    p1, c1, pr1 = predict_head(cal, X)
+    assert list(p0) == list(p1)                       # 校準不改預測(argmax 不變),只縮放信心
+
+    def _nll(proba):
+        return float(-np.mean(np.log(proba[np.arange(len(y)), [head["classes"].index(t) for t in y]] + 1e-12)))
+
+    assert _nll(pr1) <= _nll(pr0) + 1e-9              # 校準後 NLL 不增(校準的定義)
+
+
+def test_calibration_gated_uses_calibrated_conf():  # AC8:閘控吃校準後信心(過度自信被壓→更易進 Unknown)
+    X, y = _data()
+    head = train_head(X, y)
+    # 人工塞極小溫度的反例不需要;用大 T 模擬「壓低信心」→ 邊界點更可能 Unknown
+    cal = {**head, "temperature": 5.0}
+    boundary = np.zeros((1, D), dtype=np.float32); boundary[0, 0] = 2.5; boundary[0, 1] = 2.5
+    _, c_raw, _ = predict_head(head, boundary)
+    _, c_cal, _ = predict_head(cal, boundary)
+    assert c_cal[0] <= c_raw[0] + 1e-6               # 高溫 → 信心被壓低(過度自信修正方向)

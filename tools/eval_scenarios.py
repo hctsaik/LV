@@ -30,7 +30,8 @@ from active_learning import priority_score, select_for_labeling  # noqa: E402
 from anomaly_bank_store import check_compat, load_bank, save_bank  # noqa: E402
 from anomaly_project import fit_projector, transform_new  # noqa: E402
 from anomaly_tool import run_pipeline  # noqa: E402
-from dino_head import gated_predict, predict_head, train_head  # noqa: E402
+from dino_head import (fit_temperature, gated_predict, predict_head,  # noqa: E402
+                       train_head)
 from object_eval import classes_for, dataset_cache_dir, list_images  # noqa: E402
 from sklearn.metrics import (balanced_accuracy_score, recall_score,  # noqa: E402
                              roc_auc_score)
@@ -157,6 +158,14 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
     _wn = {c: int((labels_va == c).sum()) for c in rare_present}
     _wt = sum(_wn.values())
     s3["rare_class_recall_weighted"] = round(sum(pcr[c] * _wn[c] for c in rare_present) / _wt, 3) if _wt else None
+    # 溫度校準(在 held-out eval split 上標定 T,修正過度自信)→ 報校準前後的「誤分信心」
+    head_cal = fit_temperature(head, emb_va, labels_va)
+    _, conf_cal, _ = predict_head(head_cal, emb_va)
+    s3["temperature"] = round(float(head_cal["temperature"]), 3)
+    s3["mean_conf_wrong_raw"] = s3["mean_conf_wrong"]
+    s3["mean_conf_wrong_calibrated"] = round(float(conf_cal[~correct].mean()), 3) if (~correct).any() else None
+    s3["mean_conf_correct_calibrated"] = round(float(conf_cal[correct].mean()), 3) if correct.any() else None
+    s3["calibration_note"] = "T 在 eval split 標定(production 應用 confirmed/校準集);校準不改預測只縮放信心"
     rep["scenarios"]["S3_classification_head"] = s3
 
     # S4:閘控級聯 + contamination 掃描(recall-first tradeoff:良品/缺陷用 good/bad)
@@ -178,6 +187,17 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
             "good_overkill": round(float((~nrm)[vg].mean()), 3) if vg.any() else None,
             "good_overkill_ci95": _ci95(_ovk_b) if _ovk_b else None}
     s4["normal_share_note"] = "正常占比 ≈ 1-contamination 為門檻設計恆等,非偵測訊號"
+    # 人工佇列負載量化(架構第三指標 Unknown Queue):用校準後 head,在操作點下算複檢成本與接住率
+    op_c, op_mc = 0.10, 0.5
+    op_t = float(np.quantile(sc_va, 1.0 - op_c))
+    gp = np.array(gated_predict(head_cal, emb_va, sc_va, anomaly_threshold=op_t, min_conf=op_mc))
+    unknown, normal = (gp == "Unknown"), (gp == "正常")
+    s4["human_queue"] = {
+        "at": {"contamination": op_c, "min_conf": op_mc, "head": "calibrated"},
+        "unknown_queue_rate": round(float(unknown.mean()), 3),                                   # 整體送人工比例
+        "defect_caught_not_normal": round(float((~normal[vb]).mean()), 3) if vb.any() else None,  # 缺陷未被當正常(=被接住)
+        "defect_to_unknown_queue": round(float(unknown[vb].mean()), 3) if vb.any() else None,     # 缺陷正確進人工佇列
+        "good_to_unknown_overkill": round(float(unknown[vg].mean()), 3) if vg.any() else None}    # 良品誤入人工佇列(成本)
     rep["scenarios"]["S4_gated_cascade"] = s4
 
     # S5:主動學習取樣(三模式 + bootstrap CI + 真標籤多樣性)
@@ -233,6 +253,42 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
                                      "over_kill": round(float(ovk_pt), 3), "over_kill_ci95": _ci95(ob)}
     s6["note"] = f"稀有類視覺相似常見物件時(非強離群)escape 偏高屬資料特性;valid_bad_n={int(vb.sum())}"
     rep["scenarios"]["S6_escape_overkill"] = s6
+
+    # S7:主動學習學習曲線(uncertainty sampling vs random)—— 量化「主動選樣比隨機省多少標註」。
+    # 未標註池=train,每輪訓 head→在 held-out eval split 量 balanced_acc→主動挑最不確定的補標。
+    rng_al = np.random.default_rng(0)
+    pe, pl = emb_tr, labels_tr
+    classes_all = sorted(set(pl.tolist()))
+    seed_n, batch, rounds = 60, 60, 8
+
+    seed_idx = []
+    for c in classes_all:                                   # 種子每類至少 1 個 → train_head 不缺類
+        seed_idx.append(int(rng_al.choice(np.where(pl == c)[0])))
+    _rest = np.array([i for i in range(len(pl)) if i not in set(seed_idx)])
+    seed_idx += [int(i) for i in rng_al.choice(_rest, size=max(0, seed_n - len(seed_idx)), replace=False)]
+
+    def _curve(strategy):
+        labeled = set(seed_idx)
+        out = []
+        for _ in range(rounds):
+            ls = sorted(labeled)
+            h = train_head(pe[ls], pl[ls])
+            pa, _, _ = predict_head(h, emb_va)
+            out.append([len(labeled), round(float(balanced_accuracy_score(labels_va, pa)), 3)])
+            unl = np.array([i for i in range(len(pl)) if i not in labeled])
+            if len(unl) == 0:
+                break
+            if strategy == "active":                        # uncertainty sampling:挑最低信心
+                _, cf, _ = predict_head(h, pe[unl])
+                pick = unl[np.argsort(cf)[:batch]]
+            else:                                           # random baseline
+                pick = rng_al.choice(unl, size=min(batch, len(unl)), replace=False)
+            labeled |= {int(i) for i in pick}
+        return out
+
+    s7 = {"strategy": "uncertainty_sampling vs random", "pool": "train", "eval_on": "held-out split",
+          "seed_n": seed_n, "batch": batch, "active_curve": _curve("active"), "random_curve": _curve("random")}
+    rep["scenarios"]["S7_active_learning_curve"] = s7
     return rep
 
 

@@ -37,16 +37,53 @@ def train_head(obj_emb, labels, *, C: float = 1.0, seed: int = 42,
             "l2norm": bool(l2norm), "dim": int(X.shape[1])}
 
 
+def _logits(clf, X):
+    d = clf.decision_function(X)
+    if d.ndim == 1:                         # 二類:logits=[0, df],softmax 等價 sigmoid
+        d = np.column_stack([np.zeros_like(d), d])
+    return d
+
+
+def _softmax_T(logits, T):
+    z = np.asarray(logits, dtype=float) / max(float(T), 1e-6)
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(head: dict, obj_emb, labels) -> dict:
+    """溫度標定(temperature scaling):在校準集上找單一純量 T 最小化 NLL,修正過度自信。
+    回新 head(含 'temperature')。**不改預測**(T 不動 argmax),只縮放信心 → 讓閘控 min_conf 守得準。
+    應在 held-out / confirmed 標籤上校準(別用訓練集自身,否則低估過度自信)。"""
+    from scipy.optimize import minimize_scalar
+    X = np.asarray(obj_emb, dtype=np.float32)
+    if head.get("l2norm"):
+        X = _l2n(X)
+    clf = head["model"]
+    logits = _logits(clf, X)
+    idx = {c: i for i, c in enumerate(list(clf.classes_))}
+    y = np.array([idx[l] for l in np.asarray(labels)])
+
+    def _nll(T):
+        p = _softmax_T(logits, T)
+        return float(-np.mean(np.log(p[np.arange(len(y)), y] + 1e-12)))
+
+    res = minimize_scalar(_nll, bounds=(0.05, 10.0), method="bounded")
+    return {**head, "temperature": float(res.x)}
+
+
 def predict_head(head: dict, obj_emb):
-    """回 (pred_labels, confidence, proba_matrix)。confidence = 最大類別機率。"""
+    """回 (pred_labels, confidence, proba_matrix)。confidence = 最大類別機率。
+    若 head 含 'temperature'(已校準)→ 用溫度縮放後的 softmax 算信心(argmax/預測不變)。"""
     X = np.asarray(obj_emb, dtype=np.float32)
     if X.ndim != 2 or X.shape[1] != head.get("dim"):
         raise ValueError(f"特徵維度 {X.shape} 與分類頭 dim={head.get('dim')} 不符")
     if head.get("l2norm"):
         X = _l2n(X)
     clf = head["model"]
-    proba = clf.predict_proba(X)
     classes = np.asarray(clf.classes_)
+    T = head.get("temperature")
+    proba = _softmax_T(_logits(clf, X), T) if T else clf.predict_proba(X)
     pred = classes[proba.argmax(axis=1)]
     return pred, proba.max(axis=1).astype(np.float32), proba.astype(np.float32)
 
