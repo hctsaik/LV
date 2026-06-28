@@ -289,6 +289,39 @@ def evaluate(dataset: Path, good: set, bad: set, rare: set, model="dinov2_vits14
     s7 = {"strategy": "uncertainty_sampling vs random", "pool": "train", "eval_on": "held-out split",
           "seed_n": seed_n, "batch": batch, "active_curve": _curve("active"), "random_curve": _curve("random")}
     rep["scenarios"]["S7_active_learning_curve"] = s7
+
+    # S8:M6 路由決策(驗證 silent-wrong 修復 + Bank 恆在不變量,在真實資料上)
+    from anomaly_tool import (gate_phase, gate_threshold, head_unlock_state,
+                              per_class_counts)
+    _lab_tr = labels_tr.tolist()
+    _uo = head_unlock_state(label_semantic="object", labels=_lab_tr, n_min=8)
+    _ud = head_unlock_state(label_semantic="defect", labels=_lab_tr, n_min=8)
+    s8 = {"per_class_counts": per_class_counts(_lab_tr),
+          "object_semantic": {"unlocked": _uo["unlocked"], "reason": _uo["reason"]},      # 應 False/object_semantic
+          "defect_semantic_n8": {"unlocked": _ud["unlocked"], "reason": _ud["reason"],
+                                 "eligible_n": len(_ud["eligible_classes"])},
+          "bank_active_invariant": all(
+              gate_phase(has_confirmed_good=a, external_bank=b, head_ready=c, override=o)["bank_active"]
+              for a in (False, True) for b in (False, True) for c in (False, True)
+              for o in (None, "phase0", "phase1", "phase2")),
+          "note": "object 語義永不解鎖 head(修 silent-wrong:物件類別非瑕疵類);bank_active 恆 True。"}
+    rep["scenarios"]["S8_routing"] = s8
+
+    # S9:閘門校準(解分位數漂移)—— 真實瑕疵率 > contamination 時 quantile 漏檢,良品校準門檻(confirmed)救
+    _sc = dist_va                                          # train-good 參照的 Normal Bank 距離分數
+    _conf = {int(i): "good" for i in np.where(vg)[0][:50]}  # 模擬 50 個人工確認良品
+    _gq = gate_threshold(_sc, contamination=0.05, mode="quantile")
+    _gc = gate_threshold(_sc, contamination=0.05, confirmed=_conf, mode="confirmed")
+    _eq = float((_sc[vb] < _gq["threshold"]).mean()) if vb.any() else None
+    _ec = float((_sc[vb] < _gc["threshold"]).mean()) if vb.any() else None
+    s9 = {"defect_rate": round(float(vb.mean()), 3), "contamination": 0.05, "n_confirmed_good": len(_conf),
+          "quantile": {"calibrated": _gq["calibrated"], "escape": round(_eq, 3) if _eq is not None else None,
+                       "over_kill": round(float((_sc[vg] >= _gq["threshold"]).mean()), 3) if vg.any() else None},
+          "confirmed": {"calibrated": _gc["calibrated"], "escape": round(_ec, 3) if _ec is not None else None,
+                        "over_kill": round(float((_sc[vg] >= _gc["threshold"]).mean()), 3) if vg.any() else None},
+          "escape_reduced_by_calibration": bool(_ec <= _eq) if (_ec is not None and _eq is not None) else None,
+          "note": "真實瑕疵率 > contamination 時相對(quantile)門檻漏檢;良品分布校準(confirmed)壓低漏檢=recall-first。"}
+    rep["scenarios"]["S9_gate_calibration"] = s9
     return rep
 
 

@@ -5,6 +5,14 @@
 > `python verify/unet_status.py` 核對是否漂移。
 
 ## 里程碑
+- **M6 — 統一主動學習畫面(修正版 Option2)** — ✅ **完成**(2026-06-29) — 多 agent 兩場討論(架構選型
+  3 輪 + 頁面改造 3 輪)達共識:單畫面、Normal Bank+閘控**恆在**當骨幹,分類頭改成「label 語義=瑕疵類
+  AND ≥2 類各達 N_min」才解鎖的 additive 第二段。路由判定下沉 `anomaly_tool` 純函式(per_class_counts /
+  head_unlock_state / gate_phase / label_semantic_hint / gate_threshold)。**修 silent-wrong**:把 YOLO 物件
+  類別當瑕疵類訓 head(加 label 語義宣告)。app.py 加成熟度狀態列 + 進階 popover + 閘門良品校準。
+  設計 [3_Architect_Design/M6_unified_al_screen.md](3_Architect_Design/M6_unified_al_screen.md)。驗證:
+  gate anomaly_tool 23 + 全 anomaly gate/E2E 綠;真實 indoor 雙 split S8 路由(object 語義不解鎖=修復坐實、
+  bank 恆在)+ S9 閘門校準(test 瑕疵率15.6%>contam 時 escape 87%→57%)。**未定**:N_min=8 待三 split 敏感度掃描。
 - **M5 — Active Learning Loop(主動學習標註迴圈)** — ✅ **完成**(2026-06-28) — 把 M2 bank + M3 head +
   M4 佇列串成主動學習工具:佇列選樣(弱類定向)→ 人工 confirm 回流擴 Normal Bank(真閉環)→ 標註效益
   學習曲線(主動 vs 隨機,**回顧模擬**展示省標註,不消費 confirm;分類頭重訓走訓練按鈕)→ 曲線走平就停。

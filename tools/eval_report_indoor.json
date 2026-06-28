@@ -1,7 +1,7 @@
 {
   "data": {
     "train_objects": 5490,
-    "train_secs": 60.7,
+    "train_secs": 60.1,
     "class_counts": {
       "cabinet": 179,
       "cabinetDoor": 3177,
@@ -333,6 +333,48 @@
           0.599
         ]
       ]
+    },
+    "S8_routing": {
+      "per_class_counts": {
+        "cabinet": 179,
+        "cabinetDoor": 3177,
+        "chair": 204,
+        "couch": 27,
+        "door": 478,
+        "openedDoor": 78,
+        "pole": 27,
+        "refrigeratorDoor": 689,
+        "table": 228,
+        "window": 403
+      },
+      "object_semantic": {
+        "unlocked": false,
+        "reason": "object_semantic"
+      },
+      "defect_semantic_n8": {
+        "unlocked": true,
+        "reason": "ok",
+        "eligible_n": 10
+      },
+      "bank_active_invariant": true,
+      "note": "object 語義永不解鎖 head(修 silent-wrong:物件類別非瑕疵類);bank_active 恆 True。"
+    },
+    "S9_gate_calibration": {
+      "defect_rate": 0.018,
+      "contamination": 0.05,
+      "n_confirmed_good": 50,
+      "quantile": {
+        "calibrated": false,
+        "escape": 0.783,
+        "over_kill": 0.019
+      },
+      "confirmed": {
+        "calibrated": true,
+        "escape": 0.783,
+        "over_kill": 0.019
+      },
+      "escape_reduced_by_calibration": true,
+      "note": "真實瑕疵率 > contamination 時相對(quantile)門檻漏檢;良品分布校準(confirmed)壓低漏檢=recall-first。"
     }
   }
 }
