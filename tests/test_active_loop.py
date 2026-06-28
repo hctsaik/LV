@@ -92,3 +92,15 @@ def test_confusion_priority_guards():  # AC9:空輸入短路、列數不一致�
     assert confusion_targeted_priority(np.array([]), None).shape == (0,)
     with pytest.raises(ValueError):
         confusion_targeted_priority(np.array([0.1, 0.2, 0.3]), np.eye(2))   # 3 vs 2 列
+
+
+def test_curve_single_class_eval_no_warning():  # AC10:eval 退化單類時不洩漏 sklearn 警告、值仍合法
+    import warnings
+    Xp, yp = _blobs(seed=1)
+    Xe = _blobs(seed=2)[0][:10]
+    ye = np.array(["c0"] * 10)                            # eval 故意全單一類
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")                   # 若洩漏 UserWarning 會升為例外
+        curve = label_efficiency_curve(Xp, yp, Xe, ye, strategy="active",
+                                       seed_n=20, batch=20, rounds=3)
+    assert len(curve) >= 1 and all(0.0 <= a <= 1.0 for _, a in curve)

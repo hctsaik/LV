@@ -6,7 +6,8 @@
 
 ## 里程碑
 - **M5 — Active Learning Loop(主動學習標註迴圈)** — ✅ **完成**(2026-06-28) — 把 M2 bank + M3 head +
-  M4 佇列從**開迴圈串成閉迴圈**:佇列選樣→人工標→回流(擴 Normal Bank + 重訓 head)→量測學習曲線→重複。
+  M4 佇列串成主動學習工具:佇列選樣(弱類定向)→ 人工 confirm 回流擴 Normal Bank(真閉環)→ 標註效益
+  學習曲線(主動 vs 隨機,**回顧模擬**展示省標註,不消費 confirm;分類頭重訓走訓練按鈕)→ 曲線走平就停。
   模組 `active_loop`(entropy_score / confusion_targeted_priority 弱類定向 / label_efficiency_curve 學習
   曲線 / should_stop_labeling 停止準則 / round_summary);GUI「🔁 主動學習迴圈」面板(active vs random 學習
   曲線 + 停止建議)+ 取樣佇列加「弱類定向」模式。實證:雙-split S7 主動選樣省 ~60-75% 標註。設計:

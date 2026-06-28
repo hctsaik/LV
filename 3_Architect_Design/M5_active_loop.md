@@ -29,6 +29,8 @@ M5 工具:佇列選樣(弱類定向)→ 人工 confirm 回流 Normal Bank → �
     成單類(那會讓 balanced_accuracy 恆 1.0、學習曲線變假平圖)。不重不漏。
 - `confusion_targeted_priority` 防呆
   - **AC9**:空 anomaly_scores → 回 shape (0,);scores 與 head_proba 列數不一致 → 明確 ValueError。
+- `label_efficiency_curve` 單類 eval 韌性
+  - **AC10**:eval 退化成單一類別時不洩漏 sklearn 警告(內部 catch_warnings)、回傳值仍合法(acc∈[0,1])。
 
 > **誠實界定(名實相符)**:本迴圈對 **Normal Bank 是真閉環**(人工 confirm 的 good/bad 回流擴 bank,
 > 走既有 confirm/rerun);**分類頭重訓走「訓練分類頭」按鈕**(在物件 label 上)。**學習曲線是回顧模擬**
