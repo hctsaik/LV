@@ -1245,6 +1245,24 @@ def _anomaly_save_bank(bank_dir: str, folders: list) -> None:
         st.session_state["_anomaly_bank_err"] = f"存檔失敗:{exc}"
 
 
+def _anomaly_run_loop_curve(emb, lab, pool_i, eval_i, batch) -> None:
+    """M5 主動學習迴圈:在現有物件上跑 active(uncertainty)vs random 標註效益曲線(回流→重訓→量測)。"""
+    from active_loop import label_efficiency_curve
+    try:
+        eff = max(4, min(int(batch), max(2, len(pool_i) // 3)))   # 依池大小縮放,小資料也能跑多輪
+        kw = dict(seed_n=eff, batch=eff, rounds=6)
+        ca = label_efficiency_curve(emb[pool_i], lab[pool_i], emb[eval_i], lab[eval_i],
+                                    strategy="active", **kw)
+        cr = label_efficiency_curve(emb[pool_i], lab[pool_i], emb[eval_i], lab[eval_i],
+                                    strategy="random", **kw)
+        if len(ca) < 2:
+            st.session_state["anomaly_loop_curves"] = {"_err": "類別/樣本不足以跑多輪迴圈"}
+        else:
+            st.session_state["anomaly_loop_curves"] = {"active": ca, "random": cr}
+    except Exception as exc:
+        st.session_state["anomaly_loop_curves"] = {"_err": str(exc)}
+
+
 def _anomaly_train_head() -> None:
     """在凍結 DINOv2 物件特徵上訓練 closed-set 分類頭(用當前物件的 label 當已知類別)。"""
     import numpy as _np
@@ -1525,13 +1543,12 @@ def _anomaly_ui() -> None:
         _almpc = st.slider("每群上限(diversity)", 1, 5, 2, key="anomaly_al_mpc")
         # 優先模式:實測顯示純 novelty 對「撈稀有/未知」最強(距離訊號 > softmax);三訊號合成會被
         # 邊界/分歧稀釋稀有命中 → 預設「偏 novelty」,並把操作點交給使用者。
-        _almode = st.radio("優先模式", ["偏 novelty(對稀有/未知更強)", "三訊號均衡", "純 novelty"],
-                           horizontal=True, key="anomaly_al_mode",
-                           help="Novelty=Normal Bank 異常(距離訊號,對未知最可靠);邊界/分歧靠分類頭,"
-                                "對『撈稀有』會稀釋。要找未知瑕疵→偏 novelty;要找分類頭最猶豫→三訊號均衡。")
-        _wn, _wb, _wd = {"偏 novelty(對稀有/未知更強)": (1.0, 0.4, 0.4),
-                         "三訊號均衡": (1.0, 1.0, 1.0),
-                         "純 novelty": (1.0, 0.0, 0.0)}[_almode]
+        _almode = st.radio(
+            "優先模式",
+            ["偏 novelty(對稀有/未知更強)", "弱類定向(分類頭最混淆)", "三訊號均衡", "純 novelty"],
+            horizontal=True, key="anomaly_al_mode",
+            help="Novelty=Normal Bank 異常(距離訊號,對未知最可靠);弱類定向=novelty+分類頭預測熵"
+                 "(挑分類頭最混淆/最弱的類去標,M5);邊界/分歧靠分類頭,對『撈稀有』會稀釋。")
         from active_learning import priority_score, select_for_labeling
         _proba, _pred_al = None, None
         _head_al = st.session_state.get("anomaly_head")
@@ -1541,9 +1558,16 @@ def _anomaly_ui() -> None:
                 _pred_al, _, _proba = predict_head(_head_al, np.asarray(result["obj_emb"], dtype=float))
             except Exception:
                 _proba = _pred_al = None
-        _pri = priority_score(scores, head_proba=_proba,
-                              anomaly_threshold=float(result["threshold"]),
-                              w_novelty=_wn, w_boundary=_wb, w_disagreement=_wd)
+        if _almode == "弱類定向(分類頭最混淆)":
+            from active_loop import confusion_targeted_priority
+            _pri = confusion_targeted_priority(scores, _proba, w_novelty=1.0, w_entropy=1.0)
+        else:
+            _wn, _wb, _wd = {"偏 novelty(對稀有/未知更強)": (1.0, 0.4, 0.4),
+                             "三訊號均衡": (1.0, 1.0, 1.0),
+                             "純 novelty": (1.0, 0.0, 0.0)}[_almode]
+            _pri = priority_score(scores, head_proba=_proba,
+                                  anomaly_threshold=float(result["threshold"]),
+                                  w_novelty=_wn, w_boundary=_wb, w_disagreement=_wd)
         # diversity 分群:有分類頭 → 用「預測類別」(最自然,別挑一堆同類);否則退回 HDBSCAN 群
         # (高維 DINOv2 上 min_cluster_size≈0.05N 常塌成 1 群、多樣性失效)。
         _div = (_pred_al if _pred_al is not None
@@ -1565,6 +1589,50 @@ def _anomaly_ui() -> None:
         st.button(f"🛒 把取樣佇列 {len(_sel_al)} 個加入購物車(送標註)", key="anomaly_al_cart",
                   disabled=not _sel_al, use_container_width=True,
                   on_click=_anomaly_add_to_cart, args=(records, _sel_al))
+
+    # ── 🔁 主動學習迴圈(M5):標→回流→重訓→量測,證明標註值得 ──
+    _loop_labels = [r.get("label", "") for r in records]
+    _loop_uniq = sorted({l for l in _loop_labels if l})
+    if len(_loop_uniq) >= 2 and len(records) >= 20:
+        with st.expander("🔁 主動學習迴圈(標註效益:主動選樣 vs 隨機 — 看標註是否值得)"):
+            st.caption("把『佇列→人工標→回流(擴 Normal Bank + 重訓分類頭)→量測』串成閉迴圈。"
+                       "學習曲線比較 uncertainty sampling 與隨機:同樣準度,主動選樣通常省 50-70% 標註"
+                       "(雙-split 完整測試實證)。曲線是決策輔助,真實標註仍走上方 confirm。")
+            from active_loop import (label_efficiency_curve, round_summary,
+                                     should_stop_labeling)
+            _emb_l = np.asarray(result["obj_emb"], dtype=float)
+            _lab_l = np.array(_loop_labels)
+            _rng_l = np.random.default_rng(0)
+            _perm = _rng_l.permutation(len(_lab_l))
+            _cut = int(len(_lab_l) * 0.7)
+            _pool_i, _eval_i = _perm[:_cut], _perm[_cut:]
+            _bsz = st.slider("每輪標註數", 10, 60, 30, key="anomaly_loop_batch")
+            st.button("▶ 跑標註效益曲線(主動 vs 隨機)", key="anomaly_loop_run",
+                      use_container_width=True, on_click=_anomaly_run_loop_curve,
+                      args=(_emb_l, _lab_l, _pool_i, _eval_i, _bsz))
+            _cv = st.session_state.get("anomaly_loop_curves")
+            if _cv and "_err" not in _cv:
+                import pandas as pd
+                _ca, _cr = _cv["active"], _cv["random"]
+                _n = min(len(_ca), len(_cr))
+                _df = pd.DataFrame({"標註數": [x[0] for x in _ca[:_n]],
+                                    "主動選樣(active)": [x[1] for x in _ca[:_n]],
+                                    "隨機(random)": [x[1] for x in _cr[:_n]]}).set_index("標註數")
+                st.line_chart(_df)
+                _fa, _fr = _ca[-1][1], _cr[-1][1]
+                _stop = should_stop_labeling(_ca)
+                st.markdown(
+                    f"**最終(標 {_ca[-1][0]} 個):主動 `{_fa:.3f}` vs 隨機 `{_fr:.3f}`** "
+                    f"(主動領先 `{_fa - _fr:+.3f}`)。"
+                    + (" ⏹ 曲線走平 → **建議停止標註**(再標效益遞減)。" if _stop
+                       else " ↗ 仍上升 → **值得繼續標**。"))
+            elif _cv and "_err" in _cv:
+                st.info(f"資料不足以跑迴圈:{_cv['_err']}")
+            _conf_l = st.session_state.get("anomaly_confirmed", {})
+            if _conf_l:
+                _rs = round_summary(_conf_l)
+                st.caption(f"已人工確認 {_rs['total']} 個:"
+                           + " · ".join(f"`{k}` {v}" for k, v in _rs["per_class"].items()))
 
     left, right = st.columns([3, 2], gap="medium")
 
