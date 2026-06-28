@@ -1245,6 +1245,49 @@ def _anomaly_save_bank(bank_dir: str, folders: list) -> None:
         st.session_state["_anomaly_bank_err"] = f"存檔失敗:{exc}"
 
 
+def _anomaly_train_head() -> None:
+    """在凍結 DINOv2 物件特徵上訓練 closed-set 分類頭(用當前物件的 label 當已知類別)。"""
+    import numpy as _np
+
+    from dino_head import train_head
+    res = st.session_state.get("anomaly_result") or {}
+    recs, emb = res.get("records") or [], res.get("obj_emb")
+    if not recs or emb is None:
+        st.session_state["_anomaly_head_err"] = "請先執行偵測產生物件特徵。"
+        return
+    try:
+        head = train_head(_np.asarray(emb, _np.float32),
+                          [r.get("label", "") for r in recs])
+        head["_model_name"] = res.get("_model")
+        st.session_state["anomaly_head"] = head
+        st.session_state.pop("_anomaly_head_err", None)
+    except Exception as exc:                          # <2 類 / 空特徵 → 明確訊息
+        st.session_state["_anomaly_head_err"] = f"訓練失敗:{exc}"
+
+
+def _anomaly_save_head(path: str) -> None:
+    from dino_head import save_head
+    head = st.session_state.get("anomaly_head")
+    if not head:
+        st.session_state["_anomaly_head_err"] = "請先訓練分類頭。"
+        return
+    try:
+        save_head(path, head)
+        st.session_state["_anomaly_head_saved"] = str(path)
+        st.session_state.pop("_anomaly_head_err", None)
+    except Exception as exc:
+        st.session_state["_anomaly_head_err"] = f"存檔失敗:{exc}"
+
+
+def _anomaly_load_head(path: str) -> None:
+    from dino_head import load_head
+    try:
+        st.session_state["anomaly_head"] = load_head(path)
+        st.session_state.pop("_anomaly_head_err", None)
+    except Exception as exc:
+        st.session_state["_anomaly_head_err"] = f"載入失敗:{exc}"
+
+
 def _anomaly_ui() -> None:
     """🔧 瑕疵偵測(AnomalyDINO 風格):載入 YOLO 資料夾 → 物件級 patch 異常分數 →
     排序 + 散點圖框選/購物車 + 熱力圖 + 匯出原圖。實作委派 anomaly_tool.run_pipeline。"""
@@ -1423,6 +1466,42 @@ def _anomaly_ui() -> None:
             _saved2 = st.session_state.pop("_anomaly_bank_saved", None)
             if _saved2:
                 st.success(f"✅ 已存:`{_saved2}` —— 側欄「載入 bank」填這路徑即可在新資料夾重用。")
+
+    # ── 🏷 分類頭(closed-set 已知瑕疵分類)+ 閘控級聯:Normal Bank 異常分數先守門 ──
+    _labels_all = sorted({r.get("label", "") for r in records if r.get("label", "")})
+    if len(_labels_all) >= 2:
+        with st.expander("🏷 瑕疵分類頭(closed-set 已知類別 + 閘控級聯:Normal Bank 先守門)"):
+            st.caption(f"在凍結 DINOv2 物件特徵上訓 linear 分類頭(類別:{', '.join(_labels_all)})。"
+                       "**閘控**:Normal Bank 異常分數先守門 → 只有離正常遠才信任 head 的已知類別;"
+                       "head 沒把握就標 Unknown,不硬塞已知類別(防未知瑕疵被自信誤分)。")
+            st.button("🏷 訓練/重訓分類頭", key="anomaly_train_head_btn",
+                      on_click=_anomaly_train_head, use_container_width=True)
+            if st.session_state.get("_anomaly_head_err"):
+                st.error(st.session_state["_anomaly_head_err"])
+            _head = st.session_state.get("anomaly_head")
+            if _head:
+                from collections import Counter
+
+                from dino_head import gated_predict
+                _mc = st.slider("分類信心門檻(低於 → Unknown)", 0.0, 1.0, 0.5, 0.05,
+                                key="anomaly_head_minconf")
+                _gp = gated_predict(_head, np.asarray(result["obj_emb"], dtype=float), scores,
+                                    anomaly_threshold=float(result["threshold"]), min_conf=_mc)
+                _cnt = Counter(_gp)
+                st.markdown("**閘控分類結果**:" + " · ".join(
+                    f"`{k}` {v}" for k, v in sorted(_cnt.items(), key=lambda kv: -kv[1])))
+                st.caption("(正常=異常分數低於門檻;Unknown=異常高但分類沒把握 → 送人工 / active learning。)")
+                _sc1, _sc2, _sc3 = st.columns([2, 1, 1])
+                _hp = _sc1.text_input(
+                    "分類頭存/讀路徑(.joblib,部署用)", key="anomaly_head_path",
+                    value=_anomaly_bank_default_dir(folders[0] if folders else "", "head") + ".joblib")
+                _sc2.button("💾 存頭", key="anomaly_head_save_btn", disabled=not _hp,
+                            on_click=_anomaly_save_head, args=(_hp,), use_container_width=True)
+                _sc3.button("📂 讀頭", key="anomaly_head_load_btn", disabled=not _hp,
+                            on_click=_anomaly_load_head, args=(_hp,), use_container_width=True)
+                _hsaved = st.session_state.pop("_anomaly_head_saved", None)
+                if _hsaved:
+                    st.success(f"✅ 分類頭已存:`{_hsaved}`")
 
     left, right = st.columns([3, 2], gap="medium")
 
