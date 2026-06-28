@@ -35,8 +35,11 @@ def _run(page):
     wait_idle(page, timeout=60000); page.wait_for_timeout(1500)
 
 
-def test_train_head_gated_classify(app_server, browser, synthetic_yolo_dataset):
-    ds = synthetic_yolo_dataset
+def test_train_head_gated_classify(app_server, browser, yolo_defect_at_nmin):
+    # M6 後 head 解鎖門檻 = 語義=defect AND ≥2 類各達 N_min(預設8)。
+    # 改用 scratch×8 + stain×8 的「每圖單框瑕疵」資料(預設語義 defect、兩類各 8=N_min)
+    # → head expander 會出現,可訓練 + 閘控分類 + 存 .joblib。
+    ds = yolo_defect_at_nmin
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
     page = ctx.new_page()
     page.set_default_timeout(30000)

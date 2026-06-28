@@ -113,3 +113,77 @@ def synthetic_yolo_dataset(tmp_path_factory):
         "defect_box_norm": (defect_px[0] / W, defect_px[1] / H,
                             defect_px[2] / W, defect_px[3] / H),
     }
+
+
+# ── M6 統一主動學習畫面:label 語義 gate 的 E2E fixtures ──
+# 都是「每圖單框」資料(每張圖一個 YOLO box)→ label_semantic_hint 預設偏 'defect'
+# (multi_same_class_ratio=0),好讓 head 解鎖只由「語義=defect AND ≥2 類各達 N_min」決定。
+# 沿用上面 synthetic_yolo_dataset 的 _write 慣例:128x128 綠底、缺陷加色塊、寫
+# images/<stem>.jpg + labels/<stem>.txt + classes.txt。每個 fixture 回 {"root": root}。
+
+def _build_yolo_single_box(root, classes: list[str], specs: list[tuple]):
+    """寫一個「每圖單框」YOLO 偵測資料夾。
+    classes: classes.txt 的類別名(行序=class_id)。
+    specs: [(stem, class_id, patch_rgb_or_None, corner), ...];patch_rgb=None → 純綠底;
+           corner ∈ {"tl","bl"} 決定色塊放左上/左下(讓兩瑕疵類視覺可分)。
+    每張圖整框為物件(cx,cy,w,h≈whole image),class_id 寫進 label。"""
+    (root / "images").mkdir(); (root / "labels").mkdir()
+    (root / "classes.txt").write_text("\n".join(classes) + "\n", encoding="utf-8")
+    W = H = 128
+    box = (0.5, 0.5, 0.92, 0.92)
+    for stem, cls, patch_rgb, corner in specs:
+        img = Image.new("RGB", (W, H), (0, 170, 0))
+        if patch_rgb is not None:
+            # 64x64 ≈ 25% 面積色塊;tl=左上(10..74)、bl=左下(10..74 x、54..118 y)
+            x0 = 10
+            y0 = 10 if corner == "tl" else 54
+            for x in range(x0, x0 + 64):
+                for y in range(y0, y0 + 64):
+                    img.putpixel((x, y), patch_rgb)
+        img.save(root / "images" / f"{stem}.jpg", quality=92)
+        cx, cy, w, h = box
+        (root / "labels" / f"{stem}.txt").write_text(
+            f"{cls} {cx} {cy} {w} {h}\n", encoding="utf-8")
+    return {"root": root}
+
+
+@pytest.fixture(scope="session")
+def yolo_defect_at_nmin(tmp_path_factory):
+    """每圖單框瑕疵資料:scratch(class0,紅塊左上)×8 + stain(class1,藍塊左下)×8。
+    預設語義啟發式 → 'defect',兩類各 8 達預設 N_min=8 → 分類頭解鎖。兩類視覺可分
+    (紅 vs 藍、左上 vs 左下)讓真實 DINOv2 head 學得起來。"""
+    root = tmp_path_factory.mktemp("yolo_defect_at_nmin")
+    specs = []
+    for i in range(8):
+        specs.append((f"scratch_{i:02d}", 0, (220, 0, 0), "tl"))
+    for i in range(8):
+        specs.append((f"stain_{i:02d}", 1, (0, 0, 220), "bl"))
+    return _build_yolo_single_box(root, ["scratch", "stain"], specs)
+
+
+@pytest.fixture(scope="session")
+def yolo_defect_below_nmin(tmp_path_factory):
+    """每圖單框瑕疵資料:scratch(class0,紅塊)×7 + stain(class1,藍塊)×9。
+    預設語義 'defect',但 scratch=7 < 預設 N_min=8 → 達標類 <2 → head 不解鎖。
+    狀態列應列『待補樣本:scratch(7)』。"""
+    root = tmp_path_factory.mktemp("yolo_defect_below_nmin")
+    specs = []
+    for i in range(7):
+        specs.append((f"scratch_{i:02d}", 0, (220, 0, 0), "tl"))
+    for i in range(9):
+        specs.append((f"stain_{i:02d}", 1, (0, 0, 220), "bl"))
+    return _build_yolo_single_box(root, ["scratch", "stain"], specs)
+
+
+@pytest.fixture(scope="session")
+def yolo_object_2class(tmp_path_factory):
+    """每圖單框物件偵測資料:door(class0)×10 + window(class1)×10,都純綠底無瑕疵
+    (視覺相同即可,只測語義 gate 不測準度)。兩類各 10 ≥ N_min=8,所以一旦語義設成
+    'object' 仍不訓 head 就證明是『語義守門』非『資料量不足』。"""
+    root = tmp_path_factory.mktemp("yolo_object_2class")
+    specs = []
+    for i in range(10):
+        specs.append((f"door_{i:02d}", 0, None, "tl"))
+    for i in range(10):
+        specs.append((f"window_{i:02d}", 1, None, "tl"))
+    return _build_yolo_single_box(root, ["door", "window"], specs)

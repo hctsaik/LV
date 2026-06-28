@@ -163,3 +163,109 @@ def run_pipeline(image_paths, class_names, *, mode: str = "two_stage",
             "coords2d": None, "obj_emb": obj_emb, "normal_set": normal_set,
             "bank": bank, "scores": scores, "score_mode": score_mode,
             "skipped": skipped}
+
+
+# ── routing (純函式、streamlit-free、確定性;設計 3_Architect_Design/M6_unified_al_screen.md)──
+# 統一主動學習畫面的「成熟度路由」與「閘控門檻」判定下沉到這層,app.py 只讀回傳 dict、零邏輯。
+# 核心不變量:路由只決定「要不要解鎖分類頭」,絕不決定「Bank 閘有沒有」——run_pipeline 每分支都算 scores。
+
+DEFAULT_N_MIN = 8   # 每類最少樣本才納入閉集 head 訓練。# UNVERIFIED:暫定,須三 split 敏感度掃描定案。
+
+
+def per_class_counts(labels) -> dict:
+    """回 {label: 樣本數}(忽略空字串 label),依 key 排序。供狀態列與 head 解鎖共用。"""
+    counts: dict = {}
+    for l in labels:
+        if l == "" or l is None:
+            continue
+        counts[l] = counts.get(l, 0) + 1
+    return {k: counts[k] for k in sorted(counts)}
+
+
+def head_unlock_state(*, label_semantic, labels, n_min: int = DEFAULT_N_MIN) -> dict:
+    """唯一的分類頭解鎖判定(下沉現 app.py 的隱性 len(labels)>=2)。
+    解鎖 = (label 語義=瑕疵類) AND (distinct 類 ≥2) AND (≥2 個類各達 n_min)。
+    用「每類樣本數」非總數:500 良品 + 某缺陷 3 張 → 仍不解鎖(那 3 張會學歪)。"""
+    per_class = per_class_counts(labels)
+    base = {"per_class": per_class, "n_min": int(n_min), "label_semantic": label_semantic,
+            "eligible_classes": [], "insufficient_classes": {}}
+    if label_semantic not in ("object", "defect"):
+        return {**base, "unlocked": False, "reason": "undeclared_semantics"}
+    if label_semantic == "object":     # 物件類別當瑕疵類訓 head 在語義上是壞的 → 不開放(修 silent-wrong)
+        return {**base, "unlocked": False, "reason": "object_semantic"}
+    if len(per_class) < 2:
+        return {**base, "unlocked": False, "reason": "lt_2_classes"}
+    eligible = [c for c, n in per_class.items() if n >= int(n_min)]
+    insufficient = {c: n for c, n in per_class.items() if n < int(n_min)}
+    base = {**base, "eligible_classes": eligible, "insufficient_classes": insufficient}
+    if len(eligible) >= 2:
+        return {**base, "unlocked": True, "reason": "ok"}
+    return {**base, "unlocked": False, "reason": "classes_below_nmin"}
+
+
+def gate_phase(*, has_confirmed_good: bool, external_bank: bool, head_ready: bool,
+               override=None) -> dict:
+    """狀態列成熟度模式 + 不變量。auto:head 可用→phase2;有 confirmed good 或掛 bank→phase1;否則 phase0。
+    **bank_active 恆 True**(Bank 守門靠 run_pipeline 結構,非狀態列);override 只能改 head 顯不顯,
+    不能關 Bank,且 override='phase2' 在 head 未就緒時降級(不可假裝有 head)。"""
+    if head_ready:
+        auto = "phase2"
+    elif has_confirmed_good or external_bank:
+        auto = "phase1"
+    else:
+        auto = "phase0"
+    phase, overridden = auto, False
+    if override in ("phase0", "phase1", "phase2"):
+        if override == "phase2" and not head_ready:
+            phase, overridden = auto, True              # 假 phase2 → 降級回 auto
+        else:
+            phase, overridden = override, (override != auto)
+    return {"phase": phase, "auto_phase": auto, "overridden": overridden, "bank_active": True}
+
+
+def label_semantic_hint(records) -> dict:
+    """防亂填啟發式(只提示不擋、不自動改值):同圖多個同類框越普遍 → 越像物件偵測(label=物件類)。
+    瑕疵通常一圖零或少數、不會密集同類重複。樣本太少(<3 圖)回 'unknown' 不誤報。"""
+    from collections import Counter
+    by_img: dict = {}
+    for r in records:
+        ip = str(r.get("image_path") or r.get("path") or "")
+        if not ip:
+            continue
+        by_img.setdefault(ip, []).append(r.get("label", ""))
+    n_img = len(by_img)
+    if n_img < 3:
+        return {"suggested": "unknown", "multi_same_class_ratio": 0.0,
+                "boxes_per_image_mean": 0.0, "hint": ""}
+    multi = sum(1 for labs in by_img.values() if max(Counter(labs).values()) >= 2)
+    ratio = multi / n_img
+    bpi = sum(len(v) for v in by_img.values()) / n_img
+    if ratio >= 0.5:
+        return {"suggested": "object", "multi_same_class_ratio": round(ratio, 3),
+                "boxes_per_image_mean": round(bpi, 3),
+                "hint": f"同圖常出現多個同類框(每圖均 {bpi:.1f} 框)→ 較像物件偵測資料,"
+                        "label 多半是物件類別不是瑕疵類別。"}
+    return {"suggested": "defect", "multi_same_class_ratio": round(ratio, 3),
+            "boxes_per_image_mean": round(bpi, 3), "hint": ""}
+
+
+def gate_threshold(scores, *, contamination: float = 0.05, confirmed: dict | None = None,
+                   mode: str = "quantile", min_confirmed: int = 5, p_good: float = 99.0) -> dict:
+    """閘控門檻(解 M6 未解問題2:分位數漂移)。
+    quantile(預設):相對門檻 = scores 的 (1-contamination) 分位 —— 真實瑕疵率 > contamination 時會漏檢(escape)。
+    confirmed:有足夠人工確認良品時,用『良品自身分布 p_good 分位』(絕對、免疫漂移),與相對門檻取 min
+    (recall-first:取較嚴=較低 → 多送人工)。良品不足則誠實退回 quantile、calibrated=False(共存非取代)。"""
+    s = np.asarray(scores, dtype=float)
+    contamination = min(max(float(contamination), 0.0), 1.0)
+    thr_rel = float(np.quantile(s, 1.0 - contamination)) if s.size else float("inf")
+    if mode != "confirmed":
+        return {"threshold": thr_rel, "mode_used": "quantile", "calibrated": False,
+                "reason": "relative_quantile"}
+    conf = {int(k): v for k, v in (confirmed or {}).items()}
+    good_idx = [i for i, v in conf.items() if v == "good" and 0 <= i < s.size]
+    if len(good_idx) < int(min_confirmed):
+        return {"threshold": thr_rel, "mode_used": "quantile", "calibrated": False,
+                "reason": "insufficient_confirmed"}
+    thr_abs = float(np.percentile(s[good_idx], float(p_good)))
+    return {"threshold": min(thr_abs, thr_rel), "mode_used": "confirmed",
+            "calibrated": True, "reason": "good_percentile"}

@@ -1263,20 +1263,29 @@ def _anomaly_run_loop_curve(emb, lab, pool_i, eval_i, batch) -> None:
         st.session_state["anomaly_loop_curves"] = {"_err": str(exc)}
 
 
-def _anomaly_train_head() -> None:
-    """在凍結 DINOv2 物件特徵上訓練 closed-set 分類頭(用當前物件的 label 當已知類別)。"""
+def _anomaly_train_head(eligible=None) -> None:
+    """訓 closed-set 瑕疵分類頭。**語義安全鎖**:label 語義非『瑕疵類』→ 拒訓(防把物件類別當瑕疵類,
+    修 silent-wrong)。只用 eligible(達 N_min)類別的物件訓;樣本不足的類維持走 Bank→Unknown 佇列。"""
     import numpy as _np
 
     from dino_head import train_head
+    if st.session_state.get("anomaly_active_semantic") != "defect":   # 雙保險:UI gate + 此處硬守衛
+        st.session_state["_anomaly_head_err"] = (
+            "label 語義非『瑕疵類別』,不訓分類頭(把物件類別當瑕疵類在語義上是壞的)。"
+            "請在『⚙ 進階』把 label 語義宣告為『瑕疵類別』。")
+        return
     res = st.session_state.get("anomaly_result") or {}
     recs, emb = res.get("records") or [], res.get("obj_emb")
     if not recs or emb is None:
         st.session_state["_anomaly_head_err"] = "請先執行偵測產生物件特徵。"
         return
+    labels = [r.get("label", "") for r in recs]
+    elig = set(eligible) if eligible else {l for l in labels if l}
+    keep = [i for i, l in enumerate(labels) if l in elig]            # 只用達標類別的物件
     try:
-        head = train_head(_np.asarray(emb, _np.float32),
-                          [r.get("label", "") for r in recs])
+        head = train_head(_np.asarray(emb, _np.float32)[keep], [labels[i] for i in keep])
         head["_model_name"] = res.get("_model")
+        head["_eligible"] = sorted(elig)
         st.session_state["anomaly_head"] = head
         st.session_state.pop("_anomaly_head_err", None)
     except Exception as exc:                          # <2 類 / 空特徵 → 明確訊息
@@ -1470,6 +1479,55 @@ def _anomaly_ui() -> None:
                    "請走 **2-stage**:在下方散點圖**框選你確定正常的那一團點 →「✅ 框選標為正常範例」**"
                    "(或用「自動把最不可疑的 N 個標為正常範例」),再按「執行偵測」即用乾淨參考重新評分。")
 
+    # ── M6 統一畫面:label 語義宣告 + 成熟度狀態列(判定下沉 anomaly_tool 純函式,此處只呈現)──
+    from anomaly_tool import head_unlock_state as _hus
+    from anomaly_tool import label_semantic_hint as _lsh
+    _folder_sig = str(hash(tuple(sorted(str(f) for f in folders))))
+    _sem_key = f"anomaly_sem_{_folder_sig}"
+    _hint = _lsh(records)
+    if _sem_key not in st.session_state:                    # 預設由啟發式給(安全側偏 object),可改
+        st.session_state[_sem_key] = _hint["suggested"] if _hint["suggested"] in ("object", "defect") else "object"
+    st.session_state.setdefault("anomaly_n_min", 8)
+    _sem = st.session_state[_sem_key]
+    _nmin = int(st.session_state["anomaly_n_min"])
+    _labels_list = [r.get("label", "") for r in records]
+    _unlock = _hus(label_semantic=_sem, labels=_labels_list, n_min=_nmin)
+    _ovr = st.session_state.get("anomaly_phase_override")
+    _head_ready = bool(st.session_state.get("anomaly_head")) and _unlock["unlocked"]
+    _eff_phase = _ovr if _ovr in ("phase0", "phase1", "phase2") else (
+        "phase2" if _head_ready else ("phase1" if (st.session_state.get("anomaly_confirmed")
+                                                   or result.get("_loaded_bank")) else "phase0"))
+    if _eff_phase == "phase2" and not _head_ready:          # 假 phase2 降級(無 head 不可假裝)
+        _eff_phase = "phase1" if (st.session_state.get("anomaly_confirmed") or result.get("_loaded_bank")) else "phase0"
+    _phase_label = {"phase0": "Phase0 冷啟(無監督守未知)", "phase1": "Phase1 對照 few-shot bank",
+                    "phase2": "Phase2 bank + head 閘控級聯"}[_eff_phase]
+    _pc = _unlock["per_class"]
+    _pc_str = (" · ".join(f"`{k}`{v}" for k, v in list(_pc.items())[:8]) + ("…" if len(_pc) > 8 else "")) or "(無 label)"
+    _head_state = ("🟢 達門檻可訓分類頭" if _unlock["unlocked"] else
+                   {"object_semantic": "⚪ label=物件類別 → 不訓瑕疵 head(語義安全鎖)",
+                    "undeclared_semantics": "⚪ 待宣告 label 語義",
+                    "lt_2_classes": "⚪ 已知類別不足 2 種 → 純 Bank 守未知",
+                    "classes_below_nmin": f"⚪ 達標類 <2(每類需 ≥N_min={_nmin})→ 暫不訓 head"}.get(_unlock["reason"], "⚪"))
+    st.caption(f"🧭 **{_phase_label}** ｜ 🟢 Normal Bank 守門:啟用(恆在) ｜ 每類樣本:{_pc_str} ｜ {_head_state}"
+               + (f" ｜ 待補樣本:{', '.join(f'{c}({n})' for c, n in _unlock['insufficient_classes'].items())}"
+                  if _unlock["insufficient_classes"] else ""))
+    with st.popover("⚙ 進階(label 語義 / 模式覆寫 / N_min)"):
+        st.radio("這批 YOLO label 的語義", ["object", "defect"], key=_sem_key,
+                 format_func=lambda s: {"object": "物件類別(door/window…)→ 不訓瑕疵分類頭",
+                                        "defect": "瑕疵類別(刮傷/污漬…)→ 解鎖瑕疵分類頭"}[s])
+        if st.session_state[_sem_key] == "defect" and _hint["suggested"] == "object":
+            st.warning("⚠ " + _hint["hint"] + " 確定是瑕疵類別嗎?")
+        st.selectbox("手動覆寫模式", [None, "phase0", "phase1", "phase2"], key="anomaly_phase_override",
+                     format_func=lambda v: {None: "自動", "phase0": "強制 Phase0(只 Bank)",
+                                            "phase1": "強制 Phase1", "phase2": "強制 Phase2(顯示 head)"}.get(v, str(v)),
+                     help="只改 head 顯不顯;Normal Bank 守門恆在、不可關。")
+        st.slider("N_min(每類最少樣本才納入 head;**暫定·未經敏感度掃描驗證**)", 2, 30,
+                  key="anomaly_n_min")
+    # popover 內語義/N_min 可能被改 → 用最新值重算解鎖供下方 head 區塊
+    _sem = st.session_state[_sem_key]
+    st.session_state["anomaly_active_semantic"] = _sem      # 供 _anomaly_train_head callback 硬守衛讀
+    _unlock = _hus(label_semantic=_sem, labels=_labels_list, n_min=int(st.session_state["anomaly_n_min"]))
+
     smin, smax = float(scores.min()), float(scores.max())
     # 把本次結果存成可攜 bank(放主畫面 result 區 → 一定看得到本輪 result;掛載模式不重複存)
     if records and not result.get("_loaded_bank"):
@@ -1485,15 +1543,15 @@ def _anomaly_ui() -> None:
             if _saved2:
                 st.success(f"✅ 已存:`{_saved2}` —— 側欄「載入 bank」填這路徑即可在新資料夾重用。")
 
-    # ── 🏷 分類頭(closed-set 已知瑕疵分類)+ 閘控級聯:Normal Bank 異常分數先守門 ──
-    _labels_all = sorted({r.get("label", "") for r in records if r.get("label", "")})
-    if len(_labels_all) >= 2:
+    # ── 🏷 分類頭:additive 第二段,僅在 label 語義=瑕疵類 AND ≥2 類各達 N_min 才解鎖(覆寫 phase0 可強制隱藏)──
+    if _unlock["unlocked"] and _ovr != "phase0":
         with st.expander("🏷 瑕疵分類頭(closed-set 已知類別 + 閘控級聯:Normal Bank 先守門)"):
-            st.caption(f"在凍結 DINOv2 物件特徵上訓 linear 分類頭(類別:{', '.join(_labels_all)})。"
+            st.caption(f"在凍結 DINOv2 物件特徵上訓 linear 分類頭(達標類別:{', '.join(_unlock['eligible_classes'])})。"
                        "**閘控**:Normal Bank 異常分數先守門 → 只有離正常遠才信任 head 的已知類別;"
                        "head 沒把握就標 Unknown,不硬塞已知類別(防未知瑕疵被自信誤分)。")
             st.button("🏷 訓練/重訓分類頭", key="anomaly_train_head_btn",
-                      on_click=_anomaly_train_head, use_container_width=True)
+                      on_click=_anomaly_train_head, args=(_unlock["eligible_classes"],),
+                      use_container_width=True)
             if st.session_state.get("_anomaly_head_err"):
                 st.error(st.session_state["_anomaly_head_err"])
             _head = st.session_state.get("anomaly_head")
@@ -1510,7 +1568,15 @@ def _anomaly_ui() -> None:
                                      help="Normal Bank 守門門檻 = 異常分數的 (1−contamination) 百分位。"
                                           "『正常』占比 ≈ 1−contamination 是設計恆等(不是偵測到多少正常)。"
                                           "recall-first 要少漏檢 → 調高 contamination(門檻降、更多送人工複檢)。")
-                _gthr = float(np.quantile(scores, 1.0 - _cont)) if len(scores) else float(result["threshold"])
+                from anomaly_tool import gate_threshold as _gtf
+                _gcal = st.checkbox("用已確認良品分布校準門檻(免疫分位數漂移;需 ≥5 個確認良品)",
+                                    key="anomaly_gate_calibrate",
+                                    help="勾 → 門檻=min(良品99分位, 相對分位);真實瑕疵率 > contamination 時"
+                                         "相對門檻會漏檢真瑕疵,良品校準門檻可救(recall-first)。良品不足自動退回相對門檻。")
+                _gt = _gtf(scores, contamination=_cont,
+                           confirmed=st.session_state.get("anomaly_confirmed"),
+                           mode=("confirmed" if _gcal else "quantile"))
+                _gthr = float(_gt["threshold"]) if len(scores) else float(result["threshold"])
                 _gp = gated_predict(_head, np.asarray(result["obj_emb"], dtype=float), scores,
                                     anomaly_threshold=_gthr, min_conf=_mc)
                 _cnt = Counter(_gp)
@@ -1518,7 +1584,9 @@ def _anomaly_ui() -> None:
                 _nrm = _cnt.get("正常", 0)
                 st.markdown("**閘控分類結果**:" + " · ".join(
                     f"`{k}` {v}" for k, v in sorted(_cnt.items(), key=lambda kv: -kv[1])))
-                st.caption(f"正常 {_nrm / _ntot:.0%}(≈1−contamination,設計恆等)· "
+                _cal_note = ("🟢 已用良品分布校準(免疫漂移)" if _gt["calibrated"]
+                             else ("⚠ 良品不足、退回相對門檻" if _gcal else "相對分位門檻"))
+                st.caption(f"正常 {_nrm / _ntot:.0%}(≈1−contamination,設計恆等;{_cal_note})· "
                            f"送 head/人工 {1 - _nrm / _ntot:.0%} · Unknown {_cnt.get('Unknown', 0)}。"
                            "拉『閘控靈敏度』即移動 recall-first 操作點(↑ 少漏檢、多過殺;Unknown→送 active learning)。")
                 _sc1, _sc2, _sc3 = st.columns([2, 1, 1])

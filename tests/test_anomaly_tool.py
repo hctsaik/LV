@@ -90,3 +90,124 @@ def test_no_dataset_pollution(synthetic_yolo_dataset, color_patch_extractor, col
                  extractor=color_patch_extractor(), embed_fn=color_object_embed,
                  cache_dir=tmp_path / "cache")
     assert set(root.rglob("*")) == before
+
+
+# ── M6 統一畫面路由純函式(設計 3_Architect_Design/M6_unified_al_screen.md)──
+from anomaly_tool import (gate_phase, gate_threshold, head_unlock_state,  # noqa: E402
+                          label_semantic_hint, per_class_counts)
+
+
+def test_per_class_counts_boundaries():  # AC-F1a/b/c
+    assert per_class_counts([]) == {}
+    assert per_class_counts(["", "", None]) == {}
+    assert per_class_counts(["a", "a", "b"]) == {"a": 2, "b": 1}
+
+
+def test_head_unlock_object_semantics_never_unlocks():  # AC-F2a:物件語義永不解鎖(鎖死 silent-wrong 修復)
+    u = head_unlock_state(label_semantic="object", labels=["c%d" % (i % 5) for i in range(500)])
+    assert u["unlocked"] is False and u["reason"] == "object_semantic"
+
+
+def test_head_unlock_undeclared_semantics():  # AC-F2b
+    for sem in (None, "", "bogus"):
+        u = head_unlock_state(label_semantic=sem, labels=["a"] * 9 + ["b"] * 9)
+        assert u["unlocked"] is False and u["reason"] == "undeclared_semantics"
+
+
+def test_head_unlock_lt2_classes():  # AC-F2c:空/單類
+    assert head_unlock_state(label_semantic="defect", labels=[])["reason"] == "lt_2_classes"
+    assert head_unlock_state(label_semantic="defect", labels=["a"] * 50)["reason"] == "lt_2_classes"
+
+
+def test_head_unlock_below_nmin_stays_bank_only():  # AC-F2d
+    u = head_unlock_state(label_semantic="defect", labels=["scratch"] * 7 + ["stain"] * 9, n_min=8)
+    assert u["unlocked"] is False and u["reason"] == "classes_below_nmin"
+    assert u["insufficient_classes"] == {"scratch": 7} and u["eligible_classes"] == ["stain"]
+
+
+def test_head_unlock_exactly_nmin_unlocks():  # AC-F2e:等號邊界
+    u = head_unlock_state(label_semantic="defect", labels=["a"] * 8 + ["b"] * 8, n_min=8)
+    assert u["unlocked"] is True and u["reason"] == "ok" and set(u["eligible_classes"]) == {"a", "b"}
+
+
+def test_head_unlock_min_class_rule_not_total():  # AC-F2f:最小類規則非總數
+    u = head_unlock_state(label_semantic="defect", labels=["good"] * 500 + ["scratch"] * 3, n_min=8)
+    assert u["unlocked"] is False and u["insufficient_classes"] == {"scratch": 3}
+
+
+def test_head_unlock_single_eligible_no_unlock():  # AC-F2g:只 1 類達標 → 不解鎖
+    u = head_unlock_state(label_semantic="defect", labels=["a"] * 8 + ["b"] * 3, n_min=8)
+    assert u["unlocked"] is False and u["eligible_classes"] == ["a"]
+
+
+def test_gate_phase_auto():  # AC-F3a
+    assert gate_phase(has_confirmed_good=False, external_bank=False, head_ready=False)["phase"] == "phase0"
+    assert gate_phase(has_confirmed_good=True, external_bank=False, head_ready=False)["phase"] == "phase1"
+    assert gate_phase(has_confirmed_good=False, external_bank=True, head_ready=False)["phase"] == "phase1"
+    assert gate_phase(has_confirmed_good=True, external_bank=False, head_ready=True)["phase"] == "phase2"
+
+
+def test_bank_always_active():  # AC-F3b:窮舉 phase/override/head_ready → bank_active 恆 True(顯示鎖)
+    for hcg in (False, True):
+        for ext in (False, True):
+            for hr in (False, True):
+                for ov in (None, "phase0", "phase1", "phase2"):
+                    assert gate_phase(has_confirmed_good=hcg, external_bank=ext,
+                                      head_ready=hr, override=ov)["bank_active"] is True
+
+
+def test_gate_phase_demote_fake_phase2():  # AC-F3c:override phase2 但無 head → 降級 + overridden
+    g = gate_phase(has_confirmed_good=False, external_bank=False, head_ready=False, override="phase2")
+    assert g["phase"] == "phase0" and g["overridden"] is True
+
+
+def test_label_semantic_hint_object_vs_defect():  # AC-F4a/b
+    obj = [{"image_path": f"img{i}.jpg", "label": "door"} for i in range(5)
+           for _ in range(3)]   # 每圖 3 個同類框 → 像物件偵測
+    assert label_semantic_hint(obj)["suggested"] == "object"
+    dfc = [{"image_path": f"img{i}.jpg", "label": "scratch"} for i in range(5)]  # 每圖單框
+    assert label_semantic_hint(dfc)["suggested"] != "object"
+
+
+def test_label_semantic_hint_unknown_on_tiny():  # AC-F4c
+    assert label_semantic_hint([])["suggested"] == "unknown"
+    assert label_semantic_hint([{"image_path": "a.jpg", "label": "x"}])["suggested"] == "unknown"
+
+
+def test_quantile_gate_is_identity():  # AC-F5a:正常占比≈1-contam 是設計恆等
+    scores = np.linspace(0, 1, 100)
+    thr = gate_threshold(scores, contamination=0.05)["threshold"]
+    assert 93 <= int((scores < thr).sum()) <= 97          # ~95% 落門檻下(與真實瑕疵數無關)
+
+
+def test_quantile_gate_escapes_when_defect_rate_exceeds_contam():  # AC-F5b:相對門檻會漏檢
+    # 80 良品(0)+ 20 真瑕疵(分數各異 1~5);contamination 5% → 門檻只抓前 ~5% → 多數真瑕疵漏
+    scores = np.concatenate([np.zeros(80), np.linspace(1.0, 5.0, 20)])
+    thr = gate_threshold(scores, contamination=0.05, mode="quantile")["threshold"]
+    escaped = int((scores[80:] < thr).sum())              # 真瑕疵被判正常(< 門檻)
+    assert escaped >= 10
+
+
+def test_confirmed_gate_does_not_escape():  # AC-F5c:良品分布校準門檻 → 真瑕疵不漏
+    scores = np.concatenate([np.zeros(80), np.linspace(1.0, 5.0, 20)])
+    confirmed = {i: "good" for i in range(10)}            # 10 個確認良品(分數 0)
+    g = gate_threshold(scores, contamination=0.05, confirmed=confirmed, mode="confirmed")
+    assert g["calibrated"] is True
+    assert int((scores[80:] < g["threshold"]).sum()) == 0  # 真瑕疵全在門檻上 → 0 漏
+
+
+def test_confirmed_insufficient_falls_back():  # AC-F5d:良品不足 → 退回 quantile、誠實不假裝校準
+    scores = np.linspace(0, 1, 100)
+    g = gate_threshold(scores, confirmed={0: "good", 1: "good"}, mode="confirmed", min_confirmed=5)
+    assert g["calibrated"] is False and g["reason"] == "insufficient_confirmed"
+    assert g["threshold"] == pytest.approx(gate_threshold(scores, contamination=0.05)["threshold"])
+
+
+def test_run_pipeline_always_returns_scores(synthetic_yolo_dataset, color_patch_extractor, color_object_embed):
+    # 結構不變量(Bank 骨幹的真鎖):注入可分 fake → 每分支都算過 scores(長度 N 且非佔位零)
+    ip, cn, meta, *_ = _ds(synthetic_yolo_dataset)
+    for kw in ({"score_mode": "object"}, {"score_mode": "patch"}):
+        r = run_pipeline(ip, cn, mode="one_stage", extractor=color_patch_extractor(),
+                         embed_fn=color_object_embed, **kw)
+        s = np.asarray(r["scores"], float)
+        assert s.shape[0] == len(meta) and float(s.std()) > 0.0
