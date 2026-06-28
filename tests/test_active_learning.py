@@ -60,3 +60,20 @@ def test_priority_combines_signals():  # AC7:三訊號加權合成 + 形狀
     proba = np.array([[0.9, 0.1, 0.0], [0.34, 0.33, 0.33], [0.6, 0.4, 0.0]])
     p = priority_score(a, head_proba=proba, anomaly_threshold=0.4)
     assert p.shape == (3,) and np.isfinite(p).all()
+
+
+def test_novelty_weighting_modes():  # AC8:偏 novelty 不讓「最異常」更靠後;純 novelty 必把它排第一
+    # (實測:三訊號合成會被邊界/分歧稀釋稀有命中 → GUI 預設偏 novelty,鎖定此語義)
+    a = np.array([0.9, 0.5, 0.1])
+    proba = np.array([[0.99, 0.01, 0.0],   # idx0 最異常但 head 很確定(邊界/分歧小)
+                      [0.40, 0.35, 0.25],  # idx1 異常中等但在決策邊界(邊界大)
+                      [0.95, 0.03, 0.02]])
+
+    def rank_of(p, i):
+        return int(np.where(np.argsort(-p) == i)[0][0])
+
+    p_bal = priority_score(a, head_proba=proba, anomaly_threshold=0.4, w_boundary=1, w_disagreement=1)
+    p_nov = priority_score(a, head_proba=proba, anomaly_threshold=0.4, w_boundary=0.4, w_disagreement=0.4)
+    assert rank_of(p_nov, 0) <= rank_of(p_bal, 0)         # 偏 novelty 不讓最異常的 idx0 更靠後
+    p_pure = priority_score(a, w_boundary=0, w_disagreement=0)
+    assert int(np.argmax(p_pure)) == 0                    # 純 novelty → 最異常者第一

@@ -1,0 +1,223 @@
+{
+  "data": {
+    "train_objects": 5490,
+    "train_secs": 80.6,
+    "class_counts": {
+      "cabinet": 179,
+      "cabinetDoor": 3177,
+      "chair": 204,
+      "couch": 27,
+      "door": 478,
+      "openedDoor": 78,
+      "pole": 27,
+      "refrigeratorDoor": 689,
+      "table": 228,
+      "window": 403
+    }
+  },
+  "scenarios": {
+    "S1_normal_bank_novelty": {
+      "auroc_rare_vs_anomaly": 0.742,
+      "rare_rate_overall": 0.098,
+      "rare_rate_in_top10pct_anomaly": 0.239,
+      "per_rare_class_auroc": {
+        "cabinet": 0.599,
+        "couch": 0.884,
+        "openedDoor": 0.752,
+        "pole": 0.775,
+        "table": 0.789
+      },
+      "auroc_rare_ci95": [
+        0.718,
+        0.763
+      ]
+    },
+    "S2_bank_persist_crossfolder": {
+      "saved_files": [
+        "meta.json",
+        "projection.npz"
+      ],
+      "compat_ok": true,
+      "incompat_rejected": true,
+      "proj_roundtrip_max_abs_diff": 0.0,
+      "proj_roundtrip_equal": true,
+      "valid_scored_with_train_ref": true,
+      "train_ref_scores_nondegenerate": true
+    },
+    "S3_classification_head": {
+      "valid_balanced_acc": 0.844,
+      "valid_acc": 0.864,
+      "majority_baseline": 0.593,
+      "balanced_chance": 0.1,
+      "per_class_recall": {
+        "cabinet": 0.844,
+        "cabinetDoor": 0.869,
+        "chair": 0.878,
+        "couch": 1.0,
+        "door": 0.711,
+        "openedDoor": 0.692,
+        "pole": 0.889,
+        "refrigeratorDoor": 0.927,
+        "table": 0.675,
+        "window": 0.956
+      },
+      "rare_class_mean_recall": 0.82,
+      "mean_conf_correct": 0.782,
+      "mean_conf_wrong": 0.515,
+      "rare_class_valid_n": {
+        "cabinet": 32,
+        "couch": 1,
+        "openedDoor": 13,
+        "pole": 9,
+        "table": 40
+      },
+      "calibration_gap_correct_minus_wrong": 0.267,
+      "balanced_acc_ci95": [
+        0.79,
+        0.881
+      ],
+      "rare_recall_macro_ci95": [
+        0.708,
+        0.891
+      ],
+      "rare_class_recall_weighted": 0.758
+    },
+    "S4_gated_cascade": {
+      "contamination_scan": {
+        "c0.02": {
+          "normal_share": 0.98,
+          "defect_escape": 0.913,
+          "defect_escape_ci95": [
+            0.783,
+            1.0
+          ],
+          "good_overkill": 0.016,
+          "good_overkill_ci95": [
+            0.009,
+            0.024
+          ]
+        },
+        "c0.05": {
+          "normal_share": 0.95,
+          "defect_escape": 0.783,
+          "defect_escape_ci95": [
+            0.609,
+            0.913
+          ],
+          "good_overkill": 0.036,
+          "good_overkill_ci95": [
+            0.025,
+            0.047
+          ]
+        },
+        "c0.1": {
+          "normal_share": 0.9,
+          "defect_escape": 0.652,
+          "defect_escape_ci95": [
+            0.435,
+            0.826
+          ],
+          "good_overkill": 0.077,
+          "good_overkill_ci95": [
+            0.063,
+            0.093
+          ]
+        },
+        "c0.2": {
+          "normal_share": 0.8,
+          "defect_escape": 0.348,
+          "defect_escape_ci95": [
+            0.174,
+            0.522
+          ],
+          "good_overkill": 0.153,
+          "good_overkill_ci95": [
+            0.134,
+            0.173
+          ]
+        },
+        "c0.3": {
+          "normal_share": 0.7,
+          "defect_escape": 0.261,
+          "defect_escape_ci95": [
+            0.087,
+            0.435
+          ],
+          "good_overkill": 0.246,
+          "good_overkill_ci95": [
+            0.222,
+            0.271
+          ]
+        }
+      },
+      "normal_share_note": "正常占比 ≈ 1-contamination 為門檻設計恆等,非偵測訊號"
+    },
+    "S5_active_learning": {
+      "k": 30,
+      "default_mode": "blend(1,0.4,0.4)",
+      "rare_rate_in_AL_queue": 0.267,
+      "rare_rate_AL_ci95": [
+        0.133,
+        0.433
+      ],
+      "rare_rate_random_mean20seed": 0.078,
+      "rare_rate_by_mode": {
+        "novelty": 0.333,
+        "blend_default": 0.267,
+        "balanced_old": 0.233
+      },
+      "mean_conf_in_AL_queue": 0.427,
+      "mean_conf_random_mean20seed": 0.739,
+      "true_label_groups_covered_AL": 9,
+      "true_label_groups_total": 10
+    },
+    "S6_escape_overkill": {
+      "valid_good_n": 1145,
+      "valid_bad_n": 23,
+      "auroc_good_vs_bad": 0.886,
+      "tradeoff": {
+        "p70": {
+          "escape_rate": 0.0,
+          "escape_ci95": [
+            0.0,
+            0.0
+          ],
+          "over_kill": 0.564
+        },
+        "p80": {
+          "escape_rate": 0.043,
+          "escape_ci95": [
+            0.0,
+            0.13
+          ],
+          "over_kill": 0.396
+        },
+        "p90": {
+          "escape_rate": 0.217,
+          "escape_ci95": [
+            0.087,
+            0.391
+          ],
+          "over_kill": 0.176
+        },
+        "p95": {
+          "escape_rate": 0.391,
+          "escape_ci95": [
+            0.217,
+            0.609
+          ],
+          "over_kill": 0.097
+        },
+        "p99": {
+          "escape_rate": 0.826,
+          "escape_ci95": [
+            0.652,
+            0.957
+          ],
+          "over_kill": 0.017
+        }
+      },
+      "note": "稀有類視覺相似常見物件時(非強離群)escape 偏高屬資料特性;valid_bad_n=23"
+    }
+  }
+}

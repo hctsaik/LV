@@ -59,5 +59,17 @@ def test_auroc_matches_sklearn():  # AC5(對齊 sklearn,設計成 0.75)
 def test_empty_and_all_invalid_confirmed():  # AC6(推導:退化不崩)
     r = classify(np.array([]), confirmed={9: "bad"})
     assert list(r["labels"]) == [] and r["ranking"] == [] and r["n_bad"] == 0
+
+
+def test_contamination_monotonic_recall_first():  # AC7:recall-first 契約 — contamination↑ → flagged 單調不減
+    # 閘控/掃描的 recall-first 旋鈕語義:調高 contamination → 門檻降 → 被標 bad(送人工)數不減、門檻不增。
+    rng = np.random.default_rng(3)
+    scores = rng.uniform(0.0, 1.0, 300)
+    prev_nbad, prev_thr = -1, float("inf")
+    for cont in (0.02, 0.05, 0.10, 0.20, 0.30, 0.50):
+        r = classify(scores, contamination=cont)
+        assert r["n_bad"] >= prev_nbad        # flagged 單調不減
+        assert r["threshold"] <= prev_thr + 1e-9   # 門檻單調不增
+        prev_nbad, prev_thr = r["n_bad"], r["threshold"]
     r2 = classify(np.array([0.1, 0.5]), confirmed={99: "bad", 0: "weird"})
     assert r2["auroc"] is None  # 全越界/非法 → 退回無標籤路

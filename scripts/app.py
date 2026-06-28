@@ -1483,14 +1483,26 @@ def _anomaly_ui() -> None:
                 from collections import Counter
 
                 from dino_head import gated_predict
-                _mc = st.slider("分類信心門檻(低於 → Unknown)", 0.0, 1.0, 0.5, 0.05,
-                                key="anomaly_head_minconf")
+                _gcc1, _gcc2 = st.columns(2)
+                _mc = _gcc1.slider("分類信心門檻(低於 → Unknown)", 0.0, 1.0, 0.5, 0.05,
+                                   key="anomaly_head_minconf")
+                # 閘控靈敏度 = recall-first 操作點旋鈕:contamination↑ → 門檻↓ → 更多物件送 head/人工(少漏檢、多過殺)
+                _cont = _gcc2.slider("閘控靈敏度 contamination(↑ 少漏檢·多過殺)", 0.01, 0.30, 0.05, 0.01,
+                                     key="anomaly_gate_contam",
+                                     help="Normal Bank 守門門檻 = 異常分數的 (1−contamination) 百分位。"
+                                          "『正常』占比 ≈ 1−contamination 是設計恆等(不是偵測到多少正常)。"
+                                          "recall-first 要少漏檢 → 調高 contamination(門檻降、更多送人工複檢)。")
+                _gthr = float(np.quantile(scores, 1.0 - _cont)) if len(scores) else float(result["threshold"])
                 _gp = gated_predict(_head, np.asarray(result["obj_emb"], dtype=float), scores,
-                                    anomaly_threshold=float(result["threshold"]), min_conf=_mc)
+                                    anomaly_threshold=_gthr, min_conf=_mc)
                 _cnt = Counter(_gp)
+                _ntot = max(1, len(_gp))
+                _nrm = _cnt.get("正常", 0)
                 st.markdown("**閘控分類結果**:" + " · ".join(
                     f"`{k}` {v}" for k, v in sorted(_cnt.items(), key=lambda kv: -kv[1])))
-                st.caption("(正常=異常分數低於門檻;Unknown=異常高但分類沒把握 → 送人工 / active learning。)")
+                st.caption(f"正常 {_nrm / _ntot:.0%}(≈1−contamination,設計恆等)· "
+                           f"送 head/人工 {1 - _nrm / _ntot:.0%} · Unknown {_cnt.get('Unknown', 0)}。"
+                           "拉『閘控靈敏度』即移動 recall-first 操作點(↑ 少漏檢、多過殺;Unknown→送 active learning)。")
                 _sc1, _sc2, _sc3 = st.columns([2, 1, 1])
                 _hp = _sc1.text_input(
                     "分類頭存/讀路徑(.joblib,部署用)", key="anomaly_head_path",
@@ -1511,20 +1523,32 @@ def _anomaly_ui() -> None:
         _alk = st.slider("挑幾個送標註", 1, min(48, len(records)), min(12, len(records)),
                          key="anomaly_al_k")
         _almpc = st.slider("每群上限(diversity)", 1, 5, 2, key="anomaly_al_mpc")
+        # 優先模式:實測顯示純 novelty 對「撈稀有/未知」最強(距離訊號 > softmax);三訊號合成會被
+        # 邊界/分歧稀釋稀有命中 → 預設「偏 novelty」,並把操作點交給使用者。
+        _almode = st.radio("優先模式", ["偏 novelty(對稀有/未知更強)", "三訊號均衡", "純 novelty"],
+                           horizontal=True, key="anomaly_al_mode",
+                           help="Novelty=Normal Bank 異常(距離訊號,對未知最可靠);邊界/分歧靠分類頭,"
+                                "對『撈稀有』會稀釋。要找未知瑕疵→偏 novelty;要找分類頭最猶豫→三訊號均衡。")
+        _wn, _wb, _wd = {"偏 novelty(對稀有/未知更強)": (1.0, 0.4, 0.4),
+                         "三訊號均衡": (1.0, 1.0, 1.0),
+                         "純 novelty": (1.0, 0.0, 0.0)}[_almode]
         from active_learning import priority_score, select_for_labeling
-        _proba = None
+        _proba, _pred_al = None, None
         _head_al = st.session_state.get("anomaly_head")
         if _head_al:
             from dino_head import predict_head
             try:
-                _, _, _proba = predict_head(_head_al, np.asarray(result["obj_emb"], dtype=float))
+                _pred_al, _, _proba = predict_head(_head_al, np.asarray(result["obj_emb"], dtype=float))
             except Exception:
-                _proba = None
+                _proba = _pred_al = None
         _pri = priority_score(scores, head_proba=_proba,
-                              anomaly_threshold=float(result["threshold"]))
-        _cl_labels = (result.get("cluster") or {}).get("labels")
-        _sel_al = select_for_labeling(_pri, k=_alk, cluster_labels=_cl_labels,
-                                      max_per_cluster=_almpc)
+                              anomaly_threshold=float(result["threshold"]),
+                              w_novelty=_wn, w_boundary=_wb, w_disagreement=_wd)
+        # diversity 分群:有分類頭 → 用「預測類別」(最自然,別挑一堆同類);否則退回 HDBSCAN 群
+        # (高維 DINOv2 上 min_cluster_size≈0.05N 常塌成 1 群、多樣性失效)。
+        _div = (_pred_al if _pred_al is not None
+                else (result.get("cluster") or {}).get("labels"))
+        _sel_al = select_for_labeling(_pri, k=_alk, cluster_labels=_div, max_per_cluster=_almpc)
         st.caption(f"取樣佇列(優先序,共 {len(_sel_al)} 個"
                    + ("" if _head_al else ";分類頭未訓練 → 目前只用 novelty,訓練後加 disagreement/邊界") + "):")
         with st.container(height=240, key="anomaly_al_queue"):
