@@ -1244,6 +1244,13 @@ def _anomaly_build_model() -> None:
         projection = fit_projector(obj_emb, good_mask if good_mask.any() else None)
         bank = res.get("bank")
         bank_vectors = getattr(bank, "vectors", None)
+        # 守衛:patch 模式卻沒建出 bank(殘餘邊界:參考全標瑕疵→無正常可建)→ 明確報錯,
+        # 不可靜默存 bank_vectors=None 假顯示「模型已建立」再悄悄退化成物件級(silent-wrong)。
+        if score_mode == "patch" and bank_vectors is None:
+            st.session_state["_anomaly_model_err"] = (
+                "patch 模式建不出 Normal Bank(參考可能全被標為瑕疵,或無正常物件)。"
+                "請確認參考資料夾多數為正常,或側欄『分數依據』改用『物件級』。")
+            return
         fewshot = confirmed_to_fewshot(_conf_build, res["records"]) if _conf_build else None
         # 語義硬守衛:只有 defect 且解鎖 ≥2 類各達 N_min 才訓 head;object → 永不訓(語義安全鎖)
         head = None

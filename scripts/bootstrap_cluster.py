@@ -25,6 +25,7 @@ def cluster_objects(emb, *, min_cluster_size: int | None = None,
                 "n_clusters": (1 if N == 1 else 0), "normal_mask": ~cand}
 
     mcs = int(min_cluster_size or max(5, round(0.05 * N)))
+    mcs = max(2, min(mcs, N))    # HDBSCAN 要 min_cluster_size≥2 且 min_samples(=mcs)≤N;少樣本不夾會崩潰
     labels = HDBSCAN(min_cluster_size=mcs, metric="euclidean").fit_predict(_l2n(emb))
 
     sizes: dict[int, int] = {}

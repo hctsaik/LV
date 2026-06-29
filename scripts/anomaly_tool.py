@@ -92,6 +92,11 @@ def run_pipeline(image_paths, class_names, *, mode: str = "two_stage",
         normal_set = good_idx
     else:
         normal_set = [i for i in range(N) if cl["normal_mask"][i] and i not in bad_idx]
+    # 純正常 / diffuse 少樣本參考:分群在少樣本/多樣資料下找不到正常密群(normal_set 空)。
+    # patch 建模(無外部 bank)此時整批參考即視為正常 → 用全體建 Normal Bank(AnomalyDINO few-shot 原意),
+    # 而非落到 leave-one-out 讓 bank 靜默 = None(下游 _anomaly_build_model 會假顯示「模型已建立」)。
+    if not normal_set and external_bank is None and score_mode != "object":
+        normal_set = [i for i in range(N) if i not in bad_idx]
 
     bank = None
     if external_bank is not None and score_mode != "object":

@@ -59,6 +59,43 @@ def test_bank_pollution_drops_score(synthetic_yolo_dataset, color_patch_extracto
     assert s_pol < 0.5 * s_clean
 
 
+def _diffuse_embed():
+    """注入式:每物件回一個正交(L2 後彼此等距)的嵌入 → HDBSCAN 找不到正常密群、normal_set 空。
+    用來確定性重現「diffuse 少樣本」(使用者實際踩的 N=5/8 靜默 None)。"""
+    c = {"i": 0}
+    def f(crop):
+        v = np.zeros(384, dtype=np.float32)
+        v[c["i"] % 384] = 1000.0
+        c["i"] += 1
+        return v
+    return f
+
+
+def test_patch_build_diffuse_normal_builds_bank(synthetic_yolo_dataset, color_patch_extractor):  # AC-F4a:diffuse 少樣本 patch 建模仍建出 bank(修 silent-wrong)
+    """diffuse 參考(N≥5 不崩潰,但分群找不到正常密群 → normal_set 空)。
+    舊行為:落 leave-one-out、bank 靜默 = None → _anomaly_build_model 假顯示「模型已建立」、
+    悄悄退化成物件級(silent-wrong)。修後:整批參考視為正常 → 用全體 patch 建出 Normal Bank。"""
+    ip, cn, meta, _, normal_idx = _ds(synthetic_yolo_dataset)
+    few = [ip[i] for i in normal_idx[:6]]                 # N=6 ≥5(不崩潰),正交嵌入 → 不分群
+    r = run_pipeline(few, cn, mode="two_stage", score_mode="patch",
+                     extractor=color_patch_extractor(), embed_fn=_diffuse_embed())
+    bank = r["bank"]
+    assert bank is not None, "diffuse 少樣本 patch 建模應建出 Normal Bank,不可靜默回 None(假成功)"
+    assert getattr(bank, "vectors", None) is not None and len(bank.vectors) > 0
+    assert len(r["records"]) == 6
+
+
+def test_patch_build_tiny_n_no_crash(synthetic_yolo_dataset, color_patch_extractor, color_object_embed):  # AC-F4b:物件數 < 分群最小群(5)不可崩潰
+    """物件數 N<5 時,舊行為 HDBSCAN min_samples(5)>N 直接拋 ValueError(GUI 顯示晦澀錯誤)。
+    修後:分群退化但不崩潰,patch 建模仍建出 bank。"""
+    ip, cn, meta, _, normal_idx = _ds(synthetic_yolo_dataset)
+    few = [ip[i] for i in normal_idx[:4]]                 # N=4 < 5 → 舊:HDBSCAN 崩潰
+    r = run_pipeline(few, cn, mode="two_stage", score_mode="patch",
+                     extractor=color_patch_extractor(), embed_fn=color_object_embed)
+    assert r["bank"] is not None and getattr(r["bank"], "vectors", None) is not None
+    assert len(r["records"]) == 4
+
+
 def test_object_mode_and_one_stage_gross(synthetic_yolo_dataset):  # AC5
     ip, cn, meta, defect_idx, _ = _ds(synthetic_yolo_dataset)
     A = np.zeros(384, np.float32); A[0] = 1.0
