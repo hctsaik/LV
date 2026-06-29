@@ -1139,24 +1139,24 @@ def _anomaly_add_to_cart(records: list[dict], indices: list[int]) -> None:
 
 def _anomaly_mark(records: list[dict], indices: list[int], verdict: str) -> None:
     """把框選的物件標為正常(good)/瑕疵(bad)範例 → 寫入 anomaly_confirmed。
-    下次「執行偵測」會用『確認為 good』建乾淨 few-shot memory bank(細微瑕疵主路徑);
-    『確認為 bad』用來校準門檻並算 AUROC。index 為全域物件索引,跨重跑於同資料集穩定。"""
+    ①(建模)會用『確認為 good』建乾淨 few-shot memory bank(細微瑕疵主路徑);
+    ②就地重評用最新 confirmed 重算分數(不動模型)。index 為全域物件索引,跨重跑於同資料集穩定。"""
     conf = st.session_state.setdefault("anomaly_confirmed", {})
     for i in indices:
         conf[int(i)] = verdict
     kind = "正常" if verdict == "good" else "瑕疵"
-    st.toast(f"已標記 {len(indices)} 個為{kind}範例;按「執行偵測」重跑套用。", icon="✅")
+    st.toast(f"已標記 {len(indices)} 個為{kind}範例。", icon="✅")
 
 
 def _anomaly_autoseed_normal(n: int = 12) -> None:
-    """免框選的快速 few-shot 種子:把『最不可疑』的 n 個物件標為正常範例。"""
-    res = st.session_state.get("anomaly_result") or {}
+    """免框選的快速 few-shot 種子:把『最不可疑』的 n 個物件標為正常範例(用②套用結果)。"""
+    res = st.session_state.get("anomaly_apply_result") or {}
     ranking = list(res.get("ranking") or [])
     seed = ranking[-n:] if len(ranking) >= n else ranking
     conf = st.session_state.setdefault("anomaly_confirmed", {})
     for i in seed:
         conf[int(i)] = "good"
-    st.toast(f"已把最不可疑的 {len(seed)} 個標為正常範例;按「執行偵測」重跑。", icon="✅")
+    st.toast(f"已把最不可疑的 {len(seed)} 個標為正常範例。", icon="✅")
 
 
 def _anomaly_clear_confirmed() -> None:
@@ -1171,212 +1171,46 @@ def _anomaly_clear_sel(scatter_key: str) -> None:
 
 
 def _anomaly_trigger_rerun() -> None:
-    """主畫面「重新偵測」:設旗標,下一輪走 run 路徑(套用最新標記)。"""
-    st.session_state["_anomaly_rerun"] = True
+    """②就地重評:設旗標,下一輪用最新 confirmed 重算分數(不動模型;正式重建走①)。"""
+    st.session_state["_anomaly_reapply"] = True
 
 
-def _anomaly_bank_default_dir(folder: str, name: str = "bank1") -> str:
-    """bank profile 預設落點 .lv_cache/<dataset>_<sha>/anomaly_bank/<name>(守 no-dataset-writes)。"""
+def _anomaly_bank_default_dir(folder: str, name: str = "anomaly_model") -> str:
+    """模型暫存目錄預設落點 .lv_cache/<dataset>_<sha>/<name>(守 no-dataset-writes)。"""
     if not folder:
         return ""
     from object_eval import dataset_cache_dir
-    return str(dataset_cache_dir(Path(folder), f"anomaly_bank/{name}"))
+    return str(dataset_cache_dir(Path(folder), name))
 
 
-def _anomaly_load_bank(bank_dir: str) -> None:
-    """讀入硬碟 bank profile → 掛載到 session(清舊結果逼重跑,讓新資料夾投影回舊 bank)。"""
-    from anomaly_bank_store import load_bank
-    try:
-        b = load_bank(bank_dir)
-        _m = b.get("meta", {})
-        # 硬鍵守門(對齊 check_compat 精神):缺 model/target_res → 掛載會回退 GUI 現值 → silent-wrong;
-        # bank.npz 維度要與 meta.patch_dim 一致(否則評分 q@vectors.T 維度不符直接炸)。
-        if not _m.get("model") or _m.get("target_res") in (None, ""):
-            raise ValueError("bank meta 缺 model/target_res,無法安全掛載(會回退到當前設定 → 分數錯)")
-        _v = b.get("vectors")
-        if _v is not None and _m.get("patch_dim") not in (None, int(_v.shape[1])):
-            raise ValueError(f"bank.npz 維度 {int(_v.shape[1])} 與 meta.patch_dim {_m.get('patch_dim')} 不符")
-        b["_dir"] = str(bank_dir)
-        st.session_state["anomaly_loaded_bank"] = b
-        st.session_state["anomaly_result"] = None
-        st.session_state.pop("_anomaly_bank_err", None)
-    except Exception as exc:                      # 壞檔/不完整/缺 meta/維度不符 → 明確訊息,不靜默
-        st.session_state["_anomaly_bank_err"] = f"載入失敗:{exc}"
+# ── M7 wizard:唯一模型槽 anomaly_model(① built / 📂 loaded 都寫這;②③ 只讀這)──
+def _anomaly_build_model() -> None:
+    """①:用 train_folder 跑 run_pipeline(confirmed)→ 凍 bank/projection/fewshot;
+    語義=defect 且解鎖 → 一起訓 head。**語義硬守衛**:非 defect 一律不訓 head(修 silent-wrong)。
+    結尾清掉舊 anomaly_apply_result(模型換了、舊結果 stale)。"""
+    import time as _time
 
-
-def _anomaly_unload_bank() -> None:
-    st.session_state.pop("anomaly_loaded_bank", None)
-    st.session_state["anomaly_result"] = None
-
-
-def _anomaly_save_bank(bank_dir: str, folders: list) -> None:
-    """把本次偵測結果凍結成可攜 bank profile(向量 + 投影基底 + few-shot),供下次跨資料夾重用。"""
     import numpy as _np
 
-    from anomaly_bank_store import (assert_safe_bank_dir, confirmed_to_fewshot,
-                                    save_bank)
+    from anomaly_bank_store import confirmed_to_fewshot
     from anomaly_project import fit_projector
-    res = st.session_state.get("anomaly_result") or {}
-    if not res.get("records") or res.get("obj_emb") is None:
-        st.session_state["_anomaly_bank_err"] = "請先執行偵測產生結果,再存 bank。"
-        return
-    try:
-        assert_safe_bank_dir(bank_dir, folders)               # 白名單防呆:絕不寫資料集
-        obj_emb = _np.asarray(res["obj_emb"], dtype=_np.float32)
-        normal_set = res.get("normal_set") or []
-        good_mask = _np.zeros(len(obj_emb), dtype=bool)
-        if normal_set:
-            good_mask[_np.asarray(normal_set, dtype=int)] = True
-        basis = fit_projector(obj_emb, good_mask if good_mask.any() else None)
-        bank = res.get("bank")
-        vectors = getattr(bank, "vectors", None)
-        confirmed = st.session_state.get("anomaly_confirmed", {})
-        fewshot = confirmed_to_fewshot(confirmed, res["records"]) if confirmed else None
-        meta = {
-            "model": res.get("_model"), "target_res": res.get("_target_res"),
-            "patch_dim": int(vectors.shape[1]) if vectors is not None else None,
-            "obj_dim": int(obj_emb.shape[1]), "score_mode": res.get("score_mode"),
-            "n_objects": len(res["records"]),
-        }
-        save_bank(bank_dir, vectors=vectors, projection=basis, meta=meta, fewshot=fewshot)
-        st.session_state["_anomaly_bank_saved"] = str(bank_dir)
-        st.session_state.pop("_anomaly_bank_err", None)
-    except Exception as exc:
-        st.session_state["_anomaly_bank_err"] = f"存檔失敗:{exc}"
-
-
-def _anomaly_run_loop_curve(emb, lab, pool_i, eval_i, batch) -> None:
-    """M5:在現有物件上跑 active(uncertainty)vs random 標註效益曲線(回顧模擬,展示主動選樣省標註)。"""
-    from active_loop import label_efficiency_curve
-    try:
-        eff = max(4, min(int(batch), max(2, len(pool_i) // 3)))   # 依池大小縮放,小資料也能跑多輪
-        kw = dict(seed_n=eff, batch=eff, rounds=6)
-        ca = label_efficiency_curve(emb[pool_i], lab[pool_i], emb[eval_i], lab[eval_i],
-                                    strategy="active", **kw)
-        cr = label_efficiency_curve(emb[pool_i], lab[pool_i], emb[eval_i], lab[eval_i],
-                                    strategy="random", **kw)
-        if len(ca) < 2:
-            st.session_state["anomaly_loop_curves"] = {"_err": "類別/樣本不足以跑多輪迴圈"}
-        else:
-            st.session_state["anomaly_loop_curves"] = {"active": ca, "random": cr}
-    except Exception as exc:
-        st.session_state["anomaly_loop_curves"] = {"_err": str(exc)}
-
-
-def _anomaly_train_head(eligible=None) -> None:
-    """訓 closed-set 瑕疵分類頭。**語義安全鎖**:label 語義非『瑕疵類』→ 拒訓(防把物件類別當瑕疵類,
-    修 silent-wrong)。只用 eligible(達 N_min)類別的物件訓;樣本不足的類維持走 Bank→Unknown 佇列。"""
-    import numpy as _np
-
+    from anomaly_tool import head_unlock_state, run_pipeline
     from dino_head import train_head
-    if st.session_state.get("anomaly_active_semantic") != "defect":   # 雙保險:UI gate + 此處硬守衛
-        st.session_state["_anomaly_head_err"] = (
-            "label 語義非『瑕疵類別』,不訓分類頭(把物件類別當瑕疵類在語義上是壞的)。"
-            "請在『⚙ 進階』把 label 語義宣告為『瑕疵類別』。")
+    from object_eval import classes_for, dataset_cache_dir, list_images
+    st.session_state.pop("_anomaly_model_err", None)
+    st.session_state.pop("_anomaly_model_saved", None)
+    folders = list(st.session_state.get("anomaly_train_folder") or [])
+    if not folders:
+        st.session_state["_anomaly_model_err"] = "請先在①選訓練/參考資料夾。"
         return
-    res = st.session_state.get("anomaly_result") or {}
-    recs, emb = res.get("records") or [], res.get("obj_emb")
-    if not recs or emb is None:
-        st.session_state["_anomaly_head_err"] = "請先執行偵測產生物件特徵。"
-        return
-    labels = [r.get("label", "") for r in recs]
-    elig = set(eligible) if eligible else {l for l in labels if l}
-    keep = [i for i, l in enumerate(labels) if l in elig]            # 只用達標類別的物件
+    model = st.session_state.get("anomaly_model_sel", "dinov2_vits14")
+    score_mode = st.session_state.get("anomaly_score_mode", "patch")
+    target_res = int(st.session_state.get("anomaly_res", 224)) if score_mode == "patch" else 224
+    mode = st.session_state.get("anomaly_mode", "two_stage")
+    sample_n = int(st.session_state.get("anomaly_sample_n", 64))
+    semantic = st.session_state.get("anomaly_train_semantic", "object")
+    n_min = int(st.session_state.get("anomaly_n_min", 8))
     try:
-        head = train_head(_np.asarray(emb, _np.float32)[keep], [labels[i] for i in keep])
-        head["_model_name"] = res.get("_model")
-        head["_eligible"] = sorted(elig)
-        st.session_state["anomaly_head"] = head
-        st.session_state.pop("_anomaly_head_err", None)
-    except Exception as exc:                          # <2 類 / 空特徵 → 明確訊息
-        st.session_state["_anomaly_head_err"] = f"訓練失敗:{exc}"
-
-
-def _anomaly_save_head(path: str) -> None:
-    from dino_head import save_head
-    head = st.session_state.get("anomaly_head")
-    if not head:
-        st.session_state["_anomaly_head_err"] = "請先訓練分類頭。"
-        return
-    try:
-        save_head(path, head)
-        st.session_state["_anomaly_head_saved"] = str(path)
-        st.session_state.pop("_anomaly_head_err", None)
-    except Exception as exc:
-        st.session_state["_anomaly_head_err"] = f"存檔失敗:{exc}"
-
-
-def _anomaly_load_head(path: str) -> None:
-    from dino_head import load_head
-    try:
-        st.session_state["anomaly_head"] = load_head(path)
-        st.session_state.pop("_anomaly_head_err", None)
-    except Exception as exc:
-        st.session_state["_anomaly_head_err"] = f"載入失敗:{exc}"
-
-
-def _anomaly_ui() -> None:
-    """🔧 瑕疵偵測(AnomalyDINO 風格):載入 YOLO 資料夾 → 物件級 patch 異常分數 →
-    排序 + 散點圖框選/購物車 + 熱力圖 + 匯出原圖。實作委派 anomaly_tool.run_pipeline。"""
-    import plotly.graph_objects as go
-    from PIL import Image
-
-    from _utils import available_models
-    from anomaly_heatmap import render_heatmap
-    from anomaly_score import score_object
-    from anomaly_tool import run_pipeline
-    from interaction import (crop_bbox, discover_yolo_objects,
-                             selection_points_to_indices, zip_selected_images)
-    from object_eval import (_adaptive_pad_px, classes_for, dataset_cache_dir,
-                             list_images)
-    from patch_features import embed_objects_patch
-
-    # 標題旁放一個 ❓ 當 manual:平常不佔版面,點開才看說明(對齊一般工具的「?」慣例)。
-    _hc1, _hc2 = st.columns([0.8, 0.2], vertical_alignment="bottom")
-    _hc1.subheader("🔧 瑕疵偵測(Anomaly Detection)")
-    with _hc2.popover("❓ 說明", use_container_width=True):
-        st.markdown("**多數良品當『正常參考』**,把偏離的物件挑出來。基於凍結 DINOv2 patch 特徵 + "
-                    "最近鄰距離(AnomalyDINO, WACV 2025);**不需瑕疵樣本訓練、不寫你的資料集**。")
-        st.markdown("**沒確認正常時 = 無監督模式**:對整個資料夾做 leave-one-out 離群偵測,把「跟其他物件都不像」的"
-                    "**少見/離群類別**排前面(適合多類別、找稀有類)。**確認正常後 = 對照模式**:只跟你確認的正常比,專抓細微瑕疵。")
-        st.markdown("**細微瑕疵流程(2-stage)**:先「執行偵測」看分布 → 框選你**確定正常**的點按"
-                    "「✅ 框選標為正常範例」(或用自動種子)→ 再「執行偵測」即用乾淨 few-shot bank。")
-
-    with st.sidebar:
-        st.markdown("### 🔧 瑕疵偵測設定")
-        folders = _folder_picker_list("anomaly_folder",
-                                      add_help="YOLO 偵測資料集:含 images/ 與 labels/")
-        _dino = [m for m in available_models() if m.startswith("dinov2")] or ["dinov2_vits14"]
-        model = st.selectbox(
-            "DINOv2 模型", _dino,
-            index=(_dino.index("dinov2_vits14") if "dinov2_vits14" in _dino else 0),
-            key="anomaly_model_sel",
-            help="vits14=快、輕(D=384);vitb14=較準、較重(D=768)。換模型用各自獨立快取。")
-        mode = st.radio("流程", ["two_stage", "one_stage"], key="anomaly_mode",
-                        format_func=lambda m: {"two_stage": "2-stage(抽樣→確認→整批)",
-                                               "one_stage": "1-stage(直接整批)"}[m],
-                        help="2-stage:先看分布、框選確認少數正常 → 對照模式抓細微瑕疵。"
-                             "1-stage:直接整批(沒確認時=無監督 leave-one-out,找少見/離群類別)。")
-        score_mode = st.radio("分數依據", ["patch", "object"], key="anomaly_score_mode",
-                              format_func=lambda m: {"patch": "patch 級(抓細微瑕疵,較準)",
-                                                     "object": "物件級(快,粗)"}[m])
-        # DINOv2 patch size 固定 14px;真正可調的是「物件裁切縮放到的解析度」=每物件 patch 細緻度。
-        # 解析度高→每 patch 覆蓋的實際區域小→能抓更小瑕疵,但更慢、bank 更大。都是 14 的倍數。
-        _RES = {224: "224(16×16 patch,快)", 336: "336(24×24,較細)",
-                448: "448(32×32,更細)", 560: "560(40×40,最細,慢)"}
-        target_res = (st.selectbox("解析度(每物件 patch 細緻度)", list(_RES),
-                                   format_func=lambda r: _RES[r], key="anomaly_res",
-                                   help="DINOv2 patch=14px 固定;這裡調物件裁切的縮放解析度,"
-                                        "等效於 patch 細緻度。瑕疵越小選越高。")
-                      if score_mode == "patch" else 224)
-        sample_n = (st.slider("2-stage 抽樣數", 16, 256, 64, key="anomaly_sample_n")
-                    if mode == "two_stage" else 64)  # 抽樣數只跟 2-stage 有關
-        run = st.button("▶ 執行偵測", key="anomaly_run", type="primary",
-                        use_container_width=True)
-
-    # 主畫面「🔁 重新偵測」(標記正常/瑕疵後就地重跑)也走同一條 run 路徑
-    run = run or st.session_state.pop("_anomaly_rerun", False)
-    if run:
         roots = [Path(f) for f in folders]
         image_paths: list[Path] = []
         class_names = None
@@ -1384,457 +1218,427 @@ def _anomaly_ui() -> None:
             image_paths.extend(list_images(r))
             class_names = class_names or classes_for(r)
         if not image_paths:
-            st.session_state["anomaly_result"] = {"records": [], "_err": "no_images"}
-        else:
-            # 掛載 bank → 用 bank 鎖死的 model/target_res/score_mode(非 GUI 現值,擋 silent-wrong)
-            # + 外部 bank(patch)/外部 ref(object)評分。
-            _lb_run = st.session_state.get("anomaly_loaded_bank")
-            _ext_bank = _ext_ref = None
-            if _lb_run:
-                from anomaly_score import MemoryBank
-                _bm = _lb_run.get("meta", {})
-                model = _bm.get("model") or model
-                target_res = int(_bm.get("target_res") or target_res)
-                if _lb_run.get("vectors") is not None:
-                    _ext_bank = MemoryBank(np.asarray(_lb_run["vectors"], dtype=np.float32))
-                    score_mode = "patch"                       # 有 patch bank → patch 級評分
-                elif _lb_run.get("projection") is not None:
-                    _ext_ref = np.asarray(_lb_run["projection"]["good_obj_emb"], dtype=np.float32)
-                    score_mode = "object"                      # 無 patch bank → 對舊 good 物件級離群
-                else:
-                    score_mode = _bm.get("score_mode") or score_mode
-            cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{model}_r{target_res}")
-            _bar = st.progress(0.0, text=f"準備中…({len(image_paths)} 張圖,{model}@{target_res};首跑載入模型較久)")
-            result = run_pipeline(
-                image_paths, class_names, mode=mode, score_mode=score_mode,
-                sample_n=sample_n, model=model, target_res=target_res,
-                confirmed=st.session_state.get("anomaly_confirmed", {}),
-                cache_dir=cache, external_bank=_ext_bank, external_ref=_ext_ref,
-                progress=lambda f, t: _bar.progress(f, text=t))
-            _bar.empty()
-            result["_image_paths"] = [str(p) for p in image_paths]
-            result["_class_names"] = list(class_names) if class_names else None
-            result["_cache"] = str(cache)
-            result["_model"] = model
-            result["_target_res"] = target_res
-            result["_loaded_bank"] = bool(_lb_run)
-            # 跨資料夾沿用 few-shot:把舊標記用內容定址對齊到新資料夾的物件索引
-            if _lb_run and _lb_run.get("fewshot"):
-                from anomaly_bank_store import match_fewshot_to_indices
-                _aligned, _un = match_fewshot_to_indices(_lb_run["fewshot"], result["records"])
-                result["_fewshot_aligned"] = _aligned
-                result["_fewshot_unmatched"] = int(_un)
-            st.session_state["anomaly_result"] = result
-            _collapse_sidebar()
-            _log_usage("anomaly_run", n=len(result["records"]), source=score_mode)
+            st.session_state["_anomaly_model_err"] = "資料夾內找不到影像(需 images/ + labels/)。"
+            return
+        cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{model}_r{target_res}")
+        _bar = st.progress(0.0, text=f"建模中…({len(image_paths)} 張圖,{model}@{target_res})")
+        res = run_pipeline(
+            image_paths, class_names, mode=mode, score_mode=score_mode,
+            sample_n=sample_n, model=model, target_res=target_res,
+            confirmed=st.session_state.get("anomaly_confirmed", {}),
+            cache_dir=cache, progress=lambda f, t: _bar.progress(f, text=t))
+        _bar.empty()
+        if not res.get("records") or res.get("obj_emb") is None:
+            st.session_state["_anomaly_model_err"] = (
+                "找不到 YOLO 物件(資料夾需含 images/ 與 labels/,labels 為 YOLO .txt)。")
+            return
+        # 凍結投影器(跨資料夾投影回此分佈 + 灰底)
+        obj_emb = _np.asarray(res["obj_emb"], dtype=_np.float32)
+        normal_set = res.get("normal_set") or []
+        good_mask = _np.zeros(len(obj_emb), dtype=bool)
+        if normal_set:
+            good_mask[_np.asarray(normal_set, dtype=int)] = True
+        projection = fit_projector(obj_emb, good_mask if good_mask.any() else None)
+        bank = res.get("bank")
+        bank_vectors = getattr(bank, "vectors", None)
+        confirmed = st.session_state.get("anomaly_confirmed", {})
+        fewshot = confirmed_to_fewshot(confirmed, res["records"]) if confirmed else None
+        # 語義硬守衛:只有 defect 且解鎖 ≥2 類各達 N_min 才訓 head;object → 永不訓(語義安全鎖)
+        head = None
+        labels = [r.get("label", "") for r in res["records"]]
+        unlock = head_unlock_state(label_semantic=semantic, labels=labels, n_min=n_min)
+        if semantic == "defect" and unlock["unlocked"]:
+            elig = set(unlock["eligible_classes"])
+            keep = [i for i, l in enumerate(labels) if l in elig]
+            head = train_head(obj_emb[keep], [labels[i] for i in keep])
+            head["_model_name"] = model
+            head["_eligible"] = sorted(elig)
+        meta = {
+            "model": model, "target_res": target_res, "score_mode": score_mode,
+            "patch_dim": int(bank_vectors.shape[1]) if bank_vectors is not None else None,
+            "obj_dim": int(obj_emb.shape[1]), "n_objects": len(res["records"]),
+        }
+        st.session_state["anomaly_model"] = {
+            "source": "built", "ref_folder": str(folders[0]), "_built_at": _time.time(),
+            "meta": meta, "label_semantic": semantic,
+            "bank_vectors": (_np.asarray(bank_vectors, dtype=_np.float32)
+                             if bank_vectors is not None else None),
+            "projection": projection, "fewshot": fewshot, "head": head, "_dir": None,
+        }
+        st.session_state["anomaly_train_result"] = res     # ①框選標 good 用
+        st.session_state.pop("anomaly_apply_result", None)  # 模型換了 → 舊套用結果 stale
+        _log_usage("anomaly_build", n=len(res["records"]), source=score_mode,
+                   semantic=semantic, head=bool(head))
+    except Exception as exc:
+        st.session_state["_anomaly_model_err"] = f"建模失敗:{exc}"
 
-    result = st.session_state.get("anomaly_result")
-    # ── Memory Bank 面板(主畫面 always 顯示;不受 run 後側欄收合影響,跨資料夾載入隨時可達)──
-    _lb = st.session_state.get("anomaly_loaded_bank")
-    with st.container(border=True, key="anomaly_bank_panel"):
-        if _lb:
-            _bm = _lb.get("meta", {})
-            _bc1, _bc2 = st.columns([6, 1], vertical_alignment="center")
-            _bc1.markdown(f"🔗 **已掛載 bank** `{Path(_lb.get('_dir', '')).name}` · "
-                          f"{_bm.get('model')}@{_bm.get('target_res')} · {_bm.get('score_mode')} —— "
-                          f"「執行偵測」用它對新資料夾評分 + 投影回舊分佈")
-            _bc2.button("✕ 卸載", key="anomaly_unload_btn", on_click=_anomaly_unload_bank,
-                        use_container_width=True)
-        else:
-            _bc1, _bc2 = st.columns([5, 1], vertical_alignment="bottom")
-            _bp = _bc1.text_input("💾 讀入既有 Memory Bank 目錄(跨資料夾重用;含 meta.json)",
-                                  key="anomaly_bank_load_path", placeholder="bank profile 目錄")
-            _bc2.button("📂 載入", key="anomaly_load_btn", use_container_width=True,
-                        disabled=not _bp, on_click=_anomaly_load_bank, args=(_bp,))
-        if st.session_state.get("_anomaly_bank_err"):
-            st.error(st.session_state["_anomaly_bank_err"])
-    if not result:
-        st.info("在左側選一個 YOLO 偵測資料夾(images/+labels/)後按「執行偵測」。"
-                "(或在上方載入既有 bank,把新資料夾投影回舊分佈。)")
+
+def _anomaly_apply_model() -> None:
+    """②:用 target_folder 跑 run_pipeline,external_bank/external_ref 取自模型,
+    model/target_res/score_mode **鎖 model.meta**(非側欄現值,擋 silent-wrong)→ anomaly_apply_result。"""
+    import numpy as _np
+
+    from anomaly_score import MemoryBank
+    from anomaly_tool import run_pipeline
+    from object_eval import classes_for, dataset_cache_dir, list_images
+    st.session_state.pop("_anomaly_apply_err", None)
+    model = st.session_state.get("anomaly_model")
+    if not model:
+        st.session_state["_anomaly_apply_err"] = "請先到①建模或載入模型。"
         return
-    # 壞檔防呆:run_pipeline 已自行過濾並回傳 skipped(壞檔路徑清單)→ 同款略過提示
+    folders = list(st.session_state.get("anomaly_target_folder") or [])
+    if not folders:
+        st.session_state["_anomaly_apply_err"] = "請先在②選異常目標資料夾。"
+        return
+    _m = model["meta"]
+    m_model = _m.get("model") or "dinov2_vits14"
+    m_res = int(_m.get("target_res") or 224)
+    try:
+        roots = [Path(f) for f in folders]
+        image_paths: list[Path] = []
+        class_names = None
+        for r in roots:
+            image_paths.extend(list_images(r))
+            class_names = class_names or classes_for(r)
+        if not image_paths:
+            st.session_state["_anomaly_apply_err"] = "目標資料夾內找不到影像(需 images/ + labels/)。"
+            return
+        # 鎖模型的評分管線:有 patch bank → patch 級;無 patch bank 但有投影 → object 級對舊 good 離群。
+        ext_bank = ext_ref = None
+        score_mode = _m.get("score_mode") or "patch"
+        if model.get("bank_vectors") is not None:
+            ext_bank = MemoryBank(_np.asarray(model["bank_vectors"], dtype=_np.float32))
+            score_mode = "patch"
+        elif model.get("projection") is not None:
+            ext_ref = _np.asarray(model["projection"]["good_obj_emb"], dtype=_np.float32)
+            score_mode = "object"
+        cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{m_model}_r{m_res}")
+        _bar = st.progress(0.0, text=f"套用偵測…({len(image_paths)} 張圖,{m_model}@{m_res})")
+        result = run_pipeline(
+            image_paths, class_names, mode="one_stage", score_mode=score_mode,
+            sample_n=64, model=m_model, target_res=m_res,
+            confirmed=st.session_state.get("anomaly_confirmed", {}),
+            cache_dir=cache, external_bank=ext_bank, external_ref=ext_ref,
+            progress=lambda f, t: _bar.progress(f, text=t))
+        _bar.empty()
+        result["_image_paths"] = [str(p) for p in image_paths]
+        result["_class_names"] = list(class_names) if class_names else None
+        result["_cache"] = str(cache)
+        result["_model"] = m_model
+        result["_target_res"] = m_res
+        result["_model_built_at"] = model.get("_built_at")
+        result["_loaded_bank"] = True
+        # 跨資料夾沿用 few-shot:把模型的標記用內容定址對齊到新資料夾的物件索引
+        if model.get("fewshot"):
+            from anomaly_bank_store import match_fewshot_to_indices
+            _aligned, _un = match_fewshot_to_indices(model["fewshot"], result["records"])
+            result["_fewshot_aligned"] = _aligned
+            result["_fewshot_unmatched"] = int(_un)
+        st.session_state["anomaly_apply_result"] = result
+        _collapse_sidebar()
+        _log_usage("anomaly_apply", n=len(result["records"]), source=score_mode)
+    except Exception as exc:
+        st.session_state["_anomaly_apply_err"] = f"套用失敗:{exc}"
+
+
+def _anomaly_save_model(model_dir: str, folders: list) -> None:
+    """(2)一鍵存模型:save_bank(bank+projection+fewshot+meta+label_semantic)+ save_head + manifest.json,
+    全進同一目錄。白名單防呆:絕不寫使用者資料集。"""
+    import json as _json
+    import time as _time
+
+    from anomaly_bank_store import assert_safe_bank_dir, save_bank
+    from dino_head import save_head
+    st.session_state.pop("_anomaly_model_err", None)
+    st.session_state.pop("_anomaly_model_saved", None)
+    model = st.session_state.get("anomaly_model")
+    if not model:
+        st.session_state["_anomaly_model_err"] = "請先建模或載入模型,再存。"
+        return
+    if not model_dir:
+        st.session_state["_anomaly_model_err"] = "請填模型暫存目錄。"
+        return
+    try:
+        assert_safe_bank_dir(model_dir, folders)
+        meta = dict(model["meta"])
+        meta["label_semantic"] = model.get("label_semantic", "object")  # 多帶語義欄(設計准許)
+        save_bank(model_dir, vectors=model.get("bank_vectors"),
+                  projection=model.get("projection"), meta=meta,
+                  fewshot=model.get("fewshot"))
+        head = model.get("head")
+        if head:
+            save_head(str(Path(model_dir) / "head.joblib"), head)
+        manifest = {
+            "model": meta.get("model"), "target_res": meta.get("target_res"),
+            "score_mode": meta.get("score_mode"), "label_semantic": meta.get("label_semantic"),
+            "eligible_classes": (head or {}).get("_eligible") or [],
+            "has_head": bool(head), "built_at": model.get("_built_at"),
+            "saved_at": _time.time(),
+        }
+        (Path(model_dir) / "manifest.json").write_text(
+            _json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        model["_dir"] = str(model_dir)
+        st.session_state["_anomaly_model_saved"] = str(model_dir)
+    except Exception as exc:
+        st.session_state["_anomaly_model_err"] = f"存檔失敗:{exc}"
+
+
+def _anomaly_load_model(model_dir: str) -> None:
+    """📂(2)一鍵載回模型:load_bank + load_head(若有)+ 讀 manifest → 填 anomaly_model(source='loaded')。
+    舊 bank 無 label_semantic → 預設 'object'(安全側),①顯示可重宣告。清掉舊套用結果逼②重跑。"""
+    import json as _json
+
+    from anomaly_bank_store import load_bank
+    from dino_head import load_head
+    st.session_state.pop("_anomaly_model_err", None)
+    try:
+        b = load_bank(model_dir)
+        _m = b.get("meta", {})
+        if not _m.get("model") or _m.get("target_res") in (None, ""):
+            raise ValueError("模型 meta 缺 model/target_res,無法安全載入(會回退到當前設定 → 分數錯)")
+        _v = b.get("vectors")
+        if _v is not None and _m.get("patch_dim") not in (None, int(_v.shape[1])):
+            raise ValueError(f"bank.npz 維度 {int(_v.shape[1])} 與 meta.patch_dim {_m.get('patch_dim')} 不符")
+        head = None
+        _hp = Path(model_dir) / "head.joblib"
+        if _hp.exists():
+            head = load_head(str(_hp))
+        manifest = {}
+        _mp = Path(model_dir) / "manifest.json"
+        if _mp.exists():
+            manifest = _json.loads(_mp.read_text(encoding="utf-8"))
+        semantic = (_m.get("label_semantic") or manifest.get("label_semantic") or "object")
+        built_at = manifest.get("built_at")
+        st.session_state["anomaly_model"] = {
+            "source": "loaded", "ref_folder": "", "_built_at": built_at,
+            "meta": {k: _m.get(k) for k in
+                     ("model", "target_res", "score_mode", "patch_dim", "obj_dim", "n_objects")},
+            "label_semantic": semantic,
+            "bank_vectors": b.get("vectors"), "projection": b.get("projection"),
+            "fewshot": b.get("fewshot"), "head": head, "_dir": str(model_dir),
+        }
+        st.session_state.pop("anomaly_apply_result", None)
+        st.session_state.pop("anomaly_train_result", None)
+    except Exception as exc:                      # 壞檔/不完整/缺 meta/維度不符 → 明確訊息,不靜默
+        st.session_state["_anomaly_model_err"] = f"載入失敗:{exc}"
+
+
+def _anomaly_pick_qmode(mode_id: str) -> None:
+    """③ 2×2 取樣矩陣:點某一格 → 設取樣模式(僅設 anomaly_q_mode)。"""
+    st.session_state["anomaly_q_mode"] = mode_id
+
+
+def _anomaly_priority_for(mode_id, scores, proba, threshold):
+    """③:依取樣模式回優先分數陣列。
+    novelty→(1,.4,.4);balanced→(1,1,1);pure→(1,0,0);confusion→弱類定向(proba=None 退純 novelty)。"""
+    from active_learning import priority_score
+    if mode_id == "confusion":
+        from active_loop import confusion_targeted_priority
+        return confusion_targeted_priority(scores, proba, w_novelty=1.0, w_entropy=1.0)
+    _w = {"novelty": (1.0, 0.4, 0.4), "balanced": (1.0, 1.0, 1.0),
+          "pure": (1.0, 0.0, 0.0)}.get(mode_id, (1.0, 0.4, 0.4))
+    return priority_score(scores, head_proba=proba, anomaly_threshold=float(threshold),
+                          w_novelty=_w[0], w_boundary=_w[1], w_disagreement=_w[2])
+
+
+def _anomaly_queue_labels(sel, records, scores, head, gthr, min_conf, obj_emb):
+    """③:每個選中 idx → {label:類別名, verdict:閘控判定, score:異常分數}。
+    有 head → gated_predict(正常/類別/Unknown);無 head → record.verdict 對映(可疑/正常)。"""
+    import numpy as _np
+    out = {}
+    gated = None
+    if head is not None and obj_emb is not None and len(sel):
+        from dino_head import gated_predict
+        try:
+            _g = gated_predict(head, _np.asarray(obj_emb, dtype=float), scores,
+                               anomaly_threshold=float(gthr), min_conf=float(min_conf))
+            gated = {int(i): _g[int(i)] for i in sel}
+        except Exception:
+            gated = None
+    for i in sel:
+        r = records[int(i)]
+        if gated is not None:
+            verdict = gated.get(int(i), "—")
+        else:
+            verdict = "可疑" if r.get("verdict") == "bad" else "正常"
+        out[int(i)] = {"label": r.get("label") or "—", "verdict": verdict,
+                       "score": float(scores[int(i)])}
+    return out
+
+
+def _anomaly_sidebar_settings() -> None:
+    """sidebar 共用設定(跨 tab):model / score_mode / res / mode / sample_n / N_min。
+    只作用於『下次①建模』;②③ 一律讀 anomaly_model.meta 鎖死的值,不吃側欄現值。"""
+    from _utils import available_models
+    with st.sidebar:
+        st.markdown("### 🔧 瑕疵偵測設定(作用於下次①建模)")
+        _dino = [m for m in available_models() if m.startswith("dinov2")] or ["dinov2_vits14"]
+        st.selectbox(
+            "DINOv2 模型", _dino,
+            index=(_dino.index("dinov2_vits14") if "dinov2_vits14" in _dino else 0),
+            key="anomaly_model_sel",
+            help="vits14=快、輕(D=384);vitb14=較準、較重(D=768)。換模型用各自獨立快取。")
+        st.radio("流程", ["two_stage", "one_stage"], key="anomaly_mode",
+                 format_func=lambda m: {"two_stage": "2-stage(抽樣→確認→整批)",
+                                        "one_stage": "1-stage(直接整批)"}[m],
+                 help="2-stage:先看分布、框選確認少數正常 → 對照模式抓細微瑕疵。"
+                      "1-stage:直接整批(沒確認時=無監督 leave-one-out,找少見/離群類別)。")
+        _score_mode = st.radio("分數依據", ["patch", "object"], key="anomaly_score_mode",
+                               format_func=lambda m: {"patch": "patch 級(抓細微瑕疵,較準)",
+                                                      "object": "物件級(快,粗)"}[m])
+        # DINOv2 patch size 固定 14px;真正可調的是「物件裁切縮放到的解析度」=每物件 patch 細緻度。
+        _RES = {224: "224(16×16 patch,快)", 336: "336(24×24,較細)",
+                448: "448(32×32,更細)", 560: "560(40×40,最細,慢)"}
+        if _score_mode == "patch":
+            st.selectbox("解析度(每物件 patch 細緻度)", list(_RES),
+                         format_func=lambda r: _RES[r], key="anomaly_res",
+                         help="DINOv2 patch=14px 固定;這裡調物件裁切的縮放解析度,"
+                              "等效於 patch 細緻度。瑕疵越小選越高。")
+        if st.session_state.get("anomaly_mode", "two_stage") == "two_stage":
+            st.slider("2-stage 抽樣數", 16, 256, 64, key="anomaly_sample_n")
+
+
+def _anomaly_tab_build() -> None:
+    """① 建模 / 載入模型:選訓練/參考資料夾 → (1)建模(凍 bank/projection/fewshot/head)
+    → (2)一鍵存模型 / 📂 一鍵載回。label 語義白話 radio(object→不訓 head)。"""
+    from anomaly_tool import head_unlock_state, label_semantic_hint
+    st.markdown("#### ① 建模 / 載入模型")
+    st.caption("用一批**多數良品**當『正常參考』建模(凍結 Normal Bank + 投影器);"
+               "或 📂 載回先前存好的模型,直接到②套用。")
+
+    # 1a. 訓練/參考資料夾
+    st.markdown("**(1) 選訓練/參考資料夾**")
+    train_folders = _folder_picker_list("anomaly_train_folder",
+                                        add_help="YOLO 偵測資料集:含 images/ 與 labels/")
+
+    # 1b. label 語義白話 radio(從舊進階 popover 提升;object → 不訓 head)
+    st.markdown("**(2) 這批標籤是什麼?**")
+    _tr = st.session_state.get("anomaly_train_result") or {}
+    _recs = _tr.get("records") or []
+    _hint = label_semantic_hint(_recs) if _recs else {"suggested": "unknown", "hint": ""}
+    if "anomaly_train_semantic" not in st.session_state:
+        st.session_state["anomaly_train_semantic"] = (
+            _hint["suggested"] if _hint["suggested"] in ("object", "defect") else "object")
+    st.radio("這批標籤是物件類別還是瑕疵類別?", ["object", "defect"],
+             key="anomaly_train_semantic", horizontal=True,
+             format_func=lambda s: {"object": "物件類別(door/window…)→ 不訓瑕疵分類頭",
+                                    "defect": "瑕疵類別(刮傷/污漬…)→ 解鎖瑕疵分類頭"}[s])
+    # 每 rerun 同步寫 active_semantic(供任何硬守衛讀;與 build callback 一致)
+    st.session_state["anomaly_active_semantic"] = st.session_state["anomaly_train_semantic"]
+    if st.session_state["anomaly_train_semantic"] == "defect" and _hint["suggested"] == "object":
+        st.warning("⚠ " + _hint["hint"] + " 確定是瑕疵類別嗎?")
+    with st.expander("⚙ 進階(N_min:每類最少樣本才納入分類頭)"):
+        st.slider("N_min(每類最少樣本才納入 head;**暫定·未經敏感度掃描驗證**)", 2, 30, 8,
+                  key="anomaly_n_min")
+
+    # 1c. 建模按鈕
+    st.button("▶ (1) 建立模型", key="anomaly_build_btn", type="primary",
+              use_container_width=True, disabled=not train_folders,
+              on_click=_anomaly_build_model)
+    if st.session_state.get("_anomaly_model_err"):
+        st.error(st.session_state["_anomaly_model_err"])
+
+    model = st.session_state.get("anomaly_model")
+    if model:
+        _m = model["meta"]
+        _src = "已建立" if model.get("source") == "built" else "已載入"
+        _head_txt = "含分類頭" if model.get("head") else "無分類頭"
+        _sem_txt = {"object": "物件類別", "defect": "瑕疵類別"}.get(
+            model.get("label_semantic", "object"), model.get("label_semantic"))
+        st.success(f"✅ **模型{_src}** · {_m.get('model')}@{_m.get('target_res')} · "
+                   f"{_m.get('score_mode')} · {_m.get('n_objects')} 物件 · 語義={_sem_txt} · {_head_txt} "
+                   "→ 切到 **②套用偵測**")
+        if model.get("source") == "loaded":
+            st.caption("此模型由 📂 載入;若舊 bank 未記語義,上方 radio 可重新宣告"
+                       "(僅影響本 session 顯示,不改已存模型)。")
+
+    # 1d. 統一模型暫存目錄:一鍵存 + 📂 一鍵載
+    st.divider()
+    st.markdown("**(2) 模型暫存目錄(一鍵存 bank + classifier + manifest;一鍵載回)**")
+    _def_dir = _anomaly_bank_default_dir(train_folders[0] if train_folders else "")
+    # ⚠ keyed text_input 的 value= 第二次起會被 Streamlit 忽略;預設目錄要等有訓練資料夾才算得出 →
+    # 用 session_state 在「算得出預設且目前為空」時填一次(使用者仍可改),省得逼使用者手打路徑。
+    if _def_dir and not (st.session_state.get("anomaly_model_dir") or "").strip():
+        st.session_state["anomaly_model_dir"] = _def_dir
+    st.text_input("模型暫存目錄(預設 .lv_cache,不寫你的資料集)", key="anomaly_model_dir",
+                  help="存:bank.npz + projection.npz + fewshot.json + head.joblib + manifest.json 全進此目錄。"
+                       "載:一鍵把它們讀回成模型。")
+    _mdir = st.session_state.get("anomaly_model_dir") or ""
+    _sc1, _sc2 = st.columns(2)
+    _sc1.button("💾 存模型", key="anomaly_save_model_btn", disabled=not (model and _mdir),
+                use_container_width=True,
+                on_click=_anomaly_save_model, args=(_mdir, train_folders))
+    _sc2.button("📂 載入模型", key="anomaly_load_model_btn", disabled=not _mdir,
+                use_container_width=True,
+                on_click=_anomaly_load_model, args=(_mdir,))
+    if st.session_state.get("_anomaly_model_saved"):
+        st.success(f"✅ 已存:`{st.session_state['_anomaly_model_saved']}` —— "
+                   "下次在此填同路徑按「📂 載入模型」即可在新資料夾重用。")
+
+    # 1e. (進階)在訓練資料上框選確認 good/bad → 影響下次建模的乾淨 few-shot bank
+    if _recs:
+        with st.expander("🔧 (進階)在訓練資料上框選確認正常/瑕疵範例(影響下次建模的乾淨 bank)"):
+            st.caption("框選你**確定正常**的點 →「✅ 框選標為正常範例」→ 再按「(1) 建立模型」即用乾淨 few-shot bank。")
+            _anomaly_render_scatter(_tr, context="build")
+            _conf = st.session_state.get("anomaly_confirmed", {})
+            _ng = sum(1 for v in _conf.values() if v == "good")
+            _nb = sum(1 for v in _conf.values() if v == "bad")
+            if _conf:
+                _cc1, _cc2 = st.columns([3, 1])
+                _cc1.caption(f"📌 已標記正常 **{_ng}** · 瑕疵 **{_nb}** —— 按「(1) 建立模型」用乾淨 few-shot bank 重建。")
+                _cc2.button("清除標記", key="anomaly_clear_confirmed_build",
+                            on_click=_anomaly_clear_confirmed, use_container_width=True)
+
+
+def _anomaly_tab_apply() -> None:
+    """② 套用偵測:選異常目標資料夾 → 用①鎖定的模型 run_pipeline → 結果概覽 + 散點 + 排序看圖 + 購物車匯出。"""
+    st.markdown("#### ② 套用偵測")
+    model = st.session_state.get("anomaly_model")
+    if not model:
+        st.info("請先到 **①建模 / 載入模型** 建立或載入一個模型,再回來套用偵測。")
+        return
+    _m = model["meta"]
+    st.caption(f":violet[🔒 用模型鎖定的 **{_m.get('model')}@{_m.get('target_res')}** · {_m.get('score_mode')} "
+               "評分(非側欄現值;側欄改 model/res 只作用於下次①建模)。]")
+
+    st.markdown("**(1) 選異常目標資料夾**")
+    target_folders = _folder_picker_list("anomaly_target_folder",
+                                         add_help="要偵測異常的 YOLO 資料夾:含 images/ 與 labels/")
+    st.button("▶ (2) 套用偵測", key="anomaly_apply_btn", type="primary",
+              use_container_width=True, disabled=not target_folders,
+              on_click=_anomaly_apply_model)
+    if st.session_state.get("_anomaly_apply_err"):
+        st.error(st.session_state["_anomaly_apply_err"])
+
+    result = st.session_state.get("anomaly_apply_result")
+    if not result:
+        st.info("選好目標資料夾後按「(2) 套用偵測」,結果(散點 / 排序 / 熱力圖)會顯示在這裡。")
+        return
     _warn_skipped(result.get("skipped") or [])
     if not result.get("records"):
-        st.error("找不到 YOLO 標註:此工具需要偵測資料集(資料夾內要有 **images/** 與 "
-                 "**labels/**,labels 為 YOLO 格式 .txt)。請確認後重選資料夾。")
+        st.error("找不到 YOLO 標註:目標資料夾需含 **images/** 與 **labels/**(YOLO .txt)。請確認後重選。")
         return
 
     records = result["records"]
     scores = np.asarray(result["scores"], dtype=float)
-    ranking = result["ranking"]
     n_bad = result["n_bad"]
     auroc = result.get("auroc")
-
     msg = f"共 **{len(records)}** 個物件 · 判為可疑(bad)**{n_bad}** 個 · 門檻 {result['threshold']:.3f}"
     if auroc is not None:
         msg += f" · 對照確認標籤 AUROC **{auroc:.3f}**"
     st.markdown(msg)
-    if result.get("_loaded_bank"):
-        _al = result.get("_fewshot_aligned") or {}
-        _extra = (f" · 對齊 {len(_al)} 個舊 few-shot 標記(對不到 {result.get('_fewshot_unmatched', 0)})"
-                  if (_al or result.get("_fewshot_unmatched")) else "")
-        st.caption(f":violet[🔗 對照已掛載 bank;新資料已投影回舊分佈(灰底=舊資料)]{_extra}")
+    _al = result.get("_fewshot_aligned") or {}
+    _extra = (f" · 對齊 {len(_al)} 個模型 few-shot 標記(對不到 {result.get('_fewshot_unmatched', 0)})"
+              if (_al or result.get("_fewshot_unmatched")) else "")
+    st.caption(f":violet[🔗 對照模型;目標資料已投影回模型分佈(灰底=參考資料)]{_extra}")
     if n_bad == len(records) and not st.session_state.get("anomaly_confirmed"):
-        st.warning("⚠ 全部被判為可疑 = 門檻無法校準(第一次跑、還沒有『正常參考』)。"
-                   "請走 **2-stage**:在下方散點圖**框選你確定正常的那一團點 →「✅ 框選標為正常範例」**"
-                   "(或用「自動把最不可疑的 N 個標為正常範例」),再按「執行偵測」即用乾淨參考重新評分。")
-
-    # ── M6 統一畫面:label 語義宣告 + 成熟度狀態列(判定下沉 anomaly_tool 純函式,此處只呈現)──
-    from anomaly_tool import head_unlock_state as _hus
-    from anomaly_tool import label_semantic_hint as _lsh
-    _folder_sig = str(hash(tuple(sorted(str(f) for f in folders))))
-    _sem_key = f"anomaly_sem_{_folder_sig}"
-    _hint = _lsh(records)
-    if _sem_key not in st.session_state:                    # 預設由啟發式給(安全側偏 object),可改
-        st.session_state[_sem_key] = _hint["suggested"] if _hint["suggested"] in ("object", "defect") else "object"
-    st.session_state.setdefault("anomaly_n_min", 8)
-    _sem = st.session_state[_sem_key]
-    _nmin = int(st.session_state["anomaly_n_min"])
-    _labels_list = [r.get("label", "") for r in records]
-    _unlock = _hus(label_semantic=_sem, labels=_labels_list, n_min=_nmin)
-    _ovr = st.session_state.get("anomaly_phase_override")
-    _head_ready = bool(st.session_state.get("anomaly_head")) and _unlock["unlocked"]
-    _eff_phase = _ovr if _ovr in ("phase0", "phase1", "phase2") else (
-        "phase2" if _head_ready else ("phase1" if (st.session_state.get("anomaly_confirmed")
-                                                   or result.get("_loaded_bank")) else "phase0"))
-    if _eff_phase == "phase2" and not _head_ready:          # 假 phase2 降級(無 head 不可假裝)
-        _eff_phase = "phase1" if (st.session_state.get("anomaly_confirmed") or result.get("_loaded_bank")) else "phase0"
-    _phase_label = {"phase0": "Phase0 冷啟(無監督守未知)", "phase1": "Phase1 對照 few-shot bank",
-                    "phase2": "Phase2 bank + head 閘控級聯"}[_eff_phase]
-    _pc = _unlock["per_class"]
-    _pc_str = (" · ".join(f"`{k}`{v}" for k, v in list(_pc.items())[:8]) + ("…" if len(_pc) > 8 else "")) or "(無 label)"
-    _head_state = ("🟢 達門檻可訓分類頭" if _unlock["unlocked"] else
-                   {"object_semantic": "⚪ label=物件類別 → 不訓瑕疵 head(語義安全鎖)",
-                    "undeclared_semantics": "⚪ 待宣告 label 語義",
-                    "lt_2_classes": "⚪ 已知類別不足 2 種 → 純 Bank 守未知",
-                    "classes_below_nmin": f"⚪ 達標類 <2(每類需 ≥N_min={_nmin})→ 暫不訓 head"}.get(_unlock["reason"], "⚪"))
-    st.caption(f"🧭 **{_phase_label}** ｜ 🟢 Normal Bank 守門:啟用(恆在) ｜ 每類樣本:{_pc_str} ｜ {_head_state}"
-               + (f" ｜ 待補樣本:{', '.join(f'{c}({n})' for c, n in _unlock['insufficient_classes'].items())}"
-                  if _unlock["insufficient_classes"] else ""))
-    with st.popover("⚙ 進階(label 語義 / 模式覆寫 / N_min)"):
-        st.radio("這批 YOLO label 的語義", ["object", "defect"], key=_sem_key,
-                 format_func=lambda s: {"object": "物件類別(door/window…)→ 不訓瑕疵分類頭",
-                                        "defect": "瑕疵類別(刮傷/污漬…)→ 解鎖瑕疵分類頭"}[s])
-        if st.session_state[_sem_key] == "defect" and _hint["suggested"] == "object":
-            st.warning("⚠ " + _hint["hint"] + " 確定是瑕疵類別嗎?")
-        st.selectbox("手動覆寫模式", [None, "phase0", "phase1", "phase2"], key="anomaly_phase_override",
-                     format_func=lambda v: {None: "自動", "phase0": "強制 Phase0(只 Bank)",
-                                            "phase1": "強制 Phase1", "phase2": "強制 Phase2(顯示 head)"}.get(v, str(v)),
-                     help="只改 head 顯不顯;Normal Bank 守門恆在、不可關。")
-        st.slider("N_min(每類最少樣本才納入 head;**暫定·未經敏感度掃描驗證**)", 2, 30,
-                  key="anomaly_n_min")
-    # popover 內語義/N_min 可能被改 → 用最新值重算解鎖供下方 head 區塊
-    _sem = st.session_state[_sem_key]
-    st.session_state["anomaly_active_semantic"] = _sem      # 供 _anomaly_train_head callback 硬守衛讀
-    _unlock = _hus(label_semantic=_sem, labels=_labels_list, n_min=int(st.session_state["anomaly_n_min"]))
-
-    smin, smax = float(scores.min()), float(scores.max())
-    # 把本次結果存成可攜 bank(放主畫面 result 區 → 一定看得到本輪 result;掛載模式不重複存)
-    if records and not result.get("_loaded_bank"):
-        with st.expander("💾 把本次結果存成 Memory Bank(供下次選新資料夾重用 + 投影回此分佈)"):
-            _sp = st.text_input("存成 bank 目錄(預設 .lv_cache,不寫你的資料集)",
-                                key="anomaly_bank_save_path",
-                                value=_anomaly_bank_default_dir(folders[0] if folders else ""))
-            st.button("💾 存成 bank", key="anomaly_save_btn", disabled=not _sp,
-                      on_click=_anomaly_save_bank, args=(_sp, folders))
-            if st.session_state.get("_anomaly_bank_err"):
-                st.error(st.session_state["_anomaly_bank_err"])
-            _saved2 = st.session_state.pop("_anomaly_bank_saved", None)
-            if _saved2:
-                st.success(f"✅ 已存:`{_saved2}` —— 側欄「載入 bank」填這路徑即可在新資料夾重用。")
-
-    # ── 🏷 分類頭:additive 第二段,僅在 label 語義=瑕疵類 AND ≥2 類各達 N_min 才解鎖(覆寫 phase0 可強制隱藏)──
-    if _unlock["unlocked"] and _ovr != "phase0":
-        with st.expander("🏷 瑕疵分類頭(closed-set 已知類別 + 閘控級聯:Normal Bank 先守門)"):
-            st.caption(f"在凍結 DINOv2 物件特徵上訓 linear 分類頭(達標類別:{', '.join(_unlock['eligible_classes'])})。"
-                       "**閘控**:Normal Bank 異常分數先守門 → 只有離正常遠才信任 head 的已知類別;"
-                       "head 沒把握就標 Unknown,不硬塞已知類別(防未知瑕疵被自信誤分)。")
-            st.button("🏷 訓練/重訓分類頭", key="anomaly_train_head_btn",
-                      on_click=_anomaly_train_head, args=(_unlock["eligible_classes"],),
-                      use_container_width=True)
-            if st.session_state.get("_anomaly_head_err"):
-                st.error(st.session_state["_anomaly_head_err"])
-            _head = st.session_state.get("anomaly_head")
-            if _head:
-                from collections import Counter
-
-                from dino_head import gated_predict
-                _gcc1, _gcc2 = st.columns(2)
-                _mc = _gcc1.slider("分類信心門檻(低於 → Unknown)", 0.0, 1.0, 0.5, 0.05,
-                                   key="anomaly_head_minconf")
-                # 閘控靈敏度 = recall-first 操作點旋鈕:contamination↑ → 門檻↓ → 更多物件送 head/人工(少漏檢、多過殺)
-                _cont = _gcc2.slider("閘控靈敏度 contamination(↑ 少漏檢·多過殺)", 0.01, 0.30, 0.05, 0.01,
-                                     key="anomaly_gate_contam",
-                                     help="Normal Bank 守門門檻 = 異常分數的 (1−contamination) 百分位。"
-                                          "『正常』占比 ≈ 1−contamination 是設計恆等(不是偵測到多少正常)。"
-                                          "recall-first 要少漏檢 → 調高 contamination(門檻降、更多送人工複檢)。")
-                from anomaly_tool import gate_threshold as _gtf
-                _gcal = st.checkbox("用已確認良品分布校準門檻(免疫分位數漂移;需 ≥5 個確認良品)",
-                                    key="anomaly_gate_calibrate",
-                                    help="勾 → 門檻=min(良品99分位, 相對分位);真實瑕疵率 > contamination 時"
-                                         "相對門檻會漏檢真瑕疵,良品校準門檻可救(recall-first)。良品不足自動退回相對門檻。")
-                _gt = _gtf(scores, contamination=_cont,
-                           confirmed=st.session_state.get("anomaly_confirmed"),
-                           mode=("confirmed" if _gcal else "quantile"))
-                _gthr = float(_gt["threshold"]) if len(scores) else float(result["threshold"])
-                _gp = gated_predict(_head, np.asarray(result["obj_emb"], dtype=float), scores,
-                                    anomaly_threshold=_gthr, min_conf=_mc)
-                _cnt = Counter(_gp)
-                _ntot = max(1, len(_gp))
-                _nrm = _cnt.get("正常", 0)
-                st.markdown("**閘控分類結果**:" + " · ".join(
-                    f"`{k}` {v}" for k, v in sorted(_cnt.items(), key=lambda kv: -kv[1])))
-                _cal_note = ("🟢 已用良品分布校準(免疫漂移)" if _gt["calibrated"]
-                             else ("⚠ 良品不足、退回相對門檻" if _gcal else "相對分位門檻"))
-                st.caption(f"正常 {_nrm / _ntot:.0%}(≈1−contamination,設計恆等;{_cal_note})· "
-                           f"送 head/人工 {1 - _nrm / _ntot:.0%} · Unknown {_cnt.get('Unknown', 0)}。"
-                           "拉『閘控靈敏度』即移動 recall-first 操作點(↑ 少漏檢、多過殺;Unknown→送 active learning)。")
-                _sc1, _sc2, _sc3 = st.columns([2, 1, 1])
-                _hp = _sc1.text_input(
-                    "分類頭存/讀路徑(.joblib,部署用)", key="anomaly_head_path",
-                    value=_anomaly_bank_default_dir(folders[0] if folders else "", "head") + ".joblib")
-                _sc2.button("💾 存頭", key="anomaly_head_save_btn", disabled=not _hp,
-                            on_click=_anomaly_save_head, args=(_hp,), use_container_width=True)
-                _sc3.button("📂 讀頭", key="anomaly_head_load_btn", disabled=not _hp,
-                            on_click=_anomaly_load_head, args=(_hp,), use_container_width=True)
-                _hsaved = st.session_state.pop("_anomaly_head_saved", None)
-                if _hsaved:
-                    st.success(f"✅ 分類頭已存:`{_hsaved}`")
-
-    # ── 🎯 主動學習取樣佇列:挑「最值得送人工標註」的物件 ──
-    with st.expander("🎯 主動學習取樣佇列(挑最值得送人工標註的物件)"):
-        st.caption("優先分數 = **Novelty**(Normal Bank 異常分數)+ **近決策邊界** + **Model Disagreement**"
-                   "(異常高但分類沒把握=Unknown),選樣再加 **Cluster Diversity**(每群代表,不挑一堆雷同的)。"
-                   "距離訊號比 softmax entropy 可靠(對未知 softmax 常過度自信)→ novelty 一定納入。")
-        _alk = st.slider("挑幾個送標註", 1, min(48, len(records)), min(12, len(records)),
-                         key="anomaly_al_k")
-        _almpc = st.slider("每群上限(diversity)", 1, 5, 2, key="anomaly_al_mpc")
-        # 優先模式:實測顯示純 novelty 對「撈稀有/未知」最強(距離訊號 > softmax);三訊號合成會被
-        # 邊界/分歧稀釋稀有命中 → 預設「偏 novelty」,並把操作點交給使用者。
-        _almode = st.radio(
-            "優先模式",
-            ["偏 novelty(對稀有/未知更強)", "弱類定向(分類頭最混淆)", "三訊號均衡", "純 novelty"],
-            horizontal=True, key="anomaly_al_mode",
-            help="Novelty=Normal Bank 異常(距離訊號,對未知最可靠);弱類定向=novelty+分類頭預測熵"
-                 "(挑分類頭最混淆/最弱的類去標,M5);邊界/分歧靠分類頭,對『撈稀有』會稀釋。")
-        from active_learning import priority_score, select_for_labeling
-        _proba, _pred_al = None, None
-        _head_al = st.session_state.get("anomaly_head")
-        if _head_al:
-            from dino_head import predict_head
-            try:
-                _pred_al, _, _proba = predict_head(_head_al, np.asarray(result["obj_emb"], dtype=float))
-            except Exception:
-                _proba = _pred_al = None
-        if _almode == "弱類定向(分類頭最混淆)":
-            from active_loop import confusion_targeted_priority
-            _pri = confusion_targeted_priority(scores, _proba, w_novelty=1.0, w_entropy=1.0)
-        else:
-            _wn, _wb, _wd = {"偏 novelty(對稀有/未知更強)": (1.0, 0.4, 0.4),
-                             "三訊號均衡": (1.0, 1.0, 1.0),
-                             "純 novelty": (1.0, 0.0, 0.0)}[_almode]
-            _pri = priority_score(scores, head_proba=_proba,
-                                  anomaly_threshold=float(result["threshold"]),
-                                  w_novelty=_wn, w_boundary=_wb, w_disagreement=_wd)
-        # diversity 分群:有分類頭 → 用「預測類別」(最自然,別挑一堆同類);否則退回 HDBSCAN 群
-        # (高維 DINOv2 上 min_cluster_size≈0.05N 常塌成 1 群、多樣性失效)。
-        _div = (_pred_al if _pred_al is not None
-                else (result.get("cluster") or {}).get("labels"))
-        _sel_al = select_for_labeling(_pri, k=_alk, cluster_labels=_div, max_per_cluster=_almpc)
-        st.caption(f"取樣佇列(優先序,共 {len(_sel_al)} 個"
-                   + ("" if _head_al else ";分類頭未訓練 → 目前只用 novelty,訓練後加 disagreement/邊界") + "):")
-        with st.container(height=240, key="anomaly_al_queue"):
-            _qc = st.columns(6)
-            for _j, _i in enumerate(_sel_al[:24]):
-                _rr = records[_i]
-                with _qc[_j % 6]:
-                    _im = safe_open_image(_rr["image_path"])
-                    if _im is None:
-                        st.caption("⚠ 缺圖")
-                    else:
-                        st.image(crop_bbox(_im, *_rr["bbox"], pad=0.1), use_container_width=True,
-                                 caption=f'P={_pri[_i]:.2f}·{_rr["verdict"]}')
-        st.button(f"🛒 把取樣佇列 {len(_sel_al)} 個加入購物車(送標註)", key="anomaly_al_cart",
-                  disabled=not _sel_al, use_container_width=True,
-                  on_click=_anomaly_add_to_cart, args=(records, _sel_al))
-
-    # ── 🔁 主動學習迴圈(M5):選樣→標→量測,展示主動選樣比隨機省標註 ──
-    _loop_labels = [r.get("label", "") for r in records]
-    _loop_uniq = sorted({l for l in _loop_labels if l})
-    if len(_loop_uniq) >= 2 and len(records) >= 20:
-        with st.expander("🔁 主動學習迴圈(標註效益:主動選樣 vs 隨機 — 看標註是否值得)"):
-            st.caption("比較 uncertainty sampling 與隨機的學習曲線:同樣準度,主動選樣在**類別不均衡的真實"
-                       "資料**上省標註(本資料集雙-split 實證約 60-75%,幅度視不均衡/可分性而定)。"
-                       "⚠ 此曲線是**以資料集既有 label 當 oracle 的回顧模擬**(不消費你在上方 confirm 的 good/bad);"
-                       "用途是決策輔助(值不值得標、何時停),真實標註與 Normal Bank 回流仍走上方 confirm。")
-            from active_loop import (round_summary, should_stop_labeling,
-                                     stratified_pool_eval_split)
-            _emb_l = np.asarray(result["obj_emb"], dtype=float)
-            _lab_l = np.array(_loop_labels)
-            # 分層切 pool/eval(每類兩側各 ≥1,避免少數類全進一側使 eval 退化單類、曲線變假平圖)
-            _pool_i, _eval_i = stratified_pool_eval_split(_lab_l, eval_frac=0.3, seed=0)
-            _eval_ok = len(set(_lab_l[_eval_i].tolist())) >= 2 if len(_eval_i) else False
-            if not _eval_ok:
-                st.info("少數類樣本太少,held-out 評估集無法涵蓋 ≥2 類 → 學習曲線無意義,已跳過"
-                        "(這是資料限制:請增加少數類樣本或合併資料夾)。")
-            else:
-                _bsz = st.slider("每輪標註數", 10, 60, 30, key="anomaly_loop_batch")
-                st.button("▶ 跑標註效益曲線(主動 vs 隨機)", key="anomaly_loop_run",
-                          use_container_width=True, on_click=_anomaly_run_loop_curve,
-                          args=(_emb_l, _lab_l, _pool_i, _eval_i, _bsz))
-                _cv = st.session_state.get("anomaly_loop_curves")
-                if _cv and "_err" not in _cv:
-                    import pandas as pd
-                    _ca, _cr = _cv["active"], _cv["random"]
-                    _n = min(len(_ca), len(_cr))
-                    _ca, _cr = _ca[:_n], _cr[:_n]
-                    _df = pd.DataFrame({"標註數": [x[0] for x in _ca],
-                                        "主動選樣(active)": [x[1] for x in _ca],
-                                        "隨機(random)": [x[1] for x in _cr]}).set_index("標註數")
-                    st.line_chart(_df)
-                    _fa, _fr = _ca[-1][1], _cr[-1][1]
-                    _lead = _fa - _fr
-                    _stop = should_stop_labeling(_ca)
-                    # 停止建議同時看「走平」與「主動是否仍領先」
-                    if _lead <= 0.005:
-                        _hint = " ≈ 主動與隨機此資料上無明顯差異(可分性高/已飽和 → 標註策略影響小)。"
-                    elif _stop:
-                        _hint = " ⏹ 曲線走平 → **建議停止標註**(再標效益遞減)。"
-                    else:
-                        _hint = " ↗ 仍上升且主動領先 → **值得繼續標(優先用主動選樣)**。"
-                    st.markdown(f"**最終(標 {_ca[-1][0]} 個):主動 `{_fa:.3f}` vs 隨機 `{_fr:.3f}`** "
-                                f"(主動領先 `{_lead:+.3f}`)。" + _hint)
-                elif _cv and "_err" in _cv:
-                    st.info(f"資料不足以跑迴圈:{_cv['_err']}")
-            _conf_l = st.session_state.get("anomaly_confirmed", {})
-            if _conf_l:
-                _rs = round_summary(_conf_l)
-                st.caption(f"已人工確認(回流 Normal Bank){_rs['total']} 個:"
-                           + " · ".join(f"`{k}` {v}" for k, v in _rs["per_class"].items()))
+        st.warning("⚠ 全部被判為可疑 = 門檻無法校準。可在下方散點**框選你確定正常的那一團點 →「✅ 框選標為正常範例」**"
+                   "→ 按「🔁 就地重評」用乾淨參考重算(不動模型;正式重建走①)。")
 
     left, right = st.columns([3, 2], gap="medium")
-
-    # ── 左:分布散點圖(物件級 embedding 投影,以異常分數上色;框選→購物車)──
     with left:
-        emb = np.asarray(result["obj_emb"], dtype=float)
-        sel_idx: list[int] = []
-        if emb.shape[0] >= 2 and emb.shape[1] >= 2:
-            # 掛載 bank 且維度相容 → 投到「舊基底」(映射回舊分佈);否則維持當資料夾即時 SVD。
-            _lbp = (st.session_state.get("anomaly_loaded_bank") or {}).get("projection")
-            _ref_bg = None
-            if _lbp is not None and emb.shape[1] == np.asarray(_lbp["mean"]).shape[0]:
-                from anomaly_project import transform_new
-                coords = transform_new(_lbp, emb)
-                _ref_bg = np.asarray(_lbp["ref_coords"], dtype=float)
-            else:
-                c = emb - emb.mean(axis=0, keepdims=True)
-                try:
-                    _u, _s, _vt = np.linalg.svd(c, full_matrices=False)
-                    coords = (_u[:, :2] * _s[:2])
-                except np.linalg.LinAlgError:
-                    coords = c[:, :2]
-            # 與右側「分數/類別篩選」連動:未達門檻或非選定類別的點 → 變淡(灰、半透明),
-            # 但仍留在圖上、可框選(標正常/瑕疵的套索流程不受影響)。篩選的 widget 在右欄
-            # 稍後才建立,這裡用同一組 key 從 session_state 讀「已提交」的值;首次無值時退回
-            # smin/空集 = 不篩選(全部實色)。
-            _band = st.session_state.get("anomaly_heat_filter", (smin, smax))
-            _lo, _hi = (_band if isinstance(_band, (tuple, list)) else (_band, smax))
-            _cls = st.session_state.get("anomaly_class_filter") or []
-            _passes = [(_lo <= scores[i] <= _hi)
-                       and (not _cls or records[i].get("label", "") in _cls)
-                       for i in range(len(records))]
-            _txt = [f"{Path(records[i]['image_path']).name}"
-                    f"<br>score={records[i]['score']:.3f}·{records[i]['verdict']}"
-                    for i in range(len(records))]
-            _dim = [i for i in range(len(records)) if not _passes[i]]
-            _hot = [i for i in range(len(records)) if _passes[i]]
-            fig = go.Figure()
-            if _ref_bg is not None and len(_ref_bg):
-                # 掛載 bank:舊資料分佈當灰底底圖(不帶 customdata + hoverinfo=skip → 不污染框選),
-                # 新點疊上去 → 一眼看出新資料落在舊 good 密集區(正常)或離群(可疑)。
-                fig.add_trace(go.Scattergl(
-                    x=_ref_bg[:, 0], y=_ref_bg[:, 1], mode="markers",
-                    marker=dict(size=5, color="rgba(140,140,140,0.28)"),
-                    hoverinfo="skip", showlegend=False, name="舊分佈"))
-            if _dim:  # 變淡的背景點(灰、半透明)——仍帶 customdata,可被套索框選
-                fig.add_trace(go.Scattergl(
-                    x=coords[_dim, 0], y=coords[_dim, 1], mode="markers",
-                    marker=dict(size=6, color="rgba(150,150,150,0.25)"),
-                    customdata=_dim, text=[_txt[i] for i in _dim],
-                    hovertemplate="%{text}<extra></extra>", showlegend=False))
-            fig.add_trace(go.Scattergl(  # 符合篩選的點:實色(異常分數上色,色階固定於全距)
-                x=coords[_hot, 0], y=coords[_hot, 1], mode="markers",
-                marker=dict(size=7, color=[scores[i] for i in _hot], colorscale="Turbo",
-                            cmin=smin, cmax=smax, showscale=True,
-                            colorbar=dict(title="異常")),
-                customdata=_hot, text=[_txt[i] for i in _hot],
-                hovertemplate="%{text}<extra></extra>", showlegend=False))
-            fig.update_layout(height=440, margin=dict(l=0, r=0, t=10, b=0),
-                              dragmode="lasso")
-            _nonce = st.session_state.get("_anomaly_clear_nonce", 0)
-            _skey = f"anomaly_scatter_{_nonce}"  # bump nonce → 重新掛載清空框選
-            # 取消框選貼在散點正上方(對齊 Visualize/Compare/完整度其它工具):placeholder
-            # 佔位,等框選事件處理完、sel_idx 定案再填入 → 鈕上顯示正確張數&啟用狀態。
-            _tb1, _tb2 = st.columns([5, 1])
-            _tb1.caption("💡 在散點上拖曳框選/套索離群點 → 下方可加購物車或標正常/瑕疵。")
-            _clear_slot = _tb2.empty()
-            ev = st.plotly_chart(fig, key=_skey, on_select="rerun",
-                                 selection_mode=("box", "lasso"))
-            if ev and getattr(ev, "selection", None):
-                sel_idx = selection_points_to_indices(ev.selection.get("points", []))
-                # 已套用篩選時:框到的「變淡(灰)點」=不符合篩選 → 不納入框選,
-                # 只選符合(實色)的點。沒篩選時 _passes 全 True、不影響。
-                sel_idx = [i for i in sel_idx if _passes[i]]
-            _clear_slot.button(
-                f"✕ 取消框選({len(sel_idx)})" if sel_idx else "✕ 取消框選",
-                key="anomaly_clear_sel", use_container_width=True,
-                disabled=not sel_idx, on_click=_anomaly_clear_sel, args=(_skey,))
-            st.caption(f"散點圖:點越紅越可疑。框選/套索離群點。已框選 {len(sel_idx)} 個。")
-            st.button("🛒 加入購物車(框選)", key="anomaly_cart_selected",
-                      disabled=not sel_idx, use_container_width=True,
-                      on_click=_anomaly_add_to_cart, args=(records, sel_idx))
-            mc1, mc2 = st.columns(2)
-            mc1.button("✅ 框選標為正常範例", key="anomaly_mark_normal",
-                       disabled=not sel_idx, use_container_width=True,
-                       on_click=_anomaly_mark, args=(records, sel_idx, "good"),
-                       help="2-stage:把你確定正常的點標起來 → 「執行偵測」用這些建乾淨 "
-                            "few-shot bank,專抓細微瑕疵。")
-            mc2.button("🔴 框選標為瑕疵範例", key="anomaly_mark_bad",
-                       disabled=not sel_idx, use_container_width=True,
-                       on_click=_anomaly_mark, args=(records, sel_idx, "bad"),
-                       help="把已知瑕疵標起來校準門檻(會算出 AUROC)。")
-            st.button("🔁 重新偵測(套用上面標記的正常/瑕疵)", key="anomaly_rerun_btn",
-                      type="primary", use_container_width=True,
-                      on_click=_anomaly_trigger_rerun,
-                      help="標好正常/瑕疵範例後按這裡就地重跑;不用回左側「執行偵測」。")
-            # 框選物件縮圖預覽:看清楚裁切的物件本身再判斷標正常/瑕疵(最多 24 個)
-            if sel_idx:
-                _ph = st.slider("預覽高度(px)", 200, 1000, 400, 40,
-                                key="anomaly_preview_h",
-                                help="拖動調整下方框選預覽區的高度(看大圖)。")
-                st.caption(f"框選 {len(sel_idx)} 個 — 預覽(看清楚再標;最多 24):")
-                with st.container(height=_ph, key="anomaly_sel_preview"):
-                    _pc = st.columns(6)
-                    for _j, _i in enumerate(sel_idx[:24]):
-                        _r = records[_i]
-                        with _pc[_j % 6]:
-                            _im = safe_open_image(_r["image_path"])  # 壞圖回 None → 略過
-                            if _im is None:
-                                st.caption("⚠ 缺圖")
-                            else:
-                                # 影像不加框;底下標籤寫「分數·類別名稱」,字色依判定:
-                                # good=黑、bad=紅(不再用 Turbo 底色,讓深色字在白底上清楚)。
-                                st.image(crop_bbox(_im, *_r["bbox"], pad=0.1),
-                                         use_container_width=True)
-                                _fg = "#cc0000" if _r["verdict"] == "bad" else "#000000"
-                                _lab = _r.get("label") or _r["verdict"]
-                                st.markdown(
-                                    f"<div style='color:{_fg};text-align:center;"
-                                    f"font-size:0.82em;line-height:1.5;font-weight:600'>"
-                                    f"{_r['score']:.2f}·{_lab}</div>",
-                                    unsafe_allow_html=True)
+        _anomaly_render_scatter(result, context="apply")
         _outliers = [i for i in range(len(records)) if records[i]["verdict"] == "bad"]
-        # 不加 help:Streamlit help tooltip 會多渲染一個 <button> → e2e strict-mode 命中 2 個。
         st.button(f"🛒 把判為可疑(bad)的 {len(_outliers)} 個加入購物車",
                   key="anomaly_select_outliers", use_container_width=True,
                   disabled=not _outliers,
@@ -1847,8 +1651,7 @@ def _anomaly_ui() -> None:
         _nb = sum(1 for v in _conf.values() if v == "bad")
         if _conf:
             sc1, sc2 = st.columns([3, 1])
-            sc1.caption(f"📌 已標記正常 **{_ng}** · 瑕疵 **{_nb}** —— 按「執行偵測」用乾淨 "
-                        "few-shot bank 重跑(抓細微瑕疵)。")
+            sc1.caption(f"📌 已標記正常 **{_ng}** · 瑕疵 **{_nb}** —— 按「🔁 就地重評」用乾淨 few-shot bank 重算。")
             sc2.button("清除標記", key="anomaly_clear_confirmed",
                        on_click=_anomaly_clear_confirmed, use_container_width=True)
         cart_n = len(_cart_snapshots("anomaly"))
@@ -1857,75 +1660,353 @@ def _anomaly_ui() -> None:
         cart = _cart_snapshots("anomaly")
         recs = [{"path": s["path"], "split": s.get("split", ""),
                  "label": s.get("label", "")} for s in cart]
+        from interaction import zip_selected_images
         st.download_button(
             "⬇ 匯出選取原圖 ZIP", key="anomaly_export",
             data=(zip_selected_images(recs, list(range(len(recs)))) if recs else b""),
             file_name="anomaly_subset.zip", mime="application/zip",
             disabled=not recs, use_container_width=True)
-
-    # ── 右:🔥 熱度篩選 + 排序清單 + 點選看圖(LOO/物件級→裁切圖;patch bank→熱力圖)──
     with right:
-        st.markdown("**🔥 最可疑物件(篩選 + 點選看圖)**")
-        if smax > smin:
-            lo, hi = st.slider("篩選:異常分數範圍 [低–高]",
-                               round(smin, 3), round(smax, 3),
-                               (round(smin, 3), round(smax, 3)),
-                               key="anomaly_heat_filter",
-                               help="雙邊範圍:只看分數落在區間內的物件。"
-                                    "拉高『低』界=濾掉低分(正常);拉低『高』界=排除最極端、只看中低段。")
-        else:
-            lo, hi = smin, smax
-        # 類別篩選:只看某一/某幾類物件——針對「某一類資料有漏」去挑該類的異常。
-        # 留空=全部;只有多類別時才顯示(單類別這欄無意義)。
-        labels_present = sorted({records[i].get("label", "") for i in ranking
-                                 if records[i].get("label", "")})
-        cls_sel: list[str] = []
-        if len(labels_present) > 1:
-            cls_sel = st.multiselect(
-                "篩選:只看類別", labels_present, default=[],
-                key="anomaly_class_filter",
-                help="只看選定類別的物件(留空=全部)。針對某一類找漏 / 挑該類的異常。")
-        shown = [i for i in ranking
-                 if lo <= scores[i] <= hi
-                 and (not cls_sel or records[i].get("label", "") in cls_sel)]
-        st.caption(f"符合 {len(shown)} / {len(records)} 個(由最可疑排到最不可疑)")
-        if shown:
-            # 篩選(分數門檻/類別)一改變 → 看圖自動跳到「符合清單中最可疑的那張」
-            # (shown 由最可疑排序,shown[0] 即最可疑)。篩選沒變時保留使用者手動選的那張;
-            # 同時防止舊 pick 被篩掉後 selectbox 撞上「session 值不在選項」而出錯。
-            _sig = (round(float(lo), 6), round(float(hi), 6), tuple(sorted(cls_sel)))
-            if (st.session_state.get("_anomaly_filt_sig") != _sig
-                    or st.session_state.get("anomaly_inspect") not in shown):
-                st.session_state["anomaly_inspect"] = shown[0]
-            st.session_state["_anomaly_filt_sig"] = _sig
-            pick = st.selectbox(
-                "選一個看圖", shown, key="anomaly_inspect",
-                format_func=lambda i: f"{scores[i]:.3f} · {Path(records[i]['image_path']).name}"
-                f" #{records[i]['obj_index']} · {records[i]['label']}")
-            r = records[pick]
-            img = safe_open_image(r["image_path"])  # 壞圖回 None → 不當 Image 用
-            try:
-                if img is None:
-                    raise OSError("來源影像損壞或格式錯誤")
-                iw, ih = img.size
-                crop = crop_bbox(img, *r["bbox"],
-                                 pad_px=_adaptive_pad_px(r["bbox"], iw, ih, 0.15))
-                if result.get("bank") is not None and result.get("_image_paths"):
-                    meta = discover_yolo_objects([Path(p) for p in result["_image_paths"]],
-                                                 result.get("_class_names"))
-                    pf = embed_objects_patch(
-                        [meta[pick]], model=result.get("_model", "dinov2_vits14"),
-                        target_res=result.get("_target_res", 224),
-                        cache_dir=Path(result["_cache"]))[0]
-                    _, pmap = score_object(pf["feats"], pf["grid"], result["bank"])
-                    st.image(render_heatmap(pmap, crop), use_container_width=True,
-                             caption=f"{r['label']} · {r['score']:.3f} · 紅=最不像正常")
+        _anomaly_render_inspector(result, scores)
+
+
+def _anomaly_tab_sample() -> None:
+    """③ 挑樣送人工標:2×2 取樣矩陣 master-detail → 點格出大圖牆 + 有意義標籤 → 加入購物車。
+    4 模式排 2×2(對齊現 radio 順序):偏novelty / 弱類定向 / 三訊號均衡 / 純novelty。"""
+    from collections import Counter
+
+    from active_learning import select_for_labeling
+    from interaction import crop_bbox
+    st.markdown("#### ③ 挑樣送人工標")
+    model = st.session_state.get("anomaly_model")
+    result = st.session_state.get("anomaly_apply_result")
+    if not model:
+        st.info("請先到 **①建模 / 載入模型**,再到 **②套用偵測** 產生結果,才能挑樣。")
+        return
+    if not result or not result.get("records"):
+        st.info("請先到 **②套用偵測** 對目標資料夾跑出結果,這裡才有物件可挑。")
+        return
+
+    records = result["records"]
+    scores = np.asarray(result["scores"], dtype=float)
+    obj_emb = result.get("obj_emb")
+    threshold = float(result["threshold"])
+    head = model.get("head")
+
+    st.caption("優先分數 = **Novelty**(Normal Bank 異常)+ **近決策邊界** + **Model Disagreement**;"
+               "選樣再加 **Cluster Diversity**。距離訊號比 softmax 可靠 → novelty 一定納入。")
+    _kmax = max(1, min(48, len(records)))
+    _alk = (st.slider("挑幾個送標註", 1, _kmax, min(12, _kmax), key="anomaly_q_k")
+            if _kmax > 1 else 1)                        # 防呆:物件極少時 slider min==max 會爆
+    _almpc = st.slider("每群上限(diversity)", 1, 5, 2, key="anomaly_q_mpc")
+
+    # head proba / pred(diversity 分群 + 弱類定向用)
+    _proba, _pred = None, None
+    if head is not None and obj_emb is not None:
+        from dino_head import predict_head
+        try:
+            _pred, _, _proba = predict_head(head, np.asarray(obj_emb, dtype=float))
+        except Exception:
+            _proba = _pred = None
+    _div = (_pred if _pred is not None else (result.get("cluster") or {}).get("labels"))
+
+    # gated 門檻(供徽章/標籤的閘控判定)。沿用 gate_threshold(quantile;有 head 才實際拆 Unknown)。
+    _min_conf = 0.5
+    if head is not None and obj_emb is not None:
+        from anomaly_tool import gate_threshold as _gtf
+        _gt = _gtf(scores, contamination=0.05,
+                   confirmed=st.session_state.get("anomaly_confirmed"), mode="quantile")
+        _gthr = float(_gt["threshold"]) if len(scores) else threshold
+    else:
+        _gthr = threshold
+
+    # 2×2 模式(固定順序對齊舊 radio):偏novelty / 弱類定向 / 三訊號均衡 / 純novelty
+    _modes = [("novelty", "偏 novelty(稀有/未知更強)"), ("confusion", "弱類定向(分類頭最混淆)"),
+              ("balanced", "三訊號均衡"), ("pure", "純 novelty")]
+    st.session_state.setdefault("anomaly_q_mode", "novelty")
+    _active = st.session_state["anomaly_q_mode"]
+
+    # 每格各算自己的 _sel + 成分拆解徽章(有 head→正常N·類別M·未知U;無 head→可疑N·正常M)
+    def _sel_for(mode_id):
+        _pri = _anomaly_priority_for(mode_id, scores, _proba, threshold)
+        return select_for_labeling(_pri, k=_alk, cluster_labels=_div, max_per_cluster=_almpc)
+
+    def _badge(sel):
+        ql = _anomaly_queue_labels(sel, records, scores, head, _gthr, _min_conf, obj_emb)
+        verdicts = [ql[i]["verdict"] for i in sel]
+        if head is not None:
+            n_norm = sum(1 for v in verdicts if v == "正常")
+            n_unk = sum(1 for v in verdicts if v == "Unknown")
+            n_cls = len(verdicts) - n_norm - n_unk
+            return f"正常 {n_norm}·類別 {n_cls}·未知 {n_unk}"
+        c = Counter(verdicts)
+        return f"可疑 {c.get('可疑', 0)}·正常 {c.get('正常', 0)}"
+
+    st.markdown("**取樣模式(點一格 → 右下出大圖牆)**")
+    _sel_cache = {}
+    r0 = st.columns(2)
+    r1 = st.columns(2)
+    _cells = [(r0[0], _modes[0]), (r0[1], _modes[1]), (r1[0], _modes[2]), (r1[1], _modes[3])]
+    for _col, (mid, mname) in _cells:
+        _sel_cache[mid] = _sel_for(mid)
+        with _col:
+            st.button(f"{mname}\n\n{_badge(_sel_cache[mid])}", key=f"anomaly_qmode_{mid}",
+                      use_container_width=True,
+                      type=("primary" if mid == _active else "secondary"),
+                      on_click=_anomaly_pick_qmode, args=(mid,))
+
+    # detail:選中模式的大圖牆
+    _sel = _sel_cache.get(_active, [])
+    _active_name = dict(_modes).get(_active, _active)
+    st.markdown(f"**{_active_name} — 取樣佇列(優先序,共 {len(_sel)} 個)**"
+                + ("" if head is not None else " ｜ 無分類頭 → 只用 novelty,標籤無 Unknown"))
+    _gc1, _gc2 = st.columns(2)
+    _cols = _gc1.slider("每列張數", 2, 6, 3, key="anomaly_q_cols")
+    _th = _gc2.slider("縮圖高度(px)", 120, 400, 200, 10, key="anomaly_q_th")
+    _labels = _anomaly_queue_labels(_sel, records, scores, head, _gthr, _min_conf, obj_emb)
+    if _sel:
+        _wall = st.columns(_cols)
+        for _j, _i in enumerate(_sel):
+            _r = records[_i]
+            with _wall[_j % _cols]:
+                _im = safe_open_image(_r["image_path"])
+                if _im is None:
+                    st.caption("⚠ 缺圖")
                 else:
-                    st.image(crop, use_container_width=True,
-                             caption=f"{r['label']} · {r['score']:.3f}"
-                             " ·(無監督模式;確認正常範例後可看熱力圖)")
-            except (OSError, Image.DecompressionBombError, IndexError) as e:
-                st.caption(f":gray[無法顯示:{e}]")
+                    # 縮圖高度 slider 真正生效:把裁切縮到指定像素高(等比),不吃欄寬。
+                    _crop = crop_bbox(_im, *_r["bbox"], pad=0.1)
+                    _cw, _ch = _crop.size
+                    _w = max(1, int(_cw * _th / max(1, _ch)))
+                    st.image(_crop.resize((_w, int(_th))))
+                _info = _labels[int(_i)]
+                # 影像標籤三行:類別名 / 閘控判定(正常·類別·Unknown)/ 異常分數
+                _vc = {"正常": "#1a7f37", "Unknown": "#9a6700"}.get(_info["verdict"], "#cc0000")
+                st.markdown(
+                    f"<div style='text-align:center;font-size:0.8em;line-height:1.45'>"
+                    f"<b>{_info['label']}</b><br>"
+                    f"<span style='color:{_vc};font-weight:600'>判定:{_info['verdict']}</span><br>"
+                    f"異常 {_info['score']:.2f}</div>",
+                    unsafe_allow_html=True)
+    st.button(f"🛒 把「{_active_name}」佇列 {len(_sel)} 個加入購物車(送標註)",
+              key="anomaly_q_cart", disabled=not _sel, use_container_width=True,
+              on_click=_anomaly_add_to_cart, args=(records, _sel))
+
+
+def _anomaly_render_scatter(result: dict, *, context: str) -> None:
+    """散點圖框選(物件級 embedding 投影,異常分數上色)+ 標 good/bad + 框選預覽。
+    context='build':標記影響下次①建模;context='apply':提供「🔁 就地重評」(用 confirmed 重算不動模型)。
+    沿用既有散點/篩選連動/取消框選/預覽邏輯(只是搬進對的 tab)。"""
+    import plotly.graph_objects as go
+
+    from interaction import crop_bbox, selection_points_to_indices
+    records = result["records"]
+    scores = np.asarray(result["scores"], dtype=float)
+    smin, smax = (float(scores.min()), float(scores.max())) if len(scores) else (0.0, 1.0)
+    emb = np.asarray(result.get("obj_emb"), dtype=float) if result.get("obj_emb") is not None else np.zeros((0, 0))
+    sel_idx: list[int] = []
+    if emb.shape[0] >= 2 and emb.shape[1] >= 2:
+        # 模型有投影器且維度相容 → 投到模型基底(映射回參考分佈);否則維持當資料夾即時 SVD。
+        _mp = (st.session_state.get("anomaly_model") or {}).get("projection")
+        _ref_bg = None
+        if _mp is not None and emb.shape[1] == np.asarray(_mp["mean"]).shape[0]:
+            from anomaly_project import transform_new
+            coords = transform_new(_mp, emb)
+            _ref_bg = np.asarray(_mp["ref_coords"], dtype=float)
+        else:
+            c = emb - emb.mean(axis=0, keepdims=True)
+            try:
+                _u, _s, _vt = np.linalg.svd(c, full_matrices=False)
+                coords = (_u[:, :2] * _s[:2])
+            except np.linalg.LinAlgError:
+                coords = c[:, :2]
+        _band = st.session_state.get("anomaly_heat_filter", (smin, smax))
+        _lo, _hi = (_band if isinstance(_band, (tuple, list)) else (_band, smax))
+        _cls = st.session_state.get("anomaly_class_filter") or []
+        _passes = [(_lo <= scores[i] <= _hi)
+                   and (not _cls or records[i].get("label", "") in _cls)
+                   for i in range(len(records))]
+        _txt = [f"{Path(records[i]['image_path']).name}"
+                f"<br>score={records[i]['score']:.3f}·{records[i]['verdict']}"
+                for i in range(len(records))]
+        _dim = [i for i in range(len(records)) if not _passes[i]]
+        _hot = [i for i in range(len(records)) if _passes[i]]
+        fig = go.Figure()
+        if _ref_bg is not None and len(_ref_bg):
+            fig.add_trace(go.Scattergl(
+                x=_ref_bg[:, 0], y=_ref_bg[:, 1], mode="markers",
+                marker=dict(size=5, color="rgba(140,140,140,0.28)"),
+                hoverinfo="skip", showlegend=False, name="參考分佈"))
+        if _dim:
+            fig.add_trace(go.Scattergl(
+                x=coords[_dim, 0], y=coords[_dim, 1], mode="markers",
+                marker=dict(size=6, color="rgba(150,150,150,0.25)"),
+                customdata=_dim, text=[_txt[i] for i in _dim],
+                hovertemplate="%{text}<extra></extra>", showlegend=False))
+        fig.add_trace(go.Scattergl(
+            x=coords[_hot, 0], y=coords[_hot, 1], mode="markers",
+            marker=dict(size=7, color=[scores[i] for i in _hot], colorscale="Turbo",
+                        cmin=smin, cmax=smax, showscale=True,
+                        colorbar=dict(title="異常")),
+            customdata=_hot, text=[_txt[i] for i in _hot],
+            hovertemplate="%{text}<extra></extra>", showlegend=False))
+        fig.update_layout(height=440, margin=dict(l=0, r=0, t=10, b=0),
+                          dragmode="lasso")
+        _nonce = st.session_state.get("_anomaly_clear_nonce", 0)
+        _skey = f"anomaly_scatter_{context}_{_nonce}"
+        _tb1, _tb2 = st.columns([5, 1])
+        _tb1.caption("💡 在散點上拖曳框選/套索離群點 → 下方可加購物車或標正常/瑕疵。")
+        _clear_slot = _tb2.empty()
+        ev = st.plotly_chart(fig, key=_skey, on_select="rerun",
+                             selection_mode=("box", "lasso"))
+        if ev and getattr(ev, "selection", None):
+            sel_idx = selection_points_to_indices(ev.selection.get("points", []))
+            sel_idx = [i for i in sel_idx if _passes[i]]
+        _clear_slot.button(
+            f"✕ 取消框選({len(sel_idx)})" if sel_idx else "✕ 取消框選",
+            key=f"anomaly_clear_sel_{context}", use_container_width=True,
+            disabled=not sel_idx, on_click=_anomaly_clear_sel, args=(_skey,))
+        st.caption(f"散點圖:點越紅越可疑。框選/套索離群點。已框選 {len(sel_idx)} 個。")
+        st.button("🛒 加入購物車(框選)", key=f"anomaly_cart_selected_{context}",
+                  disabled=not sel_idx, use_container_width=True,
+                  on_click=_anomaly_add_to_cart, args=(records, sel_idx))
+        mc1, mc2 = st.columns(2)
+        mc1.button("✅ 框選標為正常範例", key=f"anomaly_mark_normal_{context}",
+                   disabled=not sel_idx, use_container_width=True,
+                   on_click=_anomaly_mark, args=(records, sel_idx, "good"),
+                   help="把你確定正常的點標起來 → 建乾淨 few-shot bank,專抓細微瑕疵。")
+        mc2.button("🔴 框選標為瑕疵範例", key=f"anomaly_mark_bad_{context}",
+                   disabled=not sel_idx, use_container_width=True,
+                   on_click=_anomaly_mark, args=(records, sel_idx, "bad"),
+                   help="把已知瑕疵標起來校準門檻(會算出 AUROC)。")
+        if context == "apply":
+            # ② 就地重評:用最新 confirmed 重算分數(不動模型);正式重建走①(設計拍板)。
+            st.button("🔁 就地重評(套用上面標記,不動模型)", key="anomaly_reapply_btn",
+                      type="primary", use_container_width=True,
+                      on_click=_anomaly_trigger_rerun,
+                      help="用最新標記在目標資料上重算分數(不重建模型);正式重建請回①。")
+        if sel_idx:
+            _ph = st.slider("預覽高度(px)", 200, 1000, 400, 40,
+                            key=f"anomaly_preview_h_{context}",
+                            help="拖動調整下方框選預覽區的高度(看大圖)。")
+            st.caption(f"框選 {len(sel_idx)} 個 — 預覽(看清楚再標;最多 24):")
+            with st.container(height=_ph, key=f"anomaly_sel_preview_{context}"):
+                _pc = st.columns(6)
+                for _j, _i in enumerate(sel_idx[:24]):
+                    _r = records[_i]
+                    with _pc[_j % 6]:
+                        _im = safe_open_image(_r["image_path"])
+                        if _im is None:
+                            st.caption("⚠ 缺圖")
+                        else:
+                            st.image(crop_bbox(_im, *_r["bbox"], pad=0.1),
+                                     use_container_width=True)
+                            _fg = "#cc0000" if _r["verdict"] == "bad" else "#000000"
+                            _lab = _r.get("label") or _r["verdict"]
+                            st.markdown(
+                                f"<div style='color:{_fg};text-align:center;"
+                                f"font-size:0.82em;line-height:1.5;font-weight:600'>"
+                                f"{_r['score']:.2f}·{_lab}</div>",
+                                unsafe_allow_html=True)
+
+
+def _anomaly_render_inspector(result: dict, scores) -> None:
+    """右欄:🔥 熱度/類別篩選 + 排序清單 + 點選看圖(LOO/物件級→裁切圖;patch bank→熱力圖)。"""
+    from PIL import Image
+
+    from anomaly_heatmap import render_heatmap
+    from anomaly_score import score_object
+    from interaction import crop_bbox, discover_yolo_objects
+    from object_eval import _adaptive_pad_px
+    from patch_features import embed_objects_patch
+    records = result["records"]
+    ranking = result["ranking"]
+    smin, smax = float(scores.min()), float(scores.max())
+    st.markdown("**🔥 最可疑物件(篩選 + 點選看圖)**")
+    # ⚠ 防呆要用「round 後」的值比較:smin/smax 都很小(如建模+套用同資料,分數很接近)時,
+    # 原始 smax>smin 可能過關但 round(.,3) 後兩者都 = 0.0 → slider(0.0,0.0) 爆 StreamlitAPIException。
+    _rmin, _rmax = round(smin, 3), round(smax, 3)
+    if _rmax > _rmin:
+        lo, hi = st.slider("篩選:異常分數範圍 [低–高]", _rmin, _rmax, (_rmin, _rmax),
+                           key="anomaly_heat_filter",
+                           help="雙邊範圍:只看分數落在區間內的物件。"
+                                "拉高『低』界=濾掉低分(正常);拉低『高』界=排除最極端、只看中低段。")
+    else:
+        lo, hi = smin, smax
+    labels_present = sorted({records[i].get("label", "") for i in ranking
+                             if records[i].get("label", "")})
+    cls_sel: list[str] = []
+    if len(labels_present) > 1:
+        cls_sel = st.multiselect(
+            "篩選:只看類別", labels_present, default=[],
+            key="anomaly_class_filter",
+            help="只看選定類別的物件(留空=全部)。針對某一類找漏 / 挑該類的異常。")
+    shown = [i for i in ranking
+             if lo <= scores[i] <= hi
+             and (not cls_sel or records[i].get("label", "") in cls_sel)]
+    st.caption(f"符合 {len(shown)} / {len(records)} 個(由最可疑排到最不可疑)")
+    if shown:
+        _sig = (round(float(lo), 6), round(float(hi), 6), tuple(sorted(cls_sel)))
+        if (st.session_state.get("_anomaly_filt_sig") != _sig
+                or st.session_state.get("anomaly_inspect") not in shown):
+            st.session_state["anomaly_inspect"] = shown[0]
+        st.session_state["_anomaly_filt_sig"] = _sig
+        pick = st.selectbox(
+            "選一個看圖", shown, key="anomaly_inspect",
+            format_func=lambda i: f"{scores[i]:.3f} · {Path(records[i]['image_path']).name}"
+            f" #{records[i]['obj_index']} · {records[i]['label']}")
+        r = records[pick]
+        img = safe_open_image(r["image_path"])
+        try:
+            if img is None:
+                raise OSError("來源影像損壞或格式錯誤")
+            iw, ih = img.size
+            crop = crop_bbox(img, *r["bbox"],
+                             pad_px=_adaptive_pad_px(r["bbox"], iw, ih, 0.15))
+            if result.get("bank") is not None and result.get("_image_paths"):
+                meta = discover_yolo_objects([Path(p) for p in result["_image_paths"]],
+                                             result.get("_class_names"))
+                pf = embed_objects_patch(
+                    [meta[pick]], model=result.get("_model", "dinov2_vits14"),
+                    target_res=result.get("_target_res", 224),
+                    cache_dir=Path(result["_cache"]))[0]
+                _, pmap = score_object(pf["feats"], pf["grid"], result["bank"])
+                st.image(render_heatmap(pmap, crop), use_container_width=True,
+                         caption=f"{r['label']} · {r['score']:.3f} · 紅=最不像正常")
+            else:
+                st.image(crop, use_container_width=True,
+                         caption=f"{r['label']} · {r['score']:.3f}"
+                         " ·(無監督模式;確認正常範例後可看熱力圖)")
+        except (OSError, Image.DecompressionBombError, IndexError) as e:
+            st.caption(f":gray[無法顯示:{e}]")
+
+
+def _anomaly_ui() -> None:
+    """🔧 瑕疵偵測(AnomalyDINO 風格)— 引導式 wizard:
+    ① 建模 / 載入 → ② 套用偵測 → ③ 挑樣送人工標。sidebar 留共用設定。
+    跨 tab 狀態一律落 session_state;每個 tab function 開頭前置守門。"""
+    # 標題旁放一個 ❓ 當 manual:平常不佔版面,點開才看說明。
+    _hc1, _hc2 = st.columns([0.8, 0.2], vertical_alignment="bottom")
+    _hc1.subheader("🔧 瑕疵偵測(Anomaly Detection)")
+    with _hc2.popover("❓ 說明", use_container_width=True):
+        st.markdown("**多數良品當『正常參考』**,把偏離的物件挑出來。基於凍結 DINOv2 patch 特徵 + "
+                    "最近鄰距離(AnomalyDINO, WACV 2025);**不需瑕疵樣本訓練、不寫你的資料集**。")
+        st.markdown("**引導三步**:① 用訓練/參考資料夾**建模**(或載入)→ ② 對異常目標資料夾**套用偵測** → "
+                    "③ 2×2 取樣矩陣**挑最值得送人工標**的物件加入購物車匯出。")
+        st.markdown("**沒確認正常時 = 無監督**:leave-one-out 把少見/離群類別排前面;**確認正常後 = 對照模式**:"
+                    "只跟你確認的正常比,專抓細微瑕疵。")
+
+    # ② 就地重評:用最新 confirmed 重算分數(不重建模型)。在 tab 渲染前先消費旗標。
+    if st.session_state.pop("_anomaly_reapply", False):
+        _anomaly_apply_model()
+
+    _anomaly_sidebar_settings()
+    tb, ta, ts = st.tabs(["① 建模 / 載入模型", "② 套用偵測", "③ 挑樣送人工標"])
+    with tb:
+        _anomaly_tab_build()
+    with ta:
+        _anomaly_tab_apply()
+    with ts:
+        _anomaly_tab_sample()
 
 
 def _nn_index_for(model_name: str):

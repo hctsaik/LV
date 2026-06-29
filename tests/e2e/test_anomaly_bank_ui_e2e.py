@@ -1,75 +1,68 @@
-"""E2E 真實行為驗收:瑕疵偵測 Memory Bank 持久化 + 跨資料夾投影(設計見 ANOMALY_BANK_DESIGN_NOTES.md)。
+"""E2E 真實行為驗收:瑕疵偵測模型(memory bank + 投影器)持久化 + 跨資料夾投影。
 
-真實行為(非 element 存在):偵測→存 bank profile(寫出 meta/projection)→主畫面載入掛載→
-新資料夾用「對照已掛載 bank」重跑、散點疊『舊分佈』灰底 trace(把新資料映射回舊分佈)。
+重構後(M7 wizard):存/載從舊「主畫面 expander 存 bank」改成 ① 模型暫存目錄一鍵存 / 一鍵載。
+真實行為(非 element 存在):
+  ① 建模 → 💾 存模型(真的寫出 meta.json/projection.npz 到 .lv_cache)
+  → 📂 載入模型(模型狀態變『已載入』)→ ② 套用 → 散點疊『參考分佈』灰底 trace
+    (把新資料投影回模型分佈)。
 """
 from pathlib import Path
 
 import pytest
 
-from .conftest import _add_folder, load_app, wait_idle
+from ._anomaly_wizard import (apply_model, build_model, enter_anomaly,
+                              set_model_dir)
+from .conftest import wait_idle
 
 pytestmark = pytest.mark.e2e
 
 
-def _js_open(page, text):
-    page.evaluate(
-        "(t)=>{for(const d of document.querySelectorAll('details')){if(d.textContent.includes(t)) d.open=true;}}", text)
-    page.wait_for_timeout(400)
-
-
-def _js_click(page, sel):
-    page.evaluate("(s)=>{const b=document.querySelector(s); if(b) b.click();}", sel)
-
-
-def _run(page):
-    rb = page.locator('.st-key-reopen_sidebar button')   # run 後側欄收合 → 先重開
-    if rb.count():
-        try:
-            rb.first.click(); wait_idle(page); page.wait_for_timeout(500)
-        except Exception:
-            pass
-    page.locator('.st-key-anomaly_run button').click()
-    page.wait_for_timeout(1500)
-    page.locator('[class*="st-key-anomaly_scatter"]').first.wait_for(state="visible", timeout=180000)
-    wait_idle(page, timeout=60000); page.wait_for_timeout(1500)
-
-
-def test_bank_save_load_project(app_server, browser, synthetic_yolo_dataset):
+def test_model_save_load_project(app_server, browser, synthetic_yolo_dataset):
     ds = synthetic_yolo_dataset
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
     page = ctx.new_page()
     page.set_default_timeout(30000)
-    load_app(page, app_server)
-    page.locator('.st-key-tool_switch').get_by_text("瑕疵偵測", exact=True).click()
-    wait_idle(page)
-    _add_folder(page, "anomaly_folder", str(ds["root"]))
-    wait_idle(page)
-    _run(page)
+    try:
+        enter_anomaly(page, app_server)
 
-    # 1) 存 bank profile(主畫面 expander)→ 真的寫出檔(守 no-dataset-writes:落 .lv_cache)
-    _js_open(page, "把本次結果存成")
-    bank_path = page.locator('.st-key-anomaly_bank_save_path input').first.input_value()
-    assert ".lv_cache" in bank_path, "預設落點應在 .lv_cache(不寫使用者資料集)"
-    _js_click(page, '.st-key-anomaly_save_btn button')
-    wait_idle(page); page.wait_for_timeout(1200)
-    assert (Path(bank_path) / "meta.json").exists(), "存 bank 應寫出 meta.json(完整性哨兵)"
-    assert (Path(bank_path) / "projection.npz").exists(), "存 bank 應寫出投影基底"
+        # ① 建模(留在 tab①)
+        build_main = build_model(page, ds["root"])
+        assert "模型已建立" in build_main, f"① 應建模成功;實際:\n{build_main[:1000]}"
 
-    # 2) 主畫面載入 → 真的掛載(膠囊出現)
-    li = page.locator('.st-key-anomaly_bank_load_path input').first
-    li.fill(bank_path); li.press("Enter")
-    wait_idle(page); page.wait_for_timeout(800)
-    _js_click(page, '.st-key-anomaly_load_btn button')
-    wait_idle(page); page.wait_for_timeout(1200)
-    assert "已掛載 bank" in page.locator('[data-testid="stMain"]').inner_text()
+        # ① 模型暫存目錄:真實 app 行為下這欄位首次 render 在「無資料夾」時建好(value=""),
+        # 之後 value= 被忽略 → 欄位空、存鈕 disabled。像真實使用者一樣填一個 .lv_cache 路徑
+        # (守 no-dataset-writes);用 app 同款 dataset_cache_dir 算出預設落點。
+        from object_eval import dataset_cache_dir
+        want_dir = str(dataset_cache_dir(ds["root"], "anomaly_model"))
+        model_dir = set_model_dir(page, want_dir)
+        assert ".lv_cache" in model_dir, "模型暫存目錄應在 .lv_cache(不寫使用者資料集)"
 
-    # 3) 掛載後重跑 → 用外部 bank 評分 + 把新資料投影回舊分佈(散點疊『舊分佈』灰底 trace)
-    _run(page)
-    main = page.locator('[data-testid="stMain"]').inner_text()
-    assert "對照已掛載 bank" in main and "投影回舊分佈" in main
-    has_bg = page.evaluate(
-        """() => { const g = document.querySelector('[class*="st-key-anomaly_scatter"] .js-plotly-plot');
-                   return !!(g && g.data && g.data.some(t => (t.name||'') === '舊分佈')); }""")
-    assert has_bg, "掛載後散點應疊『舊分佈』灰底 trace(新資料映射回舊分佈)"
-    ctx.close()
+        # 💾 存模型 → 真的寫出 meta.json(完整性哨兵)+ projection.npz(投影基底)
+        save_btn = page.locator('.st-key-anomaly_save_model_btn button')
+        save_btn.wait_for(state="visible", timeout=30000)
+        save_btn.click()
+        wait_idle(page)
+        page.wait_for_timeout(1200)
+        assert (Path(model_dir) / "meta.json").exists(), "存模型應寫出 meta.json(完整性哨兵)"
+        assert (Path(model_dir) / "projection.npz").exists(), "存模型應寫出投影基底"
+        assert (Path(model_dir) / "manifest.json").exists(), "存模型應寫出 manifest.json"
+
+        # 📂 載入模型 → 模型狀態變『已載入』(取代 in-session built 模型)
+        load_btn = page.locator('.st-key-anomaly_load_model_btn button')
+        load_btn.wait_for(state="visible", timeout=30000)
+        load_btn.click()
+        wait_idle(page)
+        page.wait_for_timeout(1000)
+        main = page.locator('[data-testid="stMain"]').inner_text()
+        assert "模型已載入" in main, f"📂 載入後模型狀態應顯示『已載入』;實際:\n{main[:1000]}"
+
+        # ② 用載入的模型套用偵測 → 把新資料投影回模型分佈,散點疊『參考分佈』灰底 trace
+        apply_model(page, ds["root"])
+        main = page.locator('[data-testid="stMain"]').inner_text()
+        assert "投影回模型分佈" in main, f"② 應說明已投影回模型分佈;實際:\n{main[:1200]}"
+        has_bg = page.evaluate(
+            """() => { const g = document.querySelector('[class*="st-key-anomaly_scatter"] .js-plotly-plot');
+                       return !!(g && g.data && g.data.some(t => (t.name||'') === '參考分佈')); }""")
+        assert has_bg, "載入模型後散點應疊『參考分佈』灰底 trace(新資料映射回模型分佈)"
+    finally:
+        ctx.close()

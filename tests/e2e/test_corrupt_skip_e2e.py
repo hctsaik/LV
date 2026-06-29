@@ -23,7 +23,6 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
-from .conftest import _add_folder, load_app, wait_idle
 
 W = H = 128
 BOX = (0.5, 0.5, 0.92, 0.92)          # 物件 ≈ 整張圖(與 tests/conftest 同款)
@@ -179,28 +178,31 @@ def test_export_subset_skips_corrupt(corrupt_yolo_dataset, tmp_path):
 
 @pytest.mark.e2e
 def test_anomaly_gui_skips_corrupt(app_server, browser, corrupt_yolo_dataset):
-    """真實 Streamlit + Playwright:含壞檔資料夾 → 不崩潰、好檔仍排序、顯示「已略過」。"""
+    """真實 Streamlit + Playwright(M7 wizard 流程):含壞檔資料夾 → 不崩潰、好檔仍排序、
+    ② 套用偵測顯示「已略過」。訓練(①)與目標(②)同一含壞檔 root(壞檔在兩步都被前置過濾)。"""
     from playwright.sync_api import expect
+
+    from ._anomaly_wizard import apply_model, build_model, enter_anomaly
     ds = corrupt_yolo_dataset
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
     page = ctx.new_page()
     page.set_default_timeout(30000)
-    load_app(page, app_server)
-    page.locator('.st-key-tool_switch').get_by_text("瑕疵偵測", exact=True).click()
-    wait_idle(page)
-    _add_folder(page, "anomaly_folder", str(ds["root"]))
-    wait_idle(page)
-    page.locator('.st-key-anomaly_run button').click()
+    enter_anomaly(page, app_server)
+    # ① 建模:好檔(8 normal + 3 defect = 11 物件)仍建得起來,壞檔前置過濾
+    build_main = build_model(page, ds["root"])
+    assert "模型已建立" in build_main, f"含壞檔資料夾仍應建模成功;實際:\n{build_main[:1200]}"
+    # ② 套用:同 root 當目標
+    apply_model(page, ds["root"])
 
     container = page.locator('[data-testid="stAppViewContainer"]')
     # 1) 好檔仍算出排序:8 normal + 3 defect = 11 個好物件全部進管線(corrupt_bytes / truncated
-    #    兩張壞影像被略過、badlabel 的壞 label 0 框)。原可見排序清單已移除 → 改驗「共 N 個物件」
-    #    摘要:N==11 ⟹ 缺陷檔也被正常處理、沒被當壞檔丟掉。長 timeout 等冷啟動模型載入。
+    #    兩張壞影像被略過、badlabel 的壞 label 0 框)。驗「共 N 個物件」摘要:N==11
+    #    ⟹ 缺陷檔也被正常處理、沒被當壞檔丟掉。
     page.wait_for_function(
         r"() => { const m = document.body.innerText.match(/共\s*(\d+)\s*個物件/);"
         r" return m && +m[1] === 11; }", timeout=180000)
     # 2) 壞檔沒讓工具崩潰:無原始 traceback
     expect(page.locator('[data-testid="stException"]')).to_have_count(0)
-    # 3) 顯示略過提示(2 個壞影像被跳過並告知使用者)
+    # 3) ② 顯示略過提示(2 個壞影像被跳過並告知使用者)
     expect(container).to_contain_text("已略過", timeout=30000)
     ctx.close()
