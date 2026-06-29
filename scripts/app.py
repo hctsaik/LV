@@ -1520,17 +1520,19 @@ def _anomaly_tab_build() -> None:
             st.session_state.pop(_k, None)
 
     # 1b. label 語義白話 radio(從舊進階 popover 提升;object → 不訓 head)
-    st.markdown("**(2) 這批標籤是什麼?**")
+    st.markdown("**(2) 你的 YOLO 標籤名稱代表什麼?**")
     _tr = st.session_state.get("anomaly_train_result") or {}
     _recs = _tr.get("records") or []
     _hint = label_semantic_hint(_recs) if _recs else {"suggested": "unknown", "hint": ""}
     if "anomaly_train_semantic" not in st.session_state:
         st.session_state["anomaly_train_semantic"] = (
             _hint["suggested"] if _hint["suggested"] in ("object", "defect") else "object")
-    st.radio("這批標籤是物件類別還是瑕疵類別?", ["object", "defect"],
-             key="anomaly_train_semantic", horizontal=True,
-             format_func=lambda s: {"object": "物件類別(door/window…)→ 不訓瑕疵分類頭",
-                                    "defect": "瑕疵類別(刮傷/污漬…)→ 解鎖瑕疵分類頭"}[s])
+    st.radio("標籤名稱(classes.txt)指的是『物件本身』還是『缺陷本身』?", ["object", "defect"],
+             key="anomaly_train_semantic",
+             format_func=lambda s: {
+                 "object": "物件類別(門 / 窗 / 螺絲…)— 名稱指「東西本身」→ 只用離群偵測找異常,不訓分類頭",
+                 "defect": "瑕疵類別(刮傷 / 污漬 / 裂痕…)— 名稱指「缺陷本身」→ 額外解鎖:自動分辨缺陷類型",
+             }[s])
     # 每 rerun 同步寫 active_semantic(供任何硬守衛讀;與 build callback 一致)
     st.session_state["anomaly_active_semantic"] = st.session_state["anomaly_train_semantic"]
     if st.session_state["anomaly_train_semantic"] == "defect" and _hint["suggested"] == "object":
@@ -1564,10 +1566,16 @@ def _anomaly_tab_build() -> None:
     st.divider()
     st.markdown("**(2) 模型暫存目錄(一鍵存 bank + classifier + manifest;一鍵載回)**")
     _def_dir = _anomaly_bank_default_dir(train_folders[0] if train_folders else "")
-    st.text_input("模型暫存目錄(預設 .lv_cache,不寫你的資料集)",
-                  key="anomaly_model_dir", value=_def_dir,
-                  help="存:bank.npz + projection.npz + fewshot.json + head.joblib + manifest.json 全進此目錄。"
-                       "載:一鍵把它們讀回成模型。")
+    # setdefault(非 value=)初始化:避免 picker 在 callback 寫 session_state 時與 value= 衝突跳警告/例外
+    st.session_state.setdefault("anomaly_model_dir", _def_dir)
+    st.caption("模型暫存目錄(預設 .lv_cache,不寫你的資料集;可直接打路徑,或按 📁 用原生對話框選)")
+    _mdc1, _mdc2 = st.columns([5, 1])
+    _mdc1.text_input("模型暫存目錄", key="anomaly_model_dir", label_visibility="collapsed",
+                     help="存:bank.npz + projection.npz + fewshot.json + head.joblib + manifest.json 全進此目錄。"
+                          "載:一鍵把它們讀回成模型。")
+    _mdc2.button("📁 選", key="anomaly_pick_model_dir", use_container_width=True,
+                 on_click=_pick_folder, args=("anomaly_model_dir",),
+                 help="開原生資料夾對話框選一個目錄(會覆蓋左邊路徑)")
     _mdir = st.session_state.get("anomaly_model_dir") or ""
     _sc1, _sc2 = st.columns(2)
     _sc1.button("💾 存模型", key="anomaly_save_model_btn", disabled=not (model and _mdir),
@@ -1734,7 +1742,15 @@ def _anomaly_tab_sample() -> None:
     # 2×2 模式(固定順序對齊舊 radio):偏novelty / 弱類定向 / 三訊號均衡 / 純novelty
     _modes = [("novelty", "偏 novelty(稀有/未知更強)"), ("confusion", "弱類定向(分類頭最混淆)"),
               ("balanced", "三訊號均衡"), ("pure", "純 novelty")]
+    # 偏novelty/弱類定向/均衡 的差異全靠 head 的「邊界 / 分歧 / 混淆」訊號;無 head 時這些訊號=0,
+    # 三者與純 novelty 變成完全相同的排序 → 反灰它們,避免顯示「其實一模一樣」的假選項,只留純 novelty 可點。
+    _HEAD_DEP = {"novelty", "confusion", "balanced"}
+    # 反灰判據用 _proba(非 head 是否存在):模式差異全來自 head_proba 的 boundary/disagreement/entropy,
+    # _proba 不可用(無 head、obj_emb 缺、predict_head 失敗)時四模式等價 → 比只看 head 更準。
+    _no_signal = _proba is None
     st.session_state.setdefault("anomaly_q_mode", "novelty")
+    if _no_signal and st.session_state["anomaly_q_mode"] in _HEAD_DEP:
+        st.session_state["anomaly_q_mode"] = "pure"   # 無分類頭訊號 → 強制落在唯一有意義的格
     _active = st.session_state["anomaly_q_mode"]
 
     # 每格各算自己的 _sel + 成分拆解徽章(有 head→正常N·類別M·未知U;無 head→可疑N·正常M)
@@ -1756,17 +1772,25 @@ def _anomaly_tab_sample() -> None:
         return f"正常 {n_norm}·類別 {n_cls}·未知 {n_unk}"
 
     st.markdown("**取樣模式(點一格 → 右下出大圖牆)**")
+    if _no_signal:
+        st.caption("🔒 偏novelty / 弱類定向 / 三訊號均衡 需有可用的**瑕疵分類頭**訊號"
+                   "(①用瑕疵類別標籤、每類達 N_min 建模)才與純 novelty 有差異;目前只用純 novelty 排序。")
     _sel_cache = {}
     r0 = st.columns(2)
     r1 = st.columns(2)
     _cells = [(r0[0], _modes[0]), (r0[1], _modes[1]), (r1[0], _modes[2]), (r1[1], _modes[3])]
     for _col, (mid, mname) in _cells:
-        _sel_cache[mid] = _sel_for(mid)
+        _disabled = _no_signal and mid in _HEAD_DEP
         with _col:
-            st.button(f"{mname}\n\n{_badge(_sel_cache[mid])}", key=f"anomaly_qmode_{mid}",
-                      use_container_width=True,
-                      type=("primary" if mid == _active else "secondary"),
-                      on_click=_anomaly_pick_qmode, args=(mid,))
+            if _disabled:
+                st.button(f"{mname}\n\n🔒 需分類頭", key=f"anomaly_qmode_{mid}",
+                          use_container_width=True, disabled=True)
+            else:
+                _sel_cache[mid] = _sel_for(mid)
+                st.button(f"{mname}\n\n{_badge(_sel_cache[mid])}", key=f"anomaly_qmode_{mid}",
+                          use_container_width=True,
+                          type=("primary" if mid == _active else "secondary"),
+                          on_click=_anomaly_pick_qmode, args=(mid,))
 
     # detail:選中模式的大圖牆
     _sel = _sel_cache.get(_active, [])

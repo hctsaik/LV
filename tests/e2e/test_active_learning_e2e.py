@@ -25,11 +25,12 @@ def test_active_learning_queue(app_server, browser, synthetic_yolo_dataset):
         build_model(page, ds["root"])
         apply_model(page, ds["root"])
 
-        # ③ 挑樣:點一個 2×2 模式格(均衡)→ 真的算出優先序佇列(有縮圖)
+        # ③ 挑樣:點一個 2×2 模式格 → 真的算出優先序佇列(有縮圖)。
+        # synthetic(good/bad、bad=5<N_min)→ 無分類頭 → 偏novelty/弱類定向/均衡 反灰,只「純 novelty」可點。
         click_tab(page, TAB_SAMPLE)
         main = page.locator('[data-testid="stMain"]').inner_text()
         assert "取樣佇列" in main, "③ 應出現取樣矩陣(取樣佇列)"
-        balanced = page.locator('.st-key-anomaly_qmode_balanced button')
+        balanced = page.locator('.st-key-anomaly_qmode_pure button')
         balanced.wait_for(state="visible", timeout=30000)
         balanced.click()
         wait_idle(page)

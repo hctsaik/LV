@@ -101,11 +101,11 @@ def test_semantics_gate_object_no_head(app_server, browser, yolo_object_2class):
         # ② 套用偵測(同 root 當目標)
         apply_model(page, ds["root"])
 
-        # ③ 挑樣:無 head → 2×2 徽章是『可疑 N·正常 M』二分,絕不出現『未知』三分
+        # ③ 挑樣:無 head → 偏novelty/弱類定向/均衡 反灰,只「純 novelty」可點;徽章是『可疑 N·正常 M』二分
         click_tab(page, TAB_SAMPLE)
         page.wait_for_timeout(800)
-        # 先點一格讓大圖牆+標籤渲染(否則只有 2×2 徽章,沒有「判定:」標籤行)
-        nov = page.locator('.st-key-anomaly_qmode_novelty button')
+        # 點唯一可點的「純 novelty」格讓大圖牆+標籤渲染(否則只有 2×2 徽章,沒有「判定:」標籤行)
+        nov = page.locator('.st-key-anomaly_qmode_pure button')
         nov.wait_for(state="visible", timeout=30000)
         nov.click()
         wait_idle(page)
