@@ -2045,12 +2045,22 @@ def _anomaly_ui() -> None:
         _anomaly_apply_model()
 
     _anomaly_sidebar_settings()
-    tb, ta, ts = st.tabs(["① 建模 / 載入模型", "② 套用偵測", "③ 挑樣送人工標"])
-    with tb:
+    # ⚠ 用 segmented_control(存 session_state)而非 st.tabs:st.tabs 的 active tab 是純前端狀態、
+    # 沒進 session_state,任何整頁 rerun(加資料夾 / 按鈕 / slider)都會把它彈回第一步①;
+    # segmented_control 有 key → 所選步驟跨 rerun 保留,不再「每次互動都跳回 Step-1」。
+    _STEPS = ["① 建模 / 載入模型", "② 套用偵測", "③ 挑樣送人工標"]
+    st.session_state.setdefault("anomaly_step", _STEPS[0])
+    _sel = st.segmented_control("步驟", _STEPS, key="anomaly_step",
+                                label_visibility="collapsed")
+    # 點當前步驟會 deselect→None;保持上次步驟,避免空白(不重寫 widget key,避開 Streamlit gotcha)
+    _step = _sel or st.session_state.get("_anomaly_step_shown") or _STEPS[0]
+    st.session_state["_anomaly_step_shown"] = _step
+    st.divider()
+    if _step == _STEPS[0]:
         _anomaly_tab_build()
-    with ta:
+    elif _step == _STEPS[1]:
         _anomaly_tab_apply()
-    with ts:
+    else:
         _anomaly_tab_sample()
 
 

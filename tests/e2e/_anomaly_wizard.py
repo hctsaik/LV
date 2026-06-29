@@ -30,33 +30,30 @@ def enter_anomaly(page, app_server):
     wait_idle(page)
 
 
-def _tab_selected(page, name: str) -> bool:
-    """該 tab 是否為當前 active(aria-selected=true)。"""
+def _step_active(page, name: str) -> bool:
+    """該步驟內容是否正在顯示(segmented_control 選中 → 只渲染該步;用主畫面是否含該步標記判斷)。"""
     return page.evaluate(
         """(n) => {
-            const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
-            const t = tabs.find(x => (x.innerText || '').includes(n));
-            return !!(t && t.getAttribute('aria-selected') === 'true');
+            const seg = document.querySelector('.st-key-anomaly_step');
+            if (!seg) return false;
+            const btns = Array.from(seg.querySelectorAll('button,[role="radio"],[role="button"]'));
+            const t = btns.find(x => (x.innerText || '').trim() === n.trim());
+            return !!(t && (t.getAttribute('aria-checked') === 'true'
+                            || t.getAttribute('aria-pressed') === 'true'));
         }""", name)
 
 
 def click_tab(page, name: str):
-    """點 st.tabs 的某個 tab(以可見文字匹配),切完等該 tab 真的變 active 再回。
+    """切到步驟選擇器(segmented_control key=anomaly_step)的某一步。
 
-    ⚠ st.tabs 的 active tab 是 client-side 狀態:任何「整頁 rerun」(例如 _add_folder 的
-    fill+Enter on_change)會把 tabs 重置回第一個 tab(①)。所以凡是在加完資料夾後要按
-    ②/③ tab 內的按鈕,務必先 click_tab 重新切回該 tab(見 build_model/apply_model)。"""
-    page.get_by_role("tab", name=name).first.click()
-    wait_idle(page)
-    try:
-        page.wait_for_function(
-            """(n) => {
-                const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
-                const t = tabs.find(x => (x.innerText || '').includes(n));
-                return !!(t && t.getAttribute('aria-selected') === 'true');
-            }""", arg=name, timeout=15000)
-    except Exception:
-        pass
+    重構後步驟存 session_state、跨 rerun 保留(不再像 st.tabs 那樣每次 rerun 彈回①),
+    所以單擊即可。內容只渲染當前步;點當前步會 deselect→app 用上次步驟回填(內容不變),
+    故先檢查是否已在該步、未在才點(避免把當前步 toggle 掉)。"""
+    seg = page.locator('.st-key-anomaly_step')
+    seg.first.wait_for(state="visible", timeout=15000)
+    if not _step_active(page, name):
+        seg.get_by_text(name, exact=True).first.click()
+        wait_idle(page)
     page.wait_for_timeout(400)
 
 
