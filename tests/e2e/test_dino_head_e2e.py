@@ -59,6 +59,8 @@ def test_train_head_gated_classify(app_server, browser, yolo_defect_at_nmin):
         novelty.wait_for(state="visible", timeout=30000)
         novelty.click()
         wait_idle(page)
+        # ⚠ 點模式格 on_click 觸發整頁 rerun → st.tabs 重置回① → 重切回③ 才看得到大圖牆/標籤
+        click_tab(page, TAB_SAMPLE)
         page.wait_for_timeout(1000)
         body = page.locator('[data-testid="stMain"]').inner_text()
         assert "判定" in body, "③ 影像標籤應含閘控『判定:…』行"

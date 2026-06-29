@@ -109,8 +109,12 @@ def confirmed_to_fewshot(confirmed: dict, records: list) -> list:
     """session 的 {物件整數索引: 'good'/'bad'} → 內容定址 fewshot list。
     主鍵 (stem, 量化 bbox, label):跨資料夾/重掃才對得回去(int 索引綁當次掃描順序,跨檔無意義)。"""
     out = []
+    n = len(records)
     for i, verdict in confirmed.items():
-        r = records[int(i)]
+        i = int(i)
+        if not (0 <= i < n):              # 殘留/跨資料夾索引超界 → 跳過(不崩、也不誤把別物件當錨點)
+            continue
+        r = records[i]
         out.append({
             "stem": _stem(r["image_path"]),
             "bbox": [round(float(x), 3) for x in r["bbox"]],

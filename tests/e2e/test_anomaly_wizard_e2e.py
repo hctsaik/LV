@@ -105,11 +105,12 @@ def test_semantics_gate_object_no_head(app_server, browser, yolo_object_2class):
         click_tab(page, TAB_SAMPLE)
         page.wait_for_timeout(800)
         # 先點一格讓大圖牆+標籤渲染(否則只有 2×2 徽章,沒有「判定:」標籤行)
-        click_tab(page, TAB_SAMPLE)
         nov = page.locator('.st-key-anomaly_qmode_novelty button')
         nov.wait_for(state="visible", timeout=30000)
         nov.click()
         wait_idle(page)
+        # ⚠ 點模式格 rerun 重置 tab → 重切回 ③ 才讀得到 ③ 的可見內容
+        click_tab(page, TAB_SAMPLE)
         page.wait_for_timeout(1000)
         sample_main = page.locator('[data-testid="stMain"]').inner_text()
         assert "可疑" in sample_main, \

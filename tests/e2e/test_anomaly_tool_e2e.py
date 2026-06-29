@@ -156,7 +156,7 @@ def test_score_and_class_filters(anomaly_page):  # 篩選真的會篩(真實行�
 
     # 雙邊範圍 slider → 有兩個 thumb;取「低界」(.first)。拉高低界即排除低分(正常),
     # 集合縮小,沿用原本「分數 filter 真的會篩」的真實行為斷言。
-    thumb = page.locator('.st-key-anomaly_heat_filter [role="slider"]').first
+    thumb = page.locator('.st-key-anomaly_heat_filter_apply [role="slider"]').first
 
     def _slider(n_pageup: int) -> None:
         """調分數低界:n>0 往高(PageUp)、n<0 往低(PageDown)。Streamlit slider 認
@@ -181,7 +181,7 @@ def test_score_and_class_filters(anomaly_page):  # 篩選真的會篩(真實行�
     _slider(-10)                         # 回到最小門檻,單獨驗下面的類別篩選
 
     # ── (b) 類別篩選:選 bad 只剩 5 個缺陷、選 good 只剩 20 個正常 ──
-    ms = page.locator('.st-key-anomaly_class_filter')
+    ms = page.locator('.st-key-anomaly_class_filter_apply')
 
     def _pick_class(name: str) -> None:
         # multiselect 選完選項後下拉仍開著(可連選特性)→ 會蓋住 Clear all/其他控制項,

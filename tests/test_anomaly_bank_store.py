@@ -79,6 +79,12 @@ def test_empty_bank_rejected(tmp_path):  # AC5:空 bank 拒存
         save_bank(tmp_path / "bk", vectors=np.zeros((0, 384), np.float32), meta=META)
 
 
+def test_fewshot_skips_out_of_range_index():  # AC14:殘留/跨資料夾超界索引 → 跳過(不崩、不誤對別物件)
+    recs = _records()                      # len 3
+    fs = confirmed_to_fewshot({0: "good", 99: "bad", -1: "good"}, recs)
+    assert len(fs) == 1 and fs[0]["verdict"] == "good"   # 只留合法 index 0,99/-1 被跳過
+
+
 def test_fewshot_roundtrip(tmp_path):  # AC6:confirmed→fewshot→match 還原回相同索引
     recs = _records()
     confirmed = {0: "good", 2: "bad"}
