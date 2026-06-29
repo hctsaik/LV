@@ -1556,11 +1556,8 @@ def _anomaly_tab_build() -> None:
     st.divider()
     st.markdown("**(2) 模型暫存目錄(一鍵存 bank + classifier + manifest;一鍵載回)**")
     _def_dir = _anomaly_bank_default_dir(train_folders[0] if train_folders else "")
-    # ⚠ keyed text_input 的 value= 第二次起會被 Streamlit 忽略;預設目錄要等有訓練資料夾才算得出 →
-    # 用 session_state 在「算得出預設且目前為空」時填一次(使用者仍可改),省得逼使用者手打路徑。
-    if _def_dir and not (st.session_state.get("anomaly_model_dir") or "").strip():
-        st.session_state["anomaly_model_dir"] = _def_dir
-    st.text_input("模型暫存目錄(預設 .lv_cache,不寫你的資料集)", key="anomaly_model_dir",
+    st.text_input("模型暫存目錄(預設 .lv_cache,不寫你的資料集)",
+                  key="anomaly_model_dir", value=_def_dir,
                   help="存:bank.npz + projection.npz + fewshot.json + head.joblib + manifest.json 全進此目錄。"
                        "載:一鍵把它們讀回成模型。")
     _mdir = st.session_state.get("anomaly_model_dir") or ""
