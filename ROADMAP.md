@@ -4,7 +4,23 @@
 > 提醒:狀態是人的判斷,不可由「檔案存在」自動標 ✅。模組表/測試數請定期用
 > `python verify/unet_status.py` 核對是否漂移。
 
+> **🏁 Feature 狀態(2026-06-30):瑕疵偵測(AnomalyDINO 風格物件級瑕疵偵測)已宣告收斂。**
+> M1–M7 涵蓋 PRD 全部 Must/Should/Could,並在真實瑕疵資料(`C:\code\dataset\fruit`)端到端驗證;
+> 無待辦 user_needs。後續只走**維護迴圈**(只動 `scripts/app.py` + E2E、不受 appetite 約束);
+> 要再加新能力須從新的 `/user` 需求重新起輪。未蓋棺尾巴(M6 `N_min=8` 三 split 敏感度掃描)列維護候選、非阻擋。
+
 ## 里程碑
+- **M7 — 瑕疵偵測頁面重設計成引導式 wizard** — ✅ **完成**(2026-06-29~30) — 依使用者 7 項 UX 回饋 +
+  多 agent 兩場設計鎖定(架構+頁面)→ `_anomaly_ui` 整段重寫,**引擎模組公開函式幾乎零改**(僅
+  anomaly_bank_store.save_bank meta 多帶 `label_semantic`、bootstrap_cluster mcs 夾 ≤N、run_pipeline patch
+  全參考 fallback)。結構:第 8 工具改**三步 wizard**(① 建模/載入 → ② 套用偵測 → ③ 挑樣送人工標)、
+  **分兩資料夾**(訓練/參考 vs 異常目標)、**唯一模型槽 `anomaly_model`**(①寫②③讀,schema=meta+bank_vectors+
+  projection+fewshot+head+label_semantic)、統一模型暫存目錄(一鍵存/載 bank+classifier+manifest)、label 語義
+  白話 radio、**③ 2×2 取樣矩陣 master-detail**(點格出大圖牆,欄數/高度可調)。移除 M5 學習曲線 GUI 面板
+  (active_loop 函式保留)+ 拆進階 popover。**步驟列最終用 `st.segmented_control`(非 `st.tabs`)**:tabs 的
+  active tab 是純前端狀態、任何整頁 rerun 都彈回 Step-1 → 改 keyed segmented_control 跨 rerun 保留(8443933)。
+  設計 [3_Architect_Design/M7_wizard_redesign.md](3_Architect_Design/M7_wizard_redesign.md)。驗證:全 gate 綠 +
+  全套 anomaly E2E 14 綠(滿載偶有 1 既有 flaky,單跑綠)。多 agent 對抗測試揪 4 個真 bug,皆已修(見決策日誌)。
 - **M6 — 統一主動學習畫面(修正版 Option2)** — ✅ **完成**(2026-06-29) — 多 agent 兩場討論(架構選型
   3 輪 + 頁面改造 3 輪)達共識:單畫面、Normal Bank+閘控**恆在**當骨幹,分類頭改成「label 語義=瑕疵類
   AND ≥2 類各達 N_min」才解鎖的 additive 第二段。路由判定下沉 `anomaly_tool` 純函式(per_class_counts /
@@ -114,3 +130,24 @@
   j 補回 3D 高亮環 caption、w 候選池補回 headless 文字輸入。其餘為測試對齊(預設模型 vits14→vitb14、
   移除圖內標題)+ E2E harness 強化(`_ensure_sidebar` 等側欄真展開、面板切換沉澱+`.first`、互動 retry、
   multiselect 改 Clear-all)。無 skip/xfail/放寬斷言假綠。詳見 VISUALIZE_REFACTOR_E2E_PUNCHLIST.md。
+- (2026-06-29) **M5 主動學習標註迴圈**(里程碑詳列):多 agent 複驗揪出分層切分假平圖 bug + E2E 假綠 +
+  ROADMAP 名實不符殘留,fix-then-ship(commit 9fe0ba8 / b12de0a)。
+- (2026-06-29) **M6 統一主動學習畫面**:修 silent-wrong — 把 YOLO 物件類別當瑕疵類訓 head(加 label 語義
+  宣告守衛);S9 驗證 harness 樂觀洩漏誠實化(commit 950359c)。
+- (2026-06-29) **M7 瑕疵偵測 wizard 重設計**:三步 wizard + 雙資料夾 + 唯一模型槽 + 2×2 取樣;移除 M5 學習
+  曲線 GUI(active_loop 函式保留)。多 agent 對抗測試揪 [high] **confirmed 跨①②索引空間污染(silent-wrong)**:
+  單一 key 被①訓練索引/②目標索引共用 → ①框選殘留滲②被當不同物件 → classify 門檻釘死、AUROC 假成 0 →
+  命名空間化 `anomaly_confirmed_{build,apply}` 並隨 sig 變清殘留;[med] heat/class filter 共用滲漏、2×2 徽章
+  head-exists 誤判 → 改依實際 verdict。**這是雙資料夾設計引入、舊單資料夾沒有的 bug**(commit cd0665f)。
+- (2026-06-30) **M7 收尾**(三項,皆 commit 8443933 / a048ce4 / b345ead):① 步驟列 `st.tabs`→`st.segmented_control`
+  修「每次互動跳回 Step-1」(tabs 的 active 是純前端狀態、rerun 必彈回 ①;keyed widget 跨 rerun 保留)。
+  ② patch 建 Normal Bank 少樣本/diffuse **silent-wrong**(紅測 AC-F4a/F4b 先行):N<5 HDBSCAN min_samples>N 崩潰、
+  5≤N<15 全 noise→空 normal_set→bank 靜默 None→假「✅已建立」悄退化物件級;修=mcs 夾 ≤N + patch 無 bank 時
+  整批參考視為正常 fallback + app bank=None 明確報錯。real fruit 逐水果 patch 修後建出 bank(AUROC 蘋 0.844/
+  香蕉 1.0/橘 1.0,見 [[fruit-anomaly-dataset]])。③ 語義 radio 文案 + 原生目錄 picker + 2×2 無訊號反灰
+  (反灰判據用 `_proba is None` 而非 `head is None`,head 在但 predict 失敗也正確反灰)。
+- (2026-06-30) **PO 宣告 feature 收斂 → 轉維護**:瑕疵偵測 M1–M7 涵蓋 PRD 全部 MoSCoW、fruit 真實瑕疵
+  資料端到端驗證、無待辦 user_needs。後續走維護迴圈(只動 app+E2E、不受 appetite),新能力(瑕疵種類多類
+  分類 / 報表 / 批次 CLI 等當初 Won't/Could)須由新 `/user` 需求重新起輪、不在本 feature 內擴張。未蓋棺
+  尾巴 `N_min=8` 三 split 敏感度掃描列維護候選、非阻擋。(模組進度表仍為 M1 範圍;M2–M7 模組改以
+  `*_DESIGN_NOTES.md`+里程碑追蹤,屬已知可接受分歧,補表為獨立 doc 整理、未排程。)
