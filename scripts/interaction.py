@@ -1200,6 +1200,26 @@ def discover_yolo_objects(
     return out
 
 
+def discover_whole_images(
+    image_paths: Sequence[Path],
+    *,
+    label: str = "image",
+) -> list[dict]:
+    """每張影像 → 一筆「全幅物件」記錄(**不讀 label 檔、不要求 labels/**)。
+
+    回傳 ``[{image_path, label, class_id, bbox=(0.5,0.5,1.0,1.0), obj_index, score}, …]``,
+    欄位與 :func:`discover_yolo_objects` **完全同形**,故下游(embedding / 分群 / Normal Bank /
+    patch / 評分 / 散點 / 排序 / 匯出)一律不變。全幅 ``bbox`` 經
+    :func:`crop_bbox` / :func:`bbox_to_pixels`(clamped)即整張影像。
+
+    純函式:不判斷可讀性(交由上游 ``partition_readable``,與 yolo 路徑一致)。
+    單一合成類別(``class_id=0``)→ 永遠只有 1 類 → 不解鎖分類頭(與既有語義鎖一致)。
+    """
+    return [{"image_path": Path(p), "label": label, "class_id": 0,
+             "bbox": (0.5, 0.5, 1.0, 1.0), "obj_index": 0, "score": 1.0}
+            for p in image_paths]
+
+
 def cross_class_nn_pairs(
     embeddings: np.ndarray,
     labels: Sequence[str],

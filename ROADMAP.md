@@ -8,8 +8,20 @@
 > M1–M7 涵蓋 PRD 全部 Must/Should/Could,並在真實瑕疵資料(`C:\code\dataset\fruit`)端到端驗證;
 > 無待辦 user_needs。後續只走**維護迴圈**(只動 `scripts/app.py` + E2E、不受 appetite 約束);
 > 要再加新能力須從新的 `/user` 需求重新起輪。未蓋棺尾巴(M6 `N_min=8` 三 split 敏感度掃描)列維護候選、非阻擋。
+>
+> **(2026-06-30 晚續)** 使用者提新需求「整張影像級(無 YOLO 標籤)」→ 依「新能力起新輪」規矩**重新起輪 = M8(進行中)**;
+> 維護收斂結論不變,M8 是受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M8 — 整張影像級瑕疵偵測(無 YOLO 標籤)** — 📝 **進行中(PRD→設計)**(2026-06-30) — feature 收斂後第一個
+  新能力增量(走精簡 U-Net 新輪)。需求:手上只有「無標註圖片資料夾」的人,要把**整張影像當對象**做異常偵測、不必先標框
+  (現況無 `labels/` 直接跳「找不到 YOLO 物件」=完全不能用)。範圍(MoSCoW):**Must** 新「物件來源=整張影像」路徑
+  (每張可讀圖→一筆**全幅記錄**,欄位對齊 `discover_yolo_objects`、下游 embedding/分群/bank/patch/評分/散點/排序/看圖/匯出
+  **不變**)+ `run_pipeline` 依 `object_source` 選用 + GUI ① 切換「YOLO 物件 / 整張影像」+ 模式標示 + 鎖進 `model.meta`;
+  **Should** 偵測 0 物件時提示一鍵切整張影像;**Could** 自訂標籤名;**Won't** 整張內多物件分評 / 分類頭 / 背景遮罩。
+  模組:**07 `whole_image_source`(Tier B)**。需求 [1_user_needs/anomaly_whole_image.md](1_user_needs/anomaly_whole_image.md);
+  PRD [2_PO_PRD/anomaly_whole_image_prd.md](2_PO_PRD/anomaly_whole_image_prd.md)。appetite ≤1 模組 + GUI 接線,一輪做完。
+  狀態:PRD 完成,放行 `/architect`。
 - **M7 — 瑕疵偵測頁面重設計成引導式 wizard** — ✅ **完成**(2026-06-29~30) — 依使用者 7 項 UX 回饋 +
   多 agent 兩場設計鎖定(架構+頁面)→ `_anomaly_ui` 整段重寫,**引擎模組公開函式幾乎零改**(僅
   anomaly_bank_store.save_bank meta 多帶 `label_semantic`、bootstrap_cluster mcs 夾 ≤N、run_pipeline patch
@@ -151,3 +163,8 @@
   分類 / 報表 / 批次 CLI 等當初 Won't/Could)須由新 `/user` 需求重新起輪、不在本 feature 內擴張。未蓋棺
   尾巴 `N_min=8` 三 split 敏感度掃描列維護候選、非阻擋。(模組進度表仍為 M1 範圍;M2–M7 模組改以
   `*_DESIGN_NOTES.md`+里程碑追蹤,屬已知可接受分歧,補表為獨立 doc 整理、未排程。)
+- (2026-06-30) **M8 起輪(新能力)**:收斂後使用者提「整張影像級瑕疵偵測(無 YOLO 標籤)」→ 依「新能力起新輪」
+  開 `/user`→`/po`。需求:無 `labels/` 圖片資料夾要把整張圖當對象做異常偵測(現況跳「找不到 YOLO 物件」不能用)。
+  PO 拆 1 模組 `whole_image_source`(Tier B):`discover_whole_images` 全幅記錄 + `run_pipeline` `object_source` routing +
+  GUI ① 物件來源切換(鎖進 model.meta)。Won't:整張多物件分評 / 分類頭 / 背景遮罩(整張=單一對象,User 明說不在乎)。
+  appetite ≤1 模組 + GUI 接線,一輪做完。模組 07 走里程碑追蹤(同 M2–M7),不動 M1 模組表。

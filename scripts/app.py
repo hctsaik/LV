@@ -261,6 +261,15 @@ def _text_on(hex_color: str) -> str:
     return "#111" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#fff"
 
 
+def _turbo_hex(t: float) -> str:
+    """Turbo colorscale 取樣 → hex(與異常散點圖同款分數色;t∈[0,1])。"""
+    from plotly.colors import sample_colorscale
+    t = max(0.0, min(1.0, float(t)))
+    s = sample_colorscale("Turbo", [t])[0]            # 形如 'rgb(48, 18, 59)'
+    r, g, b = (int(float(v)) for v in s[s.find("(") + 1:s.find(")")].split(","))
+    return "#%02x%02x%02x" % (r, g, b)
+
+
 def _viz_color_map(records: list[dict]) -> dict:
     """Stable class→colour map (matches the scatter's sorted-label ordering)."""
     classes = sorted({r.get("label", "") for r in records})
@@ -1212,6 +1221,7 @@ def _anomaly_build_model() -> None:
     sample_n = int(st.session_state.get("anomaly_sample_n", 64))
     semantic = st.session_state.get("anomaly_train_semantic", "object")
     n_min = int(st.session_state.get("anomaly_n_min", 8))
+    object_source = st.session_state.get("anomaly_object_source", "yolo")
     try:
         roots = [Path(f) for f in folders]
         image_paths: list[Path] = []
@@ -1228,13 +1238,19 @@ def _anomaly_build_model() -> None:
         res = run_pipeline(
             image_paths, class_names, mode=mode, score_mode=score_mode,
             sample_n=sample_n, model=model, target_res=target_res,
-            confirmed=_conf_build,
+            confirmed=_conf_build, object_source=object_source,
             cache_dir=cache, progress=lambda f, t: _bar.progress(f, text=t))
         _bar.empty()
         if not res.get("records") or res.get("obj_emb") is None:
-            st.session_state["_anomaly_model_err"] = (
-                "找不到 YOLO 物件(資料夾需含 images/ 與 labels/,labels 為 YOLO .txt)。")
+            if object_source == "yolo":
+                st.session_state["_anomaly_model_err"] = (
+                    "找不到 YOLO 物件(資料夾需含 images/ 與 labels/,labels 為 YOLO .txt)。"
+                    "若這批圖沒有標註框,可改用『物件來源 → 整張影像』。")
+                st.session_state["_anomaly_offer_whole_image"] = True
+            else:
+                st.session_state["_anomaly_model_err"] = "資料夾內找不到可讀影像。"
             return
+        st.session_state.pop("_anomaly_offer_whole_image", None)
         # 凍結投影器(跨資料夾投影回此分佈 + 灰底)
         obj_emb = _np.asarray(res["obj_emb"], dtype=_np.float32)
         normal_set = res.get("normal_set") or []
@@ -1264,6 +1280,7 @@ def _anomaly_build_model() -> None:
             head["_eligible"] = sorted(elig)
         meta = {
             "model": model, "target_res": target_res, "score_mode": score_mode,
+            "object_source": object_source,
             "patch_dim": int(bank_vectors.shape[1]) if bank_vectors is not None else None,
             "obj_dim": int(obj_emb.shape[1]), "n_objects": len(res["records"]),
         }
@@ -1302,6 +1319,7 @@ def _anomaly_apply_model() -> None:
     _m = model["meta"]
     m_model = _m.get("model") or "dinov2_vits14"
     m_res = int(_m.get("target_res") or 224)
+    object_source = _m.get("object_source", "yolo")     # 鎖模型的物件來源(②沿用①的決定)
     try:
         roots = [Path(f) for f in folders]
         image_paths: list[Path] = []
@@ -1325,7 +1343,7 @@ def _anomaly_apply_model() -> None:
         _bar = st.progress(0.0, text=f"套用偵測…({len(image_paths)} 張圖,{m_model}@{m_res})")
         result = run_pipeline(
             image_paths, class_names, mode="one_stage", score_mode=score_mode,
-            sample_n=64, model=m_model, target_res=m_res,
+            sample_n=64, model=m_model, target_res=m_res, object_source=object_source,
             confirmed=st.session_state.get("anomaly_confirmed_apply", {}),  # ②只用目標資料夾索引空間
             cache_dir=cache, external_bank=ext_bank, external_ref=ext_ref,
             progress=lambda f, t: _bar.progress(f, text=t))
@@ -1509,6 +1527,15 @@ def _anomaly_sidebar_settings() -> None:
             st.slider("2-stage 抽樣數", 16, 256, 64, key="anomaly_sample_n")
 
 
+def _anomaly_switch_to_whole_image() -> None:
+    """AC-G5:YOLO 模式偵測不到物件時,一鍵切『整張影像』並重新建模。
+    在 callback 內改 widget-keyed session_state 是允許的(渲染前)。"""
+    st.session_state["anomaly_object_source"] = "whole_image"
+    st.session_state.pop("_anomaly_offer_whole_image", None)
+    st.session_state.pop("_anomaly_model_err", None)
+    _anomaly_build_model()
+
+
 def _anomaly_tab_build() -> None:
     """① 建模 / 載入模型:選訓練/參考資料夾 → (1)建模(凍 bank/projection/fewshot/head)
     → (2)一鍵存模型 / 📂 一鍵載回。label 語義白話 radio(object→不訓 head)。"""
@@ -1528,27 +1555,43 @@ def _anomaly_tab_build() -> None:
         for _k in ("anomaly_confirmed_build", "anomaly_heat_filter_build", "anomaly_class_filter_build"):
             st.session_state.pop(_k, None)
 
-    # 1b. label 語義白話 radio(從舊進階 popover 提升;object → 不訓 head)
-    st.markdown("**(2) 你的 YOLO 標籤名稱代表什麼?**")
+    # 1b. 物件來源:逐 YOLO 框 vs 整張影像(無需 labels/)
+    st.markdown("**(2) 物件來源**")
+    st.session_state.setdefault("anomaly_object_source", "yolo")
+    _osrc = st.radio("這個資料夾要怎麼當『偵測對象』?", ["yolo", "whole_image"],
+                     key="anomaly_object_source",
+                     format_func=lambda s: {
+                         "yolo": "YOLO 物件(讀 labels/,逐物件偵測)",
+                         "whole_image": "整張影像(無需 labels/,每張圖當一個對象)",
+                     }[s])
+
+    # 訓練結果(後面「框選確認」區塊也用)→ 須定義在 yolo 條件外,否則 whole_image 模式 UnboundLocalError
     _tr = st.session_state.get("anomaly_train_result") or {}
     _recs = _tr.get("records") or []
-    _hint = label_semantic_hint(_recs) if _recs else {"suggested": "unknown", "hint": ""}
-    if "anomaly_train_semantic" not in st.session_state:
-        st.session_state["anomaly_train_semantic"] = (
-            _hint["suggested"] if _hint["suggested"] in ("object", "defect") else "object")
-    st.radio("標籤名稱(classes.txt)指的是『物件本身』還是『缺陷本身』?", ["object", "defect"],
-             key="anomaly_train_semantic",
-             format_func=lambda s: {
-                 "object": "物件類別(門 / 窗 / 螺絲…)— 名稱指「東西本身」→ 只用離群偵測找異常,不訓分類頭",
-                 "defect": "瑕疵類別(刮傷 / 污漬 / 裂痕…)— 名稱指「缺陷本身」→ 額外解鎖:自動分辨缺陷類型",
-             }[s])
-    # 每 rerun 同步寫 active_semantic(供任何硬守衛讀;與 build callback 一致)
-    st.session_state["anomaly_active_semantic"] = st.session_state["anomaly_train_semantic"]
-    if st.session_state["anomaly_train_semantic"] == "defect" and _hint["suggested"] == "object":
-        st.warning("⚠ " + _hint["hint"] + " 確定是瑕疵類別嗎?")
-    with st.expander("⚙ 進階(N_min:每類最少樣本才納入分類頭)"):
-        st.slider("N_min(每類最少樣本才納入 head;**暫定·未經敏感度掃描驗證**)", 2, 30, 8,
-                  key="anomaly_n_min")
+
+    # 1c. label 語義:只有 YOLO 模式才問(整張影像恆 1 類、不訓 head → 語義無意義)
+    if _osrc == "yolo":
+        st.markdown("**(3) 你的 YOLO 標籤名稱代表什麼?**")
+        _hint = label_semantic_hint(_recs) if _recs else {"suggested": "unknown", "hint": ""}
+        if "anomaly_train_semantic" not in st.session_state:
+            st.session_state["anomaly_train_semantic"] = (
+                _hint["suggested"] if _hint["suggested"] in ("object", "defect") else "object")
+        st.radio("標籤名稱(classes.txt)指的是『物件本身』還是『缺陷本身』?", ["object", "defect"],
+                 key="anomaly_train_semantic",
+                 format_func=lambda s: {
+                     "object": "物件類別(門 / 窗 / 螺絲…)— 名稱指「東西本身」→ 只用離群偵測找異常,不訓分類頭",
+                     "defect": "瑕疵類別(刮傷 / 污漬 / 裂痕…)— 名稱指「缺陷本身」→ 額外解鎖:自動分辨缺陷類型",
+                 }[s])
+        # 每 rerun 同步寫 active_semantic(供任何硬守衛讀;與 build callback 一致)
+        st.session_state["anomaly_active_semantic"] = st.session_state["anomaly_train_semantic"]
+        if st.session_state["anomaly_train_semantic"] == "defect" and _hint["suggested"] == "object":
+            st.warning("⚠ " + _hint["hint"] + " 確定是瑕疵類別嗎?")
+        with st.expander("⚙ 進階(N_min:每類最少樣本才納入分類頭)"):
+            st.slider("N_min(每類最少樣本才納入 head;**暫定·未經敏感度掃描驗證**)", 2, 30, 8,
+                      key="anomaly_n_min")
+    else:
+        st.session_state["anomaly_active_semantic"] = "object"
+        st.caption("整張影像模式:每張圖一個對象、只做離群偵測(無分類頭、無需 labels/)。")
 
     # 1c. 建模按鈕
     st.button("▶ (1) 建立模型", key="anomaly_build_btn", type="primary",
@@ -1556,6 +1599,10 @@ def _anomaly_tab_build() -> None:
               on_click=_anomaly_build_model)
     if st.session_state.get("_anomaly_model_err"):
         st.error(st.session_state["_anomaly_model_err"])
+        if st.session_state.get("_anomaly_offer_whole_image"):
+            st.button("→ 改用『整張影像』重新建模(無需 labels/)",
+                      key="anomaly_switch_whole_image", type="primary",
+                      on_click=_anomaly_switch_to_whole_image)
 
     model = st.session_state.get("anomaly_model")
     if model:
@@ -1564,7 +1611,9 @@ def _anomaly_tab_build() -> None:
         _head_txt = "含分類頭" if model.get("head") else "無分類頭"
         _sem_txt = {"object": "物件類別", "defect": "瑕疵類別"}.get(
             model.get("label_semantic", "object"), model.get("label_semantic"))
-        st.success(f"✅ **模型{_src}** · {_m.get('model')}@{_m.get('target_res')} · "
+        _osrc_txt = {"yolo": "YOLO 物件", "whole_image": "整張影像"}.get(
+            _m.get("object_source", "yolo"), "YOLO 物件")
+        st.success(f"✅ **模型{_src}** · 來源={_osrc_txt} · {_m.get('model')}@{_m.get('target_res')} · "
                    f"{_m.get('score_mode')} · {_m.get('n_objects')} 物件 · 語義={_sem_txt} · {_head_txt} "
                    "→ 切到 **②套用偵測**")
         if model.get("source") == "loaded":
@@ -1620,8 +1669,10 @@ def _anomaly_tab_apply() -> None:
         st.info("請先到 **①建模 / 載入模型** 建立或載入一個模型,再回來套用偵測。")
         return
     _m = model["meta"]
+    _osrc_txt = {"yolo": "YOLO 物件", "whole_image": "整張影像"}.get(
+        _m.get("object_source", "yolo"), "YOLO 物件")
     st.caption(f":violet[🔒 用模型鎖定的 **{_m.get('model')}@{_m.get('target_res')}** · {_m.get('score_mode')} "
-               "評分(非側欄現值;側欄改 model/res 只作用於下次①建模)。]")
+               f"· 來源={_osrc_txt} 評分(非側欄現值;側欄改 model/res 只作用於下次①建模)。]")
 
     st.markdown("**(1) 選異常目標資料夾**")
     target_folders = _folder_picker_list("anomaly_target_folder",
@@ -1948,11 +1999,15 @@ def _anomaly_render_scatter(result: dict, *, context: str) -> None:
                         else:
                             st.image(crop_bbox(_im, *_r["bbox"], pad=0.1),
                                      use_container_width=True)
-                            _fg = "#cc0000" if _r["verdict"] == "bad" else "#000000"
+                            _t = (0.5 if smax <= smin
+                                  else (float(_r["score"]) - smin) / (smax - smin))
+                            _bg = _turbo_hex(_t)          # 底色=與上方散點同款分數色
                             _lab = _r.get("label") or _r["verdict"]
                             st.markdown(
-                                f"<div style='color:{_fg};text-align:center;"
-                                f"font-size:0.82em;line-height:1.5;font-weight:600'>"
+                                f"<div style='background:{_bg};color:{_text_on(_bg)};"
+                                f"text-align:center;font-size:0.82em;line-height:1.6;"
+                                f"font-weight:600;border-radius:6px;padding:2px 6px;"
+                                f"margin-top:3px'>"
                                 f"{_r['score']:.2f}·{_lab}</div>",
                                 unsafe_allow_html=True)
 

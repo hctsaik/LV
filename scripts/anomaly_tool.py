@@ -47,17 +47,25 @@ def run_pipeline(image_paths, class_names, *, mode: str = "two_stage",
                  confirmed: dict | None = None, contamination: float = 0.05,
                  cache_dir=None, model: str = "dinov2_vits14", target_res: int = 224,
                  extractor=None, embed_fn=None, progress=None,
-                 external_bank=None, external_ref=None) -> dict:
+                 external_bank=None, external_ref=None,
+                 object_source: str = "yolo") -> dict:
     from anomaly_classify import classify
     from bootstrap_cluster import cluster_objects
-    from interaction import compute_outlier_scores, discover_yolo_objects
+    from interaction import (compute_outlier_scores, discover_yolo_objects,
+                             discover_whole_images)
     from safe_io import partition_readable
 
     # 壞檔前置過濾：擋在 meta 之外,下游索引(records/scores/obj_emb)才一致。
     image_paths, _bad = partition_readable(list(image_paths))
     skipped = [str(b) for b in _bad]
 
-    meta = discover_yolo_objects(list(image_paths), class_names)
+    # 物件來源:yolo=逐 YOLO 框(現況);whole_image=整張影像一筆(無需 labels/)。
+    if object_source == "whole_image":
+        meta = discover_whole_images(list(image_paths))
+    elif object_source == "yolo":
+        meta = discover_yolo_objects(list(image_paths), class_names)
+    else:
+        raise ValueError("object_source must be 'yolo' or 'whole_image'")
     N = len(meta)
     if N == 0:
         return {"records": [], "ranking": [], "threshold": float("inf"),
