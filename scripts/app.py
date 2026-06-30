@@ -1462,8 +1462,10 @@ def _anomaly_queue_labels(sel, records, scores, head, gthr, min_conf, obj_emb):
             _g = gated_predict(head, _np.asarray(obj_emb, dtype=float), scores,
                                anomaly_threshold=float(gthr), min_conf=float(min_conf))
             gated = {int(i): _g[int(i)] for i in sel}
-        except Exception:
+        except Exception as _exc:
             gated = None
+            st.warning(f"⚠️ 分類頭(head)閘控判定失敗,本次退回無閘控的「可疑 / 正常」判定;"
+                       f"head 暫不作用。({type(_exc).__name__}: {_exc})")
     for i in sel:
         r = records[int(i)]
         if gated is not None:
@@ -1732,8 +1734,10 @@ def _anomaly_tab_sample() -> None:
         from dino_head import predict_head
         try:
             _pred, _, _proba = predict_head(head, np.asarray(obj_emb, dtype=float))
-        except Exception:
+        except Exception as _exc:
             _proba = _pred = None
+            st.warning(f"⚠️ 分類頭(head)預測失敗,取樣退回 cluster 分群、2×2 僅留純 novelty;"
+                       f"head 暫不作用。({type(_exc).__name__}: {_exc})")
     _div = (_pred if _pred is not None else (result.get("cluster") or {}).get("labels"))
 
     # gated 門檻(供徽章/標籤的閘控判定)。沿用 gate_threshold(quantile;有 head 才實際拆 Unknown)。
