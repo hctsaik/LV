@@ -23,7 +23,7 @@ for m in mods:
     f = lambda d: "v" if m in d else "X"
     print("%-22s  %s    %s" % (m, f(designs), f(maps)))
 
-AC = re.compile(r"AC[-_ ]?\w+")
+AC = re.compile(r"\bAC[-_ ]?[A-Za-z]?\d\w*")   # 需含數字:AC1/AC10/AC-F4a;不誤抓 LV_CACHE_DIR 的 ACHE
 print("\n== AC <-> 測試 雙向覆蓋(只驗掛名,不驗行為正確)==")
 for m in mods:
     d_ac = set(AC.findall(open(designs[m], encoding="utf-8").read())) if m in designs else set()
