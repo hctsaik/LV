@@ -19,6 +19,30 @@ _DEFAULT_MODELS_DIR = Path(
 )
 
 
+def yaml_class_names(yaml_path: Path | str) -> list[str] | None:
+    """data.yaml 的 `names:` → 類別名 list。收 Ultralytics/Roboflow 三種寫法:
+    inline list(names: ['a','b'])、多行 `- name`、dict(names: {0: a, 1: b})。
+    檔案缺席/壞 YAML/無 names 一律回 None(不 raise)。"""
+    p = Path(yaml_path)
+    if not p.exists():
+        return None
+    try:
+        import yaml
+        data = yaml.safe_load(p.read_text(encoding="utf-8", errors="replace")) or {}
+    except Exception:
+        return None
+    names = data.get("names") if isinstance(data, dict) else None
+    if isinstance(names, dict):
+        try:
+            keys = sorted(names, key=lambda k: int(k))
+        except (TypeError, ValueError):
+            keys = list(names)
+        return [str(names[k]) for k in keys] or None
+    if isinstance(names, list):
+        return [str(n) for n in names] or None
+    return None
+
+
 def available_models(models_dir: Path = _DEFAULT_MODELS_DIR) -> list[str]:
     """Return selectable model names found in models_dir. Recognises:
     - `<name>/<name>.pth`  → the per-model folder layout (see MODELS.md)

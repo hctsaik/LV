@@ -33,7 +33,7 @@ from PIL import Image
 
 from interaction import crop_bbox, discover_yolo_objects, yolo_label_path_for
 from safe_io import safe_open_image, safe_read_text
-from _utils import load_model
+from _utils import load_model, yaml_class_names
 
 _REPO = Path(__file__).resolve().parent.parent
 PROFILES_PATH = Path(
@@ -95,20 +95,9 @@ def classes_for(root: Path) -> list[str] | None:
             if lines:
                 return lines
     for folder in (root, root.parent, root.parent.parent):  # 容忍巢狀佈局(…/[Small]/split)
-        y = folder / "data.yaml"
-        if y.exists():
-            names, grab = [], False
-            for ln in safe_read_text(y).splitlines():
-                s = ln.strip()
-                if s.startswith("names:"):
-                    grab = True
-                    continue
-                if grab and s.startswith("- "):
-                    names.append(s[2:].strip())
-                elif grab and s and not s.startswith("- "):
-                    break
-            if names:
-                return names
+        names = yaml_class_names(folder / "data.yaml")  # 三種 names: 寫法皆收(共用解析器)
+        if names:
+            return names
     return None
 
 

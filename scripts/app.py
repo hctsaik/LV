@@ -26,6 +26,7 @@ from _utils import (
     load_model,
     load_text_encoder,
     supports_text_query,
+    yaml_class_names,
 )
 from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tests)
     CAUSE_H0,
@@ -34,11 +35,14 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     attribute_escape,
     build_nn_index,
     candidates_to_quiz_records,
+    annotation_boxes_for_image,
     crop_bbox,
+    folder_has_annotations,
     curation_log_csv,
     diagnose_root_cause,
     diagnose_sparse_points,
     discover_yolo_objects,
+    has_seg_like_labels,
     match_shas_to_indices,
     compute_label_disagreement,
     compute_outlier_scores,
@@ -127,6 +131,14 @@ def ref_path_for(*args, **kwargs):
     from umap_ref import ref_path_for as _f
     return _f(*args, **kwargs)
 
+_DEFAULT_MODEL = "dinov2_vits14"
+
+
+def _default_model_index(models: list[str]) -> int:
+    """全 app 模型選單的預設:dinov2_vits14(快、輕);不在清單時退回第 0 個。"""
+    return models.index(_DEFAULT_MODEL) if _DEFAULT_MODEL in models else 0
+
+
 def _pick_folder(session_key: str) -> None:
     root = tk.Tk()
     root.withdraw()
@@ -147,22 +159,22 @@ def _pick_file(session_key: str, title: str = "選擇檔案", filetypes: list | 
         st.session_state[session_key] = path
 
 
-def _pick_folder_append(list_key: str) -> None:
+def _pick_folder_set(list_key: str) -> None:
+    """原生資料夾對話框 → 單一資料夾語義:選新的直接取代舊的。
+    session 值維持 list 型別(E2E harness 與 render 端都以 list 迭代)。"""
     root = tk.Tk()
     root.withdraw()
     root.wm_attributes("-topmost", 1)
     path = filedialog.askdirectory(title="選擇資料夾")
     root.destroy()
     if path:
-        if list_key not in st.session_state:
-            st.session_state[list_key] = []
-        if path not in st.session_state[list_key]:
-            st.session_state[list_key].append(path)
+        st.session_state[list_key] = [path]
 
 
-def _pick_folder_into_text(text_key: str) -> None:
+def _pick_folder_into_text(text_key: str, replace: bool = False) -> None:
     """Open the native folder dialog and append the chosen path (one per
     line) to a text-area's value — for the tools that take a pasted path.
+    replace=True → 單一資料夾語義:直接取代整個內容(給後端只吃一個資料夾的工具用)。
     Runs as an on_click callback so the value is set before the rerun."""
     root = tk.Tk()
     root.withdraw()
@@ -170,6 +182,9 @@ def _pick_folder_into_text(text_key: str) -> None:
     path = filedialog.askdirectory(title="選擇資料夾")
     root.destroy()
     if path:
+        if replace:
+            st.session_state[text_key] = path
+            return
         cur = st.session_state.get(text_key, "").rstrip()
         lines = [ln.strip() for ln in cur.splitlines() if ln.strip()]
         if path not in lines:
@@ -177,35 +192,75 @@ def _pick_folder_into_text(text_key: str) -> None:
         st.session_state[text_key] = "\n".join(lines)
 
 
+def _class_source_expander(prefix: str) -> None:
+    """共用「類別來源」expander（與 Visualize 同款 UI）：📄 手動選 classes.txt，
+    或逗號手動輸入；皆空＝自動偵測資料集旁的 classes.txt。
+    由 _manual_class_names(prefix) 讀取；各工具用自己的 prefix，互不影響。"""
+    with st.expander("類別來源（預設自動偵測 classes.txt）"):
+        cc1, cc2 = st.columns([4, 1])
+        classes_path = st.session_state.get(f"{prefix}_classes_file", "")
+        cc1.caption("classes.txt")
+        cc1.text(Path(classes_path).name if classes_path else "（自動偵測或手動輸入）")
+        if cc2.button("📄", key=f"{prefix}_browse_classes", use_container_width=True,
+                      help="選擇 classes.txt"):
+            _pick_file(f"{prefix}_classes_file", title="選擇 classes.txt",
+                       filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+            st.rerun()
+        if classes_path:
+            if st.button("✕ 清除", key=f"{prefix}_clear_classes", use_container_width=True):
+                del st.session_state[f"{prefix}_classes_file"]
+                st.rerun()
+        st.text_input("Class names — 手動輸入（classes.txt 未選擇時使用）",
+                      key=f"{prefix}_class_names_input",
+                      placeholder="apple,banana,orange",
+                      help="逗號分隔；留空＝自動偵測。")
+
+
+def _manual_class_names(prefix: str) -> list[str] | None:
+    """共用「類別來源」的手動指定值：選檔 > 逗號輸入；皆空回 None（呼叫端自動偵測）。"""
+    classes_path = (st.session_state.get(f"{prefix}_classes_file") or "").strip()
+    if classes_path and Path(classes_path).exists():
+        lines = [ln.strip() for ln in safe_read_text(classes_path).splitlines() if ln.strip()]
+        if lines:
+            return lines
+    manual = (st.session_state.get(f"{prefix}_class_names_input") or "").strip()
+    if manual:
+        return [c.strip() for c in manual.split(",") if c.strip()]
+    return None
+
+
 def _folder_add_cb(list_key: str, input_key: str) -> None:
-    """Append a typed/pasted path to a managed folder list (on_change of the
-    small single-line add field), then clear the field."""
+    """Set the typed/pasted path as THE folder (single-folder semantics —
+    a new pick replaces the old one), then clear the field. The session value
+    stays a list so render/E2E contracts are unchanged."""
     v = (st.session_state.get(input_key) or "").strip()
     if v:
-        lst = st.session_state.setdefault(list_key, [])
-        if v not in lst:
-            lst.append(v)
+        st.session_state[list_key] = [v]
     st.session_state[input_key] = ""
 
 
 def _folder_add_input(list_key: str, *, help: str | None = None) -> None:
-    """Small single-line '輸入路徑 → Enter 加入' field — replaces the old multi-line
-    paste textarea, and is the only Playwright/headless-driveable folder input
-    (the 📁 picker is a native dialog)."""
-    st.text_input("或輸入路徑後 Enter 加入", key=f"{list_key}_add",
+    """Small single-line '輸入路徑 → Enter' field — the only Playwright/headless-
+    driveable folder input (the 📁 picker is a native dialog). Single-folder
+    semantics: entering a path replaces the previous selection."""
+    st.text_input("或輸入路徑後 Enter（取代目前選擇）", key=f"{list_key}_add",
                   on_change=_folder_add_cb, args=(list_key, f"{list_key}_add"),
                   placeholder="例：demo/coco8/train", label_visibility="collapsed",
                   help=help)
 
 
 def _folder_picker_list(list_key: str, *, add_help: str | None = None) -> list:
-    """📁 native picker + managed list (× removers) + add-input. Returns paths.
-    The unified folder-input pattern (no multi-line paste textarea)."""
+    """[輸入路徑|📁] 同列(輸入框左、📁 native picker 右)+ current folder (× remover)。
+    Returns paths (list 型別,單一資料夾語義:選新的取代舊的)。"""
     st.session_state.setdefault(list_key, [])
-    if st.button("📁 新增資料夾", use_container_width=True, key=f"add_{list_key}"):
-        _pick_folder_append(list_key)
-        st.rerun()
-    _folder_add_input(list_key, help=add_help)  # headless/E2E-driveable 文字加入（📁 為原生對話框）
+    _fc1, _fc2 = st.columns([5, 1], vertical_alignment="bottom")
+    with _fc1:
+        _folder_add_input(list_key, help=add_help)  # headless/E2E-driveable 文字加入（📁 為原生對話框）
+    with _fc2:
+        if st.button("📁", use_container_width=True, key=f"add_{list_key}",
+                     help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。"):
+            _pick_folder_set(list_key)
+            st.rerun()
     for i, folder in enumerate(st.session_state[list_key]):
         c1, c2 = st.columns([5, 1])
         c1.caption(folder)
@@ -276,6 +331,12 @@ def _viz_color_map(records: list[dict]) -> dict:
     return {c: _VIZ_COLORS[j % len(_VIZ_COLORS)] for j, c in enumerate(classes)}
 
 
+def _rec_fname(rec: dict) -> str:
+    """徽章/caption 顯示用的原圖 basename——物件級記錄 path 是 .lv_cache 裁切圖,
+    image_path 才是使用者資料夾裡的原圖;整圖級只有 path(即原圖)。"""
+    return Path(rec.get("image_path") or rec.get("path", "")).name
+
+
 def _hex_rgb(hexc: str) -> list[int]:
     h = hexc.lstrip("#")
     return [int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)]
@@ -331,8 +392,9 @@ def _viz_deck_thumbs(records: list[dict], data_token: str) -> list[str]:
 _VIZ_SYMBOLS = {"train": "circle", "test": "square", "valid": "diamond"}
 _METHOD_KEY = {"PCA": "pca", "t-SNE": "tsne", "UMAP": "umap",
                "LDA(監督)": "lda", "監督UMAP": "sumap"}
-# 預設算這幾種；監督UMAP 預設也算並作為預設顯示(用標籤排版,最易看出分群/挑標錯)
-_DEFAULT_METHODS = ["PCA", "t-SNE", "UMAP", "監督UMAP"]
+# 預設只算監督UMAP(用標籤排版,最易看出分群/挑標錯);無標籤/單一類別時
+# 監督投影會被跳過,由「未算出任何投影 → PCA 保底」接手,不會空結果。
+_DEFAULT_METHODS = ["監督UMAP"]
 _SUPERVISED_METHODS = {"lda", "sumap"}
 
 # ── Remember last selections across Streamlit restarts ───────────────────────
@@ -434,12 +496,23 @@ def _legend_toggle_buttons() -> list[dict]:
 
 
 def read_classes_txt(folder: Path) -> list[str] | None:
-    """Return class names from <folder-parent>/classes.txt, or None if absent/empty."""
+    """Return class names from <folder-parent>/classes.txt；缺席/空檔時退
+    <folder-parent>/data.yaml 的 `names:`(Roboflow/Ultralytics 匯出常只有 data.yaml)。"""
     classes_file = folder.parent / "classes.txt"
-    if not classes_file.exists():
-        return None
-    lines = [ln.strip() for ln in safe_read_text(classes_file).splitlines() if ln.strip()]
-    return lines if lines else None
+    if classes_file.exists():
+        lines = [ln.strip() for ln in safe_read_text(classes_file).splitlines() if ln.strip()]
+        if lines:
+            return lines
+    return yaml_class_names(folder.parent / "data.yaml")
+
+
+def _seg_format_hint(image_paths) -> str:
+    """「labels/ 找不到任何 bbox」的診斷尾註:抽樣發現 seg/OBB 行(>6 欄)時點名格式不符,
+    避免使用者以為自己沒標註。"""
+    if has_seg_like_labels(image_paths):
+        return ("\n\n⚠ 偵測到 labels/ 是 **segmentation／OBB 格式**（每行 >6 欄）——"
+                "目前只支援偵測框格式（class cx cy w h），請先轉成偵測框再使用。")
+    return ""
 
 
 def _classes_txt_nested(folder: Path) -> list[str] | None:
@@ -1072,7 +1145,7 @@ def _export_subset_ui() -> None:
 
     pick = st.selectbox("依來源篩選", ["全部"] + sorted(by_src), key="exp_src_filter")
     shown = _cart_snapshots(None if pick == "全部" else pick)
-    with st.container(height=280):
+    with st.container(height=480):
         cols = st.columns(6)
         for j, s in enumerate(shown[:60]):
             with cols[j % 6]:
@@ -1113,7 +1186,9 @@ def _export_subset_ui() -> None:
     uniq = len({(it.sha256 or str(it.image_path.resolve())) for it in items})
     n_lab = sum(1 for it in items if it.label_path)
     st.caption(f":gray[將處理 {len(items)} 筆 → sha256 去重後約 **{uniq}** 張影像、{n_lab} 個 label 檔。"
-               "輸出含 images/＋labels/＋classes.txt＋data.yaml＋manifest.csv＋lineage.json。]")
+               "輸出含 images/＋labels/＋classes.txt＋data.yaml＋manifest.csv＋lineage.json;"
+               "非 YOLO-txt 標註（COCO／VOC XML／LabelMe／NDJSON）會**原格式保留**"
+               "（sidecar 隨影像、資料集級檔過濾成只含匯出影像）。]")
     st.caption(":orange[⚠ 這是你刻意挑出的偏斜子集（多為難／稀疏／離群樣本），非隨機抽樣；"
                "直接拿去訓練或當 benchmark 會誤導，評估請用獨立 hold-out。]")
 
@@ -1126,11 +1201,14 @@ def _export_subset_ui() -> None:
             st.error(f"❌ 匯出被擋下：{e}")
             return
         st.success(f"✅ 完成 → `{rep.dst}`")
-        m = st.columns(4)
+        m = st.columns(5)
         m[0].metric("已匯出", rep.exported)
         m[1].metric("略過", len(rep.skipped))
         m[2].metric("去重", rep.deduped)
         m[3].metric("未解析", len(rep.unresolved))
+        m[4].metric("原格式標註", rep.annotations_preserved,
+                    help="COCO/VOC/LabelMe/NDJSON 標註被一併保留的影像數"
+                         "(YOLO txt 不計,走 labels/)。")
         if rep.warnings:
             with st.expander(f"⚠ 警告（{len(rep.warnings)}）"):
                 for w in rep.warnings[:50]:
@@ -1225,7 +1303,7 @@ def _anomaly_build_model() -> None:
     try:
         roots = [Path(f) for f in folders]
         image_paths: list[Path] = []
-        class_names = None
+        class_names = _manual_class_names("anomaly")  # 手動指定 > 各 root 自動偵測
         for r in roots:
             image_paths.extend(list_images(r))
             class_names = class_names or classes_for(r)
@@ -1323,7 +1401,7 @@ def _anomaly_apply_model() -> None:
     try:
         roots = [Path(f) for f in folders]
         image_paths: list[Path] = []
-        class_names = None
+        class_names = _manual_class_names("anomaly")  # 手動指定 > 各 root 自動偵測
         for r in roots:
             image_paths.extend(list_images(r))
             class_names = class_names or classes_for(r)
@@ -1507,6 +1585,7 @@ def _anomaly_sidebar_settings() -> None:
             index=(_dino.index("dinov2_vits14") if "dinov2_vits14" in _dino else 0),
             key="anomaly_model_sel",
             help="vits14=快、輕(D=384);vitb14=較準、較重(D=768)。換模型用各自獨立快取。")
+        _class_source_expander("anomaly")  # YOLO 類別名:手動指定 > 自動偵測(容忍巢狀)
         st.radio("流程", ["two_stage", "one_stage"], key="anomaly_mode",
                  format_func=lambda m: {"two_stage": "2-stage(抽樣→確認→整批)",
                                         "one_stage": "1-stage(直接整批)"}[m],
@@ -1882,7 +1961,7 @@ def _anomaly_tab_sample() -> None:
                 _vc = {"正常": "#1a7f37", "Unknown": "#9a6700"}.get(_info["verdict"], "#cc0000")
                 st.markdown(
                     f"<div style='text-align:center;font-size:0.8em;line-height:1.45'>"
-                    f"<b>{_info['label']}</b><br>"
+                    f"<b>{_info['label']}｜{_rec_fname(_r)}</b><br>"
                     f"<span style='color:{_vc};font-weight:600'>判定:{_info['verdict']}</span><br>"
                     f"異常 {_info['score']:.2f}</div>",
                     unsafe_allow_html=True)
@@ -2008,7 +2087,7 @@ def _anomaly_render_scatter(result: dict, *, context: str) -> None:
                                 f"text-align:center;font-size:0.82em;line-height:1.6;"
                                 f"font-weight:600;border-radius:6px;padding:2px 6px;"
                                 f"margin-top:3px'>"
-                                f"{_r['score']:.2f}·{_lab}</div>",
+                                f"{_lab}｜{_rec_fname(_r)}<br>{_r['score']:.2f}</div>",
                                 unsafe_allow_html=True)
 
 
@@ -2075,10 +2154,11 @@ def _anomaly_render_inspector(result: dict, scores) -> None:
                     cache_dir=Path(result["_cache"]))[0]
                 _, pmap = score_object(pf["feats"], pf["grid"], result["bank"])
                 st.image(render_heatmap(pmap, crop), use_container_width=True,
-                         caption=f"{r['label']} · {r['score']:.3f} · 紅=最不像正常")
+                         caption=f"{r['label']}｜{_rec_fname(r)}"
+                                 f" · {r['score']:.3f} · 紅=最不像正常")
             else:
                 st.image(crop, use_container_width=True,
-                         caption=f"{r['label']} · {r['score']:.3f}"
+                         caption=f"{r['label']}｜{_rec_fname(r)} · {r['score']:.3f}"
                          " ·(無監督模式;確認正常範例後可看熱力圖)")
         except (OSError, Image.DecompressionBombError, IndexError) as e:
             st.caption(f":gray[無法顯示:{e}]")
@@ -2192,7 +2272,8 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
         ctx = st.session_state.get("viz_viewer_ctx") or list(ctx_default) or [idx]
         pos = ctx.index(idx) if idx in ctx else 0
         h1, h2, h3, h4 = st.columns([5, 1, 1, 1])
-        h1.markdown(f"**{p.name}** — {r['label']}（{r['split']}）· {pos + 1}/{len(ctx)} · #{idx}")
+        h1.markdown(f"**{r['label']}｜{_rec_fname(r)}**（{r['split']}）"
+                    f"· {pos + 1}/{len(ctx)} · #{idx}")
         h2.button("◀", key="viz_img_prev", disabled=pos <= 0,
                   on_click=_set_active_image, args=(ctx[max(pos - 1, 0)],))
         h3.button("▶", key="viz_img_next", disabled=pos >= len(ctx) - 1,
@@ -2228,7 +2309,7 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
         if disp.exists() and b.button("🔍 放大檢視", key="viz_slot_zoom",
                                       use_container_width=True):
             _zoom_image_dialog(disp, show_boxes, class_names,
-                               f"{disp.name}（{view}）— {r['label']}（{r['split']}）· #{idx}")
+                               f"{r['label']}｜{_rec_fname(r)}（{view}）（{r['split']}）· #{idx}")
         elist = st.session_state.get("viz_export_list", {})
         if str(p) in elist:
             c.button("✓ 移除清單", key="viz_slot_remove", use_container_width=True,
@@ -2257,11 +2338,11 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
                                "、".join(f"{m} → 列 {r}" for m, r in refs.items()))
 
 
-def _render_grid(records: list[dict], shown: list[int], show_rank: bool) -> None:
+def _render_grid(records: list[dict], shown: list[int]) -> None:
     elist = st.session_state.get("viz_export_list", {})
     cmap = _viz_color_map(records)
     css_rules: list[str] = []
-    with st.container(height=440, key="viz_grid"):
+    with st.container(height=560, key="viz_grid"):
         if not shown:
             st.info("在左圖以點選、框選（box）或套索（lasso）圈出資料點，縮圖會立即顯示在這裡。")
             return
@@ -2275,9 +2356,8 @@ def _render_grid(records: list[dict], shown: list[int], show_rank: bool) -> None
                 else:
                     st.warning("⚠ 檔案遺失")
                 mark = "✓ " if str(p) in elist else ""
-                rank = f"｜第{j + 1}" if show_rank else ""
                 label = records[i].get("label") or f"#{i}"
-                st.button(f"{mark}{label}{rank}", key=f"viz_card_{i}",
+                st.button(f"{mark}{label}｜{_rec_fname(records[i])}", key=f"viz_card_{i}",
                           use_container_width=True, help=f"#{i}",
                           on_click=_set_active_image, args=(i, list(shown)))
                 col = cmap.get(records[i].get("label", ""), "#9aa0a6")
@@ -2333,7 +2413,6 @@ def _render_select_view(
 
     outlier = st.session_state.get("viz_outlier_scores", {}).get(model_name)
     disagreement = st.session_state.get("viz_label_disagreement", {}).get(model_name)
-    show_rank = False
     if sel_indices:
         if selected_split == "All":
             disp = list(sel_indices)
@@ -2341,12 +2420,10 @@ def _render_select_view(
             disp = [i for i in sel_indices if records[i]["split"] == selected_split]
         if sort == "離群度" and outlier is not None:
             order = sorted(disp, key=lambda i: -float(outlier[i]))
-            show_rank = True
         elif sort == "標籤分歧" and disagreement is not None:
             order = sorted(disp, key=lambda i: -float(disagreement[i]))
-            show_rank = True
         elif sort == "檔名":
-            order = sorted(disp, key=lambda i: records[i]["path"].name)
+            order = sorted(disp, key=lambda i: _rec_fname(records[i]))
         else:
             order = spatial_order(coords, disp)
         limit = min(st.session_state.get("viz_grid_limit", _GRID_BATCH), _GRID_CAP)
@@ -2366,7 +2443,6 @@ def _render_select_view(
         if scores is not None and len(records) >= 3:
             order = [int(i) for i in np.argsort(scores)[::-1][:_DEFAULT_TOP_OUTLIERS]]
             shown = order
-            show_rank = True
             status = f"未選取 · 預設顯示{crit}前 {len(shown)} 張（{note}）"
         else:
             order, shown = [], []
@@ -2376,19 +2452,19 @@ def _render_select_view(
             status,
             help="排序說明：空間順序＝縮圖位置模仿散點圖；離群度＝到鄰居的平均距離，"
                  "越高越「孤立」；標籤分歧＝k 近鄰中標籤不同的比例，越高越值得複查標註"
-                 "（後兩者僅供排序參考，非品質判定）。卡片上的「第n」是目前排序的名次，"
-                 "#n 是資料點編號。",
+                 "（後兩者僅供排序參考，非品質判定）。卡片文字是「類別｜檔名」"
+                 "（物件級顯示來源原圖檔名），順序即目前排序。",
         )
 
     _render_viewer_slot(records, shown)
-    _render_grid(records, shown, show_rank)
+    _render_grid(records, shown)
     if sel_indices and len(order) > len(shown):
         st.button(f"載入更多（+{_GRID_BATCH}）", key="viz_more_btn",
                   use_container_width=True, on_click=_load_more,
                   disabled=len(shown) >= _GRID_CAP)
     with st.expander("詳細表格"):
         df = pd.DataFrame([
-            {"index": i, "filename": records[i]["path"].name,
+            {"index": i, "filename": _rec_fname(records[i]),
              "label": records[i]["label"], "split": records[i]["split"]}
             for i in shown
         ])
@@ -2460,7 +2536,7 @@ def _render_text_search(records: list[dict], model_name: str,
         st.info("沒有可比對的影像。")
         return
     st.caption(f"「{q_text}」的前 {len(idxs)} 名 — cosine 距離越小越相符。")
-    with st.container(height=380):
+    with st.container(height=560):
         cols = st.columns(3)
         for j, (i, d) in enumerate(zip(idxs, dists)):
             with cols[j % 3]:
@@ -2468,9 +2544,10 @@ def _render_text_search(records: list[dict], model_name: str,
                 thumb = _thumb_or_none(p)
                 if thumb is not None:
                     st.image(thumb, use_container_width=True,
-                             caption=f"#{i} · d={d:.4f}")
+                             caption=f"{records[i].get('label') or '?'}"
+                                     f"｜{_rec_fname(records[i])} · d={d:.4f}")
                 else:
-                    st.warning(f"缺檔：{p.name}")
+                    st.warning(f"缺檔：{_rec_fname(records[i])}")
                 st.button("↻ 以此圖續查", key=f"viz_textpivot_{i}",
                           use_container_width=True,
                           on_click=_pivot_to_image_query, args=(i,))
@@ -2515,7 +2592,7 @@ def _render_similar_view(records: list[dict], model_name: str) -> None:
         for ci, qi in enumerate(chain):
             chip_cols[ci].button(f"#{qi}", key=f"viz_chip_{ci}", use_container_width=True,
                                  on_click=_truncate_chain, args=(ci,))
-        st.caption(f"查詢影像：{records[q]['path'].name} — cosine 距離越小越相似。")
+        st.caption(f"查詢影像：{_rec_fname(records[q])} — cosine 距離越小越相似。")
         k = st.number_input(
             "k（回傳數量）", min_value=1, max_value=max(1, len(records) - 1),
             value=min(9, len(records) - 1), key="viz_similar_k",
@@ -2525,7 +2602,7 @@ def _render_similar_view(records: list[dict], model_name: str) -> None:
         if not idxs:
             st.info("沒有其他影像可比對。")
             return
-        with st.container(height=380):
+        with st.container(height=560):
             cols = st.columns(3)
             for j, (i, d) in enumerate(zip(idxs, dists)):
                 with cols[j % 3]:
@@ -2533,9 +2610,10 @@ def _render_similar_view(records: list[dict], model_name: str) -> None:
                     thumb = _thumb_or_none(p)
                     if thumb is not None:
                         st.image(thumb, use_container_width=True,
-                                 caption=f"#{i} · d={d:.4f}")
+                                 caption=f"{records[i].get('label') or '?'}"
+                                         f"｜{_rec_fname(records[i])} · d={d:.4f}")
                     else:
-                        st.warning(f"缺檔：{p.name}")
+                        st.warning(f"缺檔：{_rec_fname(records[i])}")
                     st.button("↻ 以此為查詢", key=f"viz_requery_{i}", use_container_width=True,
                               on_click=_chain_query, args=(i,))
                     st.button("⬇ 加入清單", key=f"viz_simadd_{i}", use_container_width=True,
@@ -2632,7 +2710,7 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
                                for i, j, d in pairs]},
             help="把疑似重複／跨 split 洩漏『對』成對送到 Labeling 覆核（保留/丟棄）；"
                  "配對關係與距離隨件帶過，去重決策在 Labeling 端完成（不自動刪），不用回 LV。")
-        with st.container(height=330, key="viz_dup_list"):
+        with st.container(height=480, key="viz_dup_list"):
             for row, (i, j, d) in enumerate(shown_pairs):
                 dd = f"{d}" if isinstance(d, int) else f"{d:.4f}"
                 cc = st.columns([2, 2, 1.5])
@@ -2644,7 +2722,8 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
                             st.image(thumb, use_container_width=True)
                         else:
                             st.warning("⚠ 檔案遺失")
-                        st.button(f"#{idx_}（{records[idx_]['split']}）",
+                        st.button(f"{records[idx_].get('label') or '?'}"
+                                  f"｜{_rec_fname(records[idx_])}（{records[idx_]['split']}）",
                                   key=f"viz_dup_{row}_{side}", use_container_width=True,
                                   on_click=_set_active_image, args=(idx_, [i, j]))
                 with cc[2]:
@@ -2706,14 +2785,16 @@ def _render_sampling_view(records: list[dict], model_name: str) -> None:
             label="📤 送待標清單到 Labeling 標註", key="viz_sampling_to_lbl",
             help="主動學習：把最多樣的未標樣本送到 Labeling 從頭標註（fresh）；"
                  "標完在 Labeling 端「匯出 / 回傳」匯出即為新標籤，不用回 LV。")
-        with st.container(height=320):
+        with st.container(height=520):
             cols = st.columns(3)
             for j, i in enumerate(picks):
                 with cols[j % 3]:
                     p = Path(records[i]["path"])
                     thumb = _thumb_or_none(p)
                     if thumb:
-                        st.image(thumb, use_container_width=True, caption=f"#{j + 1}")
+                        st.image(thumb, use_container_width=True,
+                                 caption=f"{records[i].get('label') or '?'}"
+                                         f"｜{_rec_fname(records[i])}")
                     else:
                         st.warning("⚠ 缺檔")
                     st.button("看圖", key=f"viz_samp_view_{i}", use_container_width=True,
@@ -2895,14 +2976,15 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
         st.markdown("**最近鄰（它長得像誰）**")
         nbr_idx, nbr_d = find_similar_indices(raw, idx, k=6,
                                               nn_index=_nn_index_for(model_name))
-        with st.container(height=330):
+        with st.container(height=520):
             cols = st.columns(3)
             for j, (ni, nd) in enumerate(zip(nbr_idx, nbr_d)):
                 with cols[j % 3]:
                     thumb = _thumb_or_none(Path(records[ni]["path"]))
                     if thumb:
                         st.image(thumb, use_container_width=True,
-                                 caption=f"{records[ni]['label']} d={nd:.3f}")
+                                 caption=f"{records[ni]['label']}"
+                                         f"｜{_rec_fname(records[ni])} · d={nd:.3f}")
         # 匯出
         report = _health_card_report(p, r, idx, diag, s1, density, s3, s3_src,
                                      score_v, thr_v, radius, nbr_idx, nbr_d, records,
@@ -3127,14 +3209,15 @@ def _render_bucket1_view(records: list[dict], model_name: str) -> None:
             _cap = 60
             st.caption(f"預覽（捲動看；最多顯示 {_cap}，共 {len(picks)}）。"
                        "要完整檢視/處理請按上方『選取這…個』。")
-            with st.container(height=360):
+            with st.container(height=520):
                 cols = st.columns(3)
                 for j, i in enumerate(picks[:_cap]):
                     with cols[j % 3]:
                         th = _thumb_or_none(Path(records[i]["path"]))
                         if th is not None:
                             st.image(th, use_container_width=True)
-                        st.caption(records[i].get("label", ""))
+                        st.caption(f"{records[i].get('label') or '?'}"
+                                   f"｜{_rec_fname(records[i])}")
 
 
 _SOURCE_LABEL = {
@@ -3178,7 +3261,7 @@ def _render_export_view() -> None:
         {"path": Path(s["path"]), "label": s.get("label", ""),
          "split": s.get("split", "")} for s in snapshots]
 
-    with st.container(height=340, key="viz_export_grid"):
+    with st.container(height=500, key="viz_export_grid"):
         cols = st.columns(4)
         for j, s in enumerate(snapshots):
             with cols[j % 4]:
@@ -3186,6 +3269,7 @@ def _render_export_view() -> None:
                 cap = _SOURCE_LABEL.get(s.get("source", "manual"), s.get("source", ""))
                 if s.get("score") is not None:
                     cap += f"·{s['score']:.2f}"
+                cap = f"{s.get('label') or '?'}｜{_rec_fname(s)} · {cap}"
                 if thumb is not None:
                     st.image(thumb, use_container_width=True, caption=cap)
                 else:
@@ -3722,7 +3806,7 @@ def _visualize_embeddings_ui() -> None:
         mode = st.radio(
             "模式", ["Object Detector", "Image Classifier"],
             key="viz_mode", horizontal=True,
-            captions=["YOLO 格式（images/ + labels/）", "依類別分子資料夾"],
+            captions=["YOLO 格式（images/ + labels/）", "依類別分子資料夾；平鋪無分類也可（整夾當一類）"],
         )
         # 分析單位：物件級（YOLO，預設）vs 整張影像 — 僅偵測資料集可選物件級。
         # 兩種粒度是不同的點集（且物件級用保長寬比裁切策略），請分開 Run，勿混看。
@@ -3769,10 +3853,14 @@ def _visualize_embeddings_ui() -> None:
         if "viz_folder_list" not in st.session_state:
             st.session_state["viz_folder_list"] = []
 
-        if st.button("📁 新增資料夾", use_container_width=True, key="add_viz_folder"):
-            _pick_folder_append("viz_folder_list")
-            st.rerun()
-        _folder_add_input("viz_folder_list")  # headless/E2E-driveable 文字加入（📁 為原生對話框）
+        _vfc1, _vfc2 = st.columns([5, 1], vertical_alignment="bottom")
+        with _vfc1:
+            _folder_add_input("viz_folder_list")  # headless/E2E-driveable 文字加入（📁 為原生對話框）
+        with _vfc2:
+            if st.button("📁", use_container_width=True, key="add_viz_folder",
+                         help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。"):
+                _pick_folder_set("viz_folder_list")
+                st.rerun()
 
         for i, folder in enumerate(st.session_state["viz_folder_list"]):
             c1, c2 = st.columns([5, 1])
@@ -3783,7 +3871,7 @@ def _visualize_embeddings_ui() -> None:
                 st.rerun()
 
         if not st.session_state["viz_folder_list"]:
-            st.caption("尚未選擇任何資料夾（按上方「📁 新增資料夾」）")
+            st.caption("尚未選擇資料夾（按上方 📁 或輸入路徑）")
 
         if mode == "Object Detector":
             # 類別來源屬進階設定（預設自動偵測 classes.txt），收進 expander（G4）
@@ -3818,12 +3906,12 @@ def _visualize_embeddings_ui() -> None:
         if not all_models:
             st.error("models/ 內找不到模型檔，請放入 .pth 模型後重啟。")
             return
-        _def_models = [m for m in all_models if m == "dinov2_vitb14"] or all_models
+        _def_models = [m for m in all_models if m == _DEFAULT_MODEL] or all_models
         selected_models = st.multiselect(
             "模型", all_models, default=_def_models, key="viz_models_sel",
             label_visibility="collapsed",
             help="每個模型各算一份 embedding；chinese-clip 同時解鎖「以文搜圖」。"
-                 "預設用較大的 dinov2_vitb14；要比較可再加 dinov2_vits14。",
+                 "預設用較快的 dinov2_vits14；要更準可再加 dinov2_vitb14。",
         )
 
         st.markdown("**③ 投影方法**")
@@ -3880,7 +3968,7 @@ def _visualize_embeddings_ui() -> None:
     if run:
         folders = [Path(f) for f in st.session_state.get("viz_folder_list", [])]
         if not folders:
-            st.error("請先選擇至少一個資料夾。")
+            st.error("請先選擇資料夾。")
             return
         missing_dirs = [str(p) for p in folders if not p.exists()]
         if missing_dirs:
@@ -3898,9 +3986,16 @@ def _visualize_embeddings_ui() -> None:
 
         class_names: list[str] | None = None
         if mode == "Object Detector":
-            missing = [str(f) for f in folders if not (f / "images").exists()]
+            # images/ 或 JPEGImages/ 子資料夾(YOLO/VOC 佈局),或帶任一支援的
+            # 標註來源(COCO JSON/VOC XML/LabelMe/NDJSON,平鋪佈局)擇一即可
+            missing = [str(f) for f in folders
+                       if not (f / "images").exists()
+                       and not (f / "JPEGImages").exists()
+                       and not folder_has_annotations(f)]
             if missing:
-                st.error(f"Folder(s) missing 'images/' subdirectory: {', '.join(missing)}")
+                st.error("以下資料夾缺 images/(或 JPEGImages/)子資料夾、也找不到"
+                         "支援的標註（COCO JSON／VOC XML／LabelMe／NDJSON）: "
+                         f"{', '.join(missing)}")
                 return
 
             # classes.txt 優先級：手動選擇 > 自動偵測 > 文字輸入
@@ -3924,7 +4019,7 @@ def _visualize_embeddings_ui() -> None:
 
             records = discover_images(folders, class_names)
         else:
-            records = discover_images_classifier(folders)
+            records = discover_images_classifier(folders, allow_flat=True)
             if records:
                 detected_classes = sorted({r["label"] for r in records})
                 st.session_state["viz_class_msg"] = (
@@ -3984,7 +4079,8 @@ def _visualize_embeddings_ui() -> None:
                         progress_cb=_mk_cb(_mi, model_name))
                     if not orecs:
                         st.error("此偵測資料集的 labels/ 找不到任何 bbox，無法做物件級。"
-                                 "請改『整張影像』或先補標註。")
+                                 "請改『整張影像』或先補標註。"
+                                 + _seg_format_hint([r["path"] for r in records]))
                         return
                     if obj_records is None:
                         obj_records = orecs
@@ -4503,7 +4599,7 @@ def _render_cmp_panel(cmp_paths: list[Path], cmp_groups: list[str]) -> None:
     sel_state = st.session_state.get("cmp_selection") or {}
     sel = (sel_state.get("indices", [])
            if sel_state.get("token") == st.session_state.get("cmp_data_token") else [])
-    with st.container(height=240, border=True, key="cmp_image_viewer"):
+    with st.container(height=500, border=True, key="cmp_image_viewer"):
         idx = st.session_state.get("cmp_active_image")
         if idx is None or not (0 <= idx < len(cmp_paths)):
             st.caption("檢視槽 — 在左圖框選資料點後，點下方縮圖在此檢視大圖。")
@@ -4522,7 +4618,7 @@ def _render_cmp_panel(cmp_paths: list[Path], cmp_groups: list[str]) -> None:
                 st.image(str(p), use_container_width=True)
             else:
                 st.warning(f"找不到檔案：{p}")
-    with st.container(height=420, key="cmp_grid"):
+    with st.container(height=560, key="cmp_grid"):
         if not sel:
             st.info("在左圖以點選、框選（box）或套索（lasso）圈出資料點，"
                     "對應影像會立即顯示在這裡。")
@@ -4539,8 +4635,8 @@ def _render_cmp_panel(cmp_paths: list[Path], cmp_groups: list[str]) -> None:
                     st.image(thumb, use_container_width=True)
                 else:
                     st.warning("⚠ 檔案遺失")
-                st.button(f"#{i}（{cmp_groups[i]}）", key=f"cmp_card_{i}",
-                          use_container_width=True,
+                st.button(f"{cmp_groups[i]}｜{Path(cmp_paths[i]).name}",
+                          key=f"cmp_card_{i}", use_container_width=True,
                           on_click=_set_cmp_active, args=(i, list(shown)))
 
 
@@ -4592,7 +4688,7 @@ def _cmp_autotune(paths_a, paths_b, model):
         st.session_state["cmp_object_policy"] = best
         st.session_state["cmp_policy_token"] = _cmp_policy_token(model)
         return best
-    cnames = _cov_class_names([{"path": str(small[0])}])
+    cnames = _manual_class_names("cmp") or _cov_class_names([{"path": str(small[0])}])
     root = _cov_object_root([{"path": str(small[0])}])
     rows_at, best, fp = [], None, None
     with st.status(f"自動尋找最佳設定（用較小的 Folder {which}，{len(small)} 張）…",
@@ -4633,18 +4729,21 @@ def _compute_compare_by_class(paths_a, paths_b, name_a, name_b, model) -> bool:
     _pad = float(policy.get("pad", 0.12))
     recs_a = [{"path": str(p)} for p in paths_a]
     recs_b = [{"path": str(p)} for p in paths_b]
+    _manual = _manual_class_names("cmp")  # 手動指定 > 各邊自動偵測 classes.txt
     oa, ea, _ = _crop_and_embed_objects(
-        recs_a, model, _cov_class_names(recs_a), _pad,
+        recs_a, model, _manual or _cov_class_names(recs_a), _pad,
         base_token="cmpA" + uuid.uuid4().hex, session_key="_cmp_objA",
         spinner="A：裁切物件", policy=policy)
     ob, eb, _ = _crop_and_embed_objects(
-        recs_b, model, _cov_class_names(recs_b), _pad,
+        recs_b, model, _manual or _cov_class_names(recs_b), _pad,
         base_token="cmpB" + uuid.uuid4().hex, session_key="_cmp_objB",
         spinner="B：裁切物件", policy=policy)
     if not oa or not ob:
         which = "A" if not oa else "B"
-        st.error(f"Folder {which} 的 labels/ 找不到任何 bbox — 此功能需要 YOLO 偵測資料集"
-                 "（images/ + labels/）。請選含 labels/ 的資料夾，或先補上標註。")
+        st.error(f"Folder {which} 的 labels/ 找不到任何 bbox — 此功能需要偵測標註"
+                 "（YOLO images/+labels/ 或 COCO 標註 JSON）。請選含標註的資料夾，"
+                 "或切「整張影像（不分類別）」。"
+                 + _seg_format_hint(paths_a if not oa else paths_b))
         return False
     la = [r.get("label", "") for r in oa]
     lb = [r.get("label", "") for r in ob]
@@ -4683,20 +4782,68 @@ def _compute_compare_by_class(paths_a, paths_b, name_a, name_b, model) -> bool:
     return True
 
 
+_CMP_ALL_LABEL = "(全部影像)"
+
+
+def _compute_compare_whole(root_a: Path, root_b: Path, paths_a, paths_b,
+                           name_a, name_b, model) -> bool:
+    """整張影像・不分類別:整圖 embedding → A/B 形心餘弦距離（整體漂移）。
+    不需 labels/。結果塞進與 by-class 相同的 cmpc_* session 管線
+    （單一類別 _CMP_ALL_LABEL），由 render 端以 cmp_result_kind 區分呈現。"""
+    embed_fn = load_model(model)
+    with st.status("計算整張影像 embedding…", expanded=True):
+        bar = st.progress(0.0, text="A：特徵擷取…")
+        ea = extract_embeddings(
+            paths_a, embed_fn,
+            cache_path=_dataset_cache_dir(root_a, f"embeddings_{model}") / "embeddings.npz",
+            progress_cb=lambda d, t: bar.progress(
+                min(d / max(t, 1) * 0.5, 0.5), text=f"A：特徵擷取 {d}/{t}"))
+        eb = extract_embeddings(
+            paths_b, embed_fn,
+            cache_path=_dataset_cache_dir(root_b, f"embeddings_{model}") / "embeddings.npz",
+            progress_cb=lambda d, t: bar.progress(
+                min(0.5 + d / max(t, 1) * 0.5, 1.0), text=f"B：特徵擷取 {d}/{t}"))
+    if ea is None or eb is None or not len(ea) or not len(eb):
+        st.error("有一邊算不出 embedding（影像可能全部無法解碼）。")
+        return False
+    ma = ea.mean(0); ma = ma / (np.linalg.norm(ma) + 1e-9)
+    mb = eb.mean(0); mb = mb / (np.linalg.norm(mb) + 1e-9)
+    drift = max(0.0, 1.0 - float(ma @ mb))
+    oa = [{"path": str(p), "label": _CMP_ALL_LABEL} for p in paths_a]
+    ob = [{"path": str(p), "label": _CMP_ALL_LABEL} for p in paths_b]
+    rows = [{"類別": _CMP_ALL_LABEL, "A 數量": len(oa), "B 數量": len(ob),
+             "漂移↓": round(drift, 4)}]
+    st.session_state.update({
+        "cmpc_oa": oa, "cmpc_ea": ea, "cmpc_ob": ob, "cmpc_eb": eb,
+        "cmpc_la": [_CMP_ALL_LABEL] * len(oa), "cmpc_lb": [_CMP_ALL_LABEL] * len(ob),
+        "cmpc_rows": rows, "cmpc_aonly": {}, "cmpc_bonly": {},
+        "cmpc_names": (name_a, name_b), "cmpc_model": model,
+        "cmpc_token": uuid.uuid4().hex, "cmp_result_kind": "whole",
+    })
+    return True
+
+
 _CMPC_BOFF = 10_000_000  # customdata sentinel: code >= OFFSET ⇒ group B
 
 
 def _render_compare_by_class() -> None:
     rows = st.session_state.get("cmpc_rows") or []
     name_a, name_b = st.session_state.get("cmpc_names", ("A", "B"))
-    st.subheader(f"逐類別比較：{name_a} vs {name_b}")
-    _pol = st.session_state.get("cmp_object_policy")
-    if _pol:
-        import object_eval as oe
-        _w = (st.session_state.get("cmp_autotune") or {}).get("which", "?")
-        st.caption(f"物件設定：**{oe.policy_tag(_pol)}**（自動量測於較小的 Folder {_w}），A／B "
-                   "兩邊一致。**漂移**＝該類別在 A／B 兩邊 embedding 形心的餘弦距離，越大代表"
-                   "這類物件在兩份資料間長得越不一樣。")
+    _whole = st.session_state.get("cmp_result_kind") == "whole"
+    _noun = "影像" if _whole else "物件"
+    if _whole:
+        st.subheader(f"整張影像比較：{name_a} vs {name_b}")
+        st.caption("**整體漂移**＝A／B 全部影像 embedding 形心的餘弦距離，越大代表兩堆影像"
+                   "整體長得越不一樣。分佈細節看下方散點（監督投影以 A／B 分組，會凸顯兩邊差異）。")
+    else:
+        st.subheader(f"逐類別比較：{name_a} vs {name_b}")
+        _pol = st.session_state.get("cmp_object_policy")
+        if _pol:
+            import object_eval as oe
+            _w = (st.session_state.get("cmp_autotune") or {}).get("which", "?")
+            st.caption(f"物件設定：**{oe.policy_tag(_pol)}**（自動量測於較小的 Folder {_w}），A／B "
+                       "兩邊一致。**漂移**＝該類別在 A／B 兩邊 embedding 形心的餘弦距離，越大代表"
+                       "這類物件在兩份資料間長得越不一樣。")
     if not rows:
         st.warning("沒有可比較的共同類別。"); return
     # 整類差異（一邊有、另一邊完全沒有）——逐類別交集漂移表結構上看不到，這裡補上
@@ -4710,35 +4857,46 @@ def _render_compare_by_class() -> None:
             _seg.append(f"**只在 {name_b}**：" + "、".join(f"{c}({n})" for c, n in _bonly.items()))
         st.warning("⚠ 整類差異（一邊有、另一邊完全沒有——這是最大的分佈差異，"
                    "但逐類別漂移表只比共同類、結構上看不到）：　" + "　｜　".join(_seg))
-    _maxd = max(0.05, max(r["漂移↓"] for r in rows))
-    st.dataframe(
-        pd.DataFrame(rows), use_container_width=True, hide_index=True,
-        column_config={
-            "類別": st.column_config.TextColumn("類別"),
-            "A 數量": st.column_config.NumberColumn(f"{name_a} 數量"),
-            "B 數量": st.column_config.NumberColumn(f"{name_b} 數量"),
-            "漂移↓": st.column_config.ProgressColumn(
-                "類別漂移（越大＝越不同）", help="A／B 形心餘弦距離，已由大到小排序",
-                min_value=0.0, max_value=_maxd, format="%.3f"),
-        })
+    if not _whole:
+        _maxd = max(0.05, max(r["漂移↓"] for r in rows))
+        st.dataframe(
+            pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            column_config={
+                "類別": st.column_config.TextColumn("類別"),
+                "A 數量": st.column_config.NumberColumn(f"{name_a} 數量"),
+                "B 數量": st.column_config.NumberColumn(f"{name_b} 數量"),
+                "漂移↓": st.column_config.ProgressColumn(
+                    "類別漂移（越大＝越不同）", help="A／B 形心餘弦距離，已由大到小排序",
+                    min_value=0.0, max_value=_maxd, format="%.3f"),
+            })
 
     oa = st.session_state["cmpc_oa"]; ea = st.session_state["cmpc_ea"]
     ob = st.session_state["cmpc_ob"]; eb = st.session_state["cmpc_eb"]
     la, lb = st.session_state["cmpc_la"], st.session_state["cmpc_lb"]
     dc1, dc2, dc3 = st.columns([3, 1, 1])
-    pick = dc1.selectbox("進入某一類看 A vs B 散點（預設＝漂移最大）", [r["類別"] for r in rows])
-    _pm = dc2.selectbox("投影方法", list(_METHOD_KEY), key="cmpc_proj",
+    if _whole:
+        pick = rows[0]["類別"]
+        dc1.metric("整體漂移（越大＝越不同）", f"{rows[0]['漂移↓']:.4f}",
+                   help=f"{name_a} {rows[0]['A 數量']} 張 vs {name_b} {rows[0]['B 數量']} 張"
+                        "的 embedding 形心餘弦距離")
+    else:
+        pick = dc1.selectbox("進入某一類看 A vs B 散點（預設＝漂移最大）",
+                             [r["類別"] for r in rows])
+    _pm = dc2.selectbox("投影方法", list(_METHOD_KEY),
+                        index=list(_METHOD_KEY).index("監督UMAP"), key="cmpc_proj",
                         help="散點降維法；非線性／監督法的距離僅供視覺，漂移以上表為準。"
                              "LDA／監督UMAP 以 A／B 分組做監督，凸顯兩邊差異。")
     _dim = 3 if dc3.radio("維度", ["2D", "3D"], horizontal=True, key="cmpc_dim") == "3D" else 2
 
     ia = [i for i, l in enumerate(la) if l == pick]
     ib = [i for i, l in enumerate(lb) if l == pick]
-    # 即時過濾（信心／源短邊）：直接縮 ia/ib —— n_a/combined/coords/code/gallery 全由
-    # ia/ib 衍生 → 自動一致；filter 狀態入投影快取 key，改門檻才重投影。
-    _obj_filter_controls("cmpc", oa)
-    ia = [i for i in ia if _obj_keep(oa[i])]
-    ib = [i for i in ib if _obj_keep(ob[i])]
+    if not _whole:
+        # 即時過濾（信心／源短邊）：直接縮 ia/ib —— n_a/combined/coords/code/gallery 全由
+        # ia/ib 衍生 → 自動一致；filter 狀態入投影快取 key，改門檻才重投影。
+        # （整張影像模式無 conf／bbox 欄位 → 跳過物件過濾器。）
+        _obj_filter_controls("cmpc", oa)
+        ia = [i for i in ia if _obj_keep(oa[i])]
+        ib = [i for i in ib if _obj_keep(ob[i])]
     n_a = len(ia)
     if not (ia or ib):
         st.info("目前的信心／大小門檻把這一類的物件全濾掉了——把門檻調低看看。")
@@ -4800,7 +4958,7 @@ def _render_compare_by_class() -> None:
 
     _nsel = len(cur.get("a", [])) + len(cur.get("b", []))
     tb1, tb2 = st.columns([5, 1])
-    tb1.caption("💡 在散點上拖曳框選／套索圈點 → 下方顯示選到的物件縮圖。")
+    tb1.caption(f"💡 在散點上拖曳框選／套索圈點 → 下方顯示選到的{_noun}縮圖。")
     if tb2.button(f"✕ 取消框選（{_nsel}）" if _nsel else "✕ 取消框選",
                   key="cmpc_clear_top", use_container_width=True, disabled=not _nsel):
         st.session_state["_cmpc_clear_nonce"] = _cn + 1
@@ -4886,12 +5044,12 @@ def _render_compare_by_class() -> None:
         sb = sorted({v - _CMPC_BOFF for v in sel_codes if v >= _CMPC_BOFF})
         if (sa, sb) != (cur["a"], cur["b"]):
             cur = {"token": _sel_tok, "a": sa, "b": sb}
-            st.toast(f"框選 {len(sa) + len(sb)} 個物件", icon="🎯")
+            st.toast(f"框選 {len(sa) + len(sb)} 個{_noun}", icon="🎯")
     st.session_state["cmpc_sel"] = cur
 
     sa, sb = cur["a"], cur["b"]
     if sa or sb:
-        st.caption(f"框選：{name_a} {len(sa)} 個 · {name_b} {len(sb)} 個（下方為選到的物件；"
+        st.caption(f"框選：{name_a} {len(sa)} 個 · {name_b} {len(sb)} 個（下方為選到的{_noun}；"
                    "用上方「✕ 取消框選」清除）")
         # 加入清單：物件級框選 → 收原圖（cart 為 image-level，同圖多框去重成一張）
         _picked: dict[str, dict] = {}
@@ -4902,7 +5060,7 @@ def _render_compare_by_class() -> None:
                 _picked.setdefault(_ip, {"path": _ip, "label": _o.get("label", ""),
                                          "split": _o.get("split", "")})
         _crecs = list(_picked.values())
-        if st.button(f"🛒 把框選的物件加入清單（{len(_crecs)} 張原圖）",
+        if st.button(f"🛒 把框選的{_noun}加入清單（{len(_crecs)} 張原圖）",
                      key="cmpc_add_cart", use_container_width=True):
             _batch_add(_crecs, list(range(len(_crecs))), source="compare")
     else:
@@ -4911,7 +5069,9 @@ def _render_compare_by_class() -> None:
     def _grid(recs, ids):
         cols = st.columns(6)
         for j, i in enumerate(ids[:60]):
-            cols[j % 6].image(str(recs[i]["path"]), use_container_width=True)
+            cols[j % 6].image(str(recs[i]["path"]), use_container_width=True,
+                              caption=f"{recs[i].get('label') or '?'}"
+                                      f"｜{_rec_fname(recs[i])}")
 
     # 左右各包一個外框，框色＝散點上該資料集的點色（A 藍／B 紅），框上標資料集名，
     # 讓「左＝A、右＝B」一眼分群（先前兩欄無邊界，縮圖牆糊成一片）。
@@ -4933,31 +5093,131 @@ def _render_compare_by_class() -> None:
 
 
 def _compare_distributions_ui() -> None:
+    _UNIT_OBJ, _UNIT_WHOLE = "物件級・按類別（YOLO）", "整張影像（不分類別）"
     with st.sidebar:
-        st.caption("Folder A（偵測資料夾，含 images/＋labels/）")
-        if st.button("📁 選 Folder A", key="browse_a", use_container_width=True):
-            _pick_folder("cmp_folder_a")
-            st.rerun()
+        _is_whole = st.session_state.get("cmp_unit") == _UNIT_WHOLE
+        _freq = "" if _is_whole else "（偵測資料夾，含 images/＋labels/）"
+        # [輸入框|📁] 同列（全 app 一致樣式）。📁 用 on_click 回呼：rerun 開始、
+        # widget 實例化前寫回同名 key（同 exp_dst 模式，見 app.py exp_dst 註解）。
+        _fa1, _fa2 = st.columns([5, 1], vertical_alignment="bottom")
+        with _fa1:
+            st.text_input(f"Folder A{_freq}", key="cmp_folder_a",
+                          placeholder=r"例：C:\data\setA")
+        with _fa2:
+            st.button("📁", key="browse_a", use_container_width=True,
+                      on_click=_pick_folder, args=("cmp_folder_a",),
+                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
         folder_a = st.session_state.get("cmp_folder_a", "")
-        st.caption(f"📂 {folder_a}" if folder_a else ":gray[（未選）]")
 
-        st.caption("Folder B（偵測資料夾，含 images/＋labels/）")
-        if st.button("📁 選 Folder B", key="browse_b", use_container_width=True):
-            _pick_folder("cmp_folder_b")
-            st.rerun()
+        _fb1, _fb2 = st.columns([5, 1], vertical_alignment="bottom")
+        with _fb1:
+            st.text_input(f"Folder B{_freq}", key="cmp_folder_b",
+                          placeholder=r"例：C:\data\setB")
+        with _fb2:
+            st.button("📁", key="browse_b", use_container_width=True,
+                      on_click=_pick_folder, args=("cmp_folder_b",),
+                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
         folder_b = st.session_state.get("cmp_folder_b", "")
-        st.caption(f"📂 {folder_b}" if folder_b else ":gray[（未選）]")
         all_models = available_models()
         if not all_models:
             st.error("No .pth models found in ./models/. Add a model file and restart.")
             return
-        selected_model = st.selectbox("Model", all_models, key="cmp_model_sel")
-        st.caption("比較單位＝**物件級・按類別（YOLO）**：讀 labels/ 裁出每個物件，逐類別比"
-                   " A↔B 漂移。物件設定（pad／解析度／head）由系統**自動尋找**（用較小的資料夾），"
-                   "套用到 A／B 兩邊。")
+        selected_model = st.selectbox("Model", all_models, key="cmp_model_sel",
+                                      index=_default_model_index(all_models))
+        unit = st.radio("比較單位", [_UNIT_OBJ, _UNIT_WHOLE], key="cmp_unit",
+                        captions=["讀 labels/ 裁物件，逐類別比漂移",
+                                  "不需 labels/——平鋪／分類／YOLO 資料夾都可"])
+        if unit == _UNIT_OBJ:
+            st.caption("讀 labels/ 裁出每個物件，逐類別比 A↔B 漂移。物件設定"
+                       "（pad／解析度／head）由系統**自動尋找**（用較小的資料夾），套用到 A／B 兩邊。")
+            _class_source_expander("cmp")  # 手動指定套用到 A/B 兩邊(id→名一致)
+        else:
+            st.caption("整圖 embedding 比 A↔B **整體**分佈：一個整體漂移分數＋A/B 散點"
+                       "（框選看縮圖）。適合沒有標註、只想看兩堆影像像不像。")
         run = st.button("▶ Run", use_container_width=True, key="run_cmp", type="primary")
 
-        with st.expander("🔬 物件設定（系統自動尋找，套用到 A／B 兩邊）"):
+        if unit == _UNIT_OBJ:
+            _cmp_object_settings_expander()
+
+    if st.session_state.pop("_cmp_autorun", False):
+        run = True
+
+    if run:
+        path_a = Path(folder_a.strip()) if folder_a.strip() else None
+        path_b = Path(folder_b.strip()) if folder_b.strip() else None
+
+        if not path_a or not path_b:
+            st.error("請在左側填入 Folder A 與 Folder B 兩個資料夾路徑"
+                     "（或按下方「✨ 用範例資料試跑」）。")
+            return
+        if not path_a.exists():
+            st.error(f"找不到 Folder A：{path_a}")
+            return
+        if not path_b.exists():
+            st.error(f"找不到 Folder B：{path_b}")
+            return
+        _collapse_sidebar()
+
+        paths_a, note_a = _cmp_resolve_images(path_a)
+        paths_b, note_b = _cmp_resolve_images(path_b)
+
+        # 壞檔防呆:兩邊各自前置過濾，壞檔（連同其 label）排除在逐類別比較外
+        paths_a, _bad_a = _partition_image_paths(paths_a, "cmp_a")
+        paths_b, _bad_b = _partition_image_paths(paths_b, "cmp_b")
+        _warn_skipped(list(_bad_a) + list(_bad_b))
+
+        _hint = ("\n物件級・按類別需要 **YOLO 偵測資料夾**（含 images/ 與 labels/）。"
+                 "請選資料集根目錄（或其 images/ 子夾），例如 …/train、…/valid。"
+                 if unit == _UNIT_OBJ else "")
+        if not paths_a:
+            st.error(f"Folder A 找不到影像：{path_a}" + _hint); return
+        if not paths_b:
+            st.error(f"Folder B 找不到影像：{path_b}" + _hint); return
+        _ov = len(set(map(str, paths_a)) & set(map(str, paths_b)))
+        if _ov:
+            st.warning(f"Folder A 與 B 有 {_ov} 張重疊（A 可能是 B 的子集）；"
+                       "分佈差異會偏低、參考價值低 — 建議選兩個不重疊的資料夾。")
+        if note_a:
+            st.info(f"Folder A：{note_a}")
+        if note_b:
+            st.info(f"Folder B：{note_b}")
+
+        if unit == _UNIT_WHOLE:
+            if _compute_compare_whole(path_a, path_b, paths_a, paths_b,
+                                      path_a.name, path_b.name, selected_model):
+                st.rerun()
+            return
+        if _compute_compare_by_class(paths_a, paths_b, path_a.name, path_b.name,
+                                     selected_model):
+            st.rerun()
+        return
+
+    if st.session_state.get("cmpc_rows"):
+        _render_compare_by_class()
+        return
+
+    st.markdown("##### 快速開始")
+    st.caption("比兩份資料像不像（train vs val、資料 v1 vs v2、真實 vs 生成…）。"
+               "**物件級・按類別（YOLO）**：讀 labels/ 裁物件、逐類別比漂移；"
+               "**整張影像（不分類別）**：不需標註，整圖 embedding 比整體分佈。"
+               "和「完整度熱力圖」不同：熱力圖看單一資料集**內部**哪裡缺，"
+               "這裡看 A、B 兩份資料像不像。")
+    c1, c2, c3 = st.columns(3, gap="medium")
+    with c1, st.container(border=True):
+        st.markdown("**① 選 Folder A／B**")
+        st.caption("物件級需 YOLO 資料夾（含 images/ 與 labels/）；"
+                   "整張影像模式任何含影像的資料夾都可。")
+    with c2, st.container(border=True):
+        st.markdown("**② 選模型與比較單位**")
+        st.caption("DINOv2 embedding；物件級的 pad／解析度／head 由系統自動量測。")
+    with c3, st.container(border=True):
+        st.markdown("**③ Run**")
+        st.caption("物件級出**逐類別漂移表**；整張影像出**整體漂移＋A/B 散點**，"
+                   "框選看縮圖。")
+
+
+def _cmp_object_settings_expander() -> None:
+    with st.expander("🔬 物件設定（系統自動尋找，套用到 A／B 兩邊）"):
             import object_eval as oe
             _cur = st.session_state.get("cmp_object_policy")
             st.caption(f"目前設定：**{oe.policy_tag(_cur) if _cur else '尚未量測（首次 Run 會自動找）'}**。"
@@ -5013,74 +5273,6 @@ def _compare_distributions_ui() -> None:
                 st.session_state.pop("cmp_result_kind", None)
                 st.toast(f"已套用：{oe.policy_tag(_man)}，請按 ▶ Run。")
                 st.rerun()
-
-    if st.session_state.pop("_cmp_autorun", False):
-        run = True
-
-    if run:
-        path_a = Path(folder_a.strip()) if folder_a.strip() else None
-        path_b = Path(folder_b.strip()) if folder_b.strip() else None
-
-        if not path_a or not path_b:
-            st.error("請在左側填入 Folder A 與 Folder B 兩個資料夾路徑"
-                     "（或按下方「✨ 用範例資料試跑」）。")
-            return
-        if not path_a.exists():
-            st.error(f"找不到 Folder A：{path_a}")
-            return
-        if not path_b.exists():
-            st.error(f"找不到 Folder B：{path_b}")
-            return
-        _collapse_sidebar()
-
-        paths_a, note_a = _cmp_resolve_images(path_a)
-        paths_b, note_b = _cmp_resolve_images(path_b)
-
-        # 壞檔防呆:兩邊各自前置過濾，壞檔（連同其 label）排除在逐類別比較外
-        paths_a, _bad_a = _partition_image_paths(paths_a, "cmp_a")
-        paths_b, _bad_b = _partition_image_paths(paths_b, "cmp_b")
-        _warn_skipped(list(_bad_a) + list(_bad_b))
-
-        _no_img = ("Folder {f} 找不到影像：{p}\n"
-                   "物件級・按類別需要 **YOLO 偵測資料夾**（含 images/ 與 labels/）。"
-                   "請選資料集根目錄（或其 images/ 子夾），例如 …/train、…/valid。")
-        if not paths_a:
-            st.error(_no_img.format(f="A", p=path_a)); return
-        if not paths_b:
-            st.error(_no_img.format(f="B", p=path_b)); return
-        _ov = len(set(map(str, paths_a)) & set(map(str, paths_b)))
-        if _ov:
-            st.warning(f"Folder A 與 B 有 {_ov} 張重疊（A 可能是 B 的子集）；"
-                       "逐類別漂移會偏低、參考價值低 — 建議選兩個不重疊的資料夾。")
-        if note_a:
-            st.info(f"Folder A：{note_a}")
-        if note_b:
-            st.info(f"Folder B：{note_b}")
-
-        if _compute_compare_by_class(paths_a, paths_b, path_a.name, path_b.name,
-                                     selected_model):
-            st.rerun()
-        return
-
-    if st.session_state.get("cmpc_rows"):
-        _render_compare_by_class()
-        return
-
-    st.markdown("##### 快速開始")
-    st.caption("**逐 YOLO 類別比較兩個偵測資料集**（train vs val、資料 v1 vs v2…）："
-               "讀 labels/ 把每個框裁成物件、各自算 DINOv2 embedding，再**逐類別**"
-               "比 A↔B 的分布漂移。和「完整度熱力圖」不同：熱力圖看單一資料集"
-               "**內部**哪裡缺，這裡看 A、B 兩份資料**同一類別**像不像。")
-    c1, c2, c3 = st.columns(3, gap="medium")
-    with c1, st.container(border=True):
-        st.markdown("**① 選 Folder A／B**")
-        st.caption("左側各填一個 YOLO 偵測資料夾（含 images/ 與 labels/）。")
-    with c2, st.container(border=True):
-        st.markdown("**② 選模型（物件設定自動調校）**")
-        st.caption("DINOv2 物件 embedding；pad／解析度／head 由系統自動量測，免手動調。")
-    with c3, st.container(border=True):
-        st.markdown("**③ Run**")
-        st.caption("出**逐類別漂移表**（漂移大的類別最該注意）＋選一類看 A vs B 散點與樣本。")
 
 
 _STATE_COLOR = {
@@ -5157,7 +5349,7 @@ def _render_cov_candidates(cell: dict, records: list[dict]) -> None:
     if not items:
         st.info("候選池中沒有夠相似的候選。"); return
     st.caption(f"候選池相似候選（{len(items)} 張，距離小→大）——人工挑選後再進標註/資料集：")
-    with st.container(height=240):
+    with st.container(height=480):
         cols = st.columns(3)
         for j, it in enumerate(items):
             with cols[j % 3]:
@@ -5341,7 +5533,8 @@ def _cov_embed_candidates(model: str) -> None:
     is_obj = st.session_state.get("cov_granularity") == "物件級（YOLO）"
     if is_obj:
         pad = float((st.session_state.get("objcov_policy") or {}).get("pad", 0.12))
-        cnames = (_cov_class_names(cand_records)   # 兩層解析,與主資料一致(id→名對齊)
+        cnames = (_manual_class_names("cov")       # 手動指定 > 兩層解析(id→名對齊)
+                  or _cov_class_names(cand_records)
                   or st.session_state.get("cov_obj_class_names"))
         obj_records, cand_emb, _ = _crop_and_embed_objects(
             cand_records, model, cnames, pad,
@@ -5481,17 +5674,28 @@ def _cov_class_names(records: list[dict]) -> list[str] | None:
 
 
 def _is_detection_dataset(records: list[dict], probe: int = 25) -> bool:
-    """目前載入的影像是否帶 YOLO 標註檔（偵測格式）→ 可做物件級覆蓋。"""
-    return any(yolo_label_path_for(Path(r["path"])).exists()
-               for r in records[:probe])
+    """目前載入的影像是否帶偵測標註 → 可做物件級覆蓋。
+    認 YOLO labels/*.txt,也認 COCO JSON / VOC XML / LabelMe / NDJSON
+    (discover_yolo_objects 原生支援)。"""
+    for r in records[:probe]:
+        p = Path(r["path"])
+        if yolo_label_path_for(p).exists():
+            return True
+        if annotation_boxes_for_image(p) is not None:
+            return True
+    return False
 
 
 def _cov_class_src(records: list[dict]) -> Path | None:
-    """classes.txt 實際命中的檔案路徑（摘要卡顯示「類別來源」用）。"""
+    """類別名實際命中的檔案路徑（摘要卡顯示「類別來源」用）：classes.txt > data.yaml。"""
     root = _cov_object_root(records)
     for folder in (root, root.parent):
-        if read_classes_txt(folder):
-            return folder.parent / "classes.txt"
+        cf = folder.parent / "classes.txt"
+        if cf.exists() and [ln for ln in safe_read_text(cf).splitlines() if ln.strip()]:
+            return cf
+        yf = folder.parent / "data.yaml"
+        if yaml_class_names(yf):
+            return yf
     return None
 
 
@@ -5511,7 +5715,7 @@ def _cov_summary_card(records: list[dict]) -> None:
     整類缺失是自指稀疏度的盲區，這裡直接點名並縫到『參照分佈』去量／補。"""
     import collections
     n_img = len(records)
-    class_names = _cov_class_names(records)
+    class_names = _manual_class_names("cov") or _cov_class_names(records)
     with st.container(border=True):
         if _is_detection_dataset(records) and class_names:
             cnt: collections.Counter = collections.Counter()
@@ -5737,13 +5941,14 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
 
     active_token = st.session_state.get("cov_token", "")
     if is_obj:
-        class_names = _cov_class_names(records)
+        class_names = _manual_class_names("cov") or _cov_class_names(records)
         st.session_state["cov_obj_class_names"] = class_names
         obj_records, obj_emb, obj_token = _crop_and_embed_objects(
             records, model, class_names, pad,
             base_token=st.session_state.get("cov_token", ""))
         if not obj_records:
-            st.warning("這個資料集的 labels/ 裡找不到任何 bbox；已切回『整張影像』。")
+            st.warning("這個資料集的 labels/ 裡找不到任何 bbox；已切回『整張影像』。"
+                       + _seg_format_hint([r["path"] for r in records]))
             is_obj = False
         else:
             records, emb, active_token = obj_records, obj_emb, obj_token
@@ -5768,7 +5973,7 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
             active_token = f"{active_token}|cls={_cls}"
 
     # 投影方法來自左側工具列（5 法，含監督）；維度／稀疏度 k 在這裡即時調
-    method_lbl = st.session_state.get("cov_proj_method", "PCA")
+    method_lbl = st.session_state.get("cov_proj_method", "監督UMAP")
     if method_lbl not in _METHOD_KEY:
         method_lbl = "PCA"
     method = _METHOD_KEY[method_lbl]
@@ -5908,14 +6113,14 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                           on_click=_batch_add,
                           args=(records, view_idx, "sparse",
                                 {i: float(sparsity[i]) for i in view_idx}))
-                with st.container(height=330):
+                with st.container(height=520):
                     _gc = st.columns(3)
                     for j, i in enumerate(view_idx):
                         with _gc[j % 3]:
                             rec = records[i]
                             lbl = rec.get("label", "") or "?"
                             col = _cmap.get(lbl, "#9aa0a6")
-                            cap = f"{lbl} · 稀疏{float(sparsity[i]):.3f}"
+                            cap = f"{lbl}｜{_rec_fname(rec)} · 稀疏{float(sparsity[i]):.3f}"
                             if full_ctx:
                                 ip = Path(rec["image_path"])
                                 img = draw_yolo_boxes(ip, yolo_label_path_for(ip),
@@ -5951,9 +6156,9 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                           on_click=_batch_add, args=(cand_records, _sc, "gap_filler"))
                 _ccn = class_names
                 if full_ctx and cand_records and cand_records[0].get("image_path"):
-                    _ccn = (_cov_class_names(
+                    _ccn = (_manual_class_names("cov") or _cov_class_names(
                         [{"path": str(cand_records[0]["image_path"])}]) or class_names)
-                with st.container(height=330):
+                with st.container(height=520):
                     _gc2 = st.columns(3)
                     for _j, _i in enumerate(_sc[:24]):
                         with _gc2[_j % 3]:
@@ -5972,7 +6177,7 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                                     st.image(_th, use_container_width=True)
                                 else:
                                     st.warning("⚠ 缺檔")
-                            st.caption(_cr.get("label", "") or "候選")
+                            st.caption(f"{_cr.get('label') or '候選'}｜{_rec_fname(_cr)}")
 
         # Phase B：H1–H5 根因——這些稀疏區補資料到底有沒有用
         with st.expander("🧭 根因：這些稀疏區補資料有沒有用？（H1–H5 誠實閘）"):
@@ -6019,8 +6224,10 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
 
     with col_side:
         st.markdown("**① 候選資料夾（選完自動投影）**")
+        # 單一資料夾語義:選新的取代舊的(與全域 picker 一致);後端仍吃多行
+        # (E2E harness 直寫 session 多資料夾的相容性不變)。
         st.button("📁 選擇候選資料夾", key="cov_cand_pick", use_container_width=True,
-                  on_click=_pick_folder_into_text, args=("cov_cand_text",))
+                  on_click=_pick_folder_into_text, args=("cov_cand_text", True))
         _ctext = st.session_state.get("cov_cand_text", "").strip()
         for _l in [_x for _x in _ctext.splitlines() if _x.strip()]:
             st.caption(f"• {_l}")
@@ -6128,7 +6335,7 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
             help="把補洞／未覆蓋候選送到 Labeling 從頭標註（fresh，未標新樣本）；"
                  "標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
         st.caption(":gray[候選無標籤——暫定類別取自最近鄰，到 Labeling 盲標即為新標籤。]")
-        with st.container(height=280):
+        with st.container(height=480):
             cols = st.columns(3)
             for j, i in enumerate(picks):
                 with cols[j % 3]:
@@ -6136,13 +6343,16 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
                     thumb = _thumb_or_none(p)
                     if thumb:
                         st.image(thumb, use_container_width=True,
-                                 caption=f"#{j + 1} d={work_score[i]:.3f}"
-                                         f"→{provisional[i] or '?'}")
+                                 caption=f"{provisional[i] or '?'}"
+                                         f"｜{_rec_fname(cand_records[i])}"
+                                         f" · d={work_score[i]:.3f}")
                     else:
                         st.warning("⚠ 缺檔")
+        # CSV path 欄給原圖路徑（物件級 path=裁切快取圖，使用者要能找到原始檔）
         csv = _rows_to_csv(
             ["rank", "path", "score", "provisional_label"],
-            [[r + 1, cand_records[i]["path"], f'{work_score[i]:.6f}',
+            [[r + 1, cand_records[i].get("image_path") or cand_records[i]["path"],
+              f'{work_score[i]:.6f}',
               provisional[i] or ""] for r, i in enumerate(picks)])
         st.download_button("⬇ 匯出 CSV", data=csv,
                            file_name=csv_name, mime="text/csv",
@@ -6158,7 +6368,7 @@ def _objcov_embed_candidates(folders, model, policy, fallback_cnames) -> None:
     if not cand_records:
         st.warning("候選資料夾找不到影像。"); return
     # 與主資料同樣地探兩層（root 與其上層）→ 類別 id→名 對齊，避免比到不同類別
-    cnames = _cov_class_names(cand_records) or fallback_cnames
+    cnames = _manual_class_names("cov") or _cov_class_names(cand_records) or fallback_cnames
     orecs, cemb, _ = _crop_and_embed_objects(
         cand_records, model, cnames, float(policy.get("pad", 0.12)),
         base_token="objcovC|" + repr(sorted(str(f) for f in folders)),
@@ -6251,7 +6461,7 @@ def _objcov_sidebar(model: str) -> None:
                      use_container_width=True, disabled=not folders):
             recs = discover_images_classifier(folders)
             imgs = [Path(r["path"]) for r in recs]
-            cnames = _cov_class_names(recs)
+            cnames = _manual_class_names("cov") or _cov_class_names(recs)
             with st.status("量測中…", expanded=True) as _s:
                 _bar = st.progress(0.0)
 
@@ -6280,6 +6490,8 @@ def _objcov_sidebar(model: str) -> None:
             st.session_state.pop("_objcov_main", None)
             st.rerun()
     st.markdown("**⑤ 投影方法**")
+    # 預設維持 PCA:此處監督UMAP 的監督訊號是「主 vs 候選」分組(刻意推開兩邊),
+    # 與補洞工具「候選要落在主資料稀疏區附近」的核心視覺相矛盾,不適合當預設。
     st.selectbox("投影方法", list(_OBJCOV_PROJ), key="objcov_proj",
                  label_visibility="collapsed",
                  help="只用來畫圖；監督UMAP／LDA(監督) 以「主 vs 候選」分組做監督。"
@@ -6294,7 +6506,7 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
     if not _is_detection_dataset(records):
         st.info("此模式需 **YOLO 偵測資料夾**（含 images/＋labels/）。請在左側選偵測資料集。")
         return
-    class_names = _cov_class_names(records)
+    class_names = _manual_class_names("cov") or _cov_class_names(records)
 
     # crop 政策 + 投影方法來自左側工具列（set-once 設定）；這裡只讀。
     policy = st.session_state.get("objcov_policy") or dict(oe.DEFAULT_POLICY)
@@ -6310,7 +6522,8 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
             records, model, class_names, float(policy.get("pad", 0.12)),
             base_token="objcovM" + main_token, session_key="_objcov_objM", policy=policy)
         if not orecs:
-            st.warning("labels/ 找不到任何 bbox。"); return
+            st.warning("labels/ 找不到任何 bbox。"
+                       + _seg_format_hint([r["path"] for r in records])); return
         cache = {"token": main_token, "recs": orecs, "emb": oemb,
                  "labels": [r.get("label", "") for r in orecs]}
         st.session_state["_objcov_main"] = cache
@@ -6520,12 +6733,16 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
             _sg = st.columns(8)
             _n = 0
             for i in osel["main"][:24]:
-                _sg[_n % 8].image(str(orecs[ci[i]]["path"]), use_container_width=True)
+                _mr = orecs[ci[i]]
+                _sg[_n % 8].image(str(_mr["path"]), use_container_width=True,
+                                  caption=f"{_mr.get('label') or '?'}｜{_rec_fname(_mr)}")
                 _n += 1
             for j in osel["cand"][:24]:
                 if cand and j < len(cand_ci):
-                    _sg[_n % 8].image(str(cand["recs"][cand_ci[j]]["path"]),
-                                      use_container_width=True)
+                    _cr2 = cand["recs"][cand_ci[j]]
+                    _sg[_n % 8].image(str(_cr2["path"]), use_container_width=True,
+                                      caption=f"{_cr2.get('label') or '?'}"
+                                              f"｜{_rec_fname(_cr2)}")
                     _n += 1
 
     with col_side:
@@ -6548,7 +6765,9 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
         st.caption(f"主資料・區塊 #{bk}：{len(bmem)} 個物件（你目前的樣態）")
         gcols = st.columns(4)
         for j, i in enumerate(bmem[:8]):
-            gcols[j % 4].image(str(orecs[ci[i]]["path"]), use_container_width=True)
+            _br = orecs[ci[i]]
+            gcols[j % 4].image(str(_br["path"]), use_container_width=True,
+                               caption=f"{_br.get('label') or '?'}｜{_rec_fname(_br)}")
 
     # ── 撈候選補此（類別,區塊）→ 排名＋加入清單 ──
     st.divider()
@@ -6580,8 +6799,9 @@ def _render_objcov_view(records: list[dict], model: str) -> None:
     pcols = st.columns(6)
     for j, (gi, d) in enumerate(zip(glob[:12], m_dist[:12])):
         with pcols[j % 6]:
-            st.image(str(cand["recs"][gi]["path"]), use_container_width=True)
-            st.caption(f"d={d:.2f}")
+            _gr = cand["recs"][gi]
+            st.image(str(_gr["path"]), use_container_width=True)
+            st.caption(f"{_gr.get('label') or '?'}｜{_rec_fname(_gr)} · d={d:.2f}")
 
 
 def _completeness_ui() -> None:
@@ -6602,7 +6822,9 @@ def _completeness_ui() -> None:
             return
         st.markdown("**② 模型**")
         model = st.selectbox("模型", all_models, label_visibility="collapsed",
+                             index=_default_model_index(all_models),
                              help="算每格內 embedding 多樣性（質量探針）用。")
+        _class_source_expander("cov")  # 物件級的 YOLO 類別名(主資料與候選共用)
         st.markdown("**③ 檢視方式**")
         cov_view = st.radio(
             "檢視方式", ["嵌入覆蓋圖", "屬性棋盤"],
@@ -6619,8 +6841,9 @@ def _completeness_ui() -> None:
                 _objcov_sidebar(model)
             else:
                 st.markdown("**④ 投影方法**")
-                st.selectbox("投影方法", list(_METHOD_KEY), key="cov_proj_method",
-                             label_visibility="collapsed",
+                st.selectbox("投影方法", list(_METHOD_KEY),
+                             index=list(_METHOD_KEY).index("監督UMAP"),
+                             key="cov_proj_method", label_visibility="collapsed",
                              help="只用來畫圖；稀疏度一律高維算。LDA／監督UMAP 依類別排版"
                                   "（候選用最近鄰暫定類別）。維度／稀疏度 k 在右側即時調。")
         run = st.button("▶ 開始分析", use_container_width=True, key="run_cov",
@@ -6632,7 +6855,7 @@ def _completeness_ui() -> None:
         folders = [Path(f) for f in st.session_state.get("cov_folder_list", [])]
         missing = [str(p) for p in folders if not p.exists()]
         if not folders:
-            st.error("請先選擇至少一個資料夾。"); return
+            st.error("請先選擇資料夾。"); return
         if missing:
             st.error(f"資料夾不存在：{', '.join(missing)}"); return
         records = discover_images_classifier(folders)
@@ -6823,7 +7046,7 @@ def _completeness_ui() -> None:
                        f"n={cell['n']} / t={cell['t']:.0f} · 多樣性 d={cell['d']:.2f}")
             if cell["state"] == STATE_FAKE:
                 st.caption(":violet[假完整：量夠但多樣性低，多為近重複——建議去重而非再補。]")
-            with st.container(height=240):
+            with st.container(height=480):
                 cols = st.columns(3)
                 for j, i in enumerate(cell["indices"][:30]):
                     with cols[j % 3]:
@@ -6837,10 +7060,12 @@ def _completeness_ui() -> None:
             # (b) 缺格一鍵撈候選：候選池就地設定（popover），免回 sidebar
             with st.popover("🔎 撈候選補此格", use_container_width=True):
                 st.caption("候選池資料夾（通常是未標註的影像）")
+                # 單一資料夾語義:📁 選新的取代舊的。widget 維持 text_area
+                # (E2E 契約 .st-key-cov_pool_text textarea,headless 唯一入口)。
                 st.button("📁 選候選池資料夾", key="cov_pool_pick",
                           use_container_width=True,
-                          on_click=_pick_folder_into_text, args=("cov_pool_text",))
-                st.text_area("或貼上候選池路徑（一行一個）", key="cov_pool_text",
+                          on_click=_pick_folder_into_text, args=("cov_pool_text", True))
+                st.text_area("或貼上候選池路徑（取代目前選擇）", key="cov_pool_text",
                              height=80, label_visibility="collapsed",
                              placeholder="例：demo/pool 或 C:/data/unlabeled")
                 if st.button("開始撈候選", key="cov_mine_btn",
@@ -7035,6 +7260,7 @@ def _quiz_ui() -> None:
             st.error("models/ 內找不到模型檔。"); return
         st.markdown("**② 模型**")
         model = st.selectbox("模型", all_models, label_visibility="collapsed",
+                             index=_default_model_index(all_models),
                              help="用來找爭議樣本（kNN 標籤分歧）與對照題（以圖搜圖）。")
         run = st.button("▶ 載入資料", use_container_width=True, key="run_quiz",
                         type="primary")
@@ -7325,7 +7551,7 @@ def _gray_focus_view(records, emb, anchors, anchor_indices, disp, view,
               disabled=pos == 0, on_click=_gray_nav, args=(-1,))
     warn = " ⚠指向他類" if it["points_other"] else ""
     n2.markdown(f"第 **{pos + 1} / {len(view)}** 筆　·　分歧 {it['score']:.2f}　·　"
-                f"{orig}→{it['anchor']}{warn}")
+                f"{orig}→{it['anchor']}{warn}　·　{_rec_fname(records[cur_i])}")
     n3.button("下一張 →", key="gray_next", use_container_width=True,
               disabled=pos >= len(view) - 1, on_click=_gray_nav, args=(1,))
 
@@ -7390,7 +7616,8 @@ def _gray_zone_ui() -> None:
         if not all_models:
             st.error("models/ 內找不到模型檔。"); return
         st.markdown("**② 模型**")
-        model = st.selectbox("模型", all_models, label_visibility="collapsed")
+        model = st.selectbox("模型", all_models, label_visibility="collapsed",
+                             index=_default_model_index(all_models))
         n_q = st.number_input("本批張數（最爭議的前 N）", min_value=1, max_value=200,
                               value=20, key="gray_n")
         run = st.button("▶ 建立分流佇列", use_container_width=True, key="run_gray",
@@ -7532,7 +7759,7 @@ def _gray_zone_ui() -> None:
 
     _badge = {"soft": "🏷分級", "exclude": "🚫排除"}
     st.markdown(f"**總覽（{len(view)} 筆）**　:gray[點「🔍對照」看大圖三方對照·高分歧在前]")
-    with st.container(height=380):
+    with st.container(height=560):
         cols = st.columns(5)
         for j, it in enumerate(view):
             with cols[j % 5], st.container(border=True):
@@ -7540,7 +7767,8 @@ def _gray_zone_ui() -> None:
                 col = "red" if sc >= 0.6 else ("orange" if sc >= 0.3 else "green")
                 warn = " :red[⚠]" if it["points_other"] else ""
                 badge = _badge.get((disp.get(it["i"]) or {}).get("action"), "")
-                st.markdown(f':{col}[● {sc:.2f}]{warn} {it["orig"]}→{it["anchor"]} {badge}')
+                st.markdown(f':{col}[● {sc:.2f}]{warn} {it["orig"]}→{it["anchor"]} {badge}'
+                            f'｜{_rec_fname(records[it["i"]])}')
                 t = _gray_thumb(records, it["i"])
                 if t:
                     st.image(t, use_container_width=True)
@@ -7672,8 +7900,9 @@ def _evaluation_ui() -> None:
                "（重定義文件 §5.3）。")
     with st.sidebar:
         st.markdown("**① 資料夾（含 images/ 與 labels/）**")
+        # 評估後端只吃第一個資料夾(app 只讀 lines[0]) → 單一資料夾取代語義,避免誤導
         st.button("📁 選擇資料夾", key="eval_pick", use_container_width=True,
-                  on_click=_pick_folder_into_text, args=("eval_folder_text",))
+                  on_click=_pick_folder_into_text, args=("eval_folder_text", True))
         _picked_paths_display("eval_folder_text")
         st.markdown("**② 模型預測 CSV** `filename,class,cx,cy,w,h[,score]`")
         pred_file = st.file_uploader("predictions.csv", type="csv", key="eval_pred_file")
@@ -7757,7 +7986,7 @@ def _evaluation_ui() -> None:
     if fns:
         st.markdown(f"**漏抓畫廊（escape，共 {len(fns)}）** — 每張是被漏掉的缺陷區")
         folder = Path(data["folder"])
-        with st.container(height=330):
+        with st.container(height=520):
             cols = st.columns(4)
             for j, fn in enumerate(fns[:40]):
                 with cols[j % 4]:
@@ -7771,7 +8000,7 @@ def _evaluation_ui() -> None:
                                          b["w"], b["h"], pad=0.4)
                         crop.thumbnail((180, 180))
                         st.image(crop, use_container_width=True,
-                                 caption=f'{fn["cls"]}·{fn["filename"]}')
+                                 caption=f'{fn["cls"]}｜{fn["filename"]}')
                     except (OSError, ValueError):
                         st.warning(f'⚠ {fn["filename"]}')
         import csv as _csv

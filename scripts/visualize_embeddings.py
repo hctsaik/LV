@@ -29,44 +29,67 @@ def parse_label_file(label_path: Path, class_names: list[str]) -> str:
     return class_names[cid] if cid < len(class_names) else f"class_{cid}"
 
 
-def discover_images_classifier(folders: list[Path]) -> list[dict]:
+def discover_images_classifier(folders: list[Path], allow_flat: bool = False) -> list[dict]:
     """從分類資料集探索影像。
     結構：folder/class_name/image.jpg，split 取自 folder 名稱。
+    allow_flat=True：某資料夾的類別子資料夾掃不到任何影像時，退回該資料夾根層
+    平鋪掃描，label 用資料夾名（無標籤資料夾看 embedding 分佈用）。預設關閉——
+    類別導向的工具（cov/quiz/gray）對平鋪資料夾應維持「掃無」而非造出假類別。
     回傳 list of {path, split, label}。
     """
     records = []
     for folder in folders:
         split = folder.name
+        n_before = len(records)
         for class_dir in sorted(d for d in folder.iterdir() if d.is_dir()):
             label = class_dir.name
             for img_path in sorted(
                 p for ext in ("*.jpg", "*.jpeg", "*.png") for p in class_dir.glob(ext)
             ):
                 records.append({"path": img_path, "split": split, "label": label})
+        if allow_flat and len(records) == n_before:
+            for img_path in sorted(
+                p for ext in ("*.jpg", "*.jpeg", "*.png") for p in folder.glob(ext)
+            ):
+                records.append({"path": img_path, "split": split, "label": folder.name})
     return records
 
 
 def discover_images(folders: list[Path], class_names: list[str]) -> list[dict]:
-    """從指定資料夾列表探索影像（每個資料夾需含 images/ 和 labels/）。
+    """從指定資料夾列表探索影像（每個資料夾需含 images/（或 VOC 的 JPEGImages/）
+    和 labels/；或帶 COCO JSON／VOC XML／LabelMe／NDJSON 標註的平鋪佈局）。
     split 名稱取自資料夾名稱（e.g. train, test）。
     回傳 list of {path, split, label}。
     """
+    from interaction import (annotation_image_label,  # 延後 import 避免循環
+                             folder_has_annotations)
     records = []
     for folder in folders:
         images_dir = folder / "images"
         labels_dir = folder / "labels"
         split = folder.name
-        if not images_dir.exists():
+        if images_dir.exists():
+            base = images_dir
+        elif (folder / "JPEGImages").exists():
+            base = folder / "JPEGImages"  # 經典 VOC 佈局
+        elif folder_has_annotations(folder):
+            base = folder  # 平鋪佈局(COCO/VOC sidecar/LabelMe/NDJSON):影像在根層
+        else:
             print(f"Warning: {images_dir} not found, skipping")
             continue
         for img_path in sorted(
-            p for ext in ("*.jpg", "*.jpeg", "*.png") for p in images_dir.glob(ext)
+            p for ext in ("*.jpg", "*.jpeg", "*.png") for p in base.glob(ext)
         ):
             label_path = labels_dir / f"{img_path.stem}.txt"
+            if label_path.exists():
+                label = parse_label_file(label_path, class_names)
+            else:  # 無 YOLO txt → 試其他標註(單類=類名/多類=mix/無標=unknown)
+                label = (annotation_image_label(img_path)
+                         or parse_label_file(label_path, class_names))
             records.append({
                 "path": img_path,
                 "split": split,
-                "label": parse_label_file(label_path, class_names),
+                "label": label,
             })
     return records
 

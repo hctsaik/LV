@@ -43,6 +43,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from interaction import (  # framework-free(無 streamlit),與本模組同約束
+    _NDJSON_IMG_KEYS,
+    annotation_boxes_for_image,
+    coco_file_for_root,
+    ndjson_file_for_root,
+    parse_labelme_boxes,
+    voc_xml_for_image,
+)
 from safe_io import safe_open_image, safe_read_text
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -95,6 +103,8 @@ class ExportReport:
     # 損壞/格式錯而被「略過」的匯出項（圖檔解不開）。屬設計行為:跳過該項
     # (不寫圖與其 label),整個匯出不崩潰;每筆留底供上層顯示。
     corrupt: list = field(default_factory=list)
+    # 原格式標註(COCO/VOC/LabelMe/NDJSON)被一併保留的影像數。
+    annotations_preserved: int = 0
     dst: str = ""
 
 
@@ -342,6 +352,167 @@ def _remap_label_text(
     return "\n".join(out_lines) + ("\n" if out_lines else "")
 
 
+# ── 原格式標註保留(COCO/VOC/LabelMe/NDJSON)──────────────────────────────
+def _preserve_annotations(src_img: Path, final_img: Path, report: ExportReport,
+                          sha: str, ann_names: set,
+                          coco_srcs: dict, ndjson_srcs: dict) -> None:
+    """把該影像的原格式標註帶進匯出(YOLO txt 已由既有路徑處理,兩者可並存;
+    重讀時 txt 優先,語義一致)。優先序與讀取端 annotation_boxes_for_image 相同:
+    COCO → VOC → LabelMe → NDJSON。
+    - VOC/LabelMe 為 per-image sidecar → 直接複製到輸出影像旁(檔名跟隨消歧義
+      後的 stem;stem 改名時 XML <filename>/JSON imagePath **不改寫**,留 warning)。
+    - COCO/NDJSON 為資料集級檔 → 先登記(來源檔 → {原檔名: 輸出檔名}),
+      迴圈結束後 _write_filtered_* 統一過濾改寫。"""
+    rows = annotation_boxes_for_image(src_img)
+    if rows is None:
+        return  # 無任何原格式標註來源
+    for r in rows:  # 類名聯集(給 classes.txt/data.yaml;txt 來源另走 class_names)
+        if r[6]:
+            ann_names.add(str(r[6]))
+
+    for root in (src_img.parent, src_img.parent.parent):
+        jf = coco_file_for_root(root)
+        if jf:
+            coco_srcs.setdefault(str(jf), {})[src_img.name] = final_img.name
+            report.annotations_preserved += 1
+            return
+
+    xml = voc_xml_for_image(src_img)
+    if xml is not None:
+        try:
+            shutil.copy2(xml, final_img.with_suffix(".xml"))
+            report.annotations_preserved += 1
+        except OSError as e:
+            report.errors.append({"sha256": sha, "src": str(xml),
+                                  "reason": f"voc xml copy failed: {e}"})
+            return
+        if src_img.stem != final_img.stem:
+            report.warnings.append({
+                "sha256": sha, "kind": "sidecar-renamed",
+                "detail": f"{xml.name} → {final_img.stem}.xml"
+                          "(XML 內部 <filename> 未改寫,僅供人讀)"})
+        return
+
+    lm = src_img.with_suffix(".json")
+    if lm.exists() and parse_labelme_boxes(lm) is not None:
+        try:
+            shutil.copy2(lm, final_img.with_suffix(".json"))
+            report.annotations_preserved += 1
+        except OSError as e:
+            report.errors.append({"sha256": sha, "src": str(lm),
+                                  "reason": f"labelme json copy failed: {e}"})
+            return
+        if src_img.stem != final_img.stem:
+            report.warnings.append({
+                "sha256": sha, "kind": "sidecar-renamed",
+                "detail": f"{lm.name} → {final_img.stem}.json"
+                          "(JSON 內部 imagePath 未改寫,僅供人讀)"})
+        return
+
+    for root in (src_img.parent, src_img.parent.parent):
+        nf = ndjson_file_for_root(root)
+        if nf:
+            ndjson_srcs.setdefault(str(nf), {})[src_img.name] = final_img.name
+            report.annotations_preserved += 1
+            return
+
+
+def _write_filtered_coco(img_root: Path, coco_srcs: dict,
+                         report: ExportReport) -> None:
+    """把來源 COCO JSON 過濾成「只含匯出影像」的 _annotations.coco.json,
+    file_name 改寫成輸出檔名。多來源時 categories 依**類名**聯集重編號、
+    image/annotation id 重排(避免跨檔撞號);其餘欄位(area/segmentation…)
+    原樣保留。寫在 images/ 根(split 與非 split 佈局重讀時都探得到)。"""
+    if not coco_srcs:
+        return
+    cats_by_name: dict[str, int] = {}
+    out_images: list[dict] = []
+    out_anns: list[dict] = []
+    next_img_id, next_ann_id = 1, 1
+    for jp, name_map in sorted(coco_srcs.items()):
+        try:
+            data = json.loads(safe_read_text(Path(jp)))
+        except (json.JSONDecodeError, OSError) as e:
+            report.warnings.append({"kind": "coco-filter",
+                                    "detail": f"{jp} 解析失敗:{e}"})
+            continue
+        cat_name = {c.get("id"): str(c.get("name", c.get("id")))
+                    for c in data.get("categories", [])}
+        keep: dict = {}
+        for im in data.get("images", []):
+            nm = Path(str(im.get("file_name", ""))).name
+            if nm in name_map:
+                new_im = dict(im)
+                new_im["id"] = next_img_id
+                new_im["file_name"] = name_map[nm]
+                out_images.append(new_im)
+                keep[im.get("id")] = next_img_id
+                next_img_id += 1
+        for a in data.get("annotations", []):
+            if a.get("image_id") not in keep:
+                continue
+            nm = cat_name.get(a.get("category_id"))
+            if nm is None:
+                report.warnings.append({
+                    "kind": "coco-filter",
+                    "detail": f"annotation {a.get('id')} 的 category_id "
+                              f"{a.get('category_id')} 不在 categories — dropped"})
+                continue
+            new_a = dict(a)
+            new_a["id"] = next_ann_id
+            new_a["image_id"] = keep[a["image_id"]]
+            new_a["category_id"] = cats_by_name.setdefault(nm, len(cats_by_name) + 1)
+            out_anns.append(new_a)
+            next_ann_id += 1
+    if not out_images:
+        return
+    cats = [{"id": i, "name": n}
+            for n, i in sorted(cats_by_name.items(), key=lambda kv: kv[1])]
+    img_root.mkdir(parents=True, exist_ok=True)
+    (img_root / "_annotations.coco.json").write_text(
+        json.dumps({"images": out_images, "annotations": out_anns,
+                    "categories": cats}, ensure_ascii=False, indent=1),
+        encoding="utf-8")
+
+
+def _write_filtered_ndjson(img_root: Path, ndjson_srcs: dict,
+                           report: ExportReport) -> None:
+    """把來源 NDJSON 過濾成「只含匯出影像」的 annotations.ndjson,影像鍵改寫成
+    輸出檔名、其餘欄位原樣保留。多來源直接串接。寫在 images/ 根。"""
+    if not ndjson_srcs:
+        return
+    out_lines: list[str] = []
+    for jp, name_map in sorted(ndjson_srcs.items()):
+        try:
+            text = safe_read_text(Path(jp))
+        except OSError as e:
+            report.warnings.append({"kind": "ndjson-filter",
+                                    "detail": f"{jp} 讀取失敗:{e}"})
+            continue
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                row = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            for k in _NDJSON_IMG_KEYS:
+                v = row.get(k)
+                if isinstance(v, str) and v \
+                        and Path(v.replace("\\", "/")).name in name_map:
+                    row[k] = name_map[Path(v.replace("\\", "/")).name]
+                    out_lines.append(json.dumps(row, ensure_ascii=False))
+                    break
+    if not out_lines:
+        return
+    img_root.mkdir(parents=True, exist_ok=True)
+    (img_root / "annotations.ndjson").write_text(
+        "\n".join(out_lines) + "\n", encoding="utf-8")
+
+
 # ── crop-out ─────────────────────────────────────────────────────────────────
 def _crop_box(img_w: int, img_h: int, box: list[float], pad: float
               ) -> tuple[int, int, int, int]:
@@ -483,33 +654,44 @@ def export_subset(
     manifest_rows: list[dict] = []
     object_rows: list[dict] = []
 
+    ann_names: set = set()
     if layout == "crop-out":
         _export_crop_out(merged, dst, mode, pad, report, manifest_rows,
                          object_rows)
     else:
-        _export_yolo(merged, dst, mode, on_exists, class_remap, report,
-                     manifest_rows, drop_invalid_labels)
+        ann_names = _export_yolo(merged, dst, mode, on_exists, class_remap,
+                                 report, manifest_rows, drop_invalid_labels)
+
+    # 保留的原格式標註內的類名,聯集進 classes.txt/data.yaml(附加在既有
+    # palette 之後,不動 txt 的 remap 編號)。
+    all_classes = subset_classes + sorted(
+        n for n in ann_names if n not in set(subset_classes))
 
     # 4) provenance — always written, even for manifest-only.
     _write_manifest_csv(dst, manifest_rows)
     if layout == "crop-out":
         _write_object_manifest_csv(dst, object_rows)
     (dst / "classes.txt").write_text(
-        "\n".join(subset_classes) + ("\n" if subset_classes else ""),
+        "\n".join(all_classes) + ("\n" if all_classes else ""),
         encoding="utf-8")
-    _write_data_yaml(dst, subset_classes, layout)
+    _write_data_yaml(dst, all_classes, layout)
     _write_lineage(dst, mode=mode, layout=layout, on_exists=on_exists, pad=pad,
-                   subset_classes=subset_classes, class_remap=class_remap,
+                   subset_classes=all_classes, class_remap=class_remap,
                    shas=list(merged.keys()), manifest_rows=manifest_rows,
                    report=report)
     return report
 
 
 def _export_yolo(merged, dst, mode, on_exists, class_remap, report,
-                 manifest_rows, drop_invalid_labels) -> None:
-    """yolo layout: whole image + FULL (remapped) label file (§6 path ①)."""
+                 manifest_rows, drop_invalid_labels) -> set:
+    """yolo layout: whole image + FULL (remapped) label file (§6 path ①)
+    + 原格式標註保留(COCO/VOC/LabelMe/NDJSON)。回傳標註內蒐集到的類名集合
+    (供 classes.txt/data.yaml 聯集)。"""
     img_root = dst / "images"
     lbl_root = dst / "labels"
+    ann_names: set = set()
+    coco_srcs: dict = {}
+    ndjson_srcs: dict = {}
     # 檔名改用「原圖檔名」（使用者明確選用，取代 sha256）。同一次匯出內，
     # 不同 sha 但同 basename 會撞名（如兩個來源各有 000001.jpg）；以 __N
     # 後綴消歧義，兩張都保留。此消歧義與 on_exists（針對既有 dst 檔）無關。
@@ -563,6 +745,15 @@ def _export_yolo(merged, dst, mode, on_exists, class_remap, report,
             final_lbl = lbl_dir / f"{Path(final_img).stem}.txt"
             final_lbl.parent.mkdir(parents=True, exist_ok=True)
             final_lbl.write_text(text, encoding="utf-8")
+
+        # 原格式標註(COCO/VOC/LabelMe/NDJSON)一併保留;與 YOLO txt 可並存
+        # (重讀時 txt 優先,與全 app 讀取語義一致)。
+        _preserve_annotations(src_img, Path(final_img), report, sha,
+                              ann_names, coco_srcs, ndjson_srcs)
+
+    _write_filtered_coco(img_root, coco_srcs, report)
+    _write_filtered_ndjson(img_root, ndjson_srcs, report)
+    return ann_names
 
 
 def _export_crop_out(merged, dst, mode, pad, report, manifest_rows,
