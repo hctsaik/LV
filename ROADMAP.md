@@ -9,10 +9,32 @@
 > 無待辦 user_needs。後續只走**維護迴圈**(只動 `scripts/app.py` + E2E、不受 appetite 約束);
 > 要再加新能力須從新的 `/user` 需求重新起輪。未蓋棺尾巴(M6 `N_min=8` 三 split 敏感度掃描)列維護候選、非阻擋。
 >
-> **(2026-06-30 晚續)** 使用者提新需求「整張影像級(無 YOLO 標籤)」→ 依「新能力起新輪」規矩**重新起輪 = M8(進行中)**;
+> **(2026-06-30 晚續)** 使用者提新需求「整張影像級(無 YOLO 標籤)」→ 依「新能力起新輪」規矩**重新起輪 = M8(已完成)**;
 > 維護收斂結論不變,M8 是受 appetite 約束的新能力增量。
+>
+> **(2026-07-05)** 使用者提「大資料 AL 可用性 + 離線自動選樣服務」→ 再依「新能力起新輪」開兩個里程碑:
+> **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M9 — 大資料主動學習 GUI 可用性(分批可續跑引擎 + 顯示三模式)** — 🔨 **開發中(核心引擎 08 已 GREEN;GUI 接線待做)**(2026-07-05) —
+  瑕疵/主動學習 feature 收斂後的**新能力**輪次(起新輪)。需求:資料量大(數萬~十萬)時,現行
+  「整條 pipeline 綁在 Streamlit 互動 session 同步跑完」→ 畫面卡死/等數小時/關掉重來,實質不能用。
+  範圍(MoSCoW):**Must** 分批+checkpoint+**續跑**選樣引擎(凍結模型下逐批評分,任何時刻給得出
+  「已處理併集」正確 Top-K)+ GUI **顯示三模式**(標註免投影只佇列+直方圖 / 探索抽樣散點 / 完整=現況,
+  依量自動建議 >5000 走標註模式,可改)+ **暫定 Top-K**(明示「暫定·已處理 x%」)+ 續跑鈕;
+  **Should** 佇列每項人話理由;**Won't** 離線服務(→M10)/跨機。模組:**08 `al_batch`(Tier B,
+  無 GUI→單元+真實檔案系統整合測試驗收)**。需求 [1_user_needs/al_scale_offline.md](1_user_needs/al_scale_offline.md);
+  PRD [2_PO_PRD/al_scale_offline_prd.md](2_PO_PRD/al_scale_offline_prd.md);設計素材
+  [AL_SCALE_AND_OFFLINE_SERVICE_PLAN.md](AL_SCALE_AND_OFFLINE_SERVICE_PLAN.md)。appetite ≤1 模組 + GUI 接線,一輪做完。
+  狀態:PRD 完成,放行 `/architect`。
+- **M10 — 離線監看選樣服務(設定可攜 + 增量 + 佇列消費閉環)** — ⬜ **待設計(M9 綠了才開)**(2026-07-05) —
+  需求:資料夾持續進新圖,使用者不想一直開互動畫面等算,要有背景服務按 AL 目標自動挑出「最該標註/釐清
+  的前 100 個」。範圍(MoSCoW):**Must** 服務工作區持久化(設定/狀態/佇列/標註/摘要/鎖,單寫者)+
+  CLI **run-once**(增量掃描→08 引擎→選樣→合併標註→物化佇列→摘要)+ GUI ④ 監看設定區&**匯出設定檔**
+  給服務吃&服務狀態卡&「立即掃描一次」+ Step③ 佇列消費(縮圖+理由+三鍵 append 標註)+ **版本過期重評分**+
+  **增量只算新圖**+**只讀來源**;**Should** 確認正常→擴 bank→重存模型引導、複製排程指令;**Won't** 常駐 daemon/
+  服務自動重訓/多人/推播/跨機部署本身/CIM 平台整合(留鉤子)。模組:**09 `al_workspace`、10 `al_service`
+  (皆 Tier B)**。appetite ≤2 模組 + GUI 接線,一輪做完。狀態:待 M9 完成後放行 `/architect`。
 - **M8 — 整張影像級瑕疵偵測(無 YOLO 標籤)** — ✅ **完成**(2026-07-01,ROADMAP 於 2026-07-05 補回填,
   詳見決策日誌「ROADMAP 漂移修正」) — feature 收斂後第一個新能力增量(走精簡 U-Net 新輪)。需求:手上只有
   「無標註圖片資料夾」的人,要把**整張影像當對象**做異常偵測、不必先標框(現況無 `labels/` 直接跳
@@ -199,3 +221,30 @@
   PCA 才有交叉校驗視圖,散點圖本身保證不空白。**維護候選待辦(非阻擋)**:`test_scenarios_cov.py` s07/s10
   的既有跨測試 16-vs-384 維 embedding 快取污染(dim=16 假 embedding 測試與真實 384 維 DINOv2 測試共用
   `.lv_cache` 隔離不足),需要時走 reverse gate 交 `/pm` 補快取隔離。
+- (2026-07-05) **M9 + M10 起輪(新能力)**:使用者提「大資料 AL 可用性 + 離線自動選樣服務」→ 依「新能力
+  起新輪」開 `/user`→`/po`。根因診斷:兩個痛點(GUI 跑不動大資料、想要離線自動選樣)同一根因=重運算綁死
+  在 Streamlit 互動 session。解法一體:抽出「分批可續跑選樣引擎」,GUI 與離線服務為其兩個前端,「已存模型」
+  為兩者唯一契約,「標註佇列」為核心產出物。PO 拆:M9=**08 `al_batch`**(分批+checkpoint+續跑+暫定 Top-K,
+  Tier B);M10=**09 `al_workspace`**(工作區持久化+增量掃描)+**10 `al_service`**(CLI run-once 編排),皆 Tier B。
+  **使用者四項拍板**:K 預設=100;版本過期項目=**重評分**(非標 stale);服務/GUI=v1 同機、**長期跨機**
+  (架構不可寫死同機,路徑走可攜設定檔、服務為設定檔純消費者);GUI 有 config 設定區**可匯出設定檔**給服務吃。
+  **其餘裁決**:多 profile v1 就做;標註模式自動切門檻 5000(可調);監看==建模資料夾警告不阻擋;已刪檔佇列項標
+  stale 隱藏不刪。**Won't**:常駐 daemon(用輪詢)/服務自動重訓/多人/推播/跨機部署本身/CIM 平台整合(留鉤子,
+  佇列 schema 參考 `labeling_handoff.py`)。appetite:M9 ≤1 模組、M10 ≤2 模組,各一輪;**M9 綠了才開 M10**。
+  設計素材預聚合於 `AL_SCALE_AND_OFFLINE_SERVICE_PLAN.md`(非契約)。模組 08/09/10 走里程碑追蹤(同 M2–M8),不動 M1 表。
+  狀態:PRD 完成,放行 `/architect` 設計 08(M9)。
+- (2026-07-05) **M9 核心引擎 08 `al_batch` 設計→開發 GREEN**:走完整 /architect→/pm→/pg。
+  **/architect** 用 workflow(4 agent)對既有程式碼逐行紮根 + 對抗式挑批次正確性漏洞(7 high+5 med 缺口+11 C8 風險),
+  避開一堆 silent-wrong(最關鍵:**不呼叫 run_pipeline**——它每批無條件跑全域 HDBSCAN/門檻/ranking,違反 C8;
+  改直接組 per-item 子函式)。**經使用者審查核准 3 個與 plan 的偏離**:① objective `confusion` 更正為
+  「entropy 目標(吃 head 不吃 labels)」——既有 `confusion_targeted_priority` 本就不吃 labels,如此 al_batch 零 M10 相依;
+  ② M9 丟 disagreement 項(凍結 meta 無門檻,單批算門檻違反 C8),uncertain 改用 boundary+entropy;
+  ③ bank-only 不做 HDBSCAN 多樣性(有 head 用預測類別;純 bank `diversity_applied=False`)。
+  **/pm** 15 條釘死 AC + 2 推導(多次續跑收斂、AST 反向稽查禁用全域運算),先紅正確。
+  **/pg** 實作 `scripts/al_batch.py`(load_frozen_model/run_batched/read_checkpoint;item_id 用影像內容 sha256 → rescore 原地更新;
+  Top-K 依 item_id canonical 排序消 tie-break 不確定;shard 原子寫+state sentinel-last 續跑冪等)。
+  **反向閘門 /pg →(測試錯)→ /pm**:AC7 的 `dataset_dirs` 宣告過寬使 checkpoint 被 `assert_safe` 誤擋 + 反向稽查測試
+  grep 字面字串誤中實作註解 → PM 修為指真實資料夾 + 改用 AST 檢實際呼叫,重 snapshot baseline,再放行 PG。
+  驗證:`python verify/gate.py al_batch` = **GREEN(17 測全過、3_/4_ 契約未竄改)**。
+  al_batch 無 GUI → done=單元/整合綠(真實檔案系統續跑/原子性/不寫來源資料夾皆有整合斷言)。
+  **M9 里程碑其餘**:GUI 三模式顯示(標註/探索/完整)+ 暫定 Top-K + 續跑鈕接線,需真實 Playwright E2E,待做。
