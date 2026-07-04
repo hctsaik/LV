@@ -7246,6 +7246,52 @@ def _render_send_confirmation() -> None:
         height=0)
 
 
+def _labeling_readback_ui() -> None:
+    """標註回饋：列出送去 Labeling 的批次，套用已完成的標籤變更回目前 records。
+
+    LV 對此段路徑是無狀態重啟的（單一 active tool，切到 Labeling 時 LV 進程被
+    engine 砍掉重開），所以讀回是「使用者主動觸發」的一步，不是自動輪詢——
+    契約與 apply_readback() 見 labeling_handoff.py。"""
+    import labeling_handoff as LH
+    st.caption("列出送去 Labeling 標註的批次；標完、匯出後回來這裡按「套用讀回結果」，"
+               "把新標籤套進目前載入的資料。不用回 Labeling，也不會自動輪詢。")
+    pending = LH.list_pending()
+    if not pending:
+        st.info("目前沒有任何送出紀錄。到「Visualize Embeddings」送一批到 Labeling 後，"
+                "才會出現在這裡。")
+        return
+
+    def _row_label(row: dict) -> str:
+        return (f"{row.get('source', '?')} · {row.get('task', '?')} · "
+                f"{row.get('created_at', '')} · "
+                f"{row.get('n_annotated', 0)}/{row.get('n_total', 0)}")
+
+    idx = st.selectbox("送出批次", list(range(len(pending))),
+                       format_func=lambda i: _row_label(pending[i]),
+                       key="readback_batch_idx")
+    row = pending[idx]
+    st.write(f"已標註 {row.get('n_annotated', 0)} / {row.get('n_total', 0)}")
+
+    records = st.session_state.get("viz_records")
+    if not records:
+        st.warning("請先在「Visualize Embeddings」載入資料集，再回來套用讀回結果。")
+        return
+
+    if st.button("📥 套用讀回結果", key="readback_apply_btn", use_container_width=True):
+        st.session_state["readback_last_changes"] = LH.apply_readback(row["dir"], records)
+
+    changes = st.session_state.get("readback_last_changes")
+    if changes is not None:
+        if changes:
+            st.success(f"已套用 {len(changes)} 筆變更")
+            st.dataframe(
+                [{"檔名": c["filename"], "舊標籤": c["old_label"], "新標籤": c["new_label"]}
+                 for c in changes],
+                use_container_width=True, hide_index=True)
+        else:
+            st.info("沒有新的標籤變更（可能還沒人標，或標籤沒變）。")
+
+
 def _quiz_ui() -> None:
     st.markdown("##### 組考卷 · 標註者一致性盲測")
     st.caption("把爭議樣本變成盲測考卷，量「同一人會不會自打嘴巴」與「跨人是否一致」。"
@@ -8052,10 +8098,10 @@ def main() -> None:
     if st.session_state.get("tool_switch") in {"組考卷", "灰帶覆核", "評估"}:
         st.session_state["tool_switch"] = "Visualize Embeddings"
     with switch_col:
-        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🔧 瑕疵偵測　　📦 匯出")
+        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🔧 瑕疵偵測　　📦 匯出　　📥 標註回饋")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "瑕疵偵測", "匯出"],
+                     "完整度熱力圖", "瑕疵偵測", "匯出", "📥 標註回饋"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
@@ -8126,6 +8172,8 @@ def main() -> None:
         _gray_zone_ui()
     elif tool == "評估":
         _evaluation_ui()
+    elif tool == "📥 標註回饋":
+        _labeling_readback_ui()
     else:
         _export_subset_ui()
 
