@@ -161,11 +161,13 @@ def test_coverage_selected_candidate_is_picked_class(cls, tmp_path):
     at2.run()
     assert not at2.exception, f"render(sel) crashed: {exc_summary(at2)}"
 
-    # Gallery captions for selected candidates are the resolved labels.
+    # Gallery captions are now「類別｜檔名」(2026-07 badge spec) — the resolved
+    # label is the segment before the「｜」separator.
     captions = [c.value for c in at2.caption]
-    gallery_labels = [c for c in captions if c in
-                      ("cabinet", "cabinetDoor", "refrigeratorDoor", "window",
-                       "chair", "table", "couch", "door", "openedDoor", "pole")]
+    _cand_cls = ("cabinet", "cabinetDoor", "refrigeratorDoor", "window",
+                 "chair", "table", "couch", "door", "openedDoor", "pole")
+    gallery_labels = [c.split("｜")[0] for c in captions
+                      if "｜" in c and c.split("｜")[0] in _cand_cls]
     foreign = [c for c in gallery_labels if c != cls]
     print(f"[VIEW1 selection] pick={cls!r} selected={len(sel)} "
           f"gallery_label_captions={Counter(gallery_labels)} foreign={foreign} "

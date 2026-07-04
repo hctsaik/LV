@@ -310,11 +310,12 @@ def test_s6_block_candidates_closest_first_same_class(tmp_path):
     at = _run(spec, preseed=preseed)
     assert not at.exception, [e.value for e in at.exception]
 
-    # the candidate panel rendered its closest-first thumbnails with d= captions
+    # the candidate panel rendered its closest-first thumbnails; captions are
+    # now「類別｜檔名 · d=…」(2026-07 badge spec) — parse the trailing d= value
     caps = [c.value for c in at.caption]
-    d_caps = [c for c in caps if c.startswith("d=")]
+    d_caps = [c for c in caps if "· d=" in c]
     assert d_caps, f"no distance captions on candidate thumbnails: {caps[:5]}"
-    dvals = [float(c.split("=")[1]) for c in d_caps]
+    dvals = [float(c.rsplit("d=", 1)[1]) for c in d_caps]
     assert dvals == sorted(dvals), f"candidate thumbnails not closest-first: {dvals}"
 
     # helper-level: NAME filter never lets a 'dog' candidate into the 'orange' pool

@@ -142,6 +142,12 @@ def test_b_run_with_streaming_progress(flow_page, synthetic_dataset):
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
     _add_folder(page, "viz_folder_list", str(synthetic_dataset))
+    # 預設投影=監督UMAP(2026-07 規格);本鏈後續 test_f 要驗「切投影選取不丟」,
+    # 額外勾 PCA 讓 Run 多算一法(快,不拖慢串流斷言)。
+    page.locator('.st-key-viz_methods [data-baseweb="select"]').click()
+    page.get_by_role("option", name="PCA", exact=True).click()
+    page.keyboard.press("Escape")
+    wait_idle(page)
     page.locator('.st-key-run_viz button').click()
 
     progress_texts: set[str] = set()
@@ -248,12 +254,13 @@ def test_f_selection_persists_across_views(flow_page):
     page = flow_page
     n = _selected_count(page)
     assert n >= 1
-    _select_option(page, "viz_method_select", "t-SNE")
+    # test_b 的 Run 算了 監督UMAP(預設)+PCA — 在兩者間切換驗證選取存活
+    _select_option(page, "viz_method_select", "PCA")
     assert _selected_count(page) == n, "selection must survive a method change"
     _select_option(page, "viz_split_select", "train")
     assert _selected_count(page) == n, "selection must survive a split change"
     _select_option(page, "viz_split_select", "All")
-    _select_option(page, "viz_method_select", "PCA")
+    _select_option(page, "viz_method_select", "監督UMAP")
     assert _selected_count(page) == n
     _no_exception(page)
 
@@ -586,6 +593,9 @@ def leakage_dataset(tmp_path):
     return root
 
 
+@pytest.mark.skip(reason="單一資料夾語義(2026-07 規格):UI 一次僅能載一個資料夾,"
+                         "跨 split(train+val 同載)洩漏掃描經 UI 已不可達;"
+                         "demo 按鈕仍會程式化載入兩個資料夾,該路徑不在本測試範圍")
 def test_p_duplicate_leakage_scan(app_page, leakage_dataset):
     page = app_page
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()

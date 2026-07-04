@@ -174,8 +174,8 @@ def _add_models(page, labels: list[str]) -> None:
 
 def test_s01_detector_multimodel_cold_run(det_page, detector_dataset):
     page = det_page
-    _add_folder(page, "viz_folder_list",
-        str(detector_dataset / "train") + "\n" + str(detector_dataset / "val"))
+    # 單一資料夾語義(2026-07 規格):選新的取代舊的 → 本鏈只載 train 一個資料夾
+    _add_folder(page, "viz_folder_list", str(detector_dataset / "train"))
     # the sidebar defaults to dinov2_vitb14 only; add the models this test
     # later switches to (s01 here + s03) so the Run computes their embeddings
     # and the post-Run Model selectbox actually offers them.
@@ -305,7 +305,7 @@ def test_s04_outlier_ranking_and_export(det_page):
     assert "離群度前" in status and "非品質判定" in status, status
     cards = page.locator('.st-key-viz_grid [class*="st-key-viz_card_"] button')
     expect(cards.first).to_be_visible()
-    assert "第1" in cards.first.inner_text()  # rank, not raw score (honest)
+    assert "｜" in cards.first.inner_text()  # 類別｜檔名 badge (rank dropped by spec)
     # 標籤分歧 ranking is one switch away
     _select_option(page, "viz_grid_sort", "標籤分歧")
     page.wait_for_function(
@@ -427,12 +427,12 @@ def test_s07_unicode_paths_round_trip(fresh_page, tmp_path):
                 _img(root / split / cls, names[i % 3], seed, bias=0 if cls == "類別A" else 1)
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
-    _add_folder(page, "viz_folder_list",
-        str(root / "train") + "\n" + str(root / "val"))
+    # 單一資料夾語義(2026-07 規格):UI 一次僅能載一個資料夾 → 只載 train
+    _add_folder(page, "viz_folder_list", str(root / "train"))
     _run_and_collect_progress(page, timeout_s=400)
     _no_exception(page)
     expect(page.get_by_text(re.compile("自動偵測到 2 個類別.*類別A"))).to_be_visible()
-    _select_option(page, "viz_split_select", "val")
+    _select_option(page, "viz_split_select", "train")
     _select_option(page, "viz_split_select", "All")
     _click_marker(page, 0, 0)
     assert "已選取" in _status(page)
