@@ -13,15 +13,22 @@
 > 維護收斂結論不變,M8 是受 appetite 約束的新能力增量。
 
 ## 里程碑
-- **M8 — 整張影像級瑕疵偵測(無 YOLO 標籤)** — 📝 **進行中(PRD→設計)**(2026-06-30) — feature 收斂後第一個
-  新能力增量(走精簡 U-Net 新輪)。需求:手上只有「無標註圖片資料夾」的人,要把**整張影像當對象**做異常偵測、不必先標框
-  (現況無 `labels/` 直接跳「找不到 YOLO 物件」=完全不能用)。範圍(MoSCoW):**Must** 新「物件來源=整張影像」路徑
-  (每張可讀圖→一筆**全幅記錄**,欄位對齊 `discover_yolo_objects`、下游 embedding/分群/bank/patch/評分/散點/排序/看圖/匯出
+- **M8 — 整張影像級瑕疵偵測(無 YOLO 標籤)** — ✅ **完成**(2026-07-01,ROADMAP 於 2026-07-05 補回填,
+  詳見決策日誌「ROADMAP 漂移修正」) — feature 收斂後第一個新能力增量(走精簡 U-Net 新輪)。需求:手上只有
+  「無標註圖片資料夾」的人,要把**整張影像當對象**做異常偵測、不必先標框(現況無 `labels/` 直接跳
+  「找不到 YOLO 物件」=完全不能用)。範圍(MoSCoW):**Must** 新「物件來源=整張影像」路徑(每張可讀圖→
+  一筆**全幅記錄**,欄位對齊 `discover_yolo_objects`、下游 embedding/分群/bank/patch/評分/散點/排序/看圖/匯出
   **不變**)+ `run_pipeline` 依 `object_source` 選用 + GUI ① 切換「YOLO 物件 / 整張影像」+ 模式標示 + 鎖進 `model.meta`;
   **Should** 偵測 0 物件時提示一鍵切整張影像;**Could** 自訂標籤名;**Won't** 整張內多物件分評 / 分類頭 / 背景遮罩。
-  模組:**07 `whole_image_source`(Tier B)**。需求 [1_user_needs/anomaly_whole_image.md](1_user_needs/anomaly_whole_image.md);
-  PRD [2_PO_PRD/anomaly_whole_image_prd.md](2_PO_PRD/anomaly_whole_image_prd.md)。appetite ≤1 模組 + GUI 接線,一輪做完。
-  狀態:PRD 完成,放行 `/architect`。
+  模組:**07 `whole_image_source`(Tier B,走里程碑追蹤,同 M2–M7 不進 M1 模組表)**。設計
+  [3_Architect_Design/07_whole_image_source.md](3_Architect_Design/07_whole_image_source.md);對應表
+  [4_PM_Feedback/whole_image_source.md](4_PM_Feedback/whole_image_source.md);需求
+  [1_user_needs/anomaly_whole_image.md](1_user_needs/anomaly_whole_image.md);PRD
+  [2_PO_PRD/anomaly_whole_image_prd.md](2_PO_PRD/anomaly_whole_image_prd.md)。實作:
+  `discover_whole_images`(interaction.py)+ `run_pipeline` object_source 路由 + GUI 接線(app.py _anomaly_ui)+
+  預覽縮圖彩色徽章(commit 9bf0ae1)。驗證:單元 `test_whole_image_source.py` 11 綠 + 真實 E2E
+  `test_whole_image_source_e2e.py::test_whole_image_build_mvtec_pill`(MVTec pill/train/good 無 labels 建模,
+  commit 9bad2ba)綠;快速上手手冊見 docs(commit 86f59d2)。
 - **M7 — 瑕疵偵測頁面重設計成引導式 wizard** — ✅ **完成**(2026-06-29~30) — 依使用者 7 項 UX 回饋 +
   多 agent 兩場設計鎖定(架構+頁面)→ `_anomaly_ui` 整段重寫,**引擎模組公開函式幾乎零改**(僅
   anomaly_bank_store.save_bank meta 多帶 `label_semantic`、bootstrap_cluster mcs 夾 ≤N、run_pipeline patch
@@ -168,3 +175,27 @@
   PO 拆 1 模組 `whole_image_source`(Tier B):`discover_whole_images` 全幅記錄 + `run_pipeline` `object_source` routing +
   GUI ① 物件來源切換(鎖進 model.meta)。Won't:整張多物件分評 / 分類頭 / 背景遮罩(整張=單一對象,User 明說不在乎)。
   appetite ≤1 模組 + GUI 接線,一輪做完。模組 07 走里程碑追蹤(同 M2–M7),不動 M1 模組表。
+- (2026-07-01) **M8 完成**:`discover_whole_images` + `run_pipeline object_source` 路由 + GUI 接線 + 預覽縮圖
+  彩色徽章(commit 9bf0ae1);快速上手手冊(commit 86f59d2);單元 `test_whole_image_source.py` 11 綠 +
+  真實 E2E(MVTec pill/train/good 無 labels 建模,commit 9bad2ba)綠。M8 完成後 ROADMAP 里程碑狀態未同步
+  回填(仍停在「PRD→設計」),屬文件漂移,於 2026-07-05 維護輪查核時發現並在此補回填(見下一則)。
+- (2026-07-05) **ROADMAP 漂移修正 + 一輪維護(單一資料夾語義 / 類別｜檔名徽章 / 監督UMAP 唯一預設)**:
+  例行接手時用 `verify/unet_status.py` + git log 核對,發現 M8 早已完成(commit 9bf0ae1/9bad2ba)但
+  ROADMAP 里程碑狀態未回填,已於本則更新前補正(見 M8 里程碑)。同時發現工作樹有一批未提交的維護
+  變更(非本次新增,由使用者先前對話產出、待驗證提交),經完整驗證後提交(commit f062cb6):
+  ① 資料夾選取改「單一資料夾」語義(選新的取代舊的,UI 改 [輸入路徑|📁] 同列);② 新 `_rec_fname()`
+  統一縮圖徽章為「類別｜檔名」,鋪到 Visualize/Compare/Coverage/ObjCov/Anomaly 共 30 處;③ 預設投影方法
+  由 4 種減為只算監督UMAP(極小樣本/無標籤仍由既有 PCA 保底邏輯接手,不空結果);④ grid 移除「第n」
+  排名標籤。驗證:非 e2e 全套 490 passed(2 個 `test_scenarios_cov.py` 失敗經與 HEAD 逐一對照證實為既有
+  跨測試 `.lv_cache` 假 embedding 污染,與本輪改動無關,**未修復**,列維護候選待辦);完整 Playwright E2E
+  (55 測)跑 3 輪,過程中對抗式複查(19-agent workflow)+ 揪出並修復 1 個真回歸
+  (`test_t_umap_reference_frame` 依賴「UMAP 曾是預設方法」才能點到「固定 UMAP 參考系」開關,改為手動
+  加選 UMAP),其餘失敗逐一獨立重跑皆乾淨通過(長 session 資源衰退已知假紅模式,非本輪引入),第 3 輪
+  49 passed/6 skipped/0 failed。**已知限制(接受、記錄不迴避,皆有逃生路徑)**:(a) 跨 split(train+val
+  同載)洩漏掃描經 UI 已不可達,`test_p_duplicate_leakage_scan` 明確標 skip 並附理由,demo 按鈕程式化雙
+  資料夾路徑不受影響;(b) 一般 Classifier 分析下標準 train/val/test 三分割資料集現在同樣只能載一個
+  split(非僅洩漏掃描受影響),無額外警告,逃生路徑=分次載入分析;(c) 監督UMAP 唯一預設下,有標籤資料
+  只算監督投影,PCA(無監督誠實視圖)保底只在「完全沒算出任何投影」時觸發、正常情況不觸發,需手動加選
+  PCA 才有交叉校驗視圖,散點圖本身保證不空白。**維護候選待辦(非阻擋)**:`test_scenarios_cov.py` s07/s10
+  的既有跨測試 16-vs-384 維 embedding 快取污染(dim=16 假 embedding 測試與真實 384 維 DINOv2 測試共用
+  `.lv_cache` 隔離不足),需要時走 reverse gate 交 `/pm` 補快取隔離。
