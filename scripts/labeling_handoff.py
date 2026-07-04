@@ -373,3 +373,41 @@ def reconcile_to_records(results: dict[str, dict], sha_to_index: dict[str, int])
 
 def load_spec(handoff_dir: str | os.PathLike) -> dict:
     return json.loads((Path(handoff_dir) / HANDOFF_SPEC_NAME).read_text(encoding="utf-8"))
+
+
+def apply_readback(handoff_dir: str | os.PathLike, records: list[dict]) -> list[dict]:
+    """Read Labeling's sidecars for ``handoff_dir`` and apply any changed labels
+    onto the CURRENT ``records`` — used by the LV "read-back" UI after the user
+    navigates back from Labeling.
+
+    LV is torn down and restarted between hand-off and read-back (single active
+    tool), so ``st.session_state`` — and any index correspondence recorded at
+    send time — does not survive. This must therefore key off each record's OWN
+    sha256 (computed fresh if the record doesn't already carry one), never the
+    ``lv_index`` captured in ``_handoff.json`` at send time.
+
+    Mutates ``records`` in place (sets ``records[i]["label"]``); returns the
+    change list actually applied, sorted by index, one entry per record whose
+    label truly changed: ``{lv_index, filename, old_label, new_label}``.
+    """
+    results = read_labeling_results(handoff_dir)
+    sha_to_index: dict[str, int] = {}
+    for i, rec in enumerate(records):
+        sha = rec.get("sha256") or _manifest.file_sha256(Path(rec["path"]))
+        sha_to_index[sha] = i
+    reconciled = reconcile_to_records(results, sha_to_index)
+
+    changes: list[dict] = []
+    for idx in sorted(reconciled):
+        res = reconciled[idx]
+        old_label = records[idx].get("label")
+        new_label = res["label"]
+        if new_label != old_label:
+            records[idx]["label"] = new_label
+            changes.append({
+                "lv_index": idx,
+                "filename": Path(records[idx]["path"]).name,
+                "old_label": old_label,
+                "new_label": new_label,
+            })
+    return changes
