@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "deny": [
+      "Write(**/.venv/**)",
+      "Write(**/node_modules/**)",
+      "Write(**/.git/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          { "type": "command", "command": "python verify/role_guard.py" }
+        ]
+      }
+    ]
+  }
+}
