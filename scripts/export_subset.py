@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from interaction import (  # framework-free(無 streamlit),與本模組同約束
+from label_formats import (  # pure stdlib+PIL,與本模組同可移植性約束
     _NDJSON_IMG_KEYS,
     annotation_boxes_for_image,
     coco_file_for_root,

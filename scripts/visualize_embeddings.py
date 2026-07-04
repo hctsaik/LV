@@ -61,8 +61,8 @@ def discover_images(folders: list[Path], class_names: list[str]) -> list[dict]:
     split 名稱取自資料夾名稱（e.g. train, test）。
     回傳 list of {path, split, label}。
     """
-    from interaction import (annotation_image_label,  # 延後 import 避免循環
-                             folder_has_annotations)
+    from label_formats import (annotation_image_label,  # 輕量模組(stdlib+PIL)
+                               folder_has_annotations)
     records = []
     for folder in folders:
         images_dir = folder / "images"
