@@ -16,7 +16,7 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
-- **M9 — 大資料主動學習 GUI 可用性(分批可續跑引擎 + 顯示三模式)** — 🔨 **開發中(核心引擎 08 已 GREEN;GUI 接線待做)**(2026-07-05) —
+- **M9 — 大資料主動學習 GUI 可用性(分批可續跑引擎 + 標註佇列)** — ✅ **完成**(2026-07-05,引擎 08 gate GREEN + GUI 接線 4 E2E 綠) —
   瑕疵/主動學習 feature 收斂後的**新能力**輪次(起新輪)。需求:資料量大(數萬~十萬)時,現行
   「整條 pipeline 綁在 Streamlit 互動 session 同步跑完」→ 畫面卡死/等數小時/關掉重來,實質不能用。
   範圍(MoSCoW):**Must** 分批+checkpoint+**續跑**選樣引擎(凍結模型下逐批評分,任何時刻給得出
@@ -248,3 +248,23 @@
   驗證:`python verify/gate.py al_batch` = **GREEN(17 測全過、3_/4_ 契約未竄改)**。
   al_batch 無 GUI → done=單元/整合綠(真實檔案系統續跑/原子性/不寫來源資料夾皆有整合斷言)。
   **M9 里程碑其餘**:GUI 三模式顯示(標註/探索/完整)+ 暫定 Top-K + 續跑鈕接線,需真實 Playwright E2E,待做。
+- (2026-07-05) **M9-GUI 接線 設計 + E2E 契約完成(PG 實作待做)**:走 /architect→/pm。**/architect** 用 workflow
+  (2 agent)紮根 `_anomaly_ui`:好消息=`_anomaly_save_model` 寫的凍結目錄與 `al_batch.load_frozen_model` 消費格式
+  100% 相容、引擎公開函式零改;設計 [3_Architect_Design/M9_gui_wiring.md](3_Architect_Design/M9_gui_wiring.md)——進入點在
+  ② `_anomaly_tab_apply`(重用 model slot + 目標資料夾選取器 + `dataset_cache_dir` 產 .lv_cache checkpoint),三顯示模式
+  (標註免投影只佇列+直方圖 / 探索抽樣散點 / 完整=現況)、跨 rerun「flag+st.rerun 自續」(非 sleep 輪詢)、暫定 Top-K、
+  停止/繼續上次。**使用者審查核准**:未存模型→**自動存再掃**;順手修 `_anomaly_load_model` 掉 `object_source` 的既有
+  latent bug。**/pm** 4 條真實行為 E2E(`tests/e2e/test_al_batch_gui_e2e.py`:佇列渲染+reason、標註無散點、自動存、
+  object_source 從磁碟、續跑)+ 對應表 [4_PM_Feedback/M9_gui_wiring.md](4_PM_Feedback/M9_gui_wiring.md);snapshot 21 契約檔。
+  **狀態:設計+契約鎖定,`/pg` 接線待做**(大改動 + 需真實 Playwright E2E 驗收,不進 PG 自主修綠迴圈,交 /ux-test 或人觸發)。
+- (2026-07-05) **M9-GUI 接線 /pg 完成 → M9 里程碑達成**:在 `_anomaly_ui` ② 加「⚡ 大資料分批掃描」區塊
+  (`_anomaly_batch_run`/`_anomaly_batch_section`/`_anomaly_batch_render_queue`):選樣目標(head 閘控)+ K(預設100)+
+  掃描/繼續上次 → **未存模型自動存**(使用者拍板)→ **object_source 從磁碟 meta.json 讀**(不信 in-memory)→
+  `al_batch.run_batched`(.lv_cache checkpoint,阻塞+即時進度)→ Top-K **標註佇列**(縮圖+al_batch 自帶 reason+
+  分數分佈+分頁+購物車注入 path)。順手修 `_anomaly_load_model` 掉 `object_source` 的既有 latent bug。
+  **反向閘門 /pg→/architect**:探索/完整散點模式需 al_batch 未回傳的 obj_emb/投影 → v1 修正為**標註佇列 only**
+  (大資料本就不該畫全量散點;散點三模式延後,需 al_batch 未來回傳抽樣 obj_emb)。
+  **反向閘門 /pg→/pm**(2 次):E2E `set_model_dir` 需在 build 後呼叫(存模型鈕 `disabled=not(model and dir)`)→ 修測試順序;
+  whole_image 模式無語義 radio(恆 1 類)→ g6 不設語義;auto-save 目錄改用真實行為訊號驗證(非脆弱路徑)。
+  驗證:**真實 Playwright E2E `tests/e2e/test_al_batch_gui_e2e.py` 4/4 綠**(佇列+reason 渲染、標註無散點 scale-safe、
+  未存自動存、object_source 從磁碟=whole_image 物件數==影像數、續跑無例外)。**M9 里程碑(引擎+GUI)完成;M10 解除閘門可開。**

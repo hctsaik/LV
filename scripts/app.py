@@ -1517,7 +1517,8 @@ def _anomaly_load_model(model_dir: str) -> None:
         st.session_state["anomaly_model"] = {
             "source": "loaded", "ref_folder": "", "_built_at": built_at,
             "meta": {k: _m.get(k) for k in
-                     ("model", "target_res", "score_mode", "patch_dim", "obj_dim", "n_objects")},
+                     ("model", "target_res", "score_mode", "object_source",
+                      "patch_dim", "obj_dim", "n_objects")},
             "label_semantic": semantic,
             "bank_vectors": b.get("vectors"), "projection": b.get("projection"),
             "fewshot": b.get("fewshot"), "head": head, "_dir": str(model_dir),
@@ -1740,6 +1741,146 @@ def _anomaly_tab_build() -> None:
                             on_click=_anomaly_clear_confirmed, args=("build",), use_container_width=True)
 
 
+def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
+    """② 大資料分批掃描(on_click):用①存出的凍結模型跑 al_batch.run_batched(阻塞 + 即時進度)。
+    - 未存模型 → **自動存**(使用者拍板)後再掃(al_batch 讀磁碟目錄,非 in-memory 槽)。
+    - object_source **從磁碟 meta.json 讀**(避免 in-memory 載入模型掉此鍵 → whole_image 被默默當 yolo)。
+    - checkpoint_dir 走 dataset_cache_dir(.lv_cache)守 no-dataset-writes;結果落 anomaly_batch_result。"""
+    import al_batch
+    from anomaly_bank_store import load_bank
+    from object_eval import classes_for, dataset_cache_dir, list_images
+    st.session_state.pop("anomaly_batch_err", None)
+    model = st.session_state.get("anomaly_model")
+    folders = list(st.session_state.get("anomaly_target_folder") or [])
+    if not model or not folders:
+        st.session_state["anomaly_batch_err"] = "請先①建模 / 載入模型,並在②選目標資料夾。"
+        return
+    try:
+        model_dir = model.get("_dir")
+        if not model_dir:  # 未存 → 自動存到模型暫存目錄
+            _mdir = (st.session_state.get("anomaly_model_dir")
+                     or _anomaly_bank_default_dir(str(folders[0])))
+            _train = [Path(f) for f in (st.session_state.get("anomaly_train_folder") or folders)]
+            _anomaly_save_model(_mdir, _train)
+            model_dir = model.get("_dir")
+            if not model_dir:
+                st.session_state["anomaly_batch_err"] = (
+                    st.session_state.get("_anomaly_model_err") or "自動存模型失敗,無法分批掃描。")
+                return
+            st.session_state["anomaly_batch_autosaved"] = str(model_dir)   # 給 UX 提示「已自動存」
+        object_source = load_bank(model_dir).get("meta", {}).get("object_source", "yolo")
+        roots = [Path(f) for f in folders]
+        image_paths: list[Path] = []
+        class_names = None
+        for r in roots:
+            image_paths.extend(list_images(r))
+            class_names = class_names or classes_for(r)
+        if not image_paths:
+            st.session_state["anomaly_batch_err"] = "目標資料夾內找不到影像。"
+            return
+        ck = dataset_cache_dir(roots[0], f"al_batch_{objective}")
+        _bar = st.progress(0.0, text=f"分批掃描…({len(image_paths)} 張圖)")
+
+        def _cb(d):
+            _tot = max(int(d.get("images_total") or 1), 1)
+            _frac = min(max(int(d.get("images_processed") or 0) / _tot, 0.0), 1.0)
+            _bar.progress(_frac, text=f"分批掃描 {d.get('images_processed')}/{_tot}"
+                                      f" · 暫定 Top-{len(d.get('provisional_topk') or [])}")
+
+        res = al_batch.run_batched(
+            image_paths, model_dir=model_dir, checkpoint_dir=ck,
+            objective=objective, k=int(k), object_source=object_source,
+            class_names=class_names, dataset_dirs=roots, progress=_cb, resume=resume)
+        _bar.empty()
+        st.session_state["anomaly_batch_result"] = res
+        _log_usage("anomaly_batch_scan", n=res.get("objects_scored"),
+                   objective=objective, done=res.get("done"))
+    except Exception as exc:
+        st.session_state["anomaly_batch_err"] = f"分批掃描失敗:{exc}"
+
+
+def _anomaly_batch_render_queue(res: dict) -> None:
+    """標註模式:Top-K 縮圖佇列(用 al_batch 自帶 reason)+ 分數分佈 + 分頁 + 購物車。**不渲染散點**(scale-safe)。"""
+    from interaction import crop_bbox
+    recs = res.get("topk_records") or []
+    done = bool(res.get("done"))
+    n = int(res.get("objects_scored") or 0)
+    _warn_skipped(res.get("skipped") or [])
+    st.markdown(f"{'✅ 分批掃描完成' if done else '⏳ 暫定(掃描中)'} · 已評分 **{n}** 物件 · "
+                f"佇列 Top-**{len(recs)}**(目標:{res.get('objective')}"
+                f"{' · 已套用多樣性' if res.get('diversity_applied') else ''})")
+    if not recs:
+        st.info("佇列空(此目標/資料夾未選出物件)。")
+        return
+    st.caption("分數分佈(佇列各物件的異常分數;標註模式不畫全量散點):")
+    st.bar_chart([float(r.get("score", 0.0)) for r in recs], height=140)
+    _c1, _c2 = st.columns(2)
+    _cols = _c1.slider("每列張數", 2, 6, 3, key="anomaly_batch_cols")
+    _th = _c2.slider("縮圖高度(px)", 120, 400, 200, 10, key="anomaly_batch_th")
+    _limit = int(st.session_state.get("anomaly_batch_limit", 60))
+    _shown = recs[:_limit]
+    with st.container(key="anomaly_batch_queue"):
+        _wall = st.columns(_cols)
+        for _j, _r in enumerate(_shown):
+            with _wall[_j % _cols]:
+                _im = safe_open_image(_r["image_path"])
+                if _im is None:
+                    st.caption("⚠ 缺圖")
+                else:
+                    _crop = crop_bbox(_im, *_r["bbox"], pad=0.1)
+                    _cw, _ch = _crop.size
+                    _w = max(1, int(_cw * _th / max(1, _ch)))
+                    st.image(_crop.resize((_w, int(_th))))
+                st.markdown(
+                    f"<div style='text-align:center;font-size:0.8em;line-height:1.4'>"
+                    f"<b>{(_r.get('label') or '?')}｜{Path(_r['image_path']).name}</b><br>"
+                    f"<span style='color:#555'>{_r.get('reason', '')}</span><br>"
+                    f"異常 {float(_r.get('score', 0.0)):.2f}</div>", unsafe_allow_html=True)
+    if len(recs) > _limit:
+        st.button(f"載入更多(+60,共 {len(recs)})", key="anomaly_batch_more",
+                  use_container_width=True, on_click=_anomaly_batch_load_more, args=(len(recs),))
+    _cart_recs = [{**r, "path": r["image_path"]} for r in recs]   # 注入 path 給既有購物車(以 path 去重)
+    st.button(f"🛒 把佇列 {len(recs)} 個加入購物車(送標註)", key="anomaly_batch_cart",
+              use_container_width=True, on_click=_anomaly_add_to_cart,
+              args=(_cart_recs, list(range(len(_cart_recs)))))
+
+
+def _anomaly_batch_load_more(total: int) -> None:
+    st.session_state["anomaly_batch_limit"] = min(
+        int(st.session_state.get("anomaly_batch_limit", 60)) + 60, int(total))
+
+
+def _anomaly_batch_section(model: dict, target_folders: list) -> None:
+    """② 內的「大資料分批掃描」區塊:目標選單 + K + 掃描/續跑 + 標註佇列(不出散點)。"""
+    st.divider()
+    st.markdown("**⚡ 大資料分批掃描**(物件很多時用這條:可續跑、只給 Top-K 佇列不卡)")
+    has_head = bool(model.get("head"))
+    _OBJ = {"novelty": "抓沒看過的異常", "balanced": "三訊號均衡(需分類頭)",
+            "confusion": "模型最拿不準(需分類頭)", "pure": "純 novelty"}
+    obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
+                               key="anomaly_batch_objective", default="novelty") or "novelty"
+    _needs_head = obj in ("balanced", "confusion")
+    if _needs_head and not has_head:
+        st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常 / 純 novelty』,"
+                   "或到①用**瑕疵類別**標籤(每類達 N_min)建含 head 的模型。")
+    k = st.slider("Top-K(挑幾個送標註)", 10, 500, 100, 10, key="anomaly_batch_k")
+    _disabled = (not target_folders) or (_needs_head and not has_head)
+    _b1, _b2 = st.columns(2)
+    _b1.button("▶ 大資料分批掃描", key="anomaly_batch_scan_btn", type="primary",
+               use_container_width=True, disabled=_disabled,
+               on_click=_anomaly_batch_run, args=(obj, int(k), True))
+    _b2.button("▶ 繼續上次", key="anomaly_batch_resume_btn", use_container_width=True,
+               disabled=_disabled, on_click=_anomaly_batch_run, args=(obj, int(k), True))
+    if st.session_state.get("anomaly_batch_err"):
+        st.error(st.session_state["anomaly_batch_err"])
+    if st.session_state.get("anomaly_batch_autosaved"):
+        st.caption(f"⚡ 已自動存模型至 `{st.session_state['anomaly_batch_autosaved']}` 後開始掃描"
+                   "(al_batch 讀磁碟凍結模型)。")
+    res = st.session_state.get("anomaly_batch_result")
+    if res:
+        _anomaly_batch_render_queue(res)
+
+
 def _anomaly_tab_apply() -> None:
     """② 套用偵測:選異常目標資料夾 → 用①鎖定的模型 run_pipeline → 結果概覽 + 散點 + 排序看圖 + 購物車匯出。"""
     st.markdown("#### ② 套用偵測")
@@ -1767,6 +1908,8 @@ def _anomaly_tab_apply() -> None:
               on_click=_anomaly_apply_model)
     if st.session_state.get("_anomaly_apply_err"):
         st.error(st.session_state["_anomaly_apply_err"])
+
+    _anomaly_batch_section(model, target_folders)   # M9:大資料分批掃描(標註佇列,scale-safe)
 
     result = st.session_state.get("anomaly_apply_result")
     if not result:
