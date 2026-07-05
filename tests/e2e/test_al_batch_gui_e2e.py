@@ -22,8 +22,8 @@ from __future__ import annotations
 import pytest
 from playwright.sync_api import expect
 
-from ._anomaly_wizard import (TAB_APPLY, build_model, click_tab, enter_anomaly,
-                              set_model_dir)
+from ._anomaly_wizard import (TAB_APPLY, apply_model, build_model, click_tab,
+                              enter_anomaly, set_model_dir)
 from .conftest import _add_folder, wait_idle
 
 pytestmark = pytest.mark.e2e
@@ -227,6 +227,50 @@ def test_g4_resume(app_server, browser, yolo_ds, tmp_path):
         resume.click()
         _wait_scan_done(page)
         _assert_queue_and_no_scatter(page)
+        expect(page.locator('[data-testid="stException"]')).to_have_count(0)
+    finally:
+        ctx.close()
+
+
+# ── M12b AC-BSIM:M9 分批「找相似」(從②結果挑參考 → 相似佇列)─────────────────
+def test_g8_similar_objective_batch(app_server, browser, yolo_defect_at_nmin, tmp_path):
+    """M9 分批掃描選「🔎 找相似」→ 用②套用結果的某物件當參考 → 掃出標註佇列,
+    reason 含「相似度」(=similar 引擎路徑確實跑,參考向量流通),無 ValueError/例外。"""
+    ds = yolo_defect_at_nmin
+    ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+    page = ctx.new_page()
+    try:
+        enter_anomaly(page, app_server)
+        build_model(page, ds["root"], semantic_text="物件類別")   # 找相似不需 head
+        set_model_dir(page, tmp_path / "mdl_sim9")
+        page.locator('.st-key-anomaly_save_model_btn button').click()
+        wait_idle(page)
+        apply_model(page, ds["root"])   # ② 產生 obj_emb 供參考
+
+        click_tab(page, TAB_APPLY)
+        page.locator('.st-key-anomaly_batch_objective').get_by_text(
+            "找相似", exact=False).first.click()
+        wait_idle(page)
+        click_tab(page, TAB_APPLY)
+        ref = page.locator('.st-key-anomaly_batch_ref_idx input').first
+        ref.wait_for(state="visible", timeout=30000)
+        ref.fill("0")
+        ref.press("Enter")
+        wait_idle(page)
+        click_tab(page, TAB_APPLY)
+        btn = page.locator('.st-key-anomaly_batch_scan_btn button')
+        btn.wait_for(state="visible", timeout=30000)
+        page.wait_for_function(
+            """() => { const b=document.querySelector('.st-key-anomaly_batch_scan_btn button');
+                       return b && !b.disabled; }""", timeout=30000)
+        btn.click()
+        _wait_scan_done(page)
+        queue = page.locator('.st-key-anomaly_batch_queue')
+        expect(queue.locator('[data-testid="stImage"]').first).to_be_visible(timeout=30000)
+        assert "相似" in queue.inner_text(), \
+            f"similar 佇列理由應含『相似度』:{queue.inner_text()[:200]}"
+        main = page.locator('[data-testid="stMain"]').inner_text()
+        assert "分批掃描失敗" not in main, f"similar 分批不應失敗:{main[:400]}"
         expect(page.locator('[data-testid="stException"]')).to_have_count(0)
     finally:
         ctx.close()

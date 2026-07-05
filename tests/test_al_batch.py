@@ -459,3 +459,68 @@ def test_derived_no_forbidden_global_ops_in_batch(tmp_path):
     assert "run_pipeline" not in called, "禁止呼叫 run_pipeline(每批會跑全域 HDBSCAN/門檻,違反 C8)"
     assert "cluster_objects" not in called, "禁止在批次流程做全域分群(C8);多樣性只用 head 預測類別"
     assert not loo_true, "禁止 candidates_in_reference=True(全域 leave-one-out,非批次可合併)"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# M12b / A3:objective="similar"(找長得像參考物件的)—— 復用注入式 embed_fn
+#   ref_vector=_E2 → X 群(blue=0→obj_emb E2)cosine=1、Y 群(blue=255→E3)cosine=0
+# ══════════════════════════════════════════════════════════════════════
+
+def test_ac_sim1_similar_ranks_by_reference(tmp_path):
+    # AC-SIM1:ref=E2 → topk 全為 X 群、priority 降冪、reason 含「相似度」
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 5 * i, blue=0) for i in range(6)]
+    ys = [_img(ds, f"y_{i:02d}.png", red=10 + 5 * i, blue=255) for i in range(6)]
+    md = tmp_path / "model"; _make_model(md)
+    r = _run(image_paths=xs + ys, model_dir=md, checkpoint_dir=tmp_path / "ck",
+             objective="similar", ref_vector=_E2, k=6, batch_size=40, dataset_dirs=(ds,))
+    assert r["done"] and len(r["topk_records"]) == 6
+    assert all("x_" in Path(rec["image_path"]).name for rec in r["topk_records"]), \
+        f"ref=E2(X群) → topk 應全為 X 群:{[Path(x['image_path']).name for x in r['topk_records']]}"
+    pris = [rec["priority"] for rec in r["topk_records"]]
+    assert pris == sorted(pris, reverse=True), "priority 應降冪(最像在前)"
+    assert all("相似度" in rec["reason"] for rec in r["topk_records"])
+
+
+def test_ac_sim2_similar_requires_ref_vector(tmp_path):
+    # AC-SIM2:objective=similar 但缺 ref_vector → ValueError(含 ref_vector)
+    ds = tmp_path / "ds"
+    paths = [_img(ds, f"x_{i}.png", red=10 + i, blue=0) for i in range(3)]
+    md = tmp_path / "model"; _make_model(md)
+    with pytest.raises(ValueError, match="ref_vector"):
+        _run(image_paths=paths, model_dir=md, checkpoint_dir=tmp_path / "ck",
+             objective="similar", k=3, dataset_dirs=(ds,))
+
+
+def test_ac_sim3_change_ref_is_new_run(tmp_path):
+    # AC-SIM3:換參考=另一 run(error 拒續跑;restart 重算 topk 翻群)
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 5 * i, blue=0) for i in range(4)]
+    ys = [_img(ds, f"y_{i:02d}.png", red=10 + 5 * i, blue=255) for i in range(4)]
+    md = tmp_path / "model"; _make_model(md); ck = tmp_path / "ck"
+    r1 = _run(image_paths=xs + ys, model_dir=md, checkpoint_dir=ck,
+              objective="similar", ref_vector=_E2, k=4, dataset_dirs=(ds,))
+    assert all("x_" in Path(rec["image_path"]).name for rec in r1["topk_records"])
+    with pytest.raises(ValueError):        # 換 ref=E3、同 ck、error → 身分不符
+        _run(image_paths=xs + ys, model_dir=md, checkpoint_dir=ck,
+             objective="similar", ref_vector=_E3, k=4, dataset_dirs=(ds,),
+             on_identity_mismatch="error")
+    r2 = _run(image_paths=xs + ys, model_dir=md, checkpoint_dir=ck,   # restart → 重算翻 Y
+              objective="similar", ref_vector=_E3, k=4, dataset_dirs=(ds,),
+              on_identity_mismatch="restart")
+    assert all("y_" in Path(rec["image_path"]).name for rec in r2["topk_records"]), \
+        f"換 ref=E3 重算後 topk 應翻成 Y 群:{[Path(y['image_path']).name for y in r2['topk_records']]}"
+
+
+def test_ac_sim4_similar_batched_equals_single(tmp_path):
+    # AC-SIM4(C8):similar 分批(4)==一次跑完(40)topk 逐一相同
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 5 * i, blue=0) for i in range(6)]
+    ys = [_img(ds, f"y_{i:02d}.png", red=10 + 5 * i, blue=255) for i in range(6)]
+    md = tmp_path / "model"; _make_model(md)
+    r_split = _run(image_paths=xs + ys, model_dir=md, checkpoint_dir=tmp_path / "cka",
+                   objective="similar", ref_vector=_E2, k=8, batch_size=4, dataset_dirs=(ds,))
+    r_whole = _run(image_paths=xs + ys, model_dir=md, checkpoint_dir=tmp_path / "ckb",
+                   objective="similar", ref_vector=_E2, k=8, batch_size=40, dataset_dirs=(ds,))
+    assert r_split["done"] and r_whole["done"]
+    assert r_split["topk"] == r_whole["topk"], "similar 分批與一次跑完 Top-K 必須逐一相同"

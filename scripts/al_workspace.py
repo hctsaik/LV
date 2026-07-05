@@ -21,6 +21,7 @@ _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
 _DEFAULTS = {
     "objective": "novelty", "k": 100, "score_mode": "patch",
     "target_res": 224, "batch_size": 1000,
+    "reference_vector_file": None,          # similar:workspace 內參考向量 .npy 相對路徑(否則 None)
     "filters": {"min_score": None, "classes": []},
 }
 

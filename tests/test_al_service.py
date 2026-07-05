@@ -208,3 +208,47 @@ def test_ac8_cli_exit_codes(tmp_path):
     # run 的完整行為由 AC1–AC7(注入)涵蓋。
     rc_bad = svc.main(["run", "--profile", str(tmp_path / "no_such_ws")])
     assert rc_bad != 0, "無 profile 的 run 應回非0"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# M12b / A3:離線監看服務 similar(profile 存參考向量 + run_once 依相似排序)
+# ══════════════════════════════════════════════════════════════════════
+
+def _img_rb(folder: Path, name: str, red: int, blue: int):
+    folder.mkdir(parents=True, exist_ok=True)
+    p = folder / name
+    Image.new("RGB", (32, 32), (int(red), 120, int(blue))).save(p)
+    return p
+
+
+def _class_embed():
+    """藍通道 → obj_emb 落 E2(blue=0)或 E3(blue=255)。"""
+    def emb(crop):
+        arr = np.asarray(crop.convert("RGB"), dtype=np.float32)
+        b = float(arr[..., 2].mean()) / 255.0
+        return _unit((1.0 - b) * _e(2) + b * _e(3))
+    return emb
+
+
+def test_ac_svc_sim_similar_profile_and_ranking(tmp_path):
+    # AC-SVC-SIM:init 存 reference.npy + profile.reference_vector_file;run_once similar → 佇列以參考同群為主
+    svc = _svc()
+    import al_workspace as ws
+    src = tmp_path / "src"
+    for i in range(3):
+        _img_rb(src, f"x_{i}.jpg", red=100, blue=0)     # X 群(E2)
+    for i in range(3):
+        _img_rb(src, f"y_{i}.jpg", red=100, blue=255)   # Y 群(E3)
+    mdl = tmp_path / "mdl"; _make_model(mdl)
+    wsd = tmp_path / "wsd"
+    svc.init_workspace(wsd, name="sim", watch_folders=[str(src)], model_dir=str(mdl),
+                       k=3, objective="similar", reference_vector=_e(2))
+    prof = ws.load_profile(wsd)
+    assert prof.get("reference_vector_file") == "reference.npy", prof
+    assert (wsd / "reference.npy").exists()
+    res = svc.run_once(wsd, extractor=_graded_extractor(), embed_fn=_class_embed(), now=1000.0)
+    assert res["status"] == "ok", res
+    q = ws.read_queue(wsd)
+    assert len(q) == 3
+    xs = sum(1 for it in q if "x_" in Path(it["image_path"]).name)
+    assert xs >= 2, f"參考=X 群 → 佇列應以 X 為主;實際 {[Path(it['image_path']).name for it in q]}"

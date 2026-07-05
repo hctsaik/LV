@@ -18,10 +18,22 @@ def _run_id(now: float) -> str:
 
 
 def init_workspace(workspace_dir, *, name, watch_folders, model_dir, **over) -> dict:
+    import os
+
+    import numpy as np
+
     from al_workspace import assert_safe_workspace, default_profile, save_profile
     assert_safe_workspace(workspace_dir, watch_folders)
+    ref = over.pop("reference_vector", None)     # similar:存成 reference.npy,profile 只留檔名(可攜)
     prof = default_profile(name=name, watch_folders=watch_folders,
                            model_dir=model_dir, **over)
+    if ref is not None:
+        wsd = Path(workspace_dir)
+        wsd.mkdir(parents=True, exist_ok=True)
+        tmp = wsd / "_tmp_reference.npy"
+        np.save(tmp, np.asarray(ref, dtype=np.float32).ravel())
+        os.replace(tmp, wsd / "reference.npy")   # atomic
+        prof["reference_vector_file"] = "reference.npy"
     save_profile(workspace_dir, prof)
     return prof
 
@@ -69,6 +81,13 @@ def run_once(workspace_dir, *, embed_fn=None, extractor=None,
         class_names = None
         for r in watch_folders:
             class_names = class_names or classes_for(r)
+        ref_vec = None
+        if profile["objective"] == "similar":       # similar:載入可攜參考向量傳給引擎
+            import numpy as np
+            rvf = profile.get("reference_vector_file")
+            if not rvf or not (wsd / rvf).exists():
+                raise ValueError("objective 'similar' 需要參考向量,但 workspace 缺 reference 檔")
+            ref_vec = np.load(wsd / rvf)
         result = al_batch.run_batched(
             all_paths, model_dir=profile["model_dir"],
             checkpoint_dir=wsd / "al_batch_ck",
@@ -76,7 +95,8 @@ def run_once(workspace_dir, *, embed_fn=None, extractor=None,
             batch_size=int(profile["batch_size"]), object_source=object_source,
             class_names=class_names, dataset_dirs=watch_folders,
             embed_fn=embed_fn, extractor=extractor, progress=progress,
-            resume=True, on_identity_mismatch="restart", max_batches=max_batches)
+            resume=True, on_identity_mismatch="restart", max_batches=max_batches,
+            ref_vector=ref_vec)
 
         # 6. 正規化 al_batch item_id → 佇列契約的 id(設計 §2.4),再合併標註 → 取前 k 個未標的
         records = [{"id": r["item_id"],

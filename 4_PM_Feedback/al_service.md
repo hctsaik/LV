@@ -24,3 +24,8 @@
 - `python verify/gate.py al_service` 印 `GREEN`(收集>0、退出碼 0、無 fail/error、3_/4_ 契約未竄改)。
 - 真實行為由對真實檔案系統(工作區、原子寫、增量、鎖)+ 對 08/09 真實整合(al_batch 分批評分、al_workspace 持久化)的斷言涵蓋;無瀏覽器 E2E。
 - M10 完整完成另需 **M10-GUI 接線**(④ 監看設定/匯出/狀態/立即掃描 + Step③ 佇列消費)通過真實 Playwright E2E。
+
+## 增補(M12b / A3):similar profile
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-SVC-SIM | init 存 reference.npy + profile.reference_vector_file;run_once similar → 佇列以參考同群為主 | `test_ac_svc_sim_similar_profile_and_ranking` |

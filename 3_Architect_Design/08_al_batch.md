@@ -273,3 +273,39 @@ progress({"images_processed": int, "images_total": int, "objects_scored": int,
 - **契約鎖點**:`item_id` 內容組成(AC7)、分批==一次跑(AC1)、暫定=已處理真 Top-K(AC3/AC13)、
   身分漂移拒絕(AC5)是防 silent-wrong 的核心,務必保留。
 - 開跑前放行 PG 記得 `python verify/gate.py --snapshot` 重建 baseline。
+
+---
+
+## 增補(M12b / A3):`objective="similar"`(找長得像參考物件的)
+
+> 加法擴充:新 objective + 一個可選參數。**既有 novelty/uncertain/confusion 行為與 17 條 AC 不得改變**(回歸鐵則)。
+> 純相似核心復用模組 12 `similarity`(cosine + _minmax)。
+
+### 契約變更
+- `run_batched(..., ref_vector=None)` 新增可選參數(`np.ndarray` 形狀 `(D,)`,= 參考物件的物件級 embedding)。
+- objective 白名單加 `"similar"`。`objective="similar"` 而 `ref_vector is None` → `ValueError`(訊息含 `ref_vector`)。
+- **run 身分**:`_resume_identity` 納入 `ref_key`(similar 時 = `sha256(ref_vector.astype(float32).tobytes())[:16]`,
+  否則 `""`)→ **換參考向量 = 另一個 run**(舊 checkpoint 不沿用;身分不符行為同既有 AC5)。
+- **per-item(C8-safe)**:similar 時每物件算 `cosine(obj_emb_i, ref_vector)`(物件級 embedding,
+  **不論 score_mode 都經 `_object_embeddings` 取 obj_emb**);shard 多存一欄 `ref_sim`(float32)。
+- **merge(唯一全域運算處)**:similar 的優先分數 = `similarity._minmax(concat(ref_sim))`(降冪=最像);
+  `reason` = `f"和參考物件相似度 {ref_sim_i:.2f}"`。無 head → 無 diversity 分群(`diversity_applied=False`)。
+- similar 仍計算並存 `anomaly_score`(供顯示),但**不參與**優先排序。
+
+### Acceptance Criteria(釘死;給 `/pm` 加進 `tests/test_al_batch.py`)
+> 用既有注入式 `embed_fn=_class_embed`(藍通道→ obj_emb 落 E2(X)或 E3(Y));`ref_vector=_E2`
+> → X 群 cosine=1.0、Y 群 cosine=0.0(E2⊥E3)。影像命名可辨群(x_*/y_*)以驗 topk 來源。
+
+- **AC-SIM1(相似排序 + reason)**:6 張 X(blue=0)+ 6 張 Y(blue=255)、紅任意;`objective="similar"`,
+  `ref_vector=_E2`,`k=6` → `topk_records` **6 筆全為 X 群**(image_path 含 `x_`),priority 降冪,
+  每筆 `reason` 含「相似度」。
+- **AC-SIM2(缺 ref_vector)**:`objective="similar"`,`ref_vector=None` → `ValueError`(訊息含 `ref_vector`)。
+- **AC-SIM3(換參考 = 另一 run,rescore)**:同一 checkpoint 先 `ref_vector=_E2`(topk=X),再以
+  `ref_vector=_E3`：`on_identity_mismatch="error"` → `ValueError`(身分不符);改 `"restart"` → 重算,
+  topk 翻成 **Y 群**(排序真的跟參考走)。
+- **AC-SIM4(分批==一次跑,C8)**:similar 下 `batch_size=4`(分批)與 `batch_size=40`(一次)→ `topk` 逐一相同。
+- **AC-SIM5(既有無回歸)**:novelty/uncertain/confusion 的既有 17 測全綠(shard 無 `ref_sim` 欄的路徑不變)。
+
+### 邊界
+- `ref_vector` 維度與 obj_emb 不符 → 由 `similarity.cosine_similarity_to_ref` 拋 `ValueError`。
+- similar 需物件級 embedding;若某型態拿不到 obj_emb → 明確報錯(不硬跑)。

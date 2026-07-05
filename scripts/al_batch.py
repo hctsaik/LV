@@ -48,7 +48,7 @@ def _item_id(rec, img_key: str) -> str:
 
 
 def _resume_identity(sorted_paths, object_source, class_names, batch_size,
-                     objective, model_version) -> str:
+                     objective, model_version, ref_key="") -> str:
     sig = json.dumps({
         "paths": [str(p) for p in sorted_paths],
         "object_source": object_source,
@@ -56,6 +56,7 @@ def _resume_identity(sorted_paths, object_source, class_names, batch_size,
         "batch_size": int(batch_size),
         "objective": objective,
         "model_version": model_version,
+        "ref_key": ref_key,          # similar:換參考向量 = 另一 run(否則 "")
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:16]
 
@@ -119,6 +120,8 @@ def _priority(objective, score, proba):
 
 
 def _reason(objective, comps, i) -> str:
+    if objective == "similar":
+        return f"和參考物件相似度 {float(comps['ref_sim'][i]):.2f}"
     if objective == "novelty":
         return f"很不像正常樣本(異常訊號 {float(comps['novelty'][i]):.2f})"
     cands = [("很不像正常樣本", float(comps["novelty"][i])),
@@ -128,7 +131,8 @@ def _reason(objective, comps, i) -> str:
 
 
 # ── 批次評分(per-item,直接組子函式,不呼叫 run_pipeline)──────────────────
-def _score_batch(meta, fm, cache_dir, extractor, embed_fn, obj_cache):
+def _score_batch(meta, fm, cache_dir, extractor, embed_fn, obj_cache,
+                 objective="novelty", ref_vector=None):
     from anomaly_tool import _object_embeddings
     n = len(meta)
     if fm["score_mode"] == "patch":
@@ -151,7 +155,12 @@ def _score_batch(meta, fm, cache_dir, extractor, embed_fn, obj_cache):
         from dino_head import predict_head
         obj_emb = _object_embeddings(meta, fm["model"], embed_fn, cache_path=obj_cache)
         proba = np.asarray(predict_head(fm["head"], obj_emb)[2], dtype=np.float32)
-    return scores, proba
+    ref_sim = None
+    if objective == "similar":                       # per-item cosine(C8-safe);物件級 embedding
+        from similarity import cosine_similarity_to_ref
+        oe = _object_embeddings(meta, fm["model"], embed_fn, cache_path=obj_cache)
+        ref_sim = cosine_similarity_to_ref(oe, ref_vector).astype(np.float32)
+    return scores, proba, ref_sim
 
 
 # ── checkpoint 讀寫 ─────────────────────────────────────────────────────
@@ -189,6 +198,8 @@ def _merge_and_topk(ck, objective, k):
                               "bbox", "obj_index", "label")}
     probas = []
     has_proba = True
+    ref_sims = []
+    has_ref_sim = True
     for bi in state.get("committed_batches", []):
         f = ck / f"shard_{bi:06d}.npz"
         if not f.exists():
@@ -202,6 +213,10 @@ def _merge_and_topk(ck, objective, k):
             probas.append(d["head_proba"])
         else:
             has_proba = False
+        if "ref_sim" in d.files:
+            ref_sims.append(d["ref_sim"])
+        else:
+            has_ref_sim = False
 
     if not cols["item_id"]:
         return {"topk": [], "topk_records": [], "diversity_applied": False,
@@ -214,6 +229,7 @@ def _merge_and_topk(ck, objective, k):
     oidx = np.concatenate(cols["obj_index"])
     label = np.concatenate(cols["label"])
     proba = np.concatenate(probas) if (has_proba and probas) else None
+    ref_sim = np.concatenate(ref_sims) if (has_ref_sim and ref_sims) else None
     objects_scored = int(len(item_id))
 
     # canonical:依 item_id 排序 → tie-break 變成 item_id 的確定函式(跨前端/續跑一致)
@@ -222,10 +238,19 @@ def _merge_and_topk(ck, objective, k):
     bbox, oidx, label = bbox[order], oidx[order], label[order]
     if proba is not None:
         proba = proba[order]
+    if ref_sim is not None:
+        ref_sim = ref_sim[order]
 
-    pri, comps = _priority(objective, score, proba)
+    if objective == "similar":
+        from similarity import _minmax as _sim_minmax
+        pri = (np.asarray(_sim_minmax(ref_sim), dtype=np.float32) if ref_sim is not None
+               else np.zeros(len(item_id), dtype=np.float32))
+        comps = {"ref_sim": ref_sim if ref_sim is not None
+                 else np.zeros(len(item_id), dtype=np.float32)}
+    else:
+        pri, comps = _priority(objective, score, proba)
 
-    if proba is not None:
+    if proba is not None and objective != "similar":   # similar 要純最像,不做多樣性分群
         cluster_labels = np.argmax(proba, axis=1)
         diversity_applied = True
     else:
@@ -255,7 +280,8 @@ def _images_processed(sorted_paths, committed, batch_size):
 def run_batched(image_paths, *, model_dir, checkpoint_dir, objective="novelty",
                 k=100, batch_size=1000, object_source="yolo", class_names=None,
                 dataset_dirs=(), embed_fn=None, extractor=None, progress=None,
-                resume=True, on_identity_mismatch="error", max_batches=None) -> dict:
+                resume=True, on_identity_mismatch="error", max_batches=None,
+                ref_vector=None) -> dict:
     from anomaly_bank_store import _atomic_npz, _atomic_text, assert_safe_bank_dir
     from interaction import discover_whole_images, discover_yolo_objects
     from safe_io import partition_readable
@@ -264,8 +290,11 @@ def run_batched(image_paths, *, model_dir, checkpoint_dir, objective="novelty",
         raise ValueError("checkpoint_dir 必填(不得 None,否則無法續跑/快取)")
     if object_source not in ("yolo", "whole_image"):
         raise ValueError("object_source must be 'yolo' or 'whole_image'")
-    if objective not in ("novelty", "uncertain", "confusion"):
-        raise ValueError("objective must be 'novelty' / 'uncertain' / 'confusion'")
+    if objective not in ("novelty", "uncertain", "confusion", "similar"):
+        raise ValueError("objective must be 'novelty' / 'uncertain' / 'confusion' / 'similar'")
+    if objective == "similar" and ref_vector is None:
+        raise ValueError("objective 'similar' 需要 ref_vector(參考物件的 embedding 向量)")
+    ref_arr = None if ref_vector is None else np.asarray(ref_vector, dtype=np.float32).ravel()
 
     ck = Path(checkpoint_dir)
     # C6:先擋不安全目錄(落在來源資料夾內等),再建目錄
@@ -279,8 +308,10 @@ def run_batched(image_paths, *, model_dir, checkpoint_dir, objective="novelty",
 
     sorted_paths = sorted((Path(p) for p in image_paths), key=lambda p: str(p))
     total_images = len(sorted_paths)
+    ref_key = (hashlib.sha256(ref_arr.tobytes()).hexdigest()[:16]
+               if (objective == "similar" and ref_arr is not None) else "")
     ident = _resume_identity(sorted_paths, object_source, class_names,
-                             batch_size, objective, fm["model_version"])
+                             batch_size, objective, fm["model_version"], ref_key)
 
     cache_dir = ck / f"cache_{fm['model']}_{fm['target_res']}"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -324,7 +355,8 @@ def run_batched(image_paths, *, model_dir, checkpoint_dir, objective="novelty",
             _atomic_npz(shard, item_id=np.array([], dtype="<U1"),
                         anomaly_score=np.zeros(0, dtype=np.float32))
         else:
-            scores, proba = _score_batch(meta, fm, cache_dir, extractor, embed_fn, obj_cache)
+            scores, proba, ref_sim = _score_batch(meta, fm, cache_dir, extractor, embed_fn,
+                                                  obj_cache, objective, ref_arr)
             ids = np.array([_item_id(m, _img_key(m["image_path"], key_cache)) for m in meta])
             arrs = {
                 "item_id": ids,
@@ -336,6 +368,8 @@ def run_batched(image_paths, *, model_dir, checkpoint_dir, objective="novelty",
             }
             if proba is not None:
                 arrs["head_proba"] = proba.astype(np.float32)
+            if ref_sim is not None:
+                arrs["ref_sim"] = ref_sim.astype(np.float32)
             _atomic_npz(shard, **arrs)
 
         committed.add(bi)

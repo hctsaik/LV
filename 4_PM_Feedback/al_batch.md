@@ -49,3 +49,12 @@ M9-GUI 接線(三模式顯示 / 暫定 Top-K / 續跑)另以 `@pytest.mark.e2e` 
 - **單元/整合綠**:`python verify/gate.py al_batch` 印 `GREEN`(收集>0、退出碼 0、無 fail/error、`3_/4_` 契約未竄改)。
 - al_batch **無 GUI → 無瀏覽器 E2E**;其「真實行為」由 AC1/AC2/AC3/AC8/AC11 等對真實檔案系統(tmp 目錄、原子寫、續跑)的整合斷言涵蓋。
 - M9 里程碑完成另需 **M9-GUI 接線**(消費 al_batch 的三模式顯示/暫定 Top-K/續跑)通過真實 Playwright E2E——那是 GUI 接線的 done 要件,不在本模組。
+
+## 增補(M12b / A3):objective="similar"
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-SIM1 | ref=E2 → topk 全為 X 群、priority 降冪、reason 含「相似度」 | `test_ac_sim1_similar_ranks_by_reference` |
+| AC-SIM2 | similar 缺 ref_vector → ValueError(含 ref_vector) | `test_ac_sim2_similar_requires_ref_vector` |
+| AC-SIM3 | 換參考=另一 run(error 拒;restart 重算翻群) | `test_ac_sim3_change_ref_is_new_run` |
+| AC-SIM4 | similar 分批==一次跑(C8) | `test_ac_sim4_similar_batched_equals_single` |
+| AC-SIM5 | 既有 17 測無回歸(novelty/uncertain/confusion 不變) | 既有全測保持綠(gate 判) |

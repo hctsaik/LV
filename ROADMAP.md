@@ -16,7 +16,9 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
-- **M12 — 找相似選樣目標(長得像指定物件)** — 🔨 **開發中**(2026-07-05 使用者拍板「A1+A3」)—
+- **M12 — 找相似選樣目標(長得像指定物件)** — ✅ **完成**(2026-07-05;A1+A3 全綠、既有無回歸)—
+  A1:`gate.py similarity` 8 + ③ E2E 1/1;A3:`gate.py al_batch` **21**(17 既有+4 similar)、`al_service` **9**
+  (8+svc_sim)、`al_workspace` 14、M9 similar E2E `test_g8` 綠、M9/M10 GUI E2E 6/6+3/3 無回歸。—
   PRD [2_PO_PRD/similar_objective_prd.md](2_PO_PRD/similar_objective_prd.md)。挑一顆參考物件 → 整批依 cosine
   相似度降冪排到佇列前面。範圍:**Must** A1(③ 互動:從②結果挑參考→排序)+ A3(al_batch 加 objective=similar
   +ref_vector;M9 選單+參考挑選;M10 profile reference_vector_file)+ 共用純函式 `similarity_priority`;
@@ -350,3 +352,13 @@
   (排除參考自身)+ 加購物車;無 obj_emb / <2 物件友善降級。**真實 E2E `test_similar_gui_e2e.py` 1/1 綠**
   (AC-S1 相似佇列同群佔多數、AC-S2 換到另一群當參考 → 佇列多數翻群 = 排序真跟參考走,真實 DINOv2 非 element 存在)。
   A1 段 commit 後接 A3(al_batch objective=similar + M9/M10)。
+- (2026-07-05) **M12b(A3)完成**:**08 `al_batch` 加法擴充**(設計增補於 [08_al_batch.md](3_Architect_Design/08_al_batch.md)):
+  `run_batched(..., ref_vector=)` + objective=`similar`;per-item cosine 存 shard `ref_sim` 欄(C8-safe)、
+  merge 端 `_minmax(ref_sim)` 排序、reason「相似度」、run 身分納入 `sha256(ref_vector)`(換參考=另一 run)。
+  復用模組 12。`gate.py al_batch` **21 綠**(17 既有無回歸 + AC-SIM1~4:相似排序/缺 ref 拒/換參考重算翻群/分批==一次跑)。
+  **09/10 服務**:profile 加 `reference_vector_file`;`init_workspace(reference_vector=)` 存 `reference.npy`(atomic)+
+  profile 欄位;`run_once` similar 載入傳引擎(`gate.py al_service` **9 綠**,AC-SVC-SIM)。**M9/M10 GUI**(設計
+  [M12b_gui_wiring.md](3_Architect_Design/M12b_gui_wiring.md)):批次/監看選單加「🔎 找相似」+ 參考物件索引(取自②結果 obj_emb)、
+  無②結果友善降級;`_AL_ENGINE_OBJ` 加 similar;批次每個參考各自 checkpoint。**M9 similar 真實 E2E `test_g8` 綠**
+  (reason 含相似度、無例外),M9/M10 既有 GUI E2E 6/6+3/3 無回歸。M10 similar 核心以 al_service 單元 AC-SVC-SIM 覆蓋。
+  **M12(找相似 A1+A3)收斂。**

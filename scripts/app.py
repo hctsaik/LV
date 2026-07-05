@@ -1745,7 +1745,7 @@ def _anomaly_tab_build() -> None:
 # "uncertain"=novelty+boundary+entropy(=GUI「三訊號均衡/balanced」);"pure" 舊鍵相容映到 novelty。
 # (Task0:GUI 曾把 balanced/pure 原樣傳 run_batched → 引擎只收 novelty/uncertain/confusion → ValueError。)
 _AL_ENGINE_OBJ = {"novelty": "novelty", "pure": "novelty",
-                  "balanced": "uncertain", "confusion": "confusion"}
+                  "balanced": "uncertain", "confusion": "confusion", "similar": "similar"}
 
 
 def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
@@ -1758,6 +1758,16 @@ def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
     from object_eval import classes_for, dataset_cache_dir, list_images
     st.session_state.pop("anomaly_batch_err", None)
     objective = _AL_ENGINE_OBJ.get(objective, objective)   # GUI 詞彙 → 引擎 objective(Task0)
+    ref_vector = None
+    if objective == "similar":                             # M12b:參考向量取自②結果 obj_emb[ref_idx]
+        _ar = st.session_state.get("anomaly_apply_result") or {}
+        _oe = _ar.get("obj_emb")
+        if _oe is None:
+            st.session_state["anomaly_batch_err"] = "「找相似」需先②套用偵測產生參考物件。"
+            return
+        _oe = np.asarray(_oe, dtype=float)
+        _ri = int(st.session_state.get("anomaly_batch_ref_idx", 0))
+        ref_vector = _oe[max(0, min(_ri, len(_oe) - 1))]
     model = st.session_state.get("anomaly_model")
     folders = list(st.session_state.get("anomaly_target_folder") or [])
     if not model or not folders:
@@ -1786,7 +1796,11 @@ def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
         if not image_paths:
             st.session_state["anomaly_batch_err"] = "目標資料夾內找不到影像。"
             return
-        ck = dataset_cache_dir(roots[0], f"al_batch_{objective}")
+        _ck_name = f"al_batch_{objective}"
+        if objective == "similar":                         # 每個參考向量各自 checkpoint(可獨立續跑)
+            import hashlib as _hl
+            _ck_name += "_" + _hl.sha256(ref_vector.astype("float32").tobytes()).hexdigest()[:8]
+        ck = dataset_cache_dir(roots[0], _ck_name)
         _bar = st.progress(0.0, text=f"分批掃描…({len(image_paths)} 張圖)")
 
         def _cb(d):
@@ -1798,7 +1812,8 @@ def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
         res = al_batch.run_batched(
             image_paths, model_dir=model_dir, checkpoint_dir=ck,
             objective=objective, k=int(k), object_source=object_source,
-            class_names=class_names, dataset_dirs=roots, progress=_cb, resume=resume)
+            class_names=class_names, dataset_dirs=roots, progress=_cb, resume=resume,
+            ref_vector=ref_vector)
         _bar.empty()
         st.session_state["anomaly_batch_result"] = res
         _log_usage("anomaly_batch_scan", n=res.get("objects_scored"),
@@ -1863,17 +1878,27 @@ def _anomaly_batch_section(model: dict, target_folders: list) -> None:
     st.divider()
     st.markdown("**⚡ 大資料分批掃描**(物件很多時用這條:可續跑、只給 Top-K 佇列不卡)")
     has_head = bool(model.get("head"))
-    # 3 項誠實選單:引擎端 novelty≡pure(純 minmax),不列同義的「純 novelty」假選項(Task0)。
+    # 誠實選單:引擎端 novelty≡pure(純 minmax),不列同義的「純 novelty」假選項(Task0)。+ M12b 找相似。
     _OBJ = {"novelty": "抓沒看過的異常(novelty)", "balanced": "三訊號均衡(需分類頭)",
-            "confusion": "模型最拿不準(需分類頭)"}
+            "confusion": "模型最拿不準(需分類頭)", "similar": "🔎 找相似(長得像指定物件)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_batch_objective", default="novelty") or "novelty"
     _needs_head = obj in ("balanced", "confusion")
     if _needs_head and not has_head:
         st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常(novelty)』,"
                    "或到①用**瑕疵類別**標籤(每類達 N_min)建含 head 的模型。")
+    _sim_ok = True
+    if obj == "similar":                              # M12b:參考物件來自②套用結果
+        _ar = st.session_state.get("anomaly_apply_result") or {}
+        if _ar.get("obj_emb") is None or not _ar.get("records"):
+            st.warning("「找相似」需先按上方 **(2) 套用偵測** 產生結果,再挑一顆參考物件。")
+            _sim_ok = False
+        else:
+            st.number_input("參考物件索引(②結果裡的第幾個物件)", 0, len(_ar["records"]) - 1, 0, 1,
+                            key="anomaly_batch_ref_idx")
     k = st.slider("Top-K(挑幾個送標註)", 10, 500, 100, 10, key="anomaly_batch_k")
-    _disabled = (not target_folders) or (_needs_head and not has_head)
+    _disabled = ((not target_folders) or (_needs_head and not has_head)
+                 or (obj == "similar" and not _sim_ok))
     _b1, _b2 = st.columns(2)
     _b1.button("▶ 大資料分批掃描", key="anomaly_batch_scan_btn", type="primary",
                use_container_width=True, disabled=_disabled,
@@ -1920,9 +1945,20 @@ def _anomaly_watch_init(objective: str, k: int) -> None:
         if not model_dir:
             return
         objective = _AL_ENGINE_OBJ.get(objective, objective)   # GUI 詞彙 → 引擎 objective(Task0)
+        _init_kw = {}
+        if objective == "similar":                             # M12b:參考向量存進 workspace(可攜給服務)
+            _ar = st.session_state.get("anomaly_apply_result") or {}
+            _oe = _ar.get("obj_emb")
+            if _oe is None:
+                st.session_state["anomaly_watch_err"] = "「找相似」監看需先②套用偵測產生參考物件。"
+                return
+            _oe = np.asarray(_oe, dtype=float)
+            _ri = int(st.session_state.get("anomaly_watch_ref_idx", 0))
+            _init_kw["reference_vector"] = _oe[max(0, min(_ri, len(_oe) - 1))]
         al_service.init_workspace(ws, name=Path(target[0]).name,
                                   watch_folders=[str(t) for t in target],
-                                  model_dir=str(model_dir), objective=objective, k=int(k))
+                                  model_dir=str(model_dir), objective=objective, k=int(k),
+                                  **_init_kw)
         st.session_state["anomaly_watch_inited"] = ws
     except Exception as exc:
         st.session_state["anomaly_watch_err"] = f"初始化監看失敗:{exc}"
@@ -2021,7 +2057,7 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
                   label_visibility="collapsed",
                   help="設定/佇列/標註都存這;profile.yaml 可匯出給離線服務。")
     _OBJ = {"novelty": "抓沒看過的異常(novelty)", "balanced": "三訊號均衡(需 head)",
-            "confusion": "模型最拿不準(需 head)"}
+            "confusion": "模型最拿不準(需 head)", "similar": "🔎 找相似(長得像指定物件)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_watch_objective", default="novelty") or "novelty"
     # watch 也要 head 閘(否則 balanced/confusion 無 head → 掃描時 run_batched raise;與批次區塊一致,Task0)
@@ -2029,9 +2065,20 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
     if _watch_needs_head and not bool(model.get("head")):
         st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常(novelty)』,"
                    "或到①用**瑕疵類別**標籤(每類達 N_min)建含 head 的模型。")
+    _wsim_ok = True
+    if obj == "similar":                              # M12b:參考物件來自②套用結果,存進 profile 給服務
+        _ar = st.session_state.get("anomaly_apply_result") or {}
+        if _ar.get("obj_emb") is None or not _ar.get("records"):
+            st.warning("「找相似」監看需先按上方 **(2) 套用偵測** 產生結果,再挑一顆參考物件。")
+            _wsim_ok = False
+        else:
+            st.number_input("參考物件索引(②結果裡的第幾個物件)", 0, len(_ar["records"]) - 1, 0, 1,
+                            key="anomaly_watch_ref_idx")
     k = st.slider("Top-K(每次挑幾個)", 10, 500, 100, 10, key="anomaly_watch_k")
     ws = (st.session_state.get("anomaly_watch_ws") or "").strip()
-    _enabled = bool(target_folders and ws) and not (_watch_needs_head and not bool(model.get("head")))
+    _enabled = (bool(target_folders and ws)
+                and not (_watch_needs_head and not bool(model.get("head")))
+                and not (obj == "similar" and not _wsim_ok))
     _c1, _c2, _c3 = st.columns(3)
     _c1.button("🆕 初始化監看", key="anomaly_watch_init_btn", use_container_width=True,
                disabled=not _enabled, on_click=_anomaly_watch_init, args=(obj, int(k)))
