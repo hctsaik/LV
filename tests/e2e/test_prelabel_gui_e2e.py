@@ -65,7 +65,7 @@ def test_e1_e4_prelabel_export_readback(app_server, browser, yolo_defect_at_nmin
     try:
         enter_anomaly(page, app_server)
         build_main = build_model(page, ds["root"], semantic_text="瑕疵類別")
-        assert "含分類頭" in build_main, f"應建出含分類頭模型;實際:{build_main[:400]}"
+        assert "能分辨瑕疵種類" in build_main, f"應建出能分辨瑕疵種類模型;實際:{build_main[:400]}"
         set_model_dir(page, tmp_path / "mdl")
         page.locator('.st-key-anomaly_save_model_btn button').click()
         wait_idle(page)
@@ -129,7 +129,7 @@ def test_e5_no_head_graceful(app_server, browser, yolo_defect_at_nmin, tmp_path)
     page = ctx.new_page()
     try:
         enter_anomaly(page, app_server)
-        # 語義=物件類別 → head 不解鎖(object_semantic)→ 無分類頭
+        # 語義=物件類別 → head 不解鎖(object_semantic)→ 只做異常偵測
         build_model(page, ds["root"], semantic_text="物件類別")
         set_model_dir(page, tmp_path / "mdl_nohead")
         page.locator('.st-key-anomaly_save_model_btn button').click()
@@ -137,7 +137,7 @@ def test_e5_no_head_graceful(app_server, browser, yolo_defect_at_nmin, tmp_path)
         apply_model(page, ds["root"])
         _open_prelabel(page)
         body = page.locator('[data-testid="stMain"]').inner_text()
-        assert "無分類頭" in body, f"無 head 應友善提示『無分類頭…』;實際:{body[-600:]}"
+        assert "不會分辨瑕疵種類" in body, f"無 head 應友善提示;實際:{body[-600:]}"
         # 無匯出鈕
         assert page.locator('.st-key-anomaly_prelabel_export_btn').count() == 0, \
             "無 head 時不應出現匯出鈕"

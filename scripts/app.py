@@ -1659,19 +1659,19 @@ def _anomaly_tab_build() -> None:
         st.radio("標籤名稱(classes.txt)指的是『物件本身』還是『缺陷本身』?", ["object", "defect"],
                  key="anomaly_train_semantic",
                  format_func=lambda s: {
-                     "object": "物件類別(門 / 窗 / 螺絲…)— 名稱指「東西本身」→ 只用離群偵測找異常,不訓分類頭",
+                     "object": "物件類別(門 / 窗 / 螺絲…)— 名稱指「東西本身」→ 只找異常,不分瑕疵種類",
                      "defect": "瑕疵類別(刮傷 / 污漬 / 裂痕…)— 名稱指「缺陷本身」→ 額外解鎖:自動分辨缺陷類型",
                  }[s])
         # 每 rerun 同步寫 active_semantic(供任何硬守衛讀;與 build callback 一致)
         st.session_state["anomaly_active_semantic"] = st.session_state["anomaly_train_semantic"]
         if st.session_state["anomaly_train_semantic"] == "defect" and _hint["suggested"] == "object":
             st.warning("⚠ " + _hint["hint"] + " 確定是瑕疵類別嗎?")
-        with st.expander("⚙ 進階(N_min:每類最少樣本才納入分類頭)"):
+        with st.expander("⚙ 進階(每種瑕疵最少幾張才拿來訓練分種類)"):
             st.slider("每種瑕疵最少幾張才拿來訓練分種類(暫定 8;尚未完整驗證)", 2, 30, 8,
                       key="anomaly_n_min")
     else:
         st.session_state["anomaly_active_semantic"] = "object"
-        st.caption("整張影像模式:每張圖一個對象、只做離群偵測(無分類頭、無需 labels/)。")
+        st.caption("整張影像模式:每張圖一個對象、只做異常偵測(不分種類、不用先框標註)。")
 
     # 1c. 建模按鈕
     st.button("▶ (1) 建立模型", key="anomaly_build_btn", type="primary",
@@ -1688,7 +1688,7 @@ def _anomaly_tab_build() -> None:
     if model:
         _m = model["meta"]
         _src = "已建立" if model.get("source") == "built" else "已載入"
-        _head_txt = "含分類頭" if model.get("head") else "無分類頭"
+        _head_txt = "能分辨瑕疵種類" if model.get("head") else "只做異常偵測(不分種類)"
         _sem_txt = {"object": "物件類別", "defect": "瑕疵類別"}.get(
             model.get("label_semantic", "object"), model.get("label_semantic"))
         _osrc_txt = {"yolo": "YOLO 物件", "whole_image": "整張影像"}.get(
@@ -2237,7 +2237,7 @@ def _anomaly_prelabel_section(model, result, scores, threshold, obj_emb) -> None
     無 head → 友善提示、不出匯出鈕;patch-only 無 obj_emb → 提示不支援(不硬跑)。"""
     import prelabel
     st.divider()
-    with st.expander("🏷️ 預標(分類頭代填,人工最終確認)", expanded=False):
+    with st.expander("🏷️ 預標(模型代填瑕疵種類,人工最終確認)", expanded=False):
         head = model.get("head")
         if not head:
             st.info("這個模型**不會分辨瑕疵種類**,無法預標。請回到①,建模時**標明每個瑕疵是哪一種**"
@@ -2464,7 +2464,7 @@ def _anomaly_tab_sample() -> None:
     _sel = _sel_cache.get(_active, [])
     _active_name = dict(_modes).get(_active, _active)
     st.markdown(f"**{_active_name} — 取樣佇列(優先序,共 {len(_sel)} 個)**"
-                + ("" if head is not None else " ｜ 無分類頭 → 只用 novelty,標籤無 Unknown"))
+                + ("" if head is not None else " ｜ 只做異常偵測 → 只用異常分數排序,不分種類"))
     _gc1, _gc2 = st.columns(2)
     _cols = _gc1.slider("每列張數", 2, 6, 3, key="anomaly_q_cols")
     _th = _gc2.slider("縮圖高度(px)", 120, 400, 200, 10, key="anomaly_q_th")

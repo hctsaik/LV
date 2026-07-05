@@ -179,7 +179,7 @@ def test_g7_balanced_objective_maps_to_uncertain(app_server, browser, yolo_defec
     try:
         enter_anomaly(page, app_server)
         build_main = build_model(page, ds["root"], semantic_text="瑕疵類別")
-        assert "含分類頭" in build_main, f"應建出含分類頭模型(balanced 才可選);實際:{build_main[:400]}"
+        assert "能分辨瑕疵種類" in build_main, f"應建出能分辨瑕疵種類模型(balanced 才可選);實際:{build_main[:400]}"
         set_model_dir(page, tmp_path / "mdl_head")
         page.locator('.st-key-anomaly_save_model_btn button').click()
         wait_idle(page)

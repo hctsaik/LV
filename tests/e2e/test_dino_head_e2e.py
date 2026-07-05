@@ -2,7 +2,7 @@
 
 重構後(M7 wizard):分類頭不再是結果區 expander 內單獨訓練,而是 ① 建模時自動一起訓
 (語義=defect AND ≥2 類各達 N_min → 解鎖);存頭併入 ① 的「💾 存模型」(head.joblib 落同目錄)。
-真實行為:① 建 defect 模型(含分類頭)→ ② 套用 → ③ 出現閘控分類(正常/已知類別/Unknown 三分)
+真實行為:① 建 defect 模型(能分辨瑕疵種類)→ ② 套用 → ③ 出現閘控分類(正常/已知類別/Unknown 三分)
 → 💾 存模型寫出 head.joblib(部署用)。
 """
 from pathlib import Path
@@ -29,7 +29,7 @@ def test_train_head_gated_classify(app_server, browser, yolo_defect_at_nmin):
         # ① 建模(語義=瑕疵類別 → 自動訓分類頭)
         build_main = build_model(page, ds["root"], semantic_text="瑕疵類別")
         assert "模型已建立" in build_main, f"① 應建模成功;實際:\n{build_main[:1200]}"
-        assert "含分類頭" in build_main, \
+        assert "能分辨瑕疵種類" in build_main, \
             f"defect 語義且每類達 N_min 應訓出分類頭;實際:\n{build_main[:1200]}"
 
         # 💾 存模型 → head.joblib 併入模型暫存目錄(部署用)。模型暫存目錄欄位在真實 app 下
