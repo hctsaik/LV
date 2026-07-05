@@ -71,11 +71,12 @@ def _under(child: Path, parent: Path) -> bool:
         return False
 
 
-def assert_safe_prelabel_dir(out_dir, source_dirs=()) -> None:
+def assert_safe_prelabel_dir(out_dir, source_dirs=(), allow_images=False) -> None:
     """C6:out_dir 含 images/ → raise(像資料集);與任一 source_dir 有等於/祖先/後代關係 → raise。
-    允許已含 labels/ 的目錄(支援重複匯出)—— 這是與 assert_safe_bank_dir 的關鍵差異。"""
+    允許已含 labels/ 的目錄(支援重複匯出)—— 這是與 assert_safe_bank_dir 的關鍵差異。
+    allow_images=True(M14c:明確要建 standalone 資料集)→ 跳過 images/ 啟發式,**來源關係檢查仍執行**。"""
     p = Path(out_dir).resolve()
-    if (p / "images").exists():
+    if not allow_images and (p / "images").exists():
         raise ValueError(f"輸出目錄含 images/,看起來是資料集,拒寫(C6):{p}")
     for f in source_dirs:
         fp = Path(f).resolve()
@@ -83,11 +84,12 @@ def assert_safe_prelabel_dir(out_dir, source_dirs=()) -> None:
             raise ValueError(f"輸出目錄不得等於/位於/包含來源資料集(C6):{p} vs {fp}")
 
 
-def export_prelabels(lines_by_image, out_dir, *, class_names=None, source_dirs=()) -> dict:
+def export_prelabels(lines_by_image, out_dir, *, class_names=None, source_dirs=(), allow_images=False) -> dict:
     """把 to_yolo_lines 結果原子寫到 out_dir/labels/<stem>.txt(+可選 classes.txt)。
-    回 {"written": 檔數, "objects": 總行數, "out_dir": str}。C6 安全檢查在寫任何檔之前。"""
+    回 {"written": 檔數, "objects": 總行數, "out_dir": str}。C6 安全檢查在寫任何檔之前。
+    allow_images=True:允許 out_dir 已含 images/(standalone 資料集匯出;來源關係檢查仍守)。"""
     from anomaly_bank_store import _atomic_text
-    assert_safe_prelabel_dir(out_dir, source_dirs=source_dirs)
+    assert_safe_prelabel_dir(out_dir, source_dirs=source_dirs, allow_images=allow_images)
     out = Path(out_dir)
     labels_dir = out / "labels"
     labels_dir.mkdir(parents=True, exist_ok=True)   # 同時建 out 與 out/labels

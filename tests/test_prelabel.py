@@ -196,3 +196,21 @@ def test_ac18_prelabel_idempotent(head):  # AC18:純函式冪等(同輸入兩次
     a = pl.prelabel_records(recs, emb, [0.9], head, anomaly_threshold=0.5, min_conf=0.0)
     b = pl.prelabel_records(recs, emb, [0.9], head, anomaly_threshold=0.5, min_conf=0.0)
     assert a == b
+
+
+# ── M14c:assert_safe_prelabel_dir allow_images(standalone 資料集匯出用)──────────
+def test_ac_pimg1_allow_images_flag(tmp_path):  # AC-PIMG-1:allow_images 放寬 images/ 啟發式
+    pl = _pl()
+    od = tmp_path / "ds_out"
+    (od / "images").mkdir(parents=True)
+    with pytest.raises(ValueError):                          # 預設:含 images/ → 拒
+        pl.assert_safe_prelabel_dir(od, source_dirs=[])
+    pl.assert_safe_prelabel_dir(od, source_dirs=[], allow_images=True)   # 放寬 → 不 raise
+
+
+def test_ac_pimg2_allow_images_keeps_source_check(tmp_path):  # AC-PIMG-2:放寬 images/ 但來源關係檢查仍守
+    pl = _pl()
+    src = tmp_path / "src"
+    (src / "images").mkdir(parents=True)
+    with pytest.raises(ValueError):     # out_dir == source_dir → 仍 raise(allow_images 不影響來源檢查)
+        pl.assert_safe_prelabel_dir(src, source_dirs=[src], allow_images=True)

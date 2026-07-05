@@ -26,6 +26,8 @@
 | AC16 | classes.txt 內容 + 空輸入不 crash | `test_ac16_classes_txt_and_empty` |
 | AC17(衍生) | C6 真實不變量:完整流程後來源零寫入 | `test_ac17_source_untouched` |
 | AC18(衍生) | 純函式冪等 | `test_ac18_prelabel_idempotent` |
+| AC-PIMG-1(M14c) | `assert_safe_prelabel_dir` `allow_images=True` 放寬 images/ 啟發式(預設仍拒) | `test_ac_pimg1_allow_images_flag` |
+| AC-PIMG-2(M14c) | 放寬 images/ 但來源關係檢查仍守(out==source 仍 raise) | `test_ac_pimg2_allow_images_keeps_source_check` |
 
 雙向覆蓋:AC1–AC16 皆有對應測試;AC17/18 為 PM 自加的不變量/冪等(設計未明列),
 逼「C6 真實不變量」與「純函式」而非只逐字轉抄。

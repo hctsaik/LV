@@ -150,6 +150,11 @@ def test_s02_export_dual_and_c6(app_server, browser, yolo_defect_at_nmin, tmp_pa
         assert (out / "retrieval_report.csv").exists() and (out / "classes.txt").exists()
         head = (out / "retrieval_report.csv").read_text(encoding="utf-8").splitlines()[0]
         assert head.startswith("image_path,obj_index,cx,cy,w,h")
+        # M14c:預設一併複製影像 → images/ 存在且與 labels 對應(可直接訓練的 YOLO 資料集)
+        assert (out / "images").is_dir(), "應含 images/(可直接訓練)"
+        img_stems = {f.stem for f in (out / "images").glob("*") if f.is_file()}
+        lbl_stems = {f.stem for f in (out / "labels").glob("*.txt")}
+        assert img_stems and lbl_stems <= img_stems, f"每個標註影像都應被複製:labels={lbl_stems} images={img_stems}"
         assert _snapshot(ds["root"]) == src_before, "來源零寫入(C6)"
         expect(page.locator('[data-testid="stException"]')).to_have_count(0)
     finally:

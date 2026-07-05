@@ -8743,7 +8743,8 @@ def _fewshot_export() -> None:
     source_dirs = [str(t) for t in (st.session_state.get("fewshot_target_folder") or [])]
     try:
         st.session_state["fewshot_export_done"] = retrieval_export.export_retrieval(
-            records, decs, out_dir, class_names=classes, source_dirs=source_dirs)
+            records, decs, out_dir, class_names=classes, source_dirs=source_dirs,
+            copy_images=bool(st.session_state.get("fewshot_copy_images", True)))
     except Exception as exc:
         st.session_state["fewshot_export_err"] = f"匯出失敗:{exc}"
 
@@ -8801,6 +8802,8 @@ def _fewshot_export_controls() -> None:
         st.session_state["fewshot_out_dir"] = _def_out
     st.markdown("**⬇ 匯出**:輸出資料夾(另存 YOLO+CSV;來源不動)")
     st.text_input("輸出資料夾", key="fewshot_out_dir", label_visibility="collapsed")
+    st.checkbox("一併複製影像(images/,匯出成可直接訓練的 YOLO 資料集)",
+                value=True, key="fewshot_copy_images")
     out_dir = (st.session_state.get("fewshot_out_dir") or "").strip()
     st.button("⬇ 匯出 YOLO + CSV", key="fewshot_export_btn", type="primary", use_container_width=True,
               disabled=not out_dir,
@@ -8811,8 +8814,10 @@ def _fewshot_export_controls() -> None:
         st.error(st.session_state["fewshot_export_err"])
     _done = st.session_state.get("fewshot_export_done")
     if _done:
-        st.success(f"✅ 以樣搜樣匯出完成 · {_done['objects']} 個標註 + CSV({_done['csv_rows']} 列) → "
-                   f"`{_done['out_dir']}`")
+        _imgs = _done.get("images_copied", 0)
+        st.success(f"✅ 以樣搜樣匯出完成 · {_done['objects']} 個標註 + CSV({_done['csv_rows']} 列)"
+                   + (f" + {_imgs} 張影像(images/)" if _imgs else "")
+                   + f" → `{_done['out_dir']}`")
 
 
 def _fewshot_add_to_bank_controls() -> None:
