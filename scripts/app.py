@@ -1881,6 +1881,181 @@ def _anomaly_batch_section(model: dict, target_folders: list) -> None:
         _anomaly_batch_render_queue(res)
 
 
+def _anomaly_watch_ensure_model(model, target_folders):
+    """確保凍結模型已存到磁碟(未存自動存);回 model_dir 或 None(失敗設 anomaly_watch_err)。"""
+    model_dir = model.get("_dir")
+    if not model_dir:
+        _mdir = (st.session_state.get("anomaly_model_dir")
+                 or _anomaly_bank_default_dir(str(target_folders[0])))
+        _train = [Path(f) for f in (st.session_state.get("anomaly_train_folder") or target_folders)]
+        _anomaly_save_model(_mdir, _train)
+        model_dir = model.get("_dir")
+        if not model_dir:
+            st.session_state["anomaly_watch_err"] = (
+                st.session_state.get("_anomaly_model_err") or "自動存模型失敗。")
+    return model_dir
+
+
+def _anomaly_watch_init(objective: str, k: int) -> None:
+    """🆕 初始化監看工作區(on_click):未存模型自動存 → al_service.init_workspace 寫 profile.yaml。"""
+    import al_service
+    st.session_state.pop("anomaly_watch_err", None)
+    model = st.session_state.get("anomaly_model")
+    target = list(st.session_state.get("anomaly_target_folder") or [])
+    ws = (st.session_state.get("anomaly_watch_ws") or "").strip()
+    if not (model and target and ws):
+        st.session_state["anomaly_watch_err"] = "請先①建模、②選目標資料夾、填工作區目錄。"
+        return
+    try:
+        model_dir = _anomaly_watch_ensure_model(model, [Path(f) for f in target])
+        if not model_dir:
+            return
+        al_service.init_workspace(ws, name=Path(target[0]).name,
+                                  watch_folders=[str(t) for t in target],
+                                  model_dir=str(model_dir), objective=objective, k=int(k))
+        st.session_state["anomaly_watch_inited"] = ws
+    except Exception as exc:
+        st.session_state["anomaly_watch_err"] = f"初始化監看失敗:{exc}"
+
+
+def _anomaly_watch_scan() -> None:
+    """▶ 立即掃描一次(on_click):profile 缺 → 先 init;跑 al_service.run_once(阻塞+進度)。"""
+    import al_service
+    st.session_state.pop("anomaly_watch_err", None)
+    model = st.session_state.get("anomaly_model")
+    target = list(st.session_state.get("anomaly_target_folder") or [])
+    ws = (st.session_state.get("anomaly_watch_ws") or "").strip()
+    if not (model and target and ws):
+        st.session_state["anomaly_watch_err"] = "請先①建模、②選目標資料夾、填工作區目錄。"
+        return
+    if not (Path(ws) / "profile.yaml").exists():
+        _anomaly_watch_init(st.session_state.get("anomaly_watch_objective", "novelty"),
+                            int(st.session_state.get("anomaly_watch_k", 100)))
+        if st.session_state.get("anomaly_watch_err"):
+            return
+    try:
+        _bar = st.progress(0.0, text="監看掃描…")
+
+        def _cb(d):
+            _tot = max(int(d.get("images_total") or 1), 1)
+            _bar.progress(min(max(int(d.get("images_processed") or 0) / _tot, 0.0), 1.0),
+                          text=f"監看掃描 {d.get('images_processed')}/{_tot}")
+
+        res = al_service.run_once(ws, progress=_cb)
+        _bar.empty()
+        st.session_state["anomaly_watch_last"] = res
+        if res.get("status") == "error":
+            st.session_state["anomaly_watch_err"] = f"監看掃描失敗:{res.get('reason')}"
+    except Exception as exc:
+        st.session_state["anomaly_watch_err"] = f"監看掃描失敗:{exc}"
+
+
+def _anomaly_watch_label(ws: str, item_id: str, decision: str, label: str) -> None:
+    import time as _t
+
+    import al_workspace
+    al_workspace.append_label(ws, {"id": item_id, "decision": decision, "label": label,
+                                   "decided_at": _t.time()})
+    st.toast({"good": "已標:正常", "defect": "已標:瑕疵", "skip": "已略過"}.get(decision, "已標"),
+             icon="✅")
+
+
+def _anomaly_watch_render_queue(ws: str, items: list) -> None:
+    from interaction import crop_bbox
+    st.markdown(f"**監看佇列**(共 {len(items)};✅正常 / 🏷瑕疵 / ⏭略過 → 下輪自動移出)")
+    if not items:
+        st.info("佇列空(尚無待標,或都標完了)。")
+        return
+    _limit = int(st.session_state.get("anomaly_watch_limit", 30))
+    with st.container(key="anomaly_watch_queue"):
+        _cols = st.columns(3)
+        for _j, _it in enumerate(items[:_limit]):
+            with _cols[_j % 3]:
+                _im = safe_open_image(_it.get("image_path"))
+                if _im is None:
+                    st.caption("⚠ 缺圖")
+                else:
+                    _crop = crop_bbox(_im, *_it.get("bbox", [0.5, 0.5, 1.0, 1.0]), pad=0.1)
+                    _cw, _ch = _crop.size
+                    st.image(_crop.resize((160, max(1, int(160 * _ch / max(1, _cw))))))
+                st.markdown(f"<div style='font-size:0.8em;color:#555;line-height:1.3'>"
+                            f"{_it.get('reason', '')}<br>異常 {float(_it.get('score', 0)):.2f}</div>",
+                            unsafe_allow_html=True)
+                _id = str(_it.get("id", ""))
+                _lb = _it.get("label", "")
+                _g, _d, _s = st.columns(3)
+                _g.button("✅", key=f"anomaly_watch_good_{_j}", help="正常", use_container_width=True,
+                          on_click=_anomaly_watch_label, args=(ws, _id, "good", _lb))
+                _d.button("🏷", key=f"anomaly_watch_defect_{_j}", help="瑕疵", use_container_width=True,
+                          on_click=_anomaly_watch_label, args=(ws, _id, "defect", _lb))
+                _s.button("⏭", key=f"anomaly_watch_skip_{_j}", help="略過", use_container_width=True,
+                          on_click=_anomaly_watch_label, args=(ws, _id, "skip", _lb))
+    if len(items) > _limit:
+        st.button(f"載入更多(+30,共 {len(items)})", key="anomaly_watch_more",
+                  use_container_width=True, on_click=lambda: st.session_state.update(
+                      anomaly_watch_limit=min(_limit + 30, len(items))))
+
+
+def _anomaly_watch_section(model: dict, target_folders: list) -> None:
+    """② 內「🛰 持續監看服務」:工作區設定 + 初始化/匯出 + 立即掃描 + 狀態卡 + 佇列消費。"""
+    import al_service
+    import al_workspace
+    st.divider()
+    st.markdown("**🛰 持續監看服務**(設定一個資料夾 → 自動選出最該標的;可**匯出設定**給離線服務跑)")
+    _def_ws = (_anomaly_bank_default_dir(str(target_folders[0]), "al_watch")
+               if target_folders else "")
+    # ws 空且有目標 → 補預設(不可只 setdefault:watch 區塊可能在目標未加時先渲染 → 鎖住空字串)
+    if not st.session_state.get("anomaly_watch_ws") and _def_ws:
+        st.session_state["anomaly_watch_ws"] = _def_ws
+    st.text_input("工作區目錄(.lv_cache;存 profile / 佇列 / 標註)", key="anomaly_watch_ws",
+                  label_visibility="collapsed",
+                  help="設定/佇列/標註都存這;profile.yaml 可匯出給離線服務。")
+    _OBJ = {"novelty": "抓沒看過的異常", "balanced": "三訊號均衡(需 head)",
+            "confusion": "模型最拿不準(需 head)", "pure": "純 novelty"}
+    obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
+                               key="anomaly_watch_objective", default="novelty") or "novelty"
+    k = st.slider("Top-K(每次挑幾個)", 10, 500, 100, 10, key="anomaly_watch_k")
+    ws = (st.session_state.get("anomaly_watch_ws") or "").strip()
+    _enabled = bool(target_folders and ws)
+    _c1, _c2, _c3 = st.columns(3)
+    _c1.button("🆕 初始化監看", key="anomaly_watch_init_btn", use_container_width=True,
+               disabled=not _enabled, on_click=_anomaly_watch_init, args=(obj, int(k)))
+    _c2.button("▶ 立即掃描一次", key="anomaly_watch_scan_btn", type="primary",
+               use_container_width=True, disabled=not _enabled, on_click=_anomaly_watch_scan)
+    _prof = (Path(ws) / "profile.yaml") if ws else None
+    with _c3:
+        if _prof and _prof.exists():
+            st.download_button("📤 匯出設定", key="anomaly_watch_export_btn",
+                               data=_prof.read_bytes(),
+                               file_name=f"al_profile_{Path(ws).name}.yaml",
+                               mime="text/yaml", use_container_width=True)
+        else:
+            st.button("📤 匯出設定", key="anomaly_watch_export_btn", disabled=True,
+                      use_container_width=True, help="先「初始化監看」才有設定可匯出。")
+    if st.session_state.get("anomaly_watch_err"):
+        st.error(st.session_state["anomaly_watch_err"])
+    _last_res = st.session_state.get("anomaly_watch_last")
+    if _last_res and _last_res.get("status") == "ok":
+        st.success(f"✅ 監看掃描完成 · 新增 {_last_res.get('new')} · "
+                   f"評分 {_last_res.get('objects_scored')} · 佇列 {_last_res.get('queue_len')}")
+    with st.container(key="anomaly_watch_status"):
+        if ws and (Path(ws) / "profile.yaml").exists():
+            try:
+                _stat = al_service.status(ws)
+            except Exception:
+                _stat = {"last_run": None, "queue_len": 0}
+            _last = _stat.get("last_run")
+            if _last:
+                st.caption(f"✅ 上次掃描 {_last.get('run_id')} · 新增 {_last.get('new')} · "
+                           f"評分 {_last.get('objects_scored')} · 佇列 {_last.get('queue_len')}")
+            else:
+                st.caption("🛰 已初始化,尚未跑過掃描 —— 按「▶ 立即掃描一次」。")
+        else:
+            st.caption("🛰 尚未初始化監看(填工作區目錄 → 按「🆕 初始化監看」)。")
+    if ws and (Path(ws) / "queue.jsonl").exists():
+        _anomaly_watch_render_queue(ws, al_workspace.read_queue(ws))
+
+
 def _anomaly_tab_apply() -> None:
     """② 套用偵測:選異常目標資料夾 → 用①鎖定的模型 run_pipeline → 結果概覽 + 散點 + 排序看圖 + 購物車匯出。"""
     st.markdown("#### ② 套用偵測")
@@ -1910,6 +2085,7 @@ def _anomaly_tab_apply() -> None:
         st.error(st.session_state["_anomaly_apply_err"])
 
     _anomaly_batch_section(model, target_folders)   # M9:大資料分批掃描(標註佇列,scale-safe)
+    _anomaly_watch_section(model, target_folders)    # M10:持續監看服務(設定/匯出/掃描/佇列消費)
 
     result = st.session_state.get("anomaly_apply_result")
     if not result:

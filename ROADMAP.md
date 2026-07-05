@@ -27,7 +27,7 @@
   PRD [2_PO_PRD/al_scale_offline_prd.md](2_PO_PRD/al_scale_offline_prd.md);設計素材
   [AL_SCALE_AND_OFFLINE_SERVICE_PLAN.md](AL_SCALE_AND_OFFLINE_SERVICE_PLAN.md)。appetite ≤1 模組 + GUI 接線,一輪做完。
   狀態:PRD 完成,放行 `/architect`。
-- **M10 — 離線監看選樣服務(設定可攜 + 增量 + 佇列消費閉環)** — ⬜ **待設計(M9 綠了才開)**(2026-07-05) —
+- **M10 — 離線監看選樣服務(設定可攜 + 增量 + 佇列消費閉環)** — ✅ **完成**(2026-07-05,09+10 gate 綠 + GUI 3 E2E 綠) —
   需求:資料夾持續進新圖,使用者不想一直開互動畫面等算,要有背景服務按 AL 目標自動挑出「最該標註/釐清
   的前 100 個」。範圍(MoSCoW):**Must** 服務工作區持久化(設定/狀態/佇列/標註/摘要/鎖,單寫者)+
   CLI **run-once**(增量掃描→08 引擎→選樣→合併標註→物化佇列→摘要)+ GUI ④ 監看設定區&**匯出設定檔**
@@ -268,3 +268,21 @@
   whole_image 模式無語義 radio(恆 1 類)→ g6 不設語義;auto-save 目錄改用真實行為訊號驗證(非脆弱路徑)。
   驗證:**真實 Playwright E2E `tests/e2e/test_al_batch_gui_e2e.py` 4/4 綠**(佇列+reason 渲染、標註無散點 scale-safe、
   未存自動存、object_source 從磁碟=whole_image 物件數==影像數、續跑無例外)。**M9 里程碑(引擎+GUI)完成;M10 解除閘門可開。**
+- (2026-07-05) **M10 完成(離線監看選樣服務)—— 瑕疵/主動學習 feature 線收斂**:M9 綠後開 M10,走完整
+  /architect→/pm→/pg ×(09、10、GUI)。**09 `al_workspace`**(工作區持久化 + 增量掃描 + 執行鎖;設計
+  [3_Architect_Design/09_al_workspace.md](3_Architect_Design/09_al_workspace.md)):單寫者(服務寫 queue/state、GUI 只
+  append labels)、可攜 profile.yaml、mtime+size 雙鍵增量、`id`=al_batch item_id(重評分原地)、原子寫/安全目錄/鎖
+  重用既有;`verify/gate.py al_workspace` **14 綠**(一次過)。**10 `al_service`**(CLI run-once 編排;設計
+  [3_Architect_Design/10_al_service.md](3_Architect_Design/10_al_service.md)):load_profile→鎖→驗模型→增量掃描→
+  al_batch 全量評分(.lv_cache 讓只有新圖真 embed=增量)→合併標註(移出已標/deleted)→物化 Top-K 佇列→摘要,
+  try/finally 放鎖;模型換版→重評分(item_id 內容不變原地更新)=拍板;`gate.py al_service` **8 綠**(修 1 個
+  item_id→id 欄位映射 PG bug 後)。**M10-GUI**(② 加「🛰 持續監看服務」;設計
+  [3_Architect_Design/M10_gui_wiring.md](3_Architect_Design/M10_gui_wiring.md)):工作區設定 + 🆕初始化 + 📤匯出設定 +
+  ▶立即掃描(in-process run_once,阻塞+進度)+ 服務狀態卡 + 監看佇列消費(縮圖+reason+✅正常/🏷瑕疵/⏭略過→
+  append_label→下輪移出)。**反向閘門 /pg→/pm**:探索/完整散點延後(同 M9,al_batch 無 embedding 回傳);
+  E2E 讀「實際生效 ws」(text_input 非空預設 fill 不覆蓋)、profile 讀 model_dir 驗自動存。**PG 修 2 個 impl bug**:
+  ① watch_ws 預設用 setdefault 在目標未加時鎖住空字串→init 反灰(改「空且有目標→補預設」);② 缺「掃描完成」DOM 標記。
+  al_service 加 `progress` 附加參數轉發 al_batch(gate 仍 8 綠)。驗證:**真實 Playwright E2E
+  `tests/e2e/test_al_service_gui_e2e.py` 3/3 綠**(初始化+profile.yaml+匯出、掃描+佇列+reason、標註閉環下輪移出、
+  未存自動存)。**M10 完成 = 瑕疵偵測→大資料→離線服務整條 feature 線收斂;要再加新能力須新 `/user` 起輪。**
+  (M10 尚在 backup 本地,未提交/未 rebase 上 remote;push+平台釘指標同 M9 流程,待觸發。)
