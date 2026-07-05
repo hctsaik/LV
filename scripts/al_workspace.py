@@ -20,7 +20,7 @@ _SCHEMA = 1
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
 _DEFAULTS = {
     "objective": "novelty", "k": 100, "score_mode": "patch",
-    "target_res": 224, "batch_size": 1000,
+    "target_res": 224, "batch_size": 20,   # 小批次 → 監看/服務掃描每 20 張更新一次進度(可續跑更細)
     "reference_vector_file": None,          # similar:workspace 內參考向量 .npy 相對路徑(否則 None)
     "filters": {"min_score": None, "classes": []},
 }

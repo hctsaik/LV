@@ -376,3 +376,9 @@
   (script body)執行長時操作」讓 progress 真的會動;M9 分批另把 batch_size 1000→64(每 64 張更新一次)
   + on_identity_mismatch='restart'(換參數不報錯改重跑)。回歸:build/apply/batch/watch 相關 **15 條 E2E 全綠**
   (完成標記照舊出現)。維護模式(無 role)。
+- (2026-07-05) **進度條後續(使用者回報)**:① 漏改 M10 監看/離線服務的 batch_size —— 它讀 profile 預設
+  (`al_workspace._DEFAULTS`),仍是 1000 → 每 1000 張才更新;改預設 1000→**20**(GUI 批次亦 64→20,兩端一致
+  每 20 張更新;既有 profile 需重按「初始化監看」才生效)。② build/apply 的 run_pipeline 進度本來就逐物件
+  回報(不受影響,只需前一輪的 callback→主體修復)。③ 四處長時操作加 `st.spinner`(動畫)+「首次先載入模型
+  (約 10~30 秒)」文字,補冷啟動空窗的狀態提示。④ 監看佇列 ✅/🏷/⏭ 按鈕改「icon+字」且不再撐滿寬度。
+  gate al_workspace 14 / al_service 9 綠、M10 GUI E2E 3/3 綠。

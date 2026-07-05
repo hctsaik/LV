@@ -1327,13 +1327,14 @@ def _anomaly_build_model() -> None:
             st.session_state["_anomaly_model_err"] = "資料夾內找不到影像(需 images/ + labels/)。"
             return
         cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{model}_r{target_res}")
-        _bar = st.progress(0.0, text=f"建模中…({len(image_paths)} 張圖,{model}@{target_res})")
+        _bar = st.progress(0.0, text=f"準備中…首次會先載入 {model} 模型(約 10~30 秒),再掃描 {len(image_paths)} 張圖")
         _conf_build = st.session_state.get("anomaly_confirmed_build", {})  # ①只用訓練資料夾索引空間的標記
-        res = run_pipeline(
-            image_paths, class_names, mode=mode, score_mode=score_mode,
-            sample_n=sample_n, model=model, target_res=target_res,
-            confirmed=_conf_build, object_source=object_source,
-            cache_dir=cache, progress=lambda f, t: _bar.progress(f, text=t))
+        with st.spinner(f"建模中…首次載入 {model} 模型較久(約 10~30 秒),請稍候"):
+            res = run_pipeline(
+                image_paths, class_names, mode=mode, score_mode=score_mode,
+                sample_n=sample_n, model=model, target_res=target_res,
+                confirmed=_conf_build, object_source=object_source,
+                cache_dir=cache, progress=lambda f, t: _bar.progress(f, text=t))
         _bar.empty()
         if not res.get("records") or res.get("obj_emb") is None:
             if object_source == "yolo":
@@ -1434,13 +1435,14 @@ def _anomaly_apply_model() -> None:
             ext_ref = _np.asarray(model["projection"]["good_obj_emb"], dtype=_np.float32)
             score_mode = "object"
         cache = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{m_model}_r{m_res}")
-        _bar = st.progress(0.0, text=f"套用偵測…({len(image_paths)} 張圖,{m_model}@{m_res})")
-        result = run_pipeline(
-            image_paths, class_names, mode="one_stage", score_mode=score_mode,
-            sample_n=64, model=m_model, target_res=m_res, object_source=object_source,
-            confirmed=st.session_state.get("anomaly_confirmed_apply", {}),  # ②只用目標資料夾索引空間
-            cache_dir=cache, external_bank=ext_bank, external_ref=ext_ref,
-            progress=lambda f, t: _bar.progress(f, text=t))
+        _bar = st.progress(0.0, text=f"準備中…首次會先載入模型(約 10~30 秒),再掃描 {len(image_paths)} 張圖")
+        with st.spinner("套用偵測中…首次會先載入模型(約 10~30 秒),請稍候"):
+            result = run_pipeline(
+                image_paths, class_names, mode="one_stage", score_mode=score_mode,
+                sample_n=64, model=m_model, target_res=m_res, object_source=object_source,
+                confirmed=st.session_state.get("anomaly_confirmed_apply", {}),  # ②只用目標資料夾索引空間
+                cache_dir=cache, external_bank=ext_bank, external_ref=ext_ref,
+                progress=lambda f, t: _bar.progress(f, text=t))
         _bar.empty()
         result["_image_paths"] = [str(p) for p in image_paths]
         result["_class_names"] = list(class_names) if class_names else None
@@ -1824,7 +1826,8 @@ def _anomaly_batch_execute() -> None:
             import hashlib as _hl
             _ck_name += "_" + _hl.sha256(ref_vector.astype("float32").tobytes()).hexdigest()[:8]
         ck = dataset_cache_dir(roots[0], _ck_name)
-        _bar = st.progress(0.0, text=f"分批掃描…({len(image_paths)} 張圖,約每 64 張更新一次)")
+        _bar = st.progress(0.0, text=f"準備中…首次會先載入模型(約 10~30 秒),再開始掃描 {len(image_paths)} 張圖"
+                                     "(之後每 20 張更新一次)")
 
         def _cb(d):
             _tot = max(int(d.get("images_total") or 1), 1)
@@ -1833,11 +1836,12 @@ def _anomaly_batch_execute() -> None:
             _bar.progress(_frac, text=f"分批掃描 {_proc}/{_tot}({_frac * 100:.0f}%)"
                                       f" · 暫定挑出 {len(d.get('provisional_topk') or [])} 個")
 
-        res = al_batch.run_batched(
-            image_paths, model_dir=model_dir, checkpoint_dir=ck,
-            objective=objective, k=int(k), object_source=object_source,
-            class_names=class_names, dataset_dirs=roots, progress=_cb, resume=resume,
-            ref_vector=ref_vector, batch_size=64, on_identity_mismatch="restart")
+        with st.spinner("分批掃描中…首次會先載入模型(約 10~30 秒),之後每 20 張更新進度,請稍候"):
+            res = al_batch.run_batched(
+                image_paths, model_dir=model_dir, checkpoint_dir=ck,
+                objective=objective, k=int(k), object_source=object_source,
+                class_names=class_names, dataset_dirs=roots, progress=_cb, resume=resume,
+                ref_vector=ref_vector, batch_size=20, on_identity_mismatch="restart")
         _bar.empty()
         st.session_state["anomaly_batch_result"] = res
         _log_usage("anomaly_batch_scan", n=res.get("objects_scored"),
@@ -2004,14 +2008,15 @@ def _anomaly_watch_scan() -> None:
         if st.session_state.get("anomaly_watch_err"):
             return
     try:
-        _bar = st.progress(0.0, text="監看掃描…")
+        _bar = st.progress(0.0, text="準備中…首次會先載入模型(約 10~30 秒),再開始掃描")
 
         def _cb(d):
             _tot = max(int(d.get("images_total") or 1), 1)
             _bar.progress(min(max(int(d.get("images_processed") or 0) / _tot, 0.0), 1.0),
                           text=f"監看掃描 {d.get('images_processed')}/{_tot}")
 
-        res = al_service.run_once(ws, progress=_cb)
+        with st.spinner("監看掃描中…首次會先載入模型(約 10~30 秒),請稍候"):
+            res = al_service.run_once(ws, progress=_cb)
         _bar.empty()
         st.session_state["anomaly_watch_last"] = res
         if res.get("status") == "error":
@@ -2054,11 +2059,11 @@ def _anomaly_watch_render_queue(ws: str, items: list) -> None:
                 _id = str(_it.get("id", ""))
                 _lb = _it.get("label", "")
                 _g, _d, _s = st.columns(3)
-                _g.button("✅", key=f"anomaly_watch_good_{_j}", help="正常", use_container_width=True,
+                _g.button("✅ 正常", key=f"anomaly_watch_good_{_j}",
                           on_click=_anomaly_watch_label, args=(ws, _id, "good", _lb))
-                _d.button("🏷", key=f"anomaly_watch_defect_{_j}", help="瑕疵", use_container_width=True,
+                _d.button("🏷 瑕疵", key=f"anomaly_watch_defect_{_j}",
                           on_click=_anomaly_watch_label, args=(ws, _id, "defect", _lb))
-                _s.button("⏭", key=f"anomaly_watch_skip_{_j}", help="略過", use_container_width=True,
+                _s.button("⏭ 略過", key=f"anomaly_watch_skip_{_j}",
                           on_click=_anomaly_watch_label, args=(ws, _id, "skip", _lb))
     if len(items) > _limit:
         st.button(f"載入更多(+30,共 {len(items)})", key="anomaly_watch_more",
