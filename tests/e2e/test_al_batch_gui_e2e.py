@@ -10,7 +10,7 @@
 ── PG 必須實作的 widget key 契約 ──
 ② 分頁內(_anomaly_tab_apply):
   anomaly_batch_scan_btn      「▶ 大資料分批掃描」按鈕
-  anomaly_batch_objective     選樣目標(novelty/balanced/confusion/pure;無 head 反灰後兩者)
+  anomaly_batch_objective     選樣目標(novelty/balanced/confusion;無 head 時 balanced/confusion 反灰)
   anomaly_batch_resume_btn    「▶ 繼續上次」按鈕
   anomaly_batch_queue         標註佇列容器(內含縮圖卡 stImage + 每卡 reason 文字)
   anomaly_batch_scatter       (v1 不渲染;此 class 存在數必為 0 = 大資料 scale-safe)
@@ -164,6 +164,47 @@ def test_g6_object_source_from_disk(app_server, browser, whole_ds, tmp_path):
         # 整張影像:物件數 == 影像數 8(主畫面掃描摘要含物件數)
         main = page.locator('[data-testid="stMain"]').inner_text()
         assert "8" in main, f"整張影像模式物件數應 == 影像數 8(避免被默默當 yolo):{main[:300]}"
+    finally:
+        ctx.close()
+
+
+# ── Task0:含 head 模型選「三訊號均衡」(balanced→引擎 uncertain)應成功掃描,非 ValueError ──
+def test_g7_balanced_objective_maps_to_uncertain(app_server, browser, yolo_defect_at_nmin, tmp_path):
+    """回歸:GUI 選樣目標『三訊號均衡』(key=balanced)修前原樣傳 run_batched → 引擎只收
+    novelty/uncertain/confusion → 「分批掃描失敗:objective must be…」。修後 _AL_ENGINE_OBJ
+    映 balanced→uncertain,含 head 模型應正常掃出佇列,不再 ValueError。"""
+    ds = yolo_defect_at_nmin   # scratch×8 + stain×8、語義 defect → ① 建模自動訓 head
+    ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+    page = ctx.new_page()
+    try:
+        enter_anomaly(page, app_server)
+        build_main = build_model(page, ds["root"], semantic_text="瑕疵類別")
+        assert "含分類頭" in build_main, f"應建出含分類頭模型(balanced 才可選);實際:{build_main[:400]}"
+        set_model_dir(page, tmp_path / "mdl_head")
+        page.locator('.st-key-anomaly_save_model_btn button').click()
+        wait_idle(page)
+        # ② 加目標 → 選「三訊號均衡」→ 掃描
+        click_tab(page, TAB_APPLY)
+        _add_folder(page, "anomaly_target_folder", str(ds["root"]))
+        wait_idle(page)
+        click_tab(page, TAB_APPLY)
+        seg = page.locator('.st-key-anomaly_batch_objective')
+        seg.get_by_text("三訊號均衡", exact=False).first.click()
+        wait_idle(page)
+        click_tab(page, TAB_APPLY)
+        btn = page.locator('.st-key-anomaly_batch_scan_btn button')
+        btn.wait_for(state="visible", timeout=30000)
+        page.wait_for_function(
+            """() => { const b = document.querySelector('.st-key-anomaly_batch_scan_btn button');
+                       return b && !b.disabled; }""", timeout=30000)
+        btn.click()
+        _wait_scan_done(page)
+        # 成功掃描 = 佇列渲染 + 無「分批掃描失敗」+ 無未捕捉例外
+        expect(page.locator('.st-key-anomaly_batch_queue [data-testid="stImage"]').first
+               ).to_be_visible(timeout=30000)
+        main = page.locator('[data-testid="stMain"]').inner_text()
+        assert "分批掃描失敗" not in main, f"balanced→uncertain 映射應成功,不再 ValueError:{main[:500]}"
+        expect(page.locator('[data-testid="stException"]')).to_have_count(0)
     finally:
         ctx.close()
 

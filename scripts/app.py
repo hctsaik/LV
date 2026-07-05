@@ -1741,6 +1741,13 @@ def _anomaly_tab_build() -> None:
                             on_click=_anomaly_clear_confirmed, args=("build",), use_container_width=True)
 
 
+# GUI 選樣目標詞彙 → al_batch 引擎 objective。引擎 "novelty"=純 minmax(=舊 GUI「純 novelty」),
+# "uncertain"=novelty+boundary+entropy(=GUI「三訊號均衡/balanced」);"pure" 舊鍵相容映到 novelty。
+# (Task0:GUI 曾把 balanced/pure 原樣傳 run_batched → 引擎只收 novelty/uncertain/confusion → ValueError。)
+_AL_ENGINE_OBJ = {"novelty": "novelty", "pure": "novelty",
+                  "balanced": "uncertain", "confusion": "confusion"}
+
+
 def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
     """② 大資料分批掃描(on_click):用①存出的凍結模型跑 al_batch.run_batched(阻塞 + 即時進度)。
     - 未存模型 → **自動存**(使用者拍板)後再掃(al_batch 讀磁碟目錄,非 in-memory 槽)。
@@ -1750,6 +1757,7 @@ def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
     from anomaly_bank_store import load_bank
     from object_eval import classes_for, dataset_cache_dir, list_images
     st.session_state.pop("anomaly_batch_err", None)
+    objective = _AL_ENGINE_OBJ.get(objective, objective)   # GUI 詞彙 → 引擎 objective(Task0)
     model = st.session_state.get("anomaly_model")
     folders = list(st.session_state.get("anomaly_target_folder") or [])
     if not model or not folders:
@@ -1855,13 +1863,14 @@ def _anomaly_batch_section(model: dict, target_folders: list) -> None:
     st.divider()
     st.markdown("**⚡ 大資料分批掃描**(物件很多時用這條:可續跑、只給 Top-K 佇列不卡)")
     has_head = bool(model.get("head"))
-    _OBJ = {"novelty": "抓沒看過的異常", "balanced": "三訊號均衡(需分類頭)",
-            "confusion": "模型最拿不準(需分類頭)", "pure": "純 novelty"}
+    # 3 項誠實選單:引擎端 novelty≡pure(純 minmax),不列同義的「純 novelty」假選項(Task0)。
+    _OBJ = {"novelty": "抓沒看過的異常(novelty)", "balanced": "三訊號均衡(需分類頭)",
+            "confusion": "模型最拿不準(需分類頭)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_batch_objective", default="novelty") or "novelty"
     _needs_head = obj in ("balanced", "confusion")
     if _needs_head and not has_head:
-        st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常 / 純 novelty』,"
+        st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常(novelty)』,"
                    "或到①用**瑕疵類別**標籤(每類達 N_min)建含 head 的模型。")
     k = st.slider("Top-K(挑幾個送標註)", 10, 500, 100, 10, key="anomaly_batch_k")
     _disabled = (not target_folders) or (_needs_head and not has_head)
@@ -1910,6 +1919,7 @@ def _anomaly_watch_init(objective: str, k: int) -> None:
         model_dir = _anomaly_watch_ensure_model(model, [Path(f) for f in target])
         if not model_dir:
             return
+        objective = _AL_ENGINE_OBJ.get(objective, objective)   # GUI 詞彙 → 引擎 objective(Task0)
         al_service.init_workspace(ws, name=Path(target[0]).name,
                                   watch_folders=[str(t) for t in target],
                                   model_dir=str(model_dir), objective=objective, k=int(k))
@@ -2010,13 +2020,18 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
     st.text_input("工作區目錄(.lv_cache;存 profile / 佇列 / 標註)", key="anomaly_watch_ws",
                   label_visibility="collapsed",
                   help="設定/佇列/標註都存這;profile.yaml 可匯出給離線服務。")
-    _OBJ = {"novelty": "抓沒看過的異常", "balanced": "三訊號均衡(需 head)",
-            "confusion": "模型最拿不準(需 head)", "pure": "純 novelty"}
+    _OBJ = {"novelty": "抓沒看過的異常(novelty)", "balanced": "三訊號均衡(需 head)",
+            "confusion": "模型最拿不準(需 head)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_watch_objective", default="novelty") or "novelty"
+    # watch 也要 head 閘(否則 balanced/confusion 無 head → 掃描時 run_batched raise;與批次區塊一致,Task0)
+    _watch_needs_head = obj in ("balanced", "confusion")
+    if _watch_needs_head and not bool(model.get("head")):
+        st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常(novelty)』,"
+                   "或到①用**瑕疵類別**標籤(每類達 N_min)建含 head 的模型。")
     k = st.slider("Top-K(每次挑幾個)", 10, 500, 100, 10, key="anomaly_watch_k")
     ws = (st.session_state.get("anomaly_watch_ws") or "").strip()
-    _enabled = bool(target_folders and ws)
+    _enabled = bool(target_folders and ws) and not (_watch_needs_head and not bool(model.get("head")))
     _c1, _c2, _c3 = st.columns(3)
     _c1.button("🆕 初始化監看", key="anomaly_watch_init_btn", use_container_width=True,
                disabled=not _enabled, on_click=_anomaly_watch_init, args=(obj, int(k)))
