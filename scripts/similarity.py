@@ -56,3 +56,32 @@ def class_centroid(obj_emb, labels, class_name) -> np.ndarray:
     if not mask.any():
         raise ValueError(f"找不到類別 '{class_name}' 的物件(可選:{sorted(set(labs.tolist()))})")
     return emb[mask].mean(axis=0).astype(np.float32)
+
+
+def multi_ref_similarity(obj_emb, ref_vectors, ref_labels):
+    """對每物件回 (best_labels, best_sims):最像哪一類樣本、多像(per-class **max**-cosine)。
+    設計:3_Architect_Design/12_similarity.md(M13 Task1)。max 不取平均(樣本少/含次型,平均會糊)。
+    N==0→兩空陣列;M==0/維度不符/任一樣本全零→ValueError。"""
+    emb = np.asarray(obj_emb, dtype=np.float32)
+    refs = np.asarray(ref_vectors, dtype=np.float32)
+    labels = np.asarray([str(l) for l in ref_labels])
+    if refs.ndim != 2 or refs.shape[0] == 0:
+        raise ValueError("需要至少一顆樣本(ref_vectors 為空)")
+    if len(labels) != refs.shape[0]:
+        raise ValueError(f"ref_labels 長度({len(labels)})需等於樣本數({refs.shape[0]})")
+    if emb.ndim != 2:
+        raise ValueError(f"obj_emb 需為 2D (N,D);得 {emb.shape}")
+    if emb.shape[0] == 0:
+        return np.array([], dtype=labels.dtype), np.zeros((0,), dtype=np.float32)
+    if emb.shape[1] != refs.shape[1]:
+        raise ValueError(f"維度不符:obj_emb D={emb.shape[1]} vs 樣本 D={refs.shape[1]}")
+    rnorms = np.linalg.norm(refs, axis=1)
+    if float(rnorms.min()) < 1e-9:
+        raise ValueError("有樣本向量範數為零(全零),無法比對")
+    cos = _l2norm_rows(emb) @ (refs / rnorms[:, None]).T          # (N, M) cosine
+    classes = list(dict.fromkeys(labels.tolist()))               # 保出現順序(tie→前者)
+    per_class = np.stack([cos[:, labels == c].max(axis=1) for c in classes], axis=1)  # (N, C)
+    best_idx = np.argmax(per_class, axis=1)
+    best_sims = per_class[np.arange(emb.shape[0]), best_idx].astype(np.float32)
+    best_labels = np.array([classes[i] for i in best_idx])
+    return best_labels, best_sims

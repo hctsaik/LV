@@ -88,3 +88,56 @@ def test_ac11_centroid_similarity_same_class():  # AC11 衍生:同類物件對�
     labs = ["a", "a", "b", "b"]
     p = np.asarray(s.similarity_priority(X, s.class_centroid(X, labs, "a")), dtype=float)
     assert int(np.argmax(p)) in (0, 1), "屬於 a 的物件應對 a-centroid 最像"
+
+
+# ── multi_ref_similarity(M13 Task1:多樣本 per-class max-cosine)────────────────
+def test_ac_m1_multi_ref_basic():  # AC-M1
+    s = _sim()
+    labs, sims = s.multi_ref_similarity([[1, 0]], [[1, 0], [0, 1]], ["a", "b"])
+    assert list(np.asarray(labs)) == ["a"]
+    assert abs(float(np.asarray(sims)[0]) - 1.0) < 1e-6
+
+
+def test_ac_m2_max_not_mean():  # AC-M2:同類兩樣本取 max(非平均)
+    s = _sim()
+    labs, sims = s.multi_ref_similarity([[0, 1]], [[1, 0], [0, 1]], ["a", "a"])
+    assert list(np.asarray(labs)) == ["a"]
+    assert abs(float(np.asarray(sims)[0]) - 1.0) < 1e-6   # max(0,1)=1,不是平均 0.5
+
+
+def test_ac_m3_picks_closer_class():  # AC-M3:歸最像的類
+    s = _sim()
+    labs, _ = s.multi_ref_similarity([[0.9, 0.1]], [[1, 0], [0, 1]], ["a", "b"])
+    assert list(np.asarray(labs)) == ["a"]
+
+
+def test_ac_m4_empty_objects():  # AC-M4:空物件 → 空
+    s = _sim()
+    labs, sims = s.multi_ref_similarity(np.zeros((0, 2), dtype=np.float32), [[1, 0]], ["a"])
+    assert np.asarray(labs).shape == (0,) and np.asarray(sims).shape == (0,)
+
+
+def test_ac_m5_empty_refs():  # AC-M5:無樣本 → raise
+    s = _sim()
+    with pytest.raises(ValueError):
+        s.multi_ref_similarity([[1, 0]], np.zeros((0, 2), dtype=np.float32), [])
+
+
+def test_ac_m6_dim_mismatch():  # AC-M6:維度不符 → raise
+    s = _sim()
+    with pytest.raises(ValueError):
+        s.multi_ref_similarity([[1, 0]], [[1, 0, 0]], ["a"])
+
+
+def test_ac_m7_zero_ref():  # AC-M7:全零樣本列 → raise
+    s = _sim()
+    with pytest.raises(ValueError):
+        s.multi_ref_similarity([[1, 0]], [[0, 0]], ["a"])
+
+
+def test_ac_m8_matches_single_ref():  # AC-M8 衍生:單類單顆 == cosine_similarity_to_ref
+    s = _sim()
+    X = [[1.0, 0.02], [0.0, 1.0], [0.9, 0.1]]
+    _, sims = s.multi_ref_similarity(X, [[1, 0]], ["a"])
+    single = s.cosine_similarity_to_ref(X, [1, 0])
+    assert np.allclose(np.asarray(sims, dtype=float), np.asarray(single, dtype=float), atol=1e-6)

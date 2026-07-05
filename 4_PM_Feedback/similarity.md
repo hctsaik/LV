@@ -22,3 +22,15 @@
 | AC9 | 類別平均向量 | `test_ac9_class_centroid` |
 | AC10 | 不存在的類別 → ValueError | `test_ac10_class_centroid_missing` |
 | AC11(衍生) | 同類物件對該類 centroid 最像 | `test_ac11_centroid_similarity_same_class` |
+
+## 增補(M13 Task1):multi_ref_similarity
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-M1 | 基本:最像的類 + max-cosine | `test_ac_m1_multi_ref_basic` |
+| AC-M2 | 同類多樣本取 **max**(非平均) | `test_ac_m2_max_not_mean` |
+| AC-M3 | 歸最像的類 | `test_ac_m3_picks_closer_class` |
+| AC-M4 | 空物件 → 空 | `test_ac_m4_empty_objects` |
+| AC-M5 | 無樣本 → ValueError | `test_ac_m5_empty_refs` |
+| AC-M6 | 維度不符 → ValueError | `test_ac_m6_dim_mismatch` |
+| AC-M7 | 全零樣本列 → ValueError | `test_ac_m7_zero_ref` |
+| AC-M8(衍生) | 單類單顆 == 單參考版 | `test_ac_m8_matches_single_ref` |

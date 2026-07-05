@@ -69,3 +69,48 @@ def class_centroid(obj_emb, labels, class_name) -> np.ndarray:
 - **AC10**:`class_centroid(..., "c")`(不存在的類別)→ `ValueError`。
 - **AC11(衍生)**:`similarity_priority(X, class_centroid(X, labs, c))` 對「屬於 c 的物件」給高分
   (centroid 與同類同向)—— 用可分兩類驗 argmax 落在該類。
+
+---
+
+## 增補(M13 Task 1):`multi_ref_similarity`(多樣本 per-class max-cosine)
+
+> M13「以樣搜樣」用:對每物件算「最像哪一類樣本、多像」。**max**(不取平均)—— 每類樣本少(5~10)且可能
+> 含次型,centroid 會糊;max=「像任何一顆就算像」。Tier A 純陣列。
+
+### 契約
+```python
+def multi_ref_similarity(obj_emb, ref_vectors, ref_labels) -> tuple:
+    """回 (best_labels, best_sims):
+      best_labels: np.ndarray (N,) 物件字串類別 —— 每物件最像的那一類;
+      best_sims:   np.ndarray (N,) float32 ∈ [-1,1] —— 該類的 max-cosine。
+    sim(x, 類c) = max over 樣本_j∈c 的 cosine(x, 樣本_j)(各自 L2 normalize)。
+    obj_emb:(N,D);ref_vectors:(M,D);ref_labels:長度 M 的類別序列。
+    N==0 → 回兩個空陣列;M==0 / 維度不符 / 任一 ref 列範數~0 → ValueError。"""
+```
+
+### 資料流
+`obj_u=L2(obj_emb)`、`ref_u=L2(ref_vectors)` → `cos=obj_u@ref_u.T`(N,M) →
+對每個 distinct 類別,取其 ref 欄的 **max** → per-class 分數 (N, C) → `argmax`=best_label、`max`=best_sim。
+
+### 邊界
+| 情境 | 行為 |
+|------|------|
+| N==0 | 回 `(np.array([]), np.zeros(0,float32))` |
+| M==0(無樣本) | `ValueError`(訊息含「樣本」) |
+| obj D ≠ ref D | `ValueError` |
+| 任一 ref 列範數 < 1e-9(全零樣本) | `ValueError`(不可比) |
+| tie(兩類同分) | 取 ref_labels 出現順序較前的類別(argmax stable) |
+
+### Acceptance Criteria(釘死;給 `/pm` 加進 tests/test_similarity.py)
+- **AC-M1(基本)**:`multi_ref_similarity([[1,0]], [[1,0],[0,1]], ["a","b"])` →
+  best_labels==["a"]、best_sims≈[1.0](差<1e-6)。
+- **AC-M2(max 非平均)**:同類兩樣本 `[[1,0],[0,1]]` 都 label "a",query `[[0,1]]` →
+  best=("a", 1.0)(max(0,1)=1;若取平均會是 0.5)。**這條鎖死 max 語義。**
+- **AC-M3(歸最像的類)**:refs `[[1,0],[0,1]]` labels `["a","b"]`,query `[[0.9,0.1]]` →
+  best_labels==["b"?]... 應==["a"](cos 到 [1,0] 較高)。best_sims 為該值。
+- **AC-M4(空物件)**:obj (0,2) → best_labels.shape==(0,)、best_sims.shape==(0,)。
+- **AC-M5(空樣本)**:`ref_vectors=[]`(M=0)→ ValueError。
+- **AC-M6(維度不符)**:obj D=2、ref D=3 → ValueError。
+- **AC-M7(全零樣本列)**:某 ref 列 `[0,0]` → ValueError。
+- **AC-M8(衍生:與單參考一致)**:單類單顆時,`multi_ref_similarity(X,[r],["a"])` 的 best_sims
+  == `cosine_similarity_to_ref(X, r)`(逐元素<1e-6)—— 多參考是單參考的一般化。
