@@ -16,6 +16,13 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M12 — 找相似選樣目標(長得像指定物件)** — 🔨 **開發中**(2026-07-05 使用者拍板「A1+A3」)—
+  PRD [2_PO_PRD/similar_objective_prd.md](2_PO_PRD/similar_objective_prd.md)。挑一顆參考物件 → 整批依 cosine
+  相似度降冪排到佇列前面。範圍:**Must** A1(③ 互動:從②結果挑參考→排序)+ A3(al_batch 加 objective=similar
+  +ref_vector;M9 選單+參考挑選;M10 profile reference_vector_file)+ 共用純函式 `similarity_priority`;
+  **Won't(v1)** 跨模型比對、A2 建模物件 provenance(進候選,參考一律來自當前②結果)。模組:**12 `similarity`
+  (Tier A)** + **08 `al_batch` 改(加 similar,既有 17 測須無回歸)** + M9/M10 GUI + 09/10 profile 小改。
+  appetite:**A1 先做完做綠 commit → 再 A3**。
 - **M11 — 看過類別 AnomalyDINO 預標(分類頭代填,人工最終確認)** — ✅ **完成**(2026-07-05,
   `gate.py prelabel` **18 綠** + 真實 E2E **2/2 綠** + M9/M10 GUI E2E 無回歸;前置 **Task 0 已修+E2E 綠**)—
   PRD [2_PO_PRD/prelabel_prd.md](2_PO_PRD/prelabel_prd.md);設計 [11_prelabel.md](3_Architect_Design/11_prelabel.md)
@@ -331,3 +338,15 @@
   無 head 友善降級。**真實 Playwright E2E `test_prelabel_gui_e2e.py` 2/2 綠**(AC-E1~E5:預覽 accept 數==實際
   匯出行數、讀回 labels/*.txt 驗 cls_id、來源資料夾前後檔案集合不變=C6 真實不變量、無 head 無匯出鈕)。
   回歸:M9 批次 GUI E2E 5/5、M10 監看 GUI E2E 3/3 全綠(Task 0 改動無回歸)。**Should AC-E6 未做進候選。**
+- (2026-07-05) **/user 起 M12「找相似」拍板(A1+A3)**:使用者在 app 找不到「找相似」→ 確認該功能原為 Feature A
+  「候選/未拍板」(只在規劃文件),遂拍板開發,scope=**A1(③ 互動)+ A3(批次:al_batch+M9/M10)**。PRD
+  [2_PO_PRD/similar_objective_prd.md](2_PO_PRD/similar_objective_prd.md)。模組:12 `similarity`(Tier A 純函式)
+  + 08 `al_batch` 加法改造(objective=similar+ref_vector,既有 17 測無回歸鐵則)+ M9/M10 GUI + 09/10 profile 小改。
+  A2(建模物件 provenance / ref_meta.json)本輪不做,參考來源限當前②結果。appetite:A1 綠+commit → 再 A3。放行 `/architect`。
+- (2026-07-05) **M12a(A1)完成**:**12 `similarity`**(設計 [12_similarity.md](3_Architect_Design/12_similarity.md);
+  `cosine_similarity_to_ref` / `similarity_priority`,降冪=最像,_minmax 與 active_learning 一致)——
+  `gate.py similarity` **8 綠**(含 AC7 正尺度不變、AC8 同向最大衍生測)。**③ GUI「🔎 找相似」**(設計
+  [M12a_gui_wiring.md](3_Architect_Design/M12a_gui_wiring.md)):挑參考物件索引 → cosine 相似度降冪縮圖牆
+  (排除參考自身)+ 加購物車;無 obj_emb / <2 物件友善降級。**真實 E2E `test_similar_gui_e2e.py` 1/1 綠**
+  (AC-S1 相似佇列同群佔多數、AC-S2 換到另一群當參考 → 佇列多數翻群 = 排序真跟參考走,真實 DINOv2 非 element 存在)。
+  A1 段 commit 後接 A3(al_batch objective=similar + M9/M10)。

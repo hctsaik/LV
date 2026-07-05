@@ -2242,6 +2242,49 @@ def _anomaly_prelabel_section(model, result, scores, threshold, obj_emb) -> None
                        f"{_done['objects']} 個標註 → `{_done['out_dir']}`")
 
 
+def _anomaly_similar_section(result, obj_emb) -> None:
+    """③「🔎 找相似」:從②結果挑一顆參考物件 → cosine 相似度降冪佇列(排除參考自身)。
+    找相似只需物件級 embedding(不需 head);無 obj_emb → 友善提示。"""
+    import similarity
+    st.divider()
+    with st.expander("🔎 找相似(長得像指定物件)", expanded=False):
+        records = result.get("records") or []
+        if obj_emb is None:
+            st.info("此結果無物件 embedding,無法找相似(需②套用產生含 embedding 的結果)。")
+            return
+        n = len(records)
+        if n < 2:
+            st.info("至少需 2 個物件才能找相似。")
+            return
+        emb = np.asarray(obj_emb, dtype=float)
+        st.caption("挑一顆你想找同款的物件當**參考**,整批依 cosine 相似度把最像的排到最前面。")
+        ref_idx = int(st.number_input("參考物件索引(②結果裡的第幾個物件)", min_value=0,
+                                      max_value=n - 1, value=0, step=1, key="anomaly_sim_ref_idx"))
+        k = st.slider("取幾個最像的送標註", 1, min(48, n - 1), min(12, n - 1), key="anomaly_sim_k")
+        with st.container(key="anomaly_sim_ref"):
+            _rr = records[ref_idx]
+            _c = st.columns([1, 3])
+            with _c[0]:
+                _im = safe_open_image(_rr["image_path"])
+                if _im is not None:
+                    st.image(crop_bbox(_im, *_rr["bbox"], pad=0.1), use_container_width=True)
+            _c[1].markdown(f"**參考:{_rr.get('label') or '—'}**｜{_rec_fname(_rr)}")
+        pri = np.asarray(similarity.similarity_priority(emb, emb[ref_idx]), dtype=float)
+        order = [int(i) for i in np.argsort(-pri) if int(i) != ref_idx][:int(k)]
+        with st.container(key="anomaly_sim_queue"):
+            _cols = st.columns(4)
+            for j, i in enumerate(order):
+                r = records[i]
+                with _cols[j % 4]:
+                    _im = safe_open_image(r["image_path"])
+                    if _im is not None:
+                        st.image(crop_bbox(_im, *r["bbox"], pad=0.1), use_container_width=True)
+                    st.caption(f"{r.get('label') or '—'}｜相似 {pri[i]:.2f}")
+            st.button(f"🛒 把這 {len(order)} 個最像的加入購物車(送標註)", key="anomaly_sim_cart",
+                      disabled=not order, use_container_width=True,
+                      on_click=_anomaly_add_to_cart, args=(records, order))
+
+
 def _anomaly_tab_sample() -> None:
     """③ 挑樣送人工標:2×2 取樣矩陣 master-detail → 點格出大圖牆 + 有意義標籤 → 加入購物車。
     4 模式排 2×2(對齊現 radio 順序):偏novelty / 弱類定向 / 三訊號均衡 / 純novelty。"""
@@ -2385,6 +2428,8 @@ def _anomaly_tab_sample() -> None:
 
     # M11:分類頭預標(代填類別 → 匯出 YOLO 到另選目錄;人工最終確認)
     _anomaly_prelabel_section(model, result, scores, threshold, obj_emb)
+    # M12a:找相似(挑參考物件 → cosine 相似度排序佇列)
+    _anomaly_similar_section(result, obj_emb)
 
 
 def _anomaly_render_scatter(result: dict, *, context: str) -> None:
