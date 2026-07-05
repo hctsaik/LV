@@ -370,3 +370,9 @@
   `test_s1_s2_class_reference_follows` 綠、M9 g8 改類別模式綠、g7 標籤更新綠;wizard/prelabel/M9(6)/M10(3)
   全回歸綠(「無分類頭」提示來自未改的取樣佇列行)。**誠實界定**:①建模狀態列「含/無分類頭」因被 ~10 條
   E2E 斷言依賴,本輪未改(留候選,要動需連同更新那批測試)。
+- (2026-07-05) **維護修復:長時操作進度條不更新(使用者回報)**:①建模、②套用、M9 分批掃描、M10 監看掃描
+  四個都把 `st.progress` 放在 **on_click callback** 裡——Streamlit **不會從 callback 即時串流**進度更新
+  (卡到整個操作跑完才一次更新,大資料時看起來像凍住)。修:改「callback 只設 pending flag → 主體
+  (script body)執行長時操作」讓 progress 真的會動;M9 分批另把 batch_size 1000→64(每 64 張更新一次)
+  + on_identity_mismatch='restart'(換參數不報錯改重跑)。回歸:build/apply/batch/watch 相關 **15 條 E2E 全綠**
+  (完成標記照舊出現)。維護模式(無 role)。

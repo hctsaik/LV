@@ -1273,6 +1273,22 @@ def _anomaly_bank_default_dir(folder: str, name: str = "anomaly_model") -> str:
 
 
 # ── M7 wizard:唯一模型槽 anomaly_model(① built / 📂 loaded 都寫這;②③ 只讀這)──
+def _anomaly_build_request() -> None:
+    """① 建模鈕(on_click):只設 flag;實際建模在主體 `_anomaly_build_model` 跑
+    ——放 on_click callback 的 st.progress 不會即時串流(卡到跑完才更新)。"""
+    st.session_state["anomaly_build_pending"] = True
+
+
+def _anomaly_apply_request() -> None:
+    """② 套用鈕(on_click):只設 flag;實際套用在主體跑(progress 即時串流)。"""
+    st.session_state["anomaly_apply_pending"] = True
+
+
+def _anomaly_watch_scan_request() -> None:
+    """▶ 立即掃描鈕(on_click):只設 flag;實際掃描在主體跑(progress 即時串流)。"""
+    st.session_state["anomaly_watch_scan_pending"] = True
+
+
 def _anomaly_build_model() -> None:
     """①:用 train_folder 跑 run_pipeline(confirmed)→ 凍 bank/projection/fewshot;
     語義=defect 且解鎖 → 一起訓 head。**語義硬守衛**:非 defect 一律不訓 head(修 silent-wrong)。
@@ -1676,7 +1692,9 @@ def _anomaly_tab_build() -> None:
     # 1c. 建模按鈕
     st.button("▶ (1) 建立模型", key="anomaly_build_btn", type="primary",
               use_container_width=True, disabled=not train_folders,
-              on_click=_anomaly_build_model)
+              on_click=_anomaly_build_request)
+    if st.session_state.pop("anomaly_build_pending", False):   # 主體執行 → progress 即時串流
+        _anomaly_build_model()
     if st.session_state.get("_anomaly_model_err"):
         st.error(st.session_state["_anomaly_model_err"])
         if st.session_state.get("_anomaly_offer_whole_image"):
@@ -1748,15 +1766,23 @@ _AL_ENGINE_OBJ = {"novelty": "novelty", "pure": "novelty",
                   "balanced": "uncertain", "confusion": "confusion", "similar": "similar"}
 
 
-def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
-    """② 大資料分批掃描(on_click):用①存出的凍結模型跑 al_batch.run_batched(阻塞 + 即時進度)。
+def _anomaly_batch_request(objective: str, k: int, resume: bool) -> None:
+    """② 分批掃描按鈕(on_click):只記下請求;實際掃描在主體 `_anomaly_batch_execute` 跑。
+    放 on_click callback 裡的 `st.progress` **不會即時串流**(會卡到整批掃完才一次更新),
+    故改「callback 設 flag → 主體執行」讓進度條真的會動。"""
+    st.session_state.pop("anomaly_batch_err", None)
+    st.session_state["anomaly_batch_pending"] = (objective, int(k), bool(resume))
+
+
+def _anomaly_batch_execute() -> None:
+    """② 大資料分批掃描(**在主體執行 → progress 即時串流**)。用①存出的凍結模型跑 al_batch.run_batched。
     - 未存模型 → **自動存**(使用者拍板)後再掃(al_batch 讀磁碟目錄,非 in-memory 槽)。
     - object_source **從磁碟 meta.json 讀**(避免 in-memory 載入模型掉此鍵 → whole_image 被默默當 yolo)。
     - checkpoint_dir 走 dataset_cache_dir(.lv_cache)守 no-dataset-writes;結果落 anomaly_batch_result。"""
     import al_batch
     from anomaly_bank_store import load_bank
     from object_eval import classes_for, dataset_cache_dir, list_images
-    st.session_state.pop("anomaly_batch_err", None)
+    objective, k, resume = st.session_state.pop("anomaly_batch_pending")
     objective = _AL_ENGINE_OBJ.get(objective, objective)   # GUI 詞彙 → 引擎 objective(Task0)
     ref_vector = None
     if objective == "similar":                             # M12b:參考向量由挑選器存進 session
@@ -1798,19 +1824,20 @@ def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
             import hashlib as _hl
             _ck_name += "_" + _hl.sha256(ref_vector.astype("float32").tobytes()).hexdigest()[:8]
         ck = dataset_cache_dir(roots[0], _ck_name)
-        _bar = st.progress(0.0, text=f"分批掃描…({len(image_paths)} 張圖)")
+        _bar = st.progress(0.0, text=f"分批掃描…({len(image_paths)} 張圖,約每 64 張更新一次)")
 
         def _cb(d):
             _tot = max(int(d.get("images_total") or 1), 1)
-            _frac = min(max(int(d.get("images_processed") or 0) / _tot, 0.0), 1.0)
-            _bar.progress(_frac, text=f"分批掃描 {d.get('images_processed')}/{_tot}"
-                                      f" · 暫定 Top-{len(d.get('provisional_topk') or [])}")
+            _proc = int(d.get("images_processed") or 0)
+            _frac = min(max(_proc / _tot, 0.0), 1.0)
+            _bar.progress(_frac, text=f"分批掃描 {_proc}/{_tot}({_frac * 100:.0f}%)"
+                                      f" · 暫定挑出 {len(d.get('provisional_topk') or [])} 個")
 
         res = al_batch.run_batched(
             image_paths, model_dir=model_dir, checkpoint_dir=ck,
             objective=objective, k=int(k), object_source=object_source,
             class_names=class_names, dataset_dirs=roots, progress=_cb, resume=resume,
-            ref_vector=ref_vector)
+            ref_vector=ref_vector, batch_size=64, on_identity_mismatch="restart")
         _bar.empty()
         st.session_state["anomaly_batch_result"] = res
         _log_usage("anomaly_batch_scan", n=res.get("objects_scored"),
@@ -1899,9 +1926,12 @@ def _anomaly_batch_section(model: dict, target_folders: list) -> None:
     _b1, _b2 = st.columns(2)
     _b1.button("▶ 大資料分批掃描", key="anomaly_batch_scan_btn", type="primary",
                use_container_width=True, disabled=_disabled,
-               on_click=_anomaly_batch_run, args=(obj, int(k), True))
+               on_click=_anomaly_batch_request, args=(obj, int(k), True))
     _b2.button("▶ 繼續上次", key="anomaly_batch_resume_btn", use_container_width=True,
-               disabled=_disabled, on_click=_anomaly_batch_run, args=(obj, int(k), True))
+               disabled=_disabled, on_click=_anomaly_batch_request, args=(obj, int(k), True))
+    # 掃描在主體跑(非 callback)→ st.progress 才會即時串流更新
+    if st.session_state.get("anomaly_batch_pending"):
+        _anomaly_batch_execute()
     if st.session_state.get("anomaly_batch_err"):
         st.error(st.session_state["anomaly_batch_err"])
     if st.session_state.get("anomaly_batch_autosaved"):
@@ -2076,7 +2106,8 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
     _c1.button("🆕 初始化監看", key="anomaly_watch_init_btn", use_container_width=True,
                disabled=not _enabled, on_click=_anomaly_watch_init, args=(obj, int(k)))
     _c2.button("▶ 立即掃描一次", key="anomaly_watch_scan_btn", type="primary",
-               use_container_width=True, disabled=not _enabled, on_click=_anomaly_watch_scan)
+               use_container_width=True, disabled=not _enabled,
+               on_click=_anomaly_watch_scan_request)
     _prof = (Path(ws) / "profile.yaml") if ws else None
     with _c3:
         if _prof and _prof.exists():
@@ -2087,6 +2118,8 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
         else:
             st.button("📤 匯出設定", key="anomaly_watch_export_btn", disabled=True,
                       use_container_width=True, help="先「初始化監看」才有設定可匯出。")
+    if st.session_state.pop("anomaly_watch_scan_pending", False):   # 主體執行 → progress 即時串流
+        _anomaly_watch_scan()
     if st.session_state.get("anomaly_watch_err"):
         st.error(st.session_state["anomaly_watch_err"])
     _last_res = st.session_state.get("anomaly_watch_last")
@@ -2135,7 +2168,9 @@ def _anomaly_tab_apply() -> None:
             st.session_state.pop(_k, None)
     st.button("▶ (2) 套用偵測", key="anomaly_apply_btn", type="primary",
               use_container_width=True, disabled=not target_folders,
-              on_click=_anomaly_apply_model)
+              on_click=_anomaly_apply_request)
+    if st.session_state.pop("anomaly_apply_pending", False):   # 主體執行 → progress 即時串流
+        _anomaly_apply_model()
     if st.session_state.get("_anomaly_apply_err"):
         st.error(st.session_state["_anomaly_apply_err"])
 
