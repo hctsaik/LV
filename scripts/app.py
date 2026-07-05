@@ -2162,6 +2162,86 @@ def _anomaly_tab_apply() -> None:
         _anomaly_render_inspector(result, scores)
 
 
+def _anomaly_prelabel_export(out_dir, lines_by_image, class_names, source_dirs) -> None:
+    """on_click:匯出預標到 out_dir(prelabel.export_prelabels 內建 C6 安全檢查)。結果/錯誤落 session。"""
+    import prelabel
+    st.session_state.pop("anomaly_prelabel_err", None)
+    st.session_state.pop("anomaly_prelabel_done", None)
+    try:
+        st.session_state["anomaly_prelabel_done"] = prelabel.export_prelabels(
+            lines_by_image, out_dir, class_names=class_names, source_dirs=source_dirs)
+    except Exception as exc:
+        st.session_state["anomaly_prelabel_err"] = f"匯出失敗(安全檢查):{exc}"
+
+
+def _anomaly_prelabel_preview_grid(records, decisions) -> None:
+    """預覽:接受的預標縮圖牆(pred·信心·✅收)。無接受 → 提示調參。"""
+    shown = [d for d in decisions if d["accept"]][:12]
+    if not shown:
+        st.caption("目前沒有可接受的預標 —— 調低信心門檻,或多選目標類別。")
+        return
+    cols = st.columns(4)
+    for j, d in enumerate(shown):
+        rec = records[d["item"]]
+        with cols[j % 4]:
+            _im = safe_open_image(rec["image_path"])
+            if _im is None:
+                st.caption("⚠ 缺圖")
+            else:
+                st.image(crop_bbox(_im, *rec["bbox"], pad=0.1), use_container_width=True)
+            st.caption(f"{d['pred']} · 信心 {d['conf']:.2f} · ✅收")
+
+
+def _anomaly_prelabel_section(model, result, scores, threshold, obj_emb) -> None:
+    """③「🏷️ 預標(分類頭代填,人工最終確認)」:min_conf + 類別過濾 + 預覽 + 匯出到另選目錄(C6)。
+    無 head → 友善提示、不出匯出鈕;patch-only 無 obj_emb → 提示不支援(不硬跑)。"""
+    import prelabel
+    st.divider()
+    with st.expander("🏷️ 預標(分類頭代填,人工最終確認)", expanded=False):
+        head = model.get("head")
+        if not head:
+            st.info("此模型**無分類頭**,無法預標。請到①用**瑕疵類別**標籤(每類達 N_min)重建含 head 的模型。")
+            return
+        records = result.get("records") or []
+        if obj_emb is None or not records:
+            st.info("此模型型態或結果無物件 embedding,無法預標(需②套用偵測產生含 embedding 的結果)。")
+            return
+        classes = list(head.get("classes") or [])
+        st.caption("模型對每個物件代填類別;**你是最終裁決**。沒把握的(Unknown / 低於信心門檻)一律留白,不亂猜。")
+        min_conf = st.slider("信心門檻(低於此 → 留白給你手標)", 0.0, 1.0, 0.5, 0.05,
+                             key="anomaly_prelabel_min_conf")
+        target = st.multiselect("只預標這些類別(其餘留給你手標)", classes, default=classes,
+                                key="anomaly_prelabel_classes")
+        decisions = prelabel.prelabel_records(
+            records, np.asarray(obj_emb, dtype=float), scores, head,
+            anomaly_threshold=float(threshold), min_conf=float(min_conf),
+            target_classes=list(target))
+        n_accept = sum(1 for d in decisions if d["accept"])
+        with st.container(key="anomaly_prelabel_preview"):
+            st.markdown(f"**接受 {n_accept}** / 共 {len(decisions)} 個物件"
+                        "(其餘 = 正常 / Unknown / 未選類別 → 留白)")
+            _anomaly_prelabel_preview_grid(records, decisions)
+        _tf = st.session_state.get("anomaly_target_folder") or []
+        _def_out = _anomaly_bank_default_dir(str(_tf[0]), "prelabel_out") if _tf else ""
+        if not st.session_state.get("anomaly_prelabel_out_dir") and _def_out:
+            st.session_state["anomaly_prelabel_out_dir"] = _def_out
+        st.text_input("輸出資料夾(另存 YOLO labels;來源資料集一律不動)",
+                      key="anomaly_prelabel_out_dir",
+                      help="預標寫這;C6:不得等於/位於來源資料集內。")
+        out_dir = (st.session_state.get("anomaly_prelabel_out_dir") or "").strip()
+        lines_by_image = prelabel.to_yolo_lines(records, decisions, class_names=classes)
+        st.button("⬇ 匯出預標 YOLO", key="anomaly_prelabel_export_btn", type="primary",
+                  disabled=not out_dir, use_container_width=True,
+                  on_click=_anomaly_prelabel_export,
+                  args=(out_dir, lines_by_image, classes, [str(f) for f in _tf]))
+        if st.session_state.get("anomaly_prelabel_err"):
+            st.error(st.session_state["anomaly_prelabel_err"])
+        _done = st.session_state.get("anomaly_prelabel_done")
+        if _done:
+            st.success(f"✅ 預標匯出完成 · 寫 {_done['written']} 檔 · "
+                       f"{_done['objects']} 個標註 → `{_done['out_dir']}`")
+
+
 def _anomaly_tab_sample() -> None:
     """③ 挑樣送人工標:2×2 取樣矩陣 master-detail → 點格出大圖牆 + 有意義標籤 → 加入購物車。
     4 模式排 2×2(對齊現 radio 順序):偏novelty / 弱類定向 / 三訊號均衡 / 純novelty。"""
@@ -2302,6 +2382,9 @@ def _anomaly_tab_sample() -> None:
     st.button(f"🛒 把「{_active_name}」佇列 {len(_sel)} 個加入購物車(送標註)",
               key="anomaly_q_cart", disabled=not _sel, use_container_width=True,
               on_click=_anomaly_add_to_cart, args=(records, _sel))
+
+    # M11:分類頭預標(代填類別 → 匯出 YOLO 到另選目錄;人工最終確認)
+    _anomaly_prelabel_section(model, result, scores, threshold, obj_emb)
 
 
 def _anomaly_render_scatter(result: dict, *, context: str) -> None:

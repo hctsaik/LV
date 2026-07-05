@@ -16,6 +16,20 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M11 — 看過類別 AnomalyDINO 預標(分類頭代填,人工最終確認)** — ✅ **完成**(2026-07-05,
+  `gate.py prelabel` **18 綠** + 真實 E2E **2/2 綠** + M9/M10 GUI E2E 無回歸;前置 **Task 0 已修+E2E 綠**)—
+  PRD [2_PO_PRD/prelabel_prd.md](2_PO_PRD/prelabel_prd.md);設計 [11_prelabel.md](3_Architect_Design/11_prelabel.md)
+  + [M11_gui_wiring.md](3_Architect_Design/M11_gui_wiring.md);對應表 [4_PM_Feedback/prelabel.md](4_PM_Feedback/prelabel.md);
+  實作 `scripts/prelabel.py` + `app.py::_anomaly_prelabel_section`(③ 挑樣內)。**Should AC-E6(M10 佇列採納建議)
+  未做,進候選。** 需求:已教過的瑕疵類別,新資料進來時模型先填好類別與信心,人只做確認/修正,
+  重複標註工大減;沒把握留白(Unknown)不亂猜。範圍建議(待 PO 定 MoSCoW):**v1 只做「已有 bbox 的分類預標」**
+  (包既有 `gated_predict`:正常/類別/Unknown + min_conf 門檻 + 指定類別 multiselect)→ 預覽表先看再收 →
+  匯出 YOLO labels 到使用者**另選**資料夾(C6 絕不寫來源)+ M10 監看佇列旁「採納建議」;
+  **Won't(v1)** 無標籤影像的偵測預標(bbox 生成,pmap→連通域是 v2 備忘)。模組建議:11 `prelabel`
+  (Tier A 純邏輯)+ GUI 接線(Tier B)。**前置**:Task 0 = M9/M10 選樣目標名稱不匹配 bug(GUI `balanced`/`pure`
+  傳 al_batch 會 ValueError,先修)。需求 [1_user_needs/prelabel_seen_class.md](1_user_needs/prelabel_seen_class.md);
+  設計素材 [SIMILAR_OBJECTIVE_AND_PRELABEL_PLAN.md](SIMILAR_OBJECTIVE_AND_PRELABEL_PLAN.md)(Feature B + Task 0;
+  同文件 Feature A「找相似選樣目標」為候選、未拍板)。
 - **M9 — 大資料主動學習 GUI 可用性(分批可續跑引擎 + 標註佇列)** — ✅ **完成**(2026-07-05,引擎 08 gate GREEN + GUI 接線 4 E2E 綠) —
   瑕疵/主動學習 feature 收斂後的**新能力**輪次(起新輪)。需求:資料量大(數萬~十萬)時,現行
   「整條 pipeline 綁在 Streamlit 互動 session 同步跑完」→ 畫面卡死/等數小時/關掉重來,實質不能用。
@@ -285,4 +299,35 @@
   al_service 加 `progress` 附加參數轉發 al_batch(gate 仍 8 綠)。驗證:**真實 Playwright E2E
   `tests/e2e/test_al_service_gui_e2e.py` 3/3 綠**(初始化+profile.yaml+匯出、掃描+佇列+reason、標註閉環下輪移出、
   未存自動存)。**M10 完成 = 瑕疵偵測→大資料→離線服務整條 feature 線收斂;要再加新能力須新 `/user` 起輪。**
-  (M10 尚在 backup 本地,未提交/未 rebase 上 remote;push+平台釘指標同 M9 流程,待觸發。)
+  (2026-07-05 後續:已 rebase+push 上 remote(e24b85b);平台 nativeApp 已釘 submodule 指標(b8521bf),
+  平台 repo 本身 push 待觸發。)
+- (2026-07-05) **/user 起新輪:M11「看過類別預標」拍板**:使用者確認要「透過 AnomalyDINO/分類頭對看過的
+  類別做預標」。與 M5「不做全自動標註」不衝突——M11 定位是**預**標+人工最終確認,人仍是最終裁決。
+  需求落 [1_user_needs/prelabel_seen_class.md](1_user_needs/prelabel_seen_class.md);設計素材
+  [SIMILAR_OBJECTIVE_AND_PRELABEL_PLAN.md](SIMILAR_OBJECTIVE_AND_PRELABEL_PLAN.md)(Feature B)。盤點時**順手挖到
+  真 bug(=Task 0,建議 M11 前置先修)**:M9/M10 GUI 選樣目標 `balanced`/`pure` 原樣傳 `al_batch.run_batched`,
+  但引擎只收 `novelty/uncertain/confusion` → ValueError「分批掃描失敗」;現有 E2E 只測 novelty 故未攔到。
+  同文件 Feature A「長得像指定物件」選樣目標為候選、**未拍板**。狀態:待 `/po` 收斂 PRD 後放行 `/architect`。
+- (2026-07-05) **Task 0 維護修復(M9/M10 選樣目標名稱不匹配)**:GUI `_OBJ` 曾列 novelty/balanced/confusion/pure
+  4 項,但 `al_batch.run_batched` 只收 novelty/uncertain/confusion → 選 balanced/pure 直接
+  「分批掃描失敗:objective must be…」(現有 E2E 只測 novelty 未攔)。修:app.py 加 `_AL_ENGINE_OBJ`
+  映射(balanced→uncertain、pure→novelty),批次/監看兩處呼叫套用;選單砍同義的「純 novelty」成 3 項誠實選單;
+  watch 區塊補 head 閘(與批次一致,無 head 選 balanced/confusion → 反灰而非掃描時 raise)。
+  驗:新增 E2E `test_al_batch_gui_e2e.py::test_g7_balanced_objective_maps_to_uncertain`(含 head 模型選
+  三訊號均衡 → 掃出佇列、無 ValueError)**1/1 綠(58s)**。維護模式(無 role)完成,不走 U-Net 五層。
+- (2026-07-05) **M11 `/po` 收斂 PRD**:[2_PO_PRD/prelabel_prd.md](2_PO_PRD/prelabel_prd.md) —— v1 只做「已有 bbox 的
+  分類預標」(Must:prelabel 三純函式 + GUI 預覽/類別過濾/匯出另選目錄;Should:M10 佇列採納建議;
+  Won't:無標籤影像的偵測預標=v2)。模組分解:**11 `prelabel`(Tier B,無 GUI→gate=單元+真實檔案系統測試)**
+  + M11 GUI 接線(Tier B,真實 E2E)。appetite ≤1 模組+GUI。給架構師 4 個開放問題(正常物件剔除/conf 定義/
+  C6 檢查粒度/類別對齊以 head 為準)。放行 `/architect`。
+- (2026-07-05) **M11 完成(architect→pm→pg 一輪)**:**11 `prelabel`**(設計
+  [11_prelabel.md](3_Architect_Design/11_prelabel.md);純函式 `prelabel_records`/`to_yolo_lines`/`export_prelabels`
+  + `assert_safe_prelabel_dir`):閘控判定→可接受預標→安全 YOLO 匯出。**架構師 4 開放問題定案**:①正常物件剔除
+  ②conf=head 最大類別機率、Unknown 一律不 accept ③C6 檢查=含 images/ 或與來源有祖先/後代/等於關係即拒
+  ④cls_id 以 head 類別空間為準。**關鍵決策**:prelabel 需**專屬** `assert_safe_prelabel_dir`(既有
+  `assert_safe_bank_dir` 見 labels/ 會誤擋重複匯出)。`gate.py prelabel` **18 綠**(含 AC17 來源零寫入不變量、
+  AC18 冪等)。**M11-GUI**(③ 挑樣加「🏷️ 預標」expander;設計 [M11_gui_wiring.md](3_Architect_Design/M11_gui_wiring.md)):
+  min_conf slider + 目標類別 multiselect + 預覽縮圖牆(pred·信心·✅收)+ 匯出到**另選**目錄(絕不寫回來源);
+  無 head 友善降級。**真實 Playwright E2E `test_prelabel_gui_e2e.py` 2/2 綠**(AC-E1~E5:預覽 accept 數==實際
+  匯出行數、讀回 labels/*.txt 驗 cls_id、來源資料夾前後檔案集合不變=C6 真實不變量、無 head 無匯出鈕)。
+  回歸:M9 批次 GUI E2E 5/5、M10 監看 GUI E2E 3/3 全綠(Task 0 改動無回歸)。**Should AC-E6 未做進候選。**
