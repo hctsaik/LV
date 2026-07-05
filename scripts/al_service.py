@@ -82,12 +82,20 @@ def run_once(workspace_dir, *, embed_fn=None, extractor=None,
         for r in watch_folders:
             class_names = class_names or classes_for(r)
         ref_vec = None
+        ref_vectors = ref_labels = None
         if profile["objective"] == "similar":       # similar:載入可攜參考向量傳給引擎
             import numpy as np
             rvf = profile.get("reference_vector_file")
             if not rvf or not (wsd / rvf).exists():
                 raise ValueError("objective 'similar' 需要參考向量,但 workspace 缺 reference 檔")
             ref_vec = np.load(wsd / rvf)
+        elif profile["objective"] == "retrieve":    # retrieve(M13 以樣搜樣):載入樣本集傳給引擎
+            import sample_bank
+            sbd = profile.get("sample_bank_dir")
+            if not sbd:
+                raise ValueError("objective 'retrieve' 需要 sample_bank_dir(樣本集目錄)")
+            _bank = sample_bank.load_sample_bank(sbd)
+            ref_vectors, ref_labels = _bank["vectors"], list(_bank["labels"])
         result = al_batch.run_batched(
             all_paths, model_dir=profile["model_dir"],
             checkpoint_dir=wsd / "al_batch_ck",
@@ -96,7 +104,7 @@ def run_once(workspace_dir, *, embed_fn=None, extractor=None,
             class_names=class_names, dataset_dirs=watch_folders,
             embed_fn=embed_fn, extractor=extractor, progress=progress,
             resume=True, on_identity_mismatch="restart", max_batches=max_batches,
-            ref_vector=ref_vec)
+            ref_vector=ref_vec, ref_vectors=ref_vectors, ref_labels=ref_labels)
 
         # 6. 正規化 al_batch item_id → 佇列契約的 id(設計 §2.4),再合併標註 → 取前 k 個未標的
         records = [{"id": r["item_id"],

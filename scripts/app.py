@@ -8852,6 +8852,168 @@ def _fewshot_step_confirm() -> None:
                    f"`{_done['out_dir']}`")
 
 
+def _fewshot_monitor_init(k: int) -> None:
+    """🆕 初始化以樣搜樣監看(on_click):用當前樣本集 + 目標夾 → al_service.init_workspace(retrieve)。"""
+    import al_service
+    st.session_state.pop("fewshot_watch_err", None)
+    bank_dir = st.session_state.get("fewshot_sample_bank_dir")
+    model = st.session_state.get("anomaly_model") or {}
+    target = list(st.session_state.get("fewshot_target_folder") or [])
+    ws = (st.session_state.get("fewshot_watch_ws") or "").strip()
+    if not (bank_dir and model.get("_dir") and target and ws):
+        st.session_state["fewshot_watch_err"] = "需先①建樣本集、②選目標夾、有凍結模型,並填工作區目錄。"
+        return
+    try:
+        al_service.init_workspace(ws, name=Path(target[0]).name,
+                                  watch_folders=[str(t) for t in target],
+                                  model_dir=str(model["_dir"]), objective="retrieve",
+                                  k=int(k), sample_bank_dir=str(bank_dir))
+        st.session_state["fewshot_watch_inited"] = ws
+    except Exception as exc:
+        st.session_state["fewshot_watch_err"] = f"初始化監看失敗:{exc}"
+
+
+def _fewshot_monitor_scan() -> None:
+    """▶ 立即掃描一次(主體執行 → progress 串流):profile 缺 → 先 init;跑 al_service.run_once。"""
+    import al_service
+    st.session_state.pop("fewshot_watch_err", None)
+    bank_dir = st.session_state.get("fewshot_sample_bank_dir")
+    model = st.session_state.get("anomaly_model") or {}
+    target = list(st.session_state.get("fewshot_target_folder") or [])
+    ws = (st.session_state.get("fewshot_watch_ws") or "").strip()
+    if not (bank_dir and model.get("_dir") and target and ws):
+        st.session_state["fewshot_watch_err"] = "需先①建樣本集、②選目標夾、有凍結模型,並填工作區目錄。"
+        return
+    if not (Path(ws) / "profile.yaml").exists():
+        _fewshot_monitor_init(int(st.session_state.get("fewshot_watch_k", 100)))
+        if st.session_state.get("fewshot_watch_err"):
+            return
+    try:
+        _bar = st.progress(0.0, text="準備中…首次會先載入模型(約 10~30 秒),再開始掃描")
+
+        def _cb(d):
+            _tot = max(int(d.get("images_total") or 1), 1)
+            _bar.progress(min(max(int(d.get("images_processed") or 0) / _tot, 0.0), 1.0),
+                          text=f"監看掃描 {d.get('images_processed')}/{_tot}")
+
+        with st.spinner("監看掃描中…首次會先載入模型(約 10~30 秒),請稍候"):
+            res = al_service.run_once(ws, progress=_cb)
+        _bar.empty()
+        st.session_state["fewshot_watch_last"] = res
+        if res.get("status") == "error":
+            st.session_state["fewshot_watch_err"] = f"監看掃描失敗:{res.get('reason')}"
+    except Exception as exc:
+        st.session_state["fewshot_watch_err"] = f"監看掃描失敗:{exc}"
+
+
+def _fewshot_monitor_label(ws: str, item_id: str, decision: str, label: str) -> None:
+    """佇列消費 → labels.jsonl。decision 用 al_workspace 合併語彙:'defect'=已確認(下輪移出)、'skip'=留下。"""
+    import time as _t
+
+    import al_workspace
+    al_workspace.append_label(ws, {"id": item_id, "decision": decision, "label": label,
+                                   "decided_at": _t.time()})
+    st.toast({"defect": "已採納", "skip": "已略過"}.get(decision, "已標"), icon="✅")
+
+
+def _fewshot_monitor_render_queue(ws: str, items: list) -> None:
+    from interaction import crop_bbox
+    st.markdown(f"**監看佇列**(共 {len(items)};✅採納 / ⏭略過,可先用下拉改類 → 下輪自動移出)")
+    if not items:
+        st.info("佇列空(尚無待標,或都標完了)。")
+        return
+    classes = st.session_state.get("fewshot_sample_classes") or []
+    _limit = int(st.session_state.get("fewshot_watch_limit", 30))
+    with st.container(key="fewshot_watch_queue"):
+        cols = st.columns(3)
+        for j, it in enumerate(items[:_limit]):
+            with cols[j % 3]:
+                im = safe_open_image(it.get("image_path"))
+                if im is None:
+                    st.caption("⚠ 缺圖")
+                else:
+                    st.image(crop_bbox(im, *it.get("bbox", [0.5, 0.5, 1.0, 1.0]), pad=0.1),
+                             use_container_width=True)
+                _sug = it.get("suggested_class", "—")
+                st.caption(f"建議 **{_sug}** · 相似 {float(it.get('similarity', 0)):.2f}")
+                _id = str(it.get("id", ""))
+                _rc = st.selectbox("改類", ["(採納建議)"] + list(classes),
+                                   key=f"fewshot_watch_relabel_{j}", label_visibility="collapsed")
+                _final = _sug if _rc == "(採納建議)" else _rc
+                _g, _s = st.columns(2)
+                _g.button("✅ 採納", key=f"fewshot_watch_accept_{j}",
+                          on_click=_fewshot_monitor_label, args=(ws, _id, "defect", _final))
+                _s.button("⏭ 略過", key=f"fewshot_watch_skip_{j}",
+                          on_click=_fewshot_monitor_label, args=(ws, _id, "skip", _final))
+    if len(items) > _limit:
+        st.button(f"載入更多(+30,共 {len(items)})", key="fewshot_watch_more",
+                  use_container_width=True, on_click=lambda: st.session_state.update(
+                      fewshot_watch_limit=min(_limit + 30, len(items))))
+
+
+def _fewshot_step_monitor() -> None:
+    """④ 監看:用當前樣本集背景自動海撈目標夾新圖(復用 al_workspace/al_service,retrieve objective)。"""
+    import al_service
+
+    import al_workspace
+    if not st.session_state.get("fewshot_sample_bank_dir"):
+        st.info("請先到「① 樣本集」建立樣本集。")
+        return
+    target = list(st.session_state.get("fewshot_target_folder") or [])
+    if not target:
+        st.info("請先到「② 海掃」選一個目標資料夾(監看會持續掃它、撈進新圖)。")
+        return
+    st.markdown("**④ 監看**:設一個工作區 → 用**當前樣本集**背景自動海撈目標夾;"
+                "可**匯出設定**(profile.yaml)給離線服務排程跑。")
+    _def_ws = _anomaly_bank_default_dir(str(target[0]), "fewshot_watch")
+    if not st.session_state.get("fewshot_watch_ws") and _def_ws:
+        st.session_state["fewshot_watch_ws"] = _def_ws
+    st.text_input("工作區目錄(.lv_cache;存 profile / 佇列 / 標註)", key="fewshot_watch_ws",
+                  help="設定/佇列/標註都存這;profile.yaml 可匯出給離線服務。")
+    k = st.slider("每次要挑前幾個", 10, 500, 100, 10, key="fewshot_watch_k")
+    ws = (st.session_state.get("fewshot_watch_ws") or "").strip()
+    _c1, _c2, _c3 = st.columns(3)
+    _c1.button("🆕 初始化監看", key="fewshot_watch_init_btn", use_container_width=True,
+               disabled=not ws, on_click=_fewshot_monitor_init, args=(int(k),))
+    _c2.button("▶ 立即掃描一次", key="fewshot_watch_scan_btn", type="primary",
+               use_container_width=True, disabled=not ws,
+               on_click=lambda: st.session_state.update(fewshot_watch_scan_pending=True))
+    _prof = (Path(ws) / "profile.yaml") if ws else None
+    with _c3:
+        if _prof and _prof.exists():
+            st.download_button("📤 匯出設定", key="fewshot_watch_export_btn",
+                               data=_prof.read_bytes(),
+                               file_name=f"al_profile_{Path(ws).name}.yaml",
+                               mime="text/yaml", use_container_width=True)
+        else:
+            st.button("📤 匯出設定", key="fewshot_watch_export_btn", disabled=True,
+                      use_container_width=True, help="先「初始化監看」才有設定可匯出。")
+    if st.session_state.pop("fewshot_watch_scan_pending", False):   # 主體執行 → progress 即時串流
+        _fewshot_monitor_scan()
+    if st.session_state.get("fewshot_watch_err"):
+        st.error(st.session_state["fewshot_watch_err"])
+    _last = st.session_state.get("fewshot_watch_last")
+    if _last and _last.get("status") == "ok":
+        st.success(f"✅ 監看掃描完成 · 新增 {_last.get('new')} · "
+                   f"評分 {_last.get('objects_scored')} · 佇列 {_last.get('queue_len')}")
+    with st.container(key="fewshot_watch_status"):
+        if ws and (Path(ws) / "profile.yaml").exists():
+            try:
+                _stat = al_service.status(ws)
+            except Exception:
+                _stat = {"last_run": None, "queue_len": 0}
+            _lr = _stat.get("last_run")
+            if _lr:
+                st.caption(f"✅ 上次掃描 {_lr.get('run_id')} · 新增 {_lr.get('new')} · "
+                           f"評分 {_lr.get('objects_scored')} · 佇列 {_lr.get('queue_len')}")
+            else:
+                st.caption("🛰 已初始化,尚未跑過掃描 —— 按「▶ 立即掃描一次」。")
+        else:
+            st.caption("🛰 尚未初始化監看(填工作區目錄 → 按「🆕 初始化監看」)。")
+    if ws and (Path(ws) / "queue.jsonl").exists():
+        _fewshot_monitor_render_queue(ws, al_workspace.read_queue(ws))
+
+
 def _fewshot_search_ui() -> None:
     """🎯 以樣搜樣(第 9 工具):小樣本 → 海掃帶粗框大資料 → 建議類別 → YOLO+CSV 匯出 → 人確認。"""
     st.subheader("🎯 以樣搜樣(小樣本海撈 → YOLO 預標 → 人工確認)")
@@ -8860,13 +9022,15 @@ def _fewshot_search_ui() -> None:
         st.info("以樣搜樣需要一個**凍結模型**當特徵器。請先到『**瑕疵偵測**』① **建立或載入一個模型**"
                 "(並存到暫存目錄),再回來這裡。")
         return
-    step = st.segmented_control("步驟", ["① 樣本集", "② 海掃", "③ 確認 / 匯出"],
+    step = st.segmented_control("步驟", ["① 樣本集", "② 海掃", "③ 確認 / 匯出", "④ 監看"],
                                 key="fewshot_step", default="① 樣本集") or "① 樣本集"
     st.divider()
     if step == "① 樣本集":
         _fewshot_step_samples()
     elif step == "② 海掃":
         _fewshot_step_scan()
+    elif step == "④ 監看":
+        _fewshot_step_monitor()
     else:
         _fewshot_step_confirm()
 

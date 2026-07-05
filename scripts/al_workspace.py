@@ -22,6 +22,7 @@ _DEFAULTS = {
     "objective": "novelty", "k": 100, "score_mode": "patch",
     "target_res": 224, "batch_size": 20,   # 小批次 → 監看/服務掃描每 20 張更新一次進度(可續跑更細)
     "reference_vector_file": None,          # similar:workspace 內參考向量 .npy 相對路徑(否則 None)
+    "sample_bank_dir": None,                # retrieve(M13 以樣搜樣):樣本集目錄(.lv_cache 絕對路徑)
     "filters": {"min_score": None, "classes": []},
 }
 

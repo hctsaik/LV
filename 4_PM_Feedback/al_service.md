@@ -29,3 +29,8 @@
 | AC | 說明 | 測試 |
 |----|------|------|
 | AC-SVC-SIM | init 存 reference.npy + profile.reference_vector_file;run_once similar → 佇列以參考同群為主 | `test_ac_svc_sim_similar_profile_and_ranking` |
+
+## 增補(M13 Task6):retrieve 監看
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-SVC-RET | init 存 sample_bank_dir;run_once retrieve → 佇列帶 suggested_class、依相似度、X樣本→X群為主 | `test_ac_svc_ret_retrieve_profile_and_queue` |

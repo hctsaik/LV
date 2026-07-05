@@ -59,3 +59,23 @@ DOM 穩定標記:海掃完成主畫面含「以樣搜樣掃描完成」;匯出�
 - **AC-F2(匯出雙出 + 讀回)**:③ 設 out_dir → 匯出 → out_dir/labels/*.txt(cls_id∈{0,1})+ retrieval_report.csv
   (表頭正確)+ classes.txt 都在;**來源資料夾零寫入**(C6,前後檔案集合比對)。
 - **AC-F3(無模型友善)**:未建/載模型直接切「以樣搜樣」→ 顯示「先到『瑕疵偵測』①…」導引,無 stException。
+
+---
+## 增補(M13 Task6):監看模式(背景自動海撈,復用 M10)
+> 資料夾持續進新圖 → 背景服務按樣本集自動海撈。復用 al_workspace/al_service(similar 的 reference 機制前例)。
+
+### 服務層契約(09/10 加法)
+- `al_workspace._DEFAULTS` 加 `sample_bank_dir: None`(workspace profile 指向 .lv_cache 的樣本集)。
+- `al_service.init_workspace(..., sample_bank_dir=None)`:透過 **over 寫進 profile(retrieve 用)。
+- `al_service.run_once`:`profile.objective=="retrieve"` 時 → `sample_bank.load_sample_bank(profile.sample_bank_dir)`
+  → `ref_vectors=bank.vectors, ref_labels=bank.labels` 傳 `run_batched(objective="retrieve", ...)`;
+  缺 sample_bank_dir → 明確 raise。既有 novelty/similar 路徑不變。
+
+### Acceptance(單元;tests/test_al_service.py)
+- **AC-SVC-RET**:`init_workspace(objective="retrieve", sample_bank_dir=<存好的樣本集>)` → profile.sample_bank_dir 正確;
+  `run_once`(注入 embed_fn;樣本 E2 標 X、E3 標 Y)→ 佇列 `id` 對應 topk 帶 **suggested_class**、依相似度排序、
+  X 群圖建議 X。
+
+### GUI(第 9 工具「④ 監看」;沿用 M10 watch 樣式;E2E 以 AC-SVC-RET 覆蓋核心,GUI 接線最小)
+- 步驟列加「④ 監看」:工作區目錄 + 🆕初始化(用當前樣本集 + 目標夾)+ 📤匯出設定 + ▶立即掃描一次 + 狀態卡 + 佇列消費(採納/改類/略過→labels.jsonl)。
+- profile 可攜:匯出 profile.yaml + sample_bank 目錄給離線服務跑。
