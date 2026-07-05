@@ -8718,7 +8718,6 @@ def _fewshot_scan_execute() -> None:
         _bar.empty()
         st.session_state["fewshot_scan_result"] = res
         st.session_state["fewshot_sample_classes"] = sorted(set(np.asarray(bank["labels"]).tolist()))
-        st.session_state.pop("fewshot_decisions", None)
     except Exception as exc:
         st.session_state["fewshot_scan_err"] = f"海掃失敗:{exc}"
 
@@ -8729,20 +8728,18 @@ def _fewshot_export() -> None:
     st.session_state.pop("fewshot_export_err", None)
     st.session_state.pop("fewshot_export_done", None)
     res = st.session_state.get("fewshot_scan_result") or {}
-    records = res.get("topk_records") or []
+    records = _fewshot_unique_records(res)     # 依 item_id 去重(與佇列 checkbox 一致、避免重複標註)
     out_dir = (st.session_state.get("fewshot_out_dir") or "").strip()
     classes = st.session_state.get("fewshot_sample_classes") or []
-    dmap = st.session_state.get("fewshot_decisions") or {}
     theta = float(st.session_state.get("fewshot_theta", 0.3))
     decs = []
     for i, r in enumerate(records):
         if float(r.get("similarity", 0)) < theta:            # 未達門檻 → 不匯(視為 pending)
             continue
-        d = dmap.get(r["item_id"])
-        if d is None:
+        if st.session_state.get(f"fewshot_accept_{r['item_id']}", True):   # 打勾=採納
             decs.append({"item": i, "decision": "accepted", "final_class": r.get("suggested_class")})
-        else:
-            decs.append({"item": i, "decision": d["decision"], "final_class": d.get("final_class")})
+        else:                                                # 取消勾選=略過
+            decs.append({"item": i, "decision": "skipped", "final_class": None})
     source_dirs = [str(t) for t in (st.session_state.get("fewshot_target_folder") or [])]
     try:
         st.session_state["fewshot_export_done"] = retrieval_export.export_retrieval(
@@ -8752,11 +8749,12 @@ def _fewshot_export() -> None:
 
 
 def _fewshot_render_queue(res, theta) -> None:
+    """佇列:縮圖 + 緊湊「☑ 採納」checkbox(預設打勾;取消=略過)。取代舊的下拉+略過按鈕。"""
     from interaction import crop_bbox
-    recs = [r for r in (res.get("topk_records") or []) if float(r.get("similarity", 0)) >= theta]
+    recs = [r for r in _fewshot_unique_records(res) if float(r.get("similarity", 0)) >= theta]
     done = bool(res.get("done"))
     st.markdown(f"{'✅ 以樣搜樣掃描完成' if done else '⏳ 掃描中'} · 命中 **{len(recs)}** 個"
-                f"(相似度 ≥ {theta:.2f};已評分 {res.get('objects_scored')})")
+                f"(相似度 ≥ {theta:.2f};已評分 {res.get('objects_scored')};**預設全採納,取消勾選=略過**)")
     if not recs:
         st.info("沒有命中 —— 調低相似度門檻,或多加樣本。")
         return
@@ -8767,7 +8765,8 @@ def _fewshot_render_queue(res, theta) -> None:
                 _im = safe_open_image(r["image_path"])
                 if _im is not None:
                     st.image(crop_bbox(_im, *r["bbox"], pad=0.1), use_container_width=True)
-                st.caption(f"建議 **{r.get('suggested_class', '—')}** · 相似 {float(r.get('similarity', 0)):.2f}")
+                st.checkbox(f"採納 · {r.get('suggested_class', '—')} {float(r.get('similarity', 0)):.2f}",
+                            value=True, key=f"fewshot_accept_{r['item_id']}")
 
 
 def _fewshot_step_samples() -> None:
@@ -8794,11 +8793,50 @@ def _fewshot_step_samples() -> None:
             st.caption("尚未建立樣本集。")
 
 
-def _fewshot_step_scan() -> None:
+def _fewshot_export_controls() -> None:
+    """匯出區(M14b:移到佇列之上,免被長佇列蓋住):輸出資料夾 + 匯出鈕 + 完成訊息。"""
+    _tf = st.session_state.get("fewshot_target_folder") or []
+    _def_out = _anomaly_bank_default_dir(str(_tf[0]), "fewshot_out") if _tf else ""
+    if not st.session_state.get("fewshot_out_dir") and _def_out:
+        st.session_state["fewshot_out_dir"] = _def_out
+    st.markdown("**⬇ 匯出**:輸出資料夾(另存 YOLO+CSV;來源不動)")
+    st.text_input("輸出資料夾", key="fewshot_out_dir", label_visibility="collapsed")
+    out_dir = (st.session_state.get("fewshot_out_dir") or "").strip()
+    st.button("⬇ 匯出 YOLO + CSV", key="fewshot_export_btn", type="primary", use_container_width=True,
+              disabled=not out_dir,
+              on_click=lambda: st.session_state.update(fewshot_export_pending=True))
+    if st.session_state.pop("fewshot_export_pending", False):
+        _fewshot_export()
+    if st.session_state.get("fewshot_export_err"):
+        st.error(st.session_state["fewshot_export_err"])
+    _done = st.session_state.get("fewshot_export_done")
+    if _done:
+        st.success(f"✅ 以樣搜樣匯出完成 · {_done['objects']} 個標註 + CSV({_done['csv_rows']} 列) → "
+                   f"`{_done['out_dir']}`")
+
+
+def _fewshot_add_to_bank_controls() -> None:
+    """➕ 加入樣本集(採納=打勾的物件重 embed → append)+ 訓頭導流提示前的按鈕區。"""
+    _n_pick = len(_fewshot_confirmed_picks())
+    st.button(f"➕ 把已採納的加入樣本集({_n_pick} 顆)", key="fewshot_add_to_bank_btn",
+              use_container_width=True, disabled=_n_pick == 0,
+              help="採納(打勾)的物件重新擷取特徵、接進當前樣本集;取消勾選的不加。下輪海掃更準。",
+              on_click=lambda: st.session_state.update(fewshot_add_pending=True))
+    if st.session_state.pop("fewshot_add_pending", False):
+        _fewshot_add_to_bank()
+    if st.session_state.get("fewshot_add_err"):
+        st.error(st.session_state["fewshot_add_err"])
+    _add_done = st.session_state.get("fewshot_add_done")
+    if _add_done:
+        st.success(f"➕ 已加入 {_add_done['added']} 顆到樣本集(現共 {_add_done['total']} 顆);下輪海掃更準。")
+
+
+def _fewshot_step_scan_confirm() -> None:
+    """② 海掃 · 確認 / 匯出(M14b 合併):海掃 → 匯出區(移頂)→ 佇列(緊湊 checkbox)→ 加入樣本集 + 訓頭提示。"""
     if not st.session_state.get("fewshot_sample_bank_dir"):
         st.info("請先到「① 樣本集」建立樣本集。")
         return
-    st.markdown("**② 海掃**:選要撈的大資料夾(帶低信心 YOLO 粗框;無框則整張影像)。")
+    st.markdown("**② 海掃 · 確認 / 匯出**:選大資料夾 → 海掃 → 佇列**預設全採納**(取消勾選=略過)→ 匯出。")
     targets = _folder_picker_list("fewshot_target_folder", add_help="要海掃的大資料夾")
     min_conf = st.slider("粗框信心預篩(低於此的粗框略過;0=不篩)", 0.0, 1.0, 0.0, 0.05, key="fewshot_min_conf")
     theta = st.slider("相似度門檻(佇列只留 ≥ 此的)", 0.0, 1.0, 0.3, 0.05, key="fewshot_theta")
@@ -8812,23 +8850,45 @@ def _fewshot_step_scan() -> None:
     if st.session_state.get("fewshot_scan_err"):
         st.error(st.session_state["fewshot_scan_err"])
     res = st.session_state.get("fewshot_scan_result")
-    if res:
-        _fewshot_render_queue(res, float(theta))
+    if not res:
+        return
+    _theta = float(st.session_state.get("fewshot_theta", 0.3))
+    shown = [r for r in (res.get("topk_records") or []) if float(r.get("similarity", 0)) >= _theta]
+    st.divider()
+    _fewshot_export_controls()          # (a) 匯出區移到最上面(佇列之上)
+    st.divider()
+    _fewshot_render_queue(res, _theta)  # (b) 佇列:縮圖 + 緊湊 checkbox(預設採納)
+    if not shown:
+        return
+    st.divider()
+    _fewshot_add_to_bank_controls()     # (c) 加入樣本集 + 訓頭提示
+    _fewshot_training_head_hint()
+
+
+def _fewshot_unique_records(res) -> list:
+    """依 item_id 去重(內容定址;同一物件只留一筆)→ 避免重複 checkbox key 撞鍵 + 避免同物件重複標註。"""
+    seen, out = set(), []
+    for r in (res.get("topk_records") or []):
+        rid = r.get("item_id")
+        if rid in seen:
+            continue
+        seen.add(rid)
+        out.append(r)
+    return out
 
 
 def _fewshot_confirmed_picks() -> list:
-    """本輪 ③ 命中(≥θ)中「採納/改類」的物件 → [(image_path, bbox, final_class, obj_index)];略過/未達 θ 不算。"""
+    """本輪命中(≥θ)中「採納(打勾)」的物件 → [(image_path, bbox, suggested_class, obj_index)];取消勾選/未達 θ 不算。"""
     res = st.session_state.get("fewshot_scan_result") or {}
     theta = float(st.session_state.get("fewshot_theta", 0.3))
-    dmap = st.session_state.get("fewshot_decisions") or {}
     picks = []
-    for r in (res.get("topk_records") or []):
+    for r in _fewshot_unique_records(res):
         if float(r.get("similarity", 0)) < theta:
             continue
-        d = dmap.get(r["item_id"])
-        cls = r.get("suggested_class") if d is None else d.get("final_class")
-        decision = "accepted" if d is None else d.get("decision")
-        if decision == "skipped" or not cls:
+        if not st.session_state.get(f"fewshot_accept_{r['item_id']}", True):   # 取消勾選 = 略過
+            continue
+        cls = r.get("suggested_class")
+        if not cls:
             continue
         picks.append((r["image_path"], r["bbox"], str(cls), int(r.get("obj_index", 0))))
     return picks
@@ -8888,69 +8948,6 @@ def _fewshot_training_head_hint() -> None:
         st.caption("🎯 訓分種類模型進度:"
                    + "、".join(f"{c} {n}/8" for c, n in rd["per_class"].items())
                    + " —— 湊到「≥2 類 × 每類 ≥8」會提示可回①訓頭。")
-
-
-def _fewshot_step_confirm() -> None:
-    from interaction import crop_bbox
-    res = st.session_state.get("fewshot_scan_result") or {}
-    theta = float(st.session_state.get("fewshot_theta", 0.3))
-    shown = [r for r in (res.get("topk_records") or []) if float(r.get("similarity", 0)) >= theta]
-    if not shown:
-        st.info("請先「② 海掃」產生命中(或調低相似度門檻)。")
-        return
-    st.markdown("**③ 確認 / 匯出**:預設全採納建議;可改類 / 略過。匯出 YOLO + CSV 到另選資料夾(不碰來源)。")
-    classes = st.session_state.get("fewshot_sample_classes") or []
-    st.session_state.setdefault("fewshot_decisions", {})
-    cols = st.columns(3)
-    for j, r in enumerate(shown[:30]):
-        _id = r["item_id"]
-        with cols[j % 3]:
-            _im = safe_open_image(r["image_path"])
-            if _im is not None:
-                st.image(crop_bbox(_im, *r["bbox"], pad=0.1), use_container_width=True)
-            _cur = st.session_state["fewshot_decisions"].get(_id)
-            _tag = _cur["decision"] if _cur else "採納建議"
-            st.caption(f"建議 {r.get('suggested_class', '—')} · 相似 {float(r.get('similarity', 0)):.2f} · {_tag}")
-            _rc = st.selectbox("改類", ["(採納建議)"] + list(classes),
-                               key=f"fewshot_relabel_{j}", label_visibility="collapsed")
-            if _rc != "(採納建議)":
-                st.session_state["fewshot_decisions"][_id] = {"decision": "relabeled", "final_class": _rc}
-            st.button("⏭ 略過", key=f"fewshot_skip_{j}",
-                      on_click=lambda _i=_id: st.session_state["fewshot_decisions"].update(
-                          {_i: {"decision": "skipped", "final_class": None}}))
-    st.divider()
-    # ➕ 加入樣本集迴圈:把確認的加回樣本集 → 下輪海掃更準(bootstrapping)
-    _n_pick = len(_fewshot_confirmed_picks())
-    st.button(f"➕ 把已確認的加入樣本集({_n_pick} 顆)", key="fewshot_add_to_bank_btn",
-              use_container_width=True, disabled=_n_pick == 0,
-              help="採納/改類的物件重新擷取特徵、接進當前樣本集;略過的不加。下輪海掃更準。",
-              on_click=lambda: st.session_state.update(fewshot_add_pending=True))
-    if st.session_state.pop("fewshot_add_pending", False):
-        _fewshot_add_to_bank()
-    if st.session_state.get("fewshot_add_err"):
-        st.error(st.session_state["fewshot_add_err"])
-    _add_done = st.session_state.get("fewshot_add_done")
-    if _add_done:
-        st.success(f"➕ 已加入 {_add_done['added']} 顆到樣本集(現共 {_add_done['total']} 顆);下輪海掃更準。")
-    _fewshot_training_head_hint()
-    st.divider()
-    _tf = st.session_state.get("fewshot_target_folder") or []
-    _def_out = _anomaly_bank_default_dir(str(_tf[0]), "fewshot_out") if _tf else ""
-    if not st.session_state.get("fewshot_out_dir") and _def_out:
-        st.session_state["fewshot_out_dir"] = _def_out
-    st.text_input("輸出資料夾(另存 YOLO+CSV;來源不動)", key="fewshot_out_dir")
-    out_dir = (st.session_state.get("fewshot_out_dir") or "").strip()
-    st.button("⬇ 匯出 YOLO + CSV", key="fewshot_export_btn", type="primary", use_container_width=True,
-              disabled=not out_dir,
-              on_click=lambda: st.session_state.update(fewshot_export_pending=True))
-    if st.session_state.pop("fewshot_export_pending", False):
-        _fewshot_export()
-    if st.session_state.get("fewshot_export_err"):
-        st.error(st.session_state["fewshot_export_err"])
-    _done = st.session_state.get("fewshot_export_done")
-    if _done:
-        st.success(f"✅ 以樣搜樣匯出完成 · {_done['objects']} 個標註 + CSV({_done['csv_rows']} 列) → "
-                   f"`{_done['out_dir']}`")
 
 
 def _fewshot_monitor_init(k: int) -> None:
@@ -9117,17 +9114,15 @@ def _fewshot_search_ui() -> None:
     """🎯 以樣搜樣(第 9 工具):小樣本 → 海掃帶粗框大資料 → 建議類別 → YOLO+CSV 匯出 → 人確認。"""
     st.subheader("🎯 以樣搜樣(小樣本海撈 → YOLO 預標 → 人工確認)")
     st.caption("用預設 DINOv2 特徵器即可開工——**不需**先到『瑕疵偵測』建模;確認累積夠了會提示可回①訓分種類模型。")
-    step = st.segmented_control("步驟", ["① 樣本集", "② 海掃", "③ 確認 / 匯出", "④ 監看"],
+    step = st.segmented_control("步驟", ["① 樣本集", "② 海掃 · 確認/匯出", "③ 監看"],
                                 key="fewshot_step", default="① 樣本集") or "① 樣本集"
     st.divider()
     if step == "① 樣本集":
         _fewshot_step_samples()
-    elif step == "② 海掃":
-        _fewshot_step_scan()
-    elif step == "④ 監看":
+    elif step == "③ 監看":
         _fewshot_step_monitor()
     else:
-        _fewshot_step_confirm()
+        _fewshot_step_scan_confirm()
 
 
 def main() -> None:

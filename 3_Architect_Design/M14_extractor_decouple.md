@@ -133,3 +133,36 @@ B1 → E1、E2、E3;E2 → E1(讀 object_source 概念,實際值由呼叫端傳)
 
 ## 非目標(守住,不擴張)
 不做全域共用特徵器(C)、不做 D 墊檔、不動其他 objective 的評分/續跑語義、不改 similarity/retrieval_export/prelabel 契約。
+
+---
+
+## 增補(M14b):第 9 工具 UX 迭代(合併 ②③ + 匯出移頂 + 緊湊 checkbox)
+> 純 GUI 版面調整(不動任何後端契約);驗收=真實 E2E。使用者拍板:合併海掃與確認、匯出區移到最上面、
+> 每張縮圖用「預設打勾」的緊湊 checkbox 取代空間大的下拉+按鈕。
+
+### 行為契約(app.py `_fewshot_search_ui` 及其子函式)
+1. **步驟列改 3 步**:`["① 樣本集", "② 海掃 · 確認/匯出", "③ 監看"]`(原 ②海掃 + ③確認/匯出 合併;原 ④監看 → ③)。
+2. **合併步 ②**:海掃控制(目標夾 / 粗框信心預篩 / 相似度門檻 θ / 取前幾個 / ▶海掃)→ 海掃後依序:
+   (a) **匯出區移到最上面**(佇列之上):輸出資料夾 `fewshot_out_dir` + `⬇ 匯出 YOLO+CSV` `fewshot_export_btn` + 完成訊息;
+   (b) **佇列** `st.container(key="fewshot_queue")`:每張縮圖 + **緊湊 `st.checkbox`**(label 含建議類別+相似度、`value=True` 預設採納、key=`fewshot_accept_<item_id>`);取消勾選=略過;
+   (c) `➕ 加入樣本集` `fewshot_add_to_bank_btn` + 訓頭導流提示。
+3. **決策改由 checkbox 狀態**(不再用下拉 `fewshot_decisions`):
+   - 匯出:`fewshot_accept_<id>` 為 True → decision=accepted(final_class=suggested_class);False → skipped。
+   - 加入樣本集(`_fewshot_confirmed_picks`):只收 checkbox=True 的(未達 θ / 取消勾選的不收)。
+   - **移除**每張的「改類」下拉(單類海掃建議類別固定;多類改類為未來候選)。
+4. **③ 監看**維持 M13/M14 行為(免 anomaly 模型),僅步驟序號 ④→③。
+
+### Acceptance(真實 E2E;tests/e2e/test_fewshot_scenarios_e2e.py,10 情境)
+E2E 標記/keys(供 /pm 寫測試):步驟 marker ①=「建立樣本集」、②=「相似度門檻」、③監看=「工作區目錄」;
+海掃後匯出區 marker=「輸出資料夾」;佇列容器 `.st-key-fewshot_queue` 內 `get_by_role("checkbox")`;匯出/加入樣本集鈕沿用既有 key。
+- **S1**(無模型全流程):乾淨 session → 建樣本集(預設特徵器)→ 海掃 → 佇列含建議類別+相似度。
+- **S2**(匯出雙出+C6):海掃 → 匯出 → `labels/*.txt`+`retrieval_report.csv`+`classes.txt` 存在、來源零寫入。
+- **S3**(匯出區在佇列之上):海掃後,`輸出資料夾`/匯出鈕在 DOM 順序**先於**第一張佇列縮圖。
+- **S4**(緊湊 checkbox 預設打勾):佇列每張有 checkbox、**預設 checked**;無舊的下拉+略過按鈕。
+- **S5**(取消勾選→不匯出):取消一張的勾 → 匯出的 `labels/*.txt` 標註數比全勾少(該顆被略過)。
+- **S6**(整張影像模式):① object_source 切「整張影像」→ 對無 YOLO 標的夾也能建樣本集 + 海掃出佇列。
+- **S7**(加入樣本集迴圈):海掃 → 加入樣本集 → 樣本集數 N1>N0。
+- **S8**(監看免模型):③ 監看 → 初始化(無 anomaly 模型)→ 立即掃描一次 → 狀態/佇列更新。
+- **S9**(θ 門檻):把 θ 調到很高 → 佇列命中數變少或空(門檻生效)。
+- **S10**(3 步導覽):步驟列只有 3 個;無「③ 確認 / 匯出」獨立步(已併入 ②)。
+> 舊 `test_fewshot_gui_e2e.py` / `test_fewshot_decouple_e2e.py` 的步驟導覽已過時 → 由本 10 情境檔取代(重疊 AC 併入 S1/S2/S7/S8)。
