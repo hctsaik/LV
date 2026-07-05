@@ -79,3 +79,33 @@ DOM 穩定標記:海掃完成主畫面含「以樣搜樣掃描完成」;匯出�
 ### GUI(第 9 工具「④ 監看」;沿用 M10 watch 樣式;E2E 以 AC-SVC-RET 覆蓋核心,GUI 接線最小)
 - 步驟列加「④ 監看」:工作區目錄 + 🆕初始化(用當前樣本集 + 目標夾)+ 📤匯出設定 + ▶立即掃描一次 + 狀態卡 + 佇列消費(採納/改類/略過→labels.jsonl)。
 - profile 可攜:匯出 profile.yaml + sample_bank 目錄給離線服務跑。
+
+## 增補(M13 Task7):加入樣本集迴圈 + 訓頭導流提示(bootstrapping 閉環)
+> ③確認過的物件一鍵加回樣本集 → 下輪更準;確認累積到「≥2 類 × 每類 ≥8」→ 提示去①訓分種類模型(C4:只導流不自動訓)。
+
+### 純邏輯(13 sample_bank 加法;Tier A 純函式)
+- `training_head_ready(labels, *, min_per_class=8, min_classes=2) -> dict`:
+  數每類樣本數,判斷是否足以訓一個分種類頭。回
+  `{"ready": bool, "per_class": {類:數}(依類名排序), "ready_classes": [達標類, 排序]}`。
+  - `ready_classes = 每類數 ≥ min_per_class 的類(排序)`;`ready = len(ready_classes) >= min_classes`。
+  - 空 labels → `{"ready": False, "per_class": {}, "ready_classes": []}`。純計數、無 I/O、不改樣本集。
+
+#### Acceptance(單元;tests/test_sample_bank.py)
+- **AC-STHR-1**:`training_head_ready(["a"]*8+["b"]*8)` == `{"ready": True, "per_class": {"a":8,"b":8}, "ready_classes": ["a","b"]}`。
+- **AC-STHR-2**:`training_head_ready(["a"]*8+["b"]*7)` → `ready is False`、`ready_classes == ["a"]`、`per_class == {"a":8,"b":7}`。
+- **AC-STHR-3**:`training_head_ready(["a"]*20)` → `ready is False`(只 1 類達標)、`ready_classes == ["a"]`。
+- **AC-STHR-4**:`training_head_ready([])` == `{"ready": False, "per_class": {}, "ready_classes": []}`。
+- **AC-STHR-5**(邊界,參數化):`training_head_ready(["a"]*3+["b"]*3, min_per_class=3)["ready"] is True`(門檻可調)。
+
+### GUI(第 9 工具「③ 確認 / 匯出」內加法;既有 append_sample 已 Task2 落地)
+- ③ 加「➕ 把已確認的加入樣本集」按鈕:蒐集本輪決策為 accepted/relabeled 的物件 →
+  以 `anomaly_tool._object_embeddings([{image_path,bbox,label=final_class}], model)` 重 embed →
+  `sample_bank.append_sample(bank_dir, vectors, labels, provenance)` → 更新 session 樣本集摘要(共 N→N+k)。
+  略過(skipped)/未達 θ 的不加。無確認可加 → 按鈕 disabled。
+- ③ 底部依 `training_head_ready(load_sample_bank(bank_dir)["labels"])` 顯示導流提示:
+  達標 → `🎓 已累積 ≥2 類 × 每類 ≥8 → 可回「瑕疵偵測①」訓分種類模型(之後改用預標更準)`;
+  未達 → 灰字列出每類已收數(離門檻還差多少)。**C4:只顯示提示,不觸發訓練。**
+
+#### Acceptance(真實 E2E;tests/e2e/test_fewshot_gui_e2e.py)
+- **AC-F4**(加入樣本集迴圈,真實行為):建模→建樣本集(記樣本數 N0)→ 海掃→③確認→點「➕ 加入樣本集」→
+  樣本集摘要數 **N1 > N0**(真的長大;由 emb.npz 或摘要斷言),且來源零寫入(C6)。訓頭提示邏輯由 AC-STHR 單元覆蓋。

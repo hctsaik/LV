@@ -12,3 +12,8 @@
 | AC-B6 | build(注入 embed_fn)→ vectors/labels/provenance/model | `test_ac_b6_build_injected` |
 | AC-B7 | build 無物件 → ValueError | `test_ac_b7_build_no_objects` |
 | AC-B8(衍生) | 往返後可直接餵 multi_ref_similarity | `test_ac_b8_load_feeds_multi_ref` |
+| AC-STHR-1 | ≥2 類 × 每類 ≥8 → ready(釘死回傳 dict) | `test_ac_sthr_1_two_classes_reach` |
+| AC-STHR-2 | 一類差 1 顆 → 未達標、只達標類進 ready_classes | `test_ac_sthr_2_one_class_short` |
+| AC-STHR-3 | 只 1 類(數量多也不夠)→ 未達標 | `test_ac_sthr_3_single_class` |
+| AC-STHR-4 | 空 labels → 全空、未達標 | `test_ac_sthr_4_empty` |
+| AC-STHR-5(衍生) | 門檻可調 + per_class/ready_classes 依類名排序 | `test_ac_sthr_5_threshold_param` |

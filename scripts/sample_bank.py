@@ -79,6 +79,17 @@ def append_sample(bank_dir, *, vectors, labels, provenance) -> dict:
     return merged
 
 
+def training_head_ready(labels, *, min_per_class=8, min_classes=2) -> dict:
+    """M13 Task7 導流門檻:數每類樣本數,判斷是否足以訓一個分種類頭(≥min_classes 類、各 ≥min_per_class)。
+    純計數、無 I/O、不改樣本集。回 {ready, per_class(依類名排序), ready_classes(排序)}。"""
+    from collections import Counter
+    counts = Counter(str(l) for l in labels)
+    per_class = {c: int(counts[c]) for c in sorted(counts)}
+    ready_classes = [c for c in sorted(per_class) if per_class[c] >= int(min_per_class)]
+    return {"ready": len(ready_classes) >= int(min_classes),
+            "per_class": per_class, "ready_classes": ready_classes}
+
+
 def assert_model_compatible(bank, *, model, target_res) -> None:
     """樣本集綁的模型/解析度與現用不符 → ValueError(不可跨 embedding 空間比對)。"""
     if str(bank.get("model")) != str(model):

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,13 @@ from ._anomaly_wizard import build_model, enter_anomaly, set_model_dir
 from .conftest import _add_folder, load_app, wait_idle
 
 pytestmark = pytest.mark.e2e
+
+
+def _bank_count(page) -> int:
+    """讀「① 樣本集」摘要『共 N 顆樣本』的 N(找不到 → -1)。"""
+    txt = page.locator('.st-key-fewshot_bank_info').inner_text()
+    m = re.search(r"共\s*(\d+)\s*顆", txt)
+    return int(m.group(1)) if m else -1
 
 
 def _switch_fewshot(page):
@@ -39,7 +47,7 @@ def _fewshot_step(page, name, marker):
 
 
 def _click(page, key, timeout=30000):
-    b = page.locator(f'.st-key-{key} button')
+    b = page.locator(f'.st-key-{key} button').first   # rerun 過場可能暫時雙 DOM → 取 first(單按鈕不受影響)
     b.wait_for(state="visible", timeout=timeout)
     page.wait_for_function(
         f"""() => {{ const b=document.querySelector('.st-key-{key} button'); return b && !b.disabled; }}""",
@@ -138,6 +146,65 @@ def test_f3_no_model_graceful(app_server, browser):
         body = page.locator('[data-testid="stMain"]').inner_text()
         assert "瑕疵偵測" in body and ("模型" in body or "建立" in body), \
             f"無模型應導引先建模;實際:{body[-400:]}"
+        expect(page.locator('[data-testid="stException"]')).to_have_count(0)
+    finally:
+        ctx.close()
+
+
+def test_f4_add_to_sample_bank_grows(app_server, browser, yolo_defect_at_nmin, tmp_path):
+    # AC-F4:③把已確認的物件加回樣本集 → 樣本集真的長大(N1>N0)、來源零寫入(C6)
+    ds = yolo_defect_at_nmin
+    ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
+    page = ctx.new_page()
+    try:
+        enter_anomaly(page, app_server)
+        build_model(page, ds["root"], semantic_text="物件類別")
+        set_model_dir(page, tmp_path / "mdl")
+        page.locator('.st-key-anomaly_save_model_btn button').click()
+        wait_idle(page)
+        page.wait_for_timeout(1500)
+
+        _switch_fewshot(page)
+        # ① 建樣本集 → 記 N0
+        _fewshot_step(page, "樣本集", "建立樣本集")
+        _add_folder(page, "fewshot_sample_folder", str(ds["root"]))
+        wait_idle(page)
+        _fewshot_step(page, "樣本集", "建立樣本集")
+        _click(page, "fewshot_build_bank_btn")
+        page.wait_for_function(
+            """() => { const m=document.querySelector('[data-testid="stMain"]');
+                       const t=(m && m.innerText) || '';
+                       return t.includes('樣本集已建立') || t.includes('建立樣本集失敗'); }""",
+            timeout=240000)
+        wait_idle(page)
+        n0 = _bank_count(page)
+        assert n0 > 0, f"樣本集應有初始樣本數:{n0}"
+
+        # ② 海掃
+        _fewshot_step(page, "海掃", "相似度門檻")
+        _add_folder(page, "fewshot_target_folder", str(ds["root"]))
+        wait_idle(page)
+        _fewshot_step(page, "海掃", "相似度門檻")
+        _click(page, "fewshot_scan_btn")
+        page.wait_for_function(
+            """() => { const m=document.querySelector('[data-testid=\"stMain\"]');
+                       return m && (m.innerText||'').includes('以樣搜樣掃描完成'); }""", timeout=300000)
+        wait_idle(page)
+
+        # ③ 確認 → 預設全採納 → ➕ 加入樣本集(真實 re-embed + append)
+        _fewshot_step(page, "確認", "加入樣本集")
+        src_before = _snapshot(ds["root"])
+        _click(page, "fewshot_add_to_bank_btn")
+        page.wait_for_function(
+            """() => { const m=document.querySelector('[data-testid=\"stMain\"]');
+                       return m && (m.innerText||'').includes('已加入'); }""", timeout=120000)
+        wait_idle(page)
+
+        # 回 ① 看樣本集摘要 → N1 > N0(真的長大、摘要同步)
+        _fewshot_step(page, "樣本集", "建立樣本集")
+        n1 = _bank_count(page)
+        assert n1 > n0, f"加入樣本集後樣本數應增長:N0={n0} → N1={n1}"
+        assert _snapshot(ds["root"]) == src_before, "加入樣本集不得改動來源(C6)"
         expect(page.locator('[data-testid="stException"]')).to_have_count(0)
     finally:
         ctx.close()

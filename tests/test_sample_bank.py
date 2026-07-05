@@ -122,3 +122,39 @@ def test_ac_b8_load_feeds_multi_ref(tmp_path):  # AC-B8 衍生:往返後可直�
     got = sb.load_sample_bank(tmp_path / "sb")
     labs, sims = similarity.multi_ref_similarity([[1, 0, 0, 0]], got["vectors"], got["labels"])
     assert list(labs) == ["a"] and abs(float(np.asarray(sims)[0]) - 1.0) < 1e-6
+
+
+# ── M13 Task7:訓頭導流門檻 training_head_ready(純計數,無 I/O)───────────────
+def test_ac_sthr_1_two_classes_reach(tmp_path):  # AC-STHR-1:≥2 類 × 每類 ≥8 → ready
+    sb = _sb()
+    assert sb.training_head_ready(["a"] * 8 + ["b"] * 8) == {
+        "ready": True, "per_class": {"a": 8, "b": 8}, "ready_classes": ["a", "b"]}
+
+
+def test_ac_sthr_2_one_class_short(tmp_path):  # AC-STHR-2:一類差 1 顆 → 未達標,只 a 達標
+    sb = _sb()
+    r = sb.training_head_ready(["a"] * 8 + ["b"] * 7)
+    assert r["ready"] is False
+    assert r["ready_classes"] == ["a"]
+    assert r["per_class"] == {"a": 8, "b": 7}
+
+
+def test_ac_sthr_3_single_class(tmp_path):  # AC-STHR-3:只 1 類(數量多也不夠)→ 未達標
+    sb = _sb()
+    r = sb.training_head_ready(["a"] * 20)
+    assert r["ready"] is False
+    assert r["ready_classes"] == ["a"]
+
+
+def test_ac_sthr_4_empty(tmp_path):  # AC-STHR-4:空 → 全空、未達標
+    sb = _sb()
+    assert sb.training_head_ready([]) == {"ready": False, "per_class": {}, "ready_classes": []}
+
+
+def test_ac_sthr_5_threshold_param(tmp_path):  # AC-STHR-5 邊界:門檻可調 + 排序不變量
+    sb = _sb()
+    assert sb.training_head_ready(["a"] * 3 + ["b"] * 3, min_per_class=3)["ready"] is True
+    assert sb.training_head_ready(["a"] * 3 + ["b"] * 3)["ready"] is False  # 預設 8 → 不達標
+    # 衍生不變量:per_class / ready_classes 皆依類名排序(與輸入順序無關)
+    r = sb.training_head_ready(["b"] * 8 + ["a"] * 8)
+    assert list(r["per_class"].keys()) == ["a", "b"] and r["ready_classes"] == ["a", "b"]

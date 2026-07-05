@@ -8805,6 +8805,83 @@ def _fewshot_step_scan() -> None:
         _fewshot_render_queue(res, float(theta))
 
 
+def _fewshot_confirmed_picks() -> list:
+    """本輪 ③ 命中(≥θ)中「採納/改類」的物件 → [(image_path, bbox, final_class, obj_index)];略過/未達 θ 不算。"""
+    res = st.session_state.get("fewshot_scan_result") or {}
+    theta = float(st.session_state.get("fewshot_theta", 0.3))
+    dmap = st.session_state.get("fewshot_decisions") or {}
+    picks = []
+    for r in (res.get("topk_records") or []):
+        if float(r.get("similarity", 0)) < theta:
+            continue
+        d = dmap.get(r["item_id"])
+        cls = r.get("suggested_class") if d is None else d.get("final_class")
+        decision = "accepted" if d is None else d.get("decision")
+        if decision == "skipped" or not cls:
+            continue
+        picks.append((r["image_path"], r["bbox"], str(cls), int(r.get("obj_index", 0))))
+    return picks
+
+
+def _fewshot_add_to_bank() -> None:
+    """➕ 加入樣本集迴圈:把本輪確認(採納/改類)的物件重 embed → append 進當前樣本集(下輪更準)。"""
+    import sample_bank
+    from anomaly_bank_store import load_bank
+    from anomaly_tool import _object_embeddings
+    st.session_state.pop("fewshot_add_err", None)
+    st.session_state.pop("fewshot_add_done", None)
+    bank_dir = st.session_state.get("fewshot_sample_bank_dir")
+    model = st.session_state.get("anomaly_model") or {}
+    mdir = model.get("_dir")
+    if not (bank_dir and mdir):
+        st.session_state["fewshot_add_err"] = "需先①建樣本集、有凍結模型。"
+        return
+    picks = _fewshot_confirmed_picks()
+    if not picks:
+        st.session_state["fewshot_add_err"] = "沒有可加入的確認物件(都略過或未達門檻)。"
+        return
+    try:
+        meta = load_bank(mdir).get("meta", {})
+        objmeta = [{"image_path": p, "bbox": list(b), "label": c, "obj_index": int(oi)}
+                   for p, b, c, oi in picks]
+        with st.spinner("加入樣本集…重新擷取特徵中(首次會先載入模型)"):
+            vecs = np.asarray(_object_embeddings(objmeta, meta.get("model"), None), dtype=np.float32)
+        prov = [{"image_path": str(p), "bbox": [float(x) for x in b], "label": c}
+                for p, b, c, oi in picks]
+        merged = sample_bank.append_sample(bank_dir, vectors=vecs,
+                                           labels=[c for _, _, c, _ in picks], provenance=prov)
+        _labels = np.asarray(merged["labels"])
+        st.session_state["fewshot_sample_bank_summary"] = {
+            "n": int(len(_labels)),
+            "classes": {c: int(np.sum(_labels == c)) for c in sorted(set(_labels.tolist()))}}
+        st.session_state["fewshot_sample_classes"] = sorted(set(_labels.tolist()))
+        st.session_state["fewshot_add_done"] = {"added": len(picks), "total": int(len(_labels))}
+    except Exception as exc:
+        st.session_state["fewshot_add_err"] = f"加入樣本集失敗:{exc}"
+
+
+def _fewshot_training_head_hint() -> None:
+    """③ 底部:依當前樣本集標籤顯示訓頭導流提示(C4:只導流、不自動訓)。"""
+    import sample_bank
+    bank_dir = st.session_state.get("fewshot_sample_bank_dir")
+    if not bank_dir:
+        return
+    try:
+        rd = sample_bank.training_head_ready(sample_bank.load_sample_bank(bank_dir)["labels"])
+    except Exception:
+        return
+    if not rd.get("per_class"):
+        return
+    if rd["ready"]:
+        st.success("🎓 已累積 " + "、".join(f"{c} {n}" for c, n in rd["per_class"].items())
+                   + " —— 達「≥2 類 × 每類 ≥8」,可回「**瑕疵偵測 ①**」訓一個**分種類模型**,"
+                   "之後改用預標(比相似度檢索更準)。")
+    else:
+        st.caption("🎯 訓分種類模型進度:"
+                   + "、".join(f"{c} {n}/8" for c, n in rd["per_class"].items())
+                   + " —— 湊到「≥2 類 × 每類 ≥8」會提示可回①訓頭。")
+
+
 def _fewshot_step_confirm() -> None:
     from interaction import crop_bbox
     res = st.session_state.get("fewshot_scan_result") or {}
@@ -8833,6 +8910,22 @@ def _fewshot_step_confirm() -> None:
             st.button("⏭ 略過", key=f"fewshot_skip_{j}",
                       on_click=lambda _i=_id: st.session_state["fewshot_decisions"].update(
                           {_i: {"decision": "skipped", "final_class": None}}))
+    st.divider()
+    # ➕ 加入樣本集迴圈:把確認的加回樣本集 → 下輪海掃更準(bootstrapping)
+    _n_pick = len(_fewshot_confirmed_picks())
+    st.button(f"➕ 把已確認的加入樣本集({_n_pick} 顆)", key="fewshot_add_to_bank_btn",
+              use_container_width=True, disabled=_n_pick == 0,
+              help="採納/改類的物件重新擷取特徵、接進當前樣本集;略過的不加。下輪海掃更準。",
+              on_click=lambda: st.session_state.update(fewshot_add_pending=True))
+    if st.session_state.pop("fewshot_add_pending", False):
+        _fewshot_add_to_bank()
+    if st.session_state.get("fewshot_add_err"):
+        st.error(st.session_state["fewshot_add_err"])
+    _add_done = st.session_state.get("fewshot_add_done")
+    if _add_done:
+        st.success(f"➕ 已加入 {_add_done['added']} 顆到樣本集(現共 {_add_done['total']} 顆);下輪海掃更準。")
+    _fewshot_training_head_hint()
+    st.divider()
     _tf = st.session_state.get("fewshot_target_folder") or []
     _def_out = _anomaly_bank_default_dir(str(_tf[0]), "fewshot_out") if _tf else ""
     if not st.session_state.get("fewshot_out_dir") and _def_out:
