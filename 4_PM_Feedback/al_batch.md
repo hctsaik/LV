@@ -58,3 +58,13 @@ M9-GUI 接線(三模式顯示 / 暫定 Top-K / 續跑)另以 `@pytest.mark.e2e` 
 | AC-SIM3 | 換參考=另一 run(error 拒;restart 重算翻群) | `test_ac_sim3_change_ref_is_new_run` |
 | AC-SIM4 | similar 分批==一次跑(C8) | `test_ac_sim4_similar_batched_equals_single` |
 | AC-SIM5 | 既有 17 測無回歸(novelty/uncertain/confusion 不變) | 既有全測保持綠(gate 判) |
+
+## 增補(M13 Task3):objective="retrieve"(以樣搜樣多參考)
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-RET1 | 建議類別由樣本決定(忽略粗框 cls)+ reason 含相似度 + suggested_class 欄 | `test_ac_ret1_suggested_class_ignores_proposal_cls` |
+| AC-RET2 | 缺 ref_vectors → ValueError | `test_ac_ret2_requires_ref_vectors` |
+| AC-RET3 | 換樣本集=另一 run | `test_ac_ret3_change_samples_new_run` |
+| AC-RET4 | 分批==一次跑(C8) | `test_ac_ret4_batched_equals_single` |
+| AC-RET5 | conf 預篩丟低信心粗框 | `test_ac_ret5_conf_prefilter` |
+| AC-RET6 | 既有 21 測無回歸 | 既有全測綠(gate 判) |

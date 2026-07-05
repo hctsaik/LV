@@ -524,3 +524,104 @@ def test_ac_sim4_similar_batched_equals_single(tmp_path):
                    objective="similar", ref_vector=_E2, k=8, batch_size=40, dataset_dirs=(ds,))
     assert r_split["done"] and r_whole["done"]
     assert r_split["topk"] == r_whole["topk"], "similar 分批與一次跑完 Top-K 必須逐一相同"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# M13 Task3:objective="retrieve"(以樣搜樣多參考;建議類別由樣本比對,忽略粗框 cls)
+# ══════════════════════════════════════════════════════════════════════
+
+def _yolo_conf_img(folder, name, *, red, blue, cls, conf=None):
+    """六欄 YOLO 粗框:cls cx cy w h [conf]。cls 故意亂標(retrieve 應忽略)。"""
+    (folder / "images").mkdir(parents=True, exist_ok=True)
+    (folder / "labels").mkdir(exist_ok=True)
+    Image.new("RGB", (32, 32), (int(red), 120, int(blue))).save(folder / "images" / f"{name}.png")
+    line = f"{cls} 0.5 0.5 0.9 0.9" + (f" {conf}" if conf is not None else "")
+    (folder / "labels" / f"{name}.txt").write_text(line + "\n", encoding="utf-8")
+    return folder / "images" / f"{name}.png"
+
+
+def _run_ret(**kw):
+    import al_batch
+    kw.setdefault("extractor", _graded_extractor())
+    kw.setdefault("embed_fn", _class_embed())
+    kw.setdefault("object_source", "whole_image")
+    return al_batch.run_batched(objective="retrieve", **kw)
+
+
+def test_ac_ret1_suggested_class_ignores_proposal_cls(tmp_path):
+    # AC-RET1:建議類別由樣本比對決定(X群→X、Y群→Y),與粗框 cls=9 無關;reason 含相似度
+    import al_batch
+    ds = tmp_path / "ds"
+    for i in range(6):
+        _yolo_conf_img(ds, f"x_{i:02d}", red=10 + 5 * i, blue=0, cls=9)
+    for i in range(6):
+        _yolo_conf_img(ds, f"y_{i:02d}", red=10 + 5 * i, blue=255, cls=9)
+    md = tmp_path / "model"; _make_model(md)
+    paths = sorted((ds / "images").glob("*.png"))
+    r = al_batch.run_batched(
+        image_paths=paths, model_dir=md, checkpoint_dir=tmp_path / "ck", objective="retrieve",
+        ref_vectors=[_E2, _E2, _E3, _E3], ref_labels=["X", "X", "Y", "Y"], k=12,
+        object_source="yolo", class_names=None, dataset_dirs=(ds,),
+        extractor=_graded_extractor(), embed_fn=_class_embed())
+    assert r["done"] and len(r["topk_records"]) == 12
+    for rec in r["topk_records"]:
+        exp = "X" if "x_" in Path(rec["image_path"]).name else "Y"
+        assert rec["suggested_class"] == exp, \
+            f"建議類別應由樣本決定(≠粗框 cls):{rec['image_path']} → {rec['suggested_class']}"
+    assert all("相似度" in rec["reason"] for rec in r["topk_records"])
+
+
+def test_ac_ret2_requires_ref_vectors(tmp_path):
+    # AC-RET2:retrieve 缺 ref_vectors → ValueError
+    ds = tmp_path / "ds"
+    paths = [_img(ds, f"x_{i}.png", red=10, blue=0) for i in range(3)]
+    md = tmp_path / "model"; _make_model(md)
+    with pytest.raises(ValueError, match="ref_vectors"):
+        _run_ret(image_paths=paths, model_dir=md, checkpoint_dir=tmp_path / "ck", k=3, dataset_dirs=(ds,))
+
+
+def test_ac_ret3_change_samples_new_run(tmp_path):
+    # AC-RET3:換樣本集=另一 run(error 拒;restart 重算)
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 5 * i, blue=0) for i in range(4)]
+    ys = [_img(ds, f"y_{i:02d}.png", red=10 + 5 * i, blue=255) for i in range(4)]
+    md = tmp_path / "model"; _make_model(md); ck = tmp_path / "ck"
+    _run_ret(image_paths=xs + ys, model_dir=md, checkpoint_dir=ck,
+             ref_vectors=[_E2], ref_labels=["X"], k=4, dataset_dirs=(ds,))
+    with pytest.raises(ValueError):
+        _run_ret(image_paths=xs + ys, model_dir=md, checkpoint_dir=ck,
+                 ref_vectors=[_E3], ref_labels=["Y"], k=4, dataset_dirs=(ds,), on_identity_mismatch="error")
+    r2 = _run_ret(image_paths=xs + ys, model_dir=md, checkpoint_dir=ck,
+                  ref_vectors=[_E3], ref_labels=["Y"], k=4, dataset_dirs=(ds,), on_identity_mismatch="restart")
+    assert r2["done"]
+
+
+def test_ac_ret4_batched_equals_single(tmp_path):
+    # AC-RET4(C8):retrieve 分批==一次跑
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 5 * i, blue=0) for i in range(6)]
+    ys = [_img(ds, f"y_{i:02d}.png", red=10 + 5 * i, blue=255) for i in range(6)]
+    md = tmp_path / "model"; _make_model(md)
+    a = _run_ret(image_paths=xs + ys, model_dir=md, checkpoint_dir=tmp_path / "cka",
+                 ref_vectors=[_E2, _E3], ref_labels=["X", "Y"], k=8, batch_size=4, dataset_dirs=(ds,))
+    b = _run_ret(image_paths=xs + ys, model_dir=md, checkpoint_dir=tmp_path / "ckb",
+                 ref_vectors=[_E2, _E3], ref_labels=["X", "Y"], k=8, batch_size=40, dataset_dirs=(ds,))
+    assert a["done"] and b["done"] and a["topk"] == b["topk"]
+
+
+def test_ac_ret5_conf_prefilter(tmp_path):
+    # AC-RET5:min_proposal_conf 丟掉低信心粗框
+    import al_batch
+    ds = tmp_path / "ds"
+    for i in range(6):
+        _yolo_conf_img(ds, f"x_{i:02d}", red=10, blue=0, cls=0, conf=0.9)
+    for i in range(6):
+        _yolo_conf_img(ds, f"z_{i:02d}", red=10, blue=0, cls=0, conf=0.01)
+    md = tmp_path / "model"; _make_model(md)
+    paths = sorted((ds / "images").glob("*.png"))
+    r = al_batch.run_batched(
+        image_paths=paths, model_dir=md, checkpoint_dir=tmp_path / "ck", objective="retrieve",
+        ref_vectors=[_E2], ref_labels=["X"], k=20, object_source="yolo", class_names=None,
+        dataset_dirs=(ds,), min_proposal_conf=0.5,
+        extractor=_graded_extractor(), embed_fn=_class_embed())
+    assert r["objects_scored"] == 6, f"低信心 6 顆應被 conf 預篩丟掉,實際 scored={r['objects_scored']}"

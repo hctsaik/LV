@@ -309,3 +309,34 @@ progress({"images_processed": int, "images_total": int, "objects_scored": int,
 ### 邊界
 - `ref_vector` 維度與 obj_emb 不符 → 由 `similarity.cosine_similarity_to_ref` 拋 `ValueError`。
 - similar 需物件級 embedding;若某型態拿不到 obj_emb → 明確報錯(不硬跑)。
+
+---
+
+## 增補(M13 Task3 / 08 擴):`objective="retrieve"`(以樣搜樣多參考檢索)
+
+> 加法擴充:新 objective + 多參考參數 + conf 預篩。**既有 novelty/uncertain/confusion/similar 與 21 條 AC 不得改變**。
+> 復用 `similarity.multi_ref_similarity`。
+
+### 契約變更
+- `run_batched(..., ref_vectors=None, ref_labels=None, min_proposal_conf=0.0)` 新增。
+- objective 白名單加 `"retrieve"`。`retrieve` 而 `ref_vectors`/`ref_labels` 缺或空 → `ValueError`(訊息含 `ref_vectors`)。
+- **per-item(C8-safe)**:retrieve 對每物件算 `multi_ref_similarity(obj_emb, ref_vectors, ref_labels)`
+  → `(best_class, best_sim)`;shard 多存 `best_sim`(float32)+ `best_class`(str)。
+- **merge**:retrieve 優先分數 = `_minmax(concat(best_sim))`(降冪=最像);`reason` = 「最像「<類>」樣本(相似度 X.XX)」;
+  `topk_records` 多一欄 **`suggested_class`**(=best_class,給 GUI 顯示建議類別)。無 head → 無 diversity 分群。
+- **run 身分**:`ref_key` 納入 `sha256(ref_vectors.bytes + "|".join(ref_labels))[:16]`(**換樣本集=另一 run**)。
+- **conf 預篩**:`min_proposal_conf > 0` 時,discover 後丟掉 `score`(六欄 YOLO 的 conf)< 門檻的粗框
+  (`score is None` 視為保留);預設 0=不篩。粗框的 **cls 一律忽略**(類別由樣本比對決定)。
+
+### Acceptance Criteria(釘死;給 `/pm` 加進 tests/test_al_batch.py)
+> 用既有注入 `embed_fn=_class_embed`(藍→E2(X)/E3(Y));樣本 = X 群兩顆 E2 + Y 群兩顆 E3(label X/Y)。
+
+- **AC-RET1(建議類別 + 排序)**:6 X(blue=0)+ 6 Y(blue=255),`ref_vectors=[E2,E2,E3,E3]`,`ref_labels=["X","X","Y","Y"]`,
+  `k=12` → 每筆 `topk_records` 有 `suggested_class`,X 群圖的建議類別=="X"、Y 群=="Y"(**與粗框 cls 無關**);
+  `reason` 含「相似度」;priority 降冪。
+- **AC-RET2(缺樣本)**:`objective="retrieve"` 無 ref_vectors → `ValueError`(含 `ref_vectors`)。
+- **AC-RET3(換樣本=另一 run)**:同 checkpoint 換 `ref_vectors` → `on_identity_mismatch="error"` 拒;`"restart"` 重算。
+- **AC-RET4(分批==一次跑,C8)**:retrieve `batch_size=4` vs `40` → topk 一致。
+- **AC-RET5(conf 預篩)**:粗框 score = [0.9]*6 + [0.01]*6(後 6 顆低信心),`min_proposal_conf=0.5`
+  → `objects_scored==6`(低信心的 6 顆被丟);`0.0` → 12。
+- **AC-RET6(既有無回歸)**:novelty/uncertain/confusion/similar 既有 21 測全綠。
