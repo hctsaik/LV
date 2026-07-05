@@ -67,9 +67,20 @@ def run_once(workspace_dir, *, embed_fn=None, extractor=None,
         return {"status": "skipped", "reason": "另一實例執行中", "run_id": run_id}
 
     try:
-        # 3. 驗凍結模型 + 取 object_source(從磁碟)
-        fm = al_batch.load_frozen_model(profile["model_dir"])
-        object_source = fm["meta"].get("object_source", "yolo")
+        # 3. 取特徵器身分 + object_source。retrieve(M14):改由 sample_bank 自描述,免整包 anomaly 模型
+        feature_extractor = None
+        _bank = None
+        if profile["objective"] == "retrieve":
+            import sample_bank
+            sbd = profile.get("sample_bank_dir")
+            if not sbd:
+                raise ValueError("objective 'retrieve' 需要 sample_bank_dir(樣本集目錄)")
+            _bank = sample_bank.load_sample_bank(sbd)
+            object_source = _bank.get("object_source", "yolo")
+            feature_extractor = {"model": _bank["model"], "target_res": _bank["target_res"]}
+        else:
+            fm = al_batch.load_frozen_model(profile["model_dir"])   # 驗凍結模型 + 取 object_source
+            object_source = fm["meta"].get("object_source", "yolo")
 
         # 4. 增量掃描
         state = ws.load_state(wsd)
@@ -89,15 +100,12 @@ def run_once(workspace_dir, *, embed_fn=None, extractor=None,
             if not rvf or not (wsd / rvf).exists():
                 raise ValueError("objective 'similar' 需要參考向量,但 workspace 缺 reference 檔")
             ref_vec = np.load(wsd / rvf)
-        elif profile["objective"] == "retrieve":    # retrieve(M13 以樣搜樣):載入樣本集傳給引擎
-            import sample_bank
-            sbd = profile.get("sample_bank_dir")
-            if not sbd:
-                raise ValueError("objective 'retrieve' 需要 sample_bank_dir(樣本集目錄)")
-            _bank = sample_bank.load_sample_bank(sbd)
+        elif profile["objective"] == "retrieve":    # retrieve(M13/M14):樣本集已於步驟 3 載入,直接取用
             ref_vectors, ref_labels = _bank["vectors"], list(_bank["labels"])
         result = al_batch.run_batched(
-            all_paths, model_dir=profile["model_dir"],
+            all_paths,
+            model_dir=(None if profile["objective"] == "retrieve" else profile["model_dir"]),
+            feature_extractor=feature_extractor,        # M14:retrieve 免整包模型(特徵器身分來自樣本集)
             checkpoint_dir=wsd / "al_batch_ck",
             objective=profile["objective"], k=int(profile["k"]) + len(labels),
             batch_size=int(profile["batch_size"]), object_source=object_source,

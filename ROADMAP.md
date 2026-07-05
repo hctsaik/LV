@@ -16,6 +16,18 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M14 — 以樣搜樣特徵器解耦(免整包建模,B+E)** — 📝 **設計中**
+  (2026-07-06 起;多 agent 討論 [wf_2da7ae02] + code 驗證確認「先建整包模型」是抽象副作用非真實依賴)—
+  問題:M13 的以樣搜樣強迫使用者先到『瑕疵偵測』①建/存整包 anomaly 模型再回來選 dataset(14 步/3 夾/2 切換),
+  但 retrieve 只需「特徵器身分(model 名+target_res+object_source)」,anomaly bank/coreset/projection/head 零消費。
+  範圍(MoSCoW):**Must** E1 sample_bank meta 加 object_source(自描述)+ E2 al_batch retrieve 免 bank/projection
+  (objective-guarded lite 載入、不算 anomaly 分數、model_version 綁特徵器身分)+ E3 al_service retrieve 同步免 model_dir
+  + B1 第 9 工具①內建預設 dinov2_vits14 + object_source 開關 + **去死路閘**;**Should** B2 進階換變體、B3 導流訓 head
+  沿用同一 model;**Won't** 全域共用特徵器(C,回歸成本過高)、D 墊檔(留死 projection=技術債)、跨變體比對。
+  目標:14 步/3 夾/2 切換 → **5 步/1 夾/0 切換**。模組 E1/E2/E3/B1 皆 **Tier B**;E2 動 al_batch 26 測契約=最高風險,
+  必須 objective-guarded 加法 + snapshot 重建。素材 [FEWSHOT_EXTRACTOR_DECOUPLE_PLAN.md](FEWSHOT_EXTRACTOR_DECOUPLE_PLAN.md);
+  PRD [2_PO_PRD/fewshot_extractor_decouple_prd.md](2_PO_PRD/fewshot_extractor_decouple_prd.md)。appetite ≤4 模組+GUI 一輪做完。
+  **要盯的風險**:model_version 續跑身分重定義(唯一 silent-stale 點,E2E 專門守)。狀態:PRD 完成,放行 `/architect`。
 - **M13 — 以樣搜樣(小樣本海撈 + YOLO 預標 + 人工確認,新功能分類=第 9 工具)** — ✅ **完成**
   (2026-07-05~07-06;PRD [2_PO_PRD/fewshot_search_prd.md](2_PO_PRD/fewshot_search_prd.md) 完成 → Task 1~7 全綠:
   gate `similarity` 19 / `sample_bank` 13 / `al_batch` 26 / `retrieval_export` 6 / `al_service` 10 / `al_workspace` 14,
@@ -422,3 +434,11 @@
   fewshot E2E 3/3 含 **AC-F4 真實驗證樣本集長大 N1>N0 + 來源零寫入**;5eb01c9)。過程修:commit 訊息誤用 PowerShell
   here-string 混入 `@` → 改 `-F 訊息檔`;E2E `_click` 取 `.first`(rerun 過場暫時雙 DOM)、加入樣本集 objmeta 補
   `obj_index`(`embed_objects` 以 `stem__obj_index` 為快取鍵)。全部 push github/uihuang_dev。**M13 收斂,無剩餘 Should。**
+- (2026-07-06) **/user→/po 起 M14「以樣搜樣特徵器解耦」**:使用者質疑以樣搜樣為何要先去『瑕疵偵測』建/存整包模型
+  再回來選 dataset(流程分散)。多 agent 討論(4 視角讀 code + 綜合,`wf_2da7ae02`)+ 我實地驗證四點皆成立:
+  ① `load_frozen_model` 硬要 bank.npz/projection(al_batch.py:77-89);② retrieve 無條件算 anomaly 分數卻用
+  `best_sim` 排序(:140-170)=死算且逼出 bank 依賴;③ `_model_version` hash bank/projection(:23-32)=解耦後
+  續跑身分要重定義;④ sample_bank meta 缺 object_source(:49-51)。**裁決:此耦合是抽象副作用非真實依賴**,
+  推薦 B(零設定預設特徵器 UX)+ E(引擎 retrieve 自足),棄 C(全域,回歸成本過高)與 D(墊檔留死 projection)。
+  PRD 落 `2_PO_PRD/fewshot_extractor_decouple_prd.md`(Must E1/E2/E3/B1),放行 `/architect`。**這是 M13 完成後的
+  再架構增量,走完整 U-Net;E2 動 al_batch 26 測契約為最高風險,objective-guarded 加法 + snapshot 重建。**

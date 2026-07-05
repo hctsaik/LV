@@ -266,11 +266,11 @@ def test_ac_svc_ret_retrieve_profile_and_queue(tmp_path):
         _img_rb(src, f"y_{i}.jpg", red=100, blue=255)    # Y 群(E3)
     mdl = tmp_path / "mdl"; _make_model(mdl)
     sbd = tmp_path / "sbank"
-    sample_bank.save_sample_bank(sbd, {
+    sample_bank.save_sample_bank(sbd, {                  # M14:樣本集自描述 object_source(圖為整張影像)
         "vectors": np.array([_e(2), _e(2), _e(3), _e(3)], dtype=np.float32),
         "labels": np.array(["X", "X", "Y", "Y"]),
         "provenance": [{"image_path": "/a", "bbox": [0.5, 0.5, 1.0, 1.0], "label": "X"}] * 4,
-        "model": "dinov2_vits14", "target_res": 224})
+        "model": "dinov2_vits14", "target_res": 224, "object_source": "whole_image"})
     wsd = tmp_path / "wsd"
     svc.init_workspace(wsd, name="ret", watch_folders=[str(src)], model_dir=str(mdl),
                        k=3, objective="retrieve", sample_bank_dir=str(sbd))
@@ -284,3 +284,33 @@ def test_ac_svc_ret_retrieve_profile_and_queue(tmp_path):
     for it in q:                                        # 建議類別 = 該物件所屬群(由樣本比對決定)
         exp = "X" if "x_" in Path(it["image_path"]).name else "Y"
         assert it["suggested_class"] == exp,             f"建議類別應=所屬群:{Path(it['image_path']).name} → {it['suggested_class']}"
+
+
+def test_ac_svc_dec1_retrieve_without_anomaly_model(tmp_path):
+    # AC-SVC-DEC-1(M14):監看 retrieve 免 anomaly 模型——model_dir="",特徵器身分取自 sample_bank(自描述)
+    svc = _svc()
+    import al_workspace as ws
+    import sample_bank
+    src = tmp_path / "src"
+    for i in range(3):
+        _img_rb(src, f"x_{i}.jpg", red=100, blue=0)      # X 群(E2)
+    for i in range(3):
+        _img_rb(src, f"y_{i}.jpg", red=100, blue=255)    # Y 群(E3)
+    sbd = tmp_path / "sbank"
+    sample_bank.save_sample_bank(sbd, {                  # 樣本集自帶特徵器身分(含 object_source)
+        "vectors": np.array([_e(2), _e(2), _e(3), _e(3)], dtype=np.float32),
+        "labels": np.array(["X", "X", "Y", "Y"]),
+        "provenance": [{"image_path": "/a", "bbox": [0.5, 0.5, 1.0, 1.0], "label": "X"}] * 4,
+        "model": "dinov2_vits14", "target_res": 224, "object_source": "whole_image"})
+    wsd = tmp_path / "wsd"
+    # model_dir="" → 無 anomaly 模型;retrieve 應改由 sample_bank 取特徵器身分
+    svc.init_workspace(wsd, name="ret", watch_folders=[str(src)], model_dir="",
+                       k=3, objective="retrieve", sample_bank_dir=str(sbd))
+    ws.load_profile(wsd)   # model_dir 空也不 raise(retrieve 放寬)
+    res = svc.run_once(wsd, extractor=_graded_extractor(), embed_fn=_class_embed(), now=1000.0)
+    assert res["status"] == "ok", res   # 全程未載入任何 anomaly bank
+    q = ws.read_queue(wsd)
+    assert len(q) == 3 and all("suggested_class" in it for it in q), q
+    for it in q:
+        exp = "X" if "x_" in Path(it["image_path"]).name else "Y"
+        assert it["suggested_class"] == exp, f"建議類別應=所屬群:{Path(it['image_path']).name}"

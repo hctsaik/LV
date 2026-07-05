@@ -58,6 +58,8 @@ def load_profile(workspace_dir) -> dict:
         raise ValueError(f"profile schema_version {sv} 不支援(本版需 {_SCHEMA})")
     for req in ("name", "watch_folders", "model_dir"):
         if not data.get(req):
+            if req == "model_dir" and data.get("objective") == "retrieve":
+                continue   # M14:retrieve 特徵器身分改由 sample_bank 提供,model_dir 可空
             raise ValueError(f"profile 缺必填欄位:{req}")
     for k, v in _DEFAULTS.items():
         data.setdefault(k, dict(v) if isinstance(v, dict) else v)

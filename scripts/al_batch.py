@@ -32,6 +32,13 @@ def _model_version(model_dir) -> str:
     return hashlib.sha256("\n".join(sorted(parts)).encode("utf-8")).hexdigest()[:16]
 
 
+def _extractor_version(model, target_res, object_source) -> str:
+    """M14 retrieve 的特徵器身分(取代 bank 檔雜湊當續跑身分):綁 model 名 + 解析度 + object_source。
+    換其中任一 → 續跑身分變 → 不吃 stale shard。純字串雜湊、無 I/O。"""
+    sig = f"{model}|{int(target_res)}|{object_source}"
+    return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:16]
+
+
 def _img_key(image_path, cache: dict) -> str:
     """影像內容雜湊前 16 碼(不可用 stem —— 跨資料夾會撞名)。以 path 快取,同圖只算一次。"""
     p = str(image_path)
@@ -99,6 +106,18 @@ def load_frozen_model(model_dir) -> dict:
             "model_version": _model_version(md)}
 
 
+def load_feature_extractor(model, target_res, object_source="yolo") -> dict:
+    """M14:retrieve 免整包模型——只需特徵器身分(model 名 + 解析度 + object_source),
+    不讀任何檔、不需 bank/projection。回一個與 load_frozen_model 同形狀的 lite fm(bank/ref/head 皆 None)。"""
+    if not model or target_res in (None, ""):
+        raise ValueError("feature_extractor 需要 model 名與 target_res")
+    return {"meta": {"model": str(model), "target_res": int(target_res),
+                     "object_source": str(object_source)},
+            "model": str(model), "target_res": int(target_res),
+            "score_mode": "object", "bank": None, "ref": None, "head": None,
+            "model_version": _extractor_version(model, target_res, object_source)}
+
+
 # ── priority 計算(全域正規化只在合併時做,C8)────────────────────────────
 def _priority(objective, score, proba):
     """回 (priority_vec, components_dict)。components 給 reason 用。"""
@@ -137,6 +156,12 @@ def _score_batch(meta, fm, cache_dir, extractor, embed_fn, obj_cache,
                  objective="novelty", ref_vector=None, ref_vectors=None, ref_labels=None):
     from anomaly_tool import _object_embeddings
     n = len(meta)
+    if objective == "retrieve":            # M14:免 bank——只 embed + 多樣本比對,不算 anomaly 分數
+        from similarity import multi_ref_similarity
+        oe = _object_embeddings(meta, fm["model"], embed_fn, cache_path=obj_cache)
+        _bl, _bs = multi_ref_similarity(oe, ref_vectors, ref_labels)
+        return (np.zeros(n, dtype=np.float32), None,
+                {"best_sim": np.asarray(_bs, dtype=np.float32), "best_class": np.asarray(_bl)})
     if fm["score_mode"] == "patch":
         from anomaly_score import score_object
         from patch_features import embed_objects_patch
@@ -162,12 +187,7 @@ def _score_batch(meta, fm, cache_dir, extractor, embed_fn, obj_cache,
         from similarity import cosine_similarity_to_ref
         oe = _object_embeddings(meta, fm["model"], embed_fn, cache_path=obj_cache)
         extra["ref_sim"] = cosine_similarity_to_ref(oe, ref_vector).astype(np.float32)
-    elif objective == "retrieve":                    # M13:多樣本 per-class max-cosine → 最像的類 + 相似度
-        from similarity import multi_ref_similarity
-        oe = _object_embeddings(meta, fm["model"], embed_fn, cache_path=obj_cache)
-        _bl, _bs = multi_ref_similarity(oe, ref_vectors, ref_labels)
-        extra["best_sim"] = np.asarray(_bs, dtype=np.float32)
-        extra["best_class"] = np.asarray(_bl)
+    # objective=="retrieve" 已於函式開頭短路(免 bank),不進此處
     return scores, proba, extra
 
 
@@ -309,12 +329,12 @@ def _images_processed(sorted_paths, committed, batch_size):
 
 
 # ── 主入口 ─────────────────────────────────────────────────────────────
-def run_batched(image_paths, *, model_dir, checkpoint_dir, objective="novelty",
+def run_batched(image_paths, *, model_dir=None, checkpoint_dir, objective="novelty",
                 k=100, batch_size=1000, object_source="yolo", class_names=None,
                 dataset_dirs=(), embed_fn=None, extractor=None, progress=None,
                 resume=True, on_identity_mismatch="error", max_batches=None,
                 ref_vector=None, ref_vectors=None, ref_labels=None,
-                min_proposal_conf=0.0) -> dict:
+                min_proposal_conf=0.0, feature_extractor=None) -> dict:
     from anomaly_bank_store import _atomic_npz, _atomic_text, assert_safe_bank_dir
     from interaction import discover_whole_images, discover_yolo_objects
     from safe_io import partition_readable
@@ -339,7 +359,14 @@ def run_batched(image_paths, *, model_dir, checkpoint_dir, objective="novelty",
     assert_safe_bank_dir(ck, selected_folders=[Path(d) for d in dataset_dirs])
     ck.mkdir(parents=True, exist_ok=True)
 
-    fm = load_frozen_model(model_dir)
+    # 載入分流:retrieve 可給 feature_extractor(免 bank,M14);否則沿用 model_dir 的整包凍結模型
+    if objective == "retrieve" and feature_extractor is not None:
+        fm = load_feature_extractor(feature_extractor["model"],
+                                    feature_extractor["target_res"], object_source)
+    elif model_dir is not None:
+        fm = load_frozen_model(model_dir)
+    else:
+        raise ValueError("run_batched 需要 model_dir;retrieve 可改給 feature_extractor(免整包模型)")
     # objective → 所需凍結產物驗證(在任何 embedding 之前)
     if objective in ("uncertain", "confusion") and fm["head"] is None:
         raise ValueError(f"objective '{objective}' 需要含分類頭的模型(缺 head.joblib)")

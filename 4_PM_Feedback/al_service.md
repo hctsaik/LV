@@ -34,3 +34,9 @@
 | AC | 說明 | 測試 |
 |----|------|------|
 | AC-SVC-RET | init 存 sample_bank_dir;run_once retrieve → 佇列帶 suggested_class、依相似度、X樣本→X群為主 | `test_ac_svc_ret_retrieve_profile_and_queue` |
+
+## 增補(M14 E3):監看 retrieve 免 anomaly 模型
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-SVC-DEC-1 | model_dir="" 也可(特徵器身分取自 sample_bank);run_once retrieve 全程未載 anomaly bank、佇列帶建議類別 | `test_ac_svc_dec1_retrieve_without_anomaly_model` |
+| AC-SVC-DEC-2 | 不變量:既有 AC-SVC-RET 及其餘 al_service 測無回歸 | 既有全綠(gate 判) |

@@ -10,6 +10,7 @@ E2E:**不適用**(無 GUI;純持久化。al_service CLI 與 GUI 消費另驗)。
 |----|------|------|------|
 | AC1 | profile round-trip;`default_profile` k==100 | `test_ac1_profile_roundtrip_and_default_k` | 🔴 |
 | AC2 | 缺 profile / 缺 model_dir / schema_version 未知 → raise | `test_ac2_missing_or_bad_profile_raises` | 🔴 |
+| AC-WS-DEC(M14) | `objective=="retrieve"` 時 model_dir 可空不 raise(特徵器身分改由 sample_bank);非 retrieve 仍必填 | `test_ac_ws_dec_retrieve_model_dir_optional` | 🔴 |
 | AC3 | scan_incremental new/changed/deleted 正確且僅含該檔;第二次掃冪等全空 | `test_ac3_scan_incremental_classes_and_idempotent` | 🔴 |
 | AC4 | mtime 不變、size 變 → changed(雙鍵) | `test_ac4_size_change_is_changed` | 🔴 |
 | AC5 | scan 只讀來源,快照零變化(C6) | `test_ac5_scan_never_writes_source` | 🔴 |

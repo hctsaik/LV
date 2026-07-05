@@ -137,15 +137,15 @@ def test_f1_f2_sample_scan_export(app_server, browser, yolo_defect_at_nmin, tmp_
         ctx.close()
 
 
-def test_f3_no_model_graceful(app_server, browser):
+def test_f3_no_model_usable(app_server, browser):
+    # M14 解耦後:無 anomaly 模型不再是死路——① 樣本集可直接用(預設特徵器)
     ctx = browser.new_context(viewport={"width": 1920, "height": 1080})
     page = ctx.new_page()
     try:
         load_app(page, app_server)
         _switch_fewshot(page)
-        body = page.locator('[data-testid="stMain"]').inner_text()
-        assert "瑕疵偵測" in body and ("模型" in body or "建立" in body), \
-            f"無模型應導引先建模;實際:{body[-400:]}"
+        _fewshot_step(page, "樣本集", "建立樣本集")   # 到得了①步 = 死路已拆(舊版會提前 return)
+        expect(page.locator('.st-key-fewshot_build_bank_btn button')).to_be_visible(timeout=15000)
         expect(page.locator('[data-testid="stException"]')).to_have_count(0)
     finally:
         ctx.close()

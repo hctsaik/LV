@@ -8632,23 +8632,33 @@ def _evaluation_ui() -> None:
             st.write(f"- {g} → {p}：{n}")
 
 
+def _fewshot_extractor_model() -> str:
+    """以樣搜樣的特徵器 model 名:優先 session 選擇 → 已載 anomaly 模型 → 預設 dinov2_vits14(免整包建模)。"""
+    m = st.session_state.get("fewshot_extractor_model")
+    if m:
+        return m
+    _loaded = st.session_state.get("anomaly_model") or {}
+    if _loaded.get("_dir"):
+        return (_loaded.get("meta") or {}).get("model") or "dinov2_vits14"
+    return "dinov2_vits14"
+
+
 def _fewshot_build_bank_execute() -> None:
-    """① 建樣本集(主體執行):用凍結模型 embed 樣本 → sample_bank.save 到 .lv_cache。"""
+    """① 建樣本集(主體執行):用選定特徵器(預設 dinov2_vits14,免先建 anomaly 模型)embed 樣本 → save。"""
     import sample_bank
     from object_eval import dataset_cache_dir
     st.session_state.pop("fewshot_bank_err", None)
-    model = st.session_state.get("anomaly_model") or {}
-    meta = model.get("meta") or {}
     samples = list(st.session_state.get("fewshot_sample_folder") or [])
-    if not (model.get("_dir") and samples):
-        st.session_state["fewshot_bank_err"] = "需先有凍結模型(瑕疵偵測①)、並選樣本資料夾。"
+    if not samples:
+        st.session_state["fewshot_bank_err"] = "請先選樣本資料夾。"
         return
+    model_name = _fewshot_extractor_model()
+    object_source = st.session_state.get("fewshot_object_source") or "yolo"
     try:
-        with st.spinner("建立樣本集…首次會先載入模型(約 10~30 秒),請稍候"):
+        with st.spinner("建立樣本集…首次會先載入特徵器(約 10~30 秒),請稍候"):
             bank = sample_bank.build_sample_bank(
-                [Path(s) for s in samples], model=meta.get("model"),
-                target_res=meta.get("target_res"),
-                object_source=meta.get("object_source", "yolo"))
+                [Path(s) for s in samples], model=model_name,
+                target_res=224, object_source=object_source)
         bank_dir = dataset_cache_dir(Path(samples[0]), "fewshot_sample_bank")
         sample_bank.save_sample_bank(bank_dir, bank)
         st.session_state["fewshot_sample_bank_dir"] = str(bank_dir)
@@ -8661,10 +8671,9 @@ def _fewshot_build_bank_execute() -> None:
 
 
 def _fewshot_scan_execute() -> None:
-    """② 海掃(主體執行 → progress 串流):al_batch retrieve(多樣本比對,建議類別由樣本決定)。"""
+    """② 海掃(主體執行 → progress 串流):al_batch retrieve;特徵器身分改由樣本集自描述(免整包模型,M14)。"""
     import al_batch
     import sample_bank
-    from anomaly_bank_store import load_bank
     from object_eval import classes_for, dataset_cache_dir, list_images
     st.session_state.pop("fewshot_scan_err", None)
     _pending = st.session_state.pop("fewshot_scan_pending", None)
@@ -8672,18 +8681,14 @@ def _fewshot_scan_execute() -> None:
         return
     _k, _min_conf = _pending
     bank_dir = st.session_state.get("fewshot_sample_bank_dir")
-    model = st.session_state.get("anomaly_model") or {}
-    mdir = model.get("_dir")
     targets = list(st.session_state.get("fewshot_target_folder") or [])
-    if not (bank_dir and mdir and targets):
-        st.session_state["fewshot_scan_err"] = "需先①建樣本集、有凍結模型、選目標資料夾。"
+    if not (bank_dir and targets):
+        st.session_state["fewshot_scan_err"] = "需先①建樣本集、選目標資料夾。"
         return
     try:
-        bank = sample_bank.load_sample_bank(bank_dir)
-        meta = load_bank(mdir).get("meta", {})
-        sample_bank.assert_model_compatible(bank, model=meta.get("model"),
-                                            target_res=meta.get("target_res"))
-        object_source = meta.get("object_source", "yolo")
+        bank = sample_bank.load_sample_bank(bank_dir)   # 樣本集自帶特徵器身分(model/res/object_source)
+        object_source = bank["object_source"]
+        feature_extractor = {"model": bank["model"], "target_res": bank["target_res"]}
         roots = [Path(t) for t in targets]
         image_paths, class_names = [], None
         for r in roots:
@@ -8702,9 +8707,10 @@ def _fewshot_scan_execute() -> None:
             _bar.progress(min(max(_proc / _tot, 0.0), 1.0),
                           text=f"海掃 {_proc}/{_tot}({_proc / _tot * 100:.0f}%)")
 
-        with st.spinner("海掃中…首次會先載入模型(約 10~30 秒),請稍候"):
+        with st.spinner("海掃中…首次會先載入特徵器(約 10~30 秒),請稍候"):
             res = al_batch.run_batched(
-                image_paths, model_dir=mdir, checkpoint_dir=ck, objective="retrieve",
+                image_paths, model_dir=None, feature_extractor=feature_extractor,
+                checkpoint_dir=ck, objective="retrieve",
                 ref_vectors=bank["vectors"], ref_labels=list(bank["labels"]), k=int(_k),
                 object_source=object_source, class_names=class_names, dataset_dirs=roots,
                 progress=_cb, resume=True, on_identity_mismatch="restart",
@@ -8765,8 +8771,13 @@ def _fewshot_render_queue(res, theta) -> None:
 
 
 def _fewshot_step_samples() -> None:
-    st.markdown("**① 樣本集**:丟一個小樣本資料夾(YOLO;想找的東西,約 4 類、每類 5~10 張)。")
-    samples = _folder_picker_list("fewshot_sample_folder", add_help="樣本 YOLO 資料夾:含 images/ 與 labels/")
+    st.markdown("**① 樣本集**:丟一個小樣本資料夾(想找的東西,約 4 類、每類 5~10 張)。")
+    samples = _folder_picker_list("fewshot_sample_folder", add_help="樣本資料夾:YOLO(images/+labels/,每框一顆)或整張影像")
+    _src = st.segmented_control("樣本框來源", ["物件(YOLO 框)", "整張影像"],
+                               key="fewshot_object_source_sel", default="物件(YOLO 框)") or "物件(YOLO 框)"
+    st.session_state["fewshot_object_source"] = "whole_image" if _src == "整張影像" else "yolo"
+    st.caption(f"特徵器:**{_fewshot_extractor_model()}**(預設,免先到『瑕疵偵測』建模;"
+               "已載模型時自動沿用同一特徵器,確認才能一致導流訓頭)。")
     st.button("▶ 建立樣本集", key="fewshot_build_bank_btn", type="primary", use_container_width=True,
               disabled=not samples,
               on_click=lambda: st.session_state.update(fewshot_build_pending=True))
@@ -8826,26 +8837,23 @@ def _fewshot_confirmed_picks() -> list:
 def _fewshot_add_to_bank() -> None:
     """➕ 加入樣本集迴圈:把本輪確認(採納/改類)的物件重 embed → append 進當前樣本集(下輪更準)。"""
     import sample_bank
-    from anomaly_bank_store import load_bank
     from anomaly_tool import _object_embeddings
     st.session_state.pop("fewshot_add_err", None)
     st.session_state.pop("fewshot_add_done", None)
     bank_dir = st.session_state.get("fewshot_sample_bank_dir")
-    model = st.session_state.get("anomaly_model") or {}
-    mdir = model.get("_dir")
-    if not (bank_dir and mdir):
-        st.session_state["fewshot_add_err"] = "需先①建樣本集、有凍結模型。"
+    if not bank_dir:
+        st.session_state["fewshot_add_err"] = "需先①建樣本集。"
         return
     picks = _fewshot_confirmed_picks()
     if not picks:
         st.session_state["fewshot_add_err"] = "沒有可加入的確認物件(都略過或未達門檻)。"
         return
     try:
-        meta = load_bank(mdir).get("meta", {})
+        model_name = sample_bank.load_sample_bank(bank_dir)["model"]   # 特徵器身分取自樣本集(自描述)
         objmeta = [{"image_path": p, "bbox": list(b), "label": c, "obj_index": int(oi)}
                    for p, b, c, oi in picks]
-        with st.spinner("加入樣本集…重新擷取特徵中(首次會先載入模型)"):
-            vecs = np.asarray(_object_embeddings(objmeta, meta.get("model"), None), dtype=np.float32)
+        with st.spinner("加入樣本集…重新擷取特徵中(首次會先載入特徵器)"):
+            vecs = np.asarray(_object_embeddings(objmeta, model_name, None), dtype=np.float32)
         prov = [{"image_path": str(p), "bbox": [float(x) for x in b], "label": c}
                 for p, b, c, oi in picks]
         merged = sample_bank.append_sample(bank_dir, vectors=vecs,
@@ -8950,16 +8958,15 @@ def _fewshot_monitor_init(k: int) -> None:
     import al_service
     st.session_state.pop("fewshot_watch_err", None)
     bank_dir = st.session_state.get("fewshot_sample_bank_dir")
-    model = st.session_state.get("anomaly_model") or {}
     target = list(st.session_state.get("fewshot_target_folder") or [])
     ws = (st.session_state.get("fewshot_watch_ws") or "").strip()
-    if not (bank_dir and model.get("_dir") and target and ws):
-        st.session_state["fewshot_watch_err"] = "需先①建樣本集、②選目標夾、有凍結模型,並填工作區目錄。"
+    if not (bank_dir and target and ws):
+        st.session_state["fewshot_watch_err"] = "需先①建樣本集、②選目標夾,並填工作區目錄。"
         return
     try:
         al_service.init_workspace(ws, name=Path(target[0]).name,
                                   watch_folders=[str(t) for t in target],
-                                  model_dir=str(model["_dir"]), objective="retrieve",
+                                  model_dir="", objective="retrieve",   # M14:特徵器身分取自樣本集,免整包模型
                                   k=int(k), sample_bank_dir=str(bank_dir))
         st.session_state["fewshot_watch_inited"] = ws
     except Exception as exc:
@@ -8971,11 +8978,10 @@ def _fewshot_monitor_scan() -> None:
     import al_service
     st.session_state.pop("fewshot_watch_err", None)
     bank_dir = st.session_state.get("fewshot_sample_bank_dir")
-    model = st.session_state.get("anomaly_model") or {}
     target = list(st.session_state.get("fewshot_target_folder") or [])
     ws = (st.session_state.get("fewshot_watch_ws") or "").strip()
-    if not (bank_dir and model.get("_dir") and target and ws):
-        st.session_state["fewshot_watch_err"] = "需先①建樣本集、②選目標夾、有凍結模型,並填工作區目錄。"
+    if not (bank_dir and target and ws):
+        st.session_state["fewshot_watch_err"] = "需先①建樣本集、②選目標夾,並填工作區目錄。"
         return
     if not (Path(ws) / "profile.yaml").exists():
         _fewshot_monitor_init(int(st.session_state.get("fewshot_watch_k", 100)))
@@ -9110,11 +9116,7 @@ def _fewshot_step_monitor() -> None:
 def _fewshot_search_ui() -> None:
     """🎯 以樣搜樣(第 9 工具):小樣本 → 海掃帶粗框大資料 → 建議類別 → YOLO+CSV 匯出 → 人確認。"""
     st.subheader("🎯 以樣搜樣(小樣本海撈 → YOLO 預標 → 人工確認)")
-    model = st.session_state.get("anomaly_model")
-    if not model or not model.get("_dir"):
-        st.info("以樣搜樣需要一個**凍結模型**當特徵器。請先到『**瑕疵偵測**』① **建立或載入一個模型**"
-                "(並存到暫存目錄),再回來這裡。")
-        return
+    st.caption("用預設 DINOv2 特徵器即可開工——**不需**先到『瑕疵偵測』建模;確認累積夠了會提示可回①訓分種類模型。")
     step = st.segmented_control("步驟", ["① 樣本集", "② 海掃", "③ 確認 / 匯出", "④ 監看"],
                                 key="fewshot_step", default="① 樣本集") or "① 樣本集"
     st.divider()

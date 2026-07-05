@@ -68,3 +68,13 @@ M9-GUI 接線(三模式顯示 / 暫定 Top-K / 續跑)另以 `@pytest.mark.e2e` 
 | AC-RET4 | 分批==一次跑(C8) | `test_ac_ret4_batched_equals_single` |
 | AC-RET5 | conf 預篩丟低信心粗框 | `test_ac_ret5_conf_prefilter` |
 | AC-RET6 | 既有 21 測無回歸 | 既有全測綠(gate 判) |
+
+## 增補(M14 E2):retrieve 免整包模型(feature_extractor lite 載入)
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-RL-1 | model_dir=None + feature_extractor(免 bank/projection)也能跑、records 帶建議類別 | `test_ac_rl1_retrieve_without_bank` |
+| AC-RL-2 | retrieve 不算 anomaly 分數 → 每筆 score==0.0 | `test_ac_rl2_retrieve_no_anomaly_score` |
+| AC-RL-3 | `_extractor_version(model,res,object_source)` 穩定且隨三者變 | `test_ac_rl3_extractor_version_identity` |
+| AC-RL-4 | 換特徵器 → 續跑身分變 → 不吃 stale shard(error 拒/restart 重算) | `test_ac_rl4_change_extractor_not_stale` |
+| AC-RL-5 | retrieve 缺 model_dir 且缺 feature_extractor → ValueError | `test_ac_rl5_requires_extractor_or_model_dir` |
+| AC-RL-6 | 不變量:既有 26 測(其他 objective)無回歸 | 既有全綠(gate 判) |

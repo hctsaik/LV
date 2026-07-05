@@ -625,3 +625,85 @@ def test_ac_ret5_conf_prefilter(tmp_path):
         dataset_dirs=(ds,), min_proposal_conf=0.5,
         extractor=_graded_extractor(), embed_fn=_class_embed())
     assert r["objects_scored"] == 6, f"低信心 6 顆應被 conf 預篩丟掉,實際 scored={r['objects_scored']}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# M14 E2:retrieve 免整包模型(feature_extractor lite 載入,免 bank/projection)
+# ══════════════════════════════════════════════════════════════════════
+_FEAT = {"model": "dinov2_vits14", "target_res": 224}
+
+
+def _run_ret_lite(**kw):
+    """retrieve 免 model_dir:給 feature_extractor(免 bank),embed_fn 注入。"""
+    import al_batch
+    kw.setdefault("extractor", _graded_extractor())
+    kw.setdefault("embed_fn", _class_embed())
+    kw.setdefault("object_source", "whole_image")
+    kw.setdefault("model_dir", None)
+    kw.setdefault("feature_extractor", dict(_FEAT))
+    return al_batch.run_batched(objective="retrieve", **kw)
+
+
+def test_ac_rl1_retrieve_without_bank(tmp_path):
+    # AC-RL-1:無 bank/projection(model_dir=None + feature_extractor)也能跑,records 帶建議類別
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 5 * i, blue=0) for i in range(4)]
+    ys = [_img(ds, f"y_{i:02d}.png", red=10 + 5 * i, blue=255) for i in range(4)]
+    r = _run_ret_lite(image_paths=xs + ys, checkpoint_dir=tmp_path / "ck",
+                      ref_vectors=[_E2, _E3], ref_labels=["X", "Y"], k=8, dataset_dirs=(ds,))
+    assert r["done"] and len(r["topk_records"]) == 8
+    for rec in r["topk_records"]:
+        exp = "X" if "x_" in Path(rec["image_path"]).name else "Y"
+        assert rec["suggested_class"] == exp
+
+
+def test_ac_rl2_retrieve_no_anomaly_score(tmp_path):
+    # AC-RL-2:retrieve 不再算 anomaly 分數 → 每筆 score==0.0(排序仍由相似度)
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 30 * i, blue=0) for i in range(4)]
+    r = _run_ret_lite(image_paths=xs, checkpoint_dir=tmp_path / "ck",
+                      ref_vectors=[_E2], ref_labels=["X"], k=4, dataset_dirs=(ds,))
+    assert r["done"]
+    assert all(rec["score"] == 0.0 for rec in r["topk_records"]), \
+        f"retrieve 不應算異常分數:{[rec['score'] for rec in r['topk_records']]}"
+
+
+def test_ac_rl3_extractor_version_identity(tmp_path):
+    # AC-RL-3:model_version 綁特徵器身分(model+res+object_source),不同則異、相同則穩定
+    import al_batch
+    v = al_batch._extractor_version
+    assert v("dinov2_vits14", 224, "yolo") == v("dinov2_vits14", 224, "yolo")          # 穩定
+    assert v("dinov2_vits14", 224, "yolo") != v("dinov2_vitb14", 224, "yolo")          # 換 model
+    assert v("dinov2_vits14", 224, "yolo") != v("dinov2_vits14", 224, "whole_image")   # 換 source
+
+
+def test_ac_rl4_change_extractor_not_stale(tmp_path):
+    # AC-RL-4:換特徵器(model 名)→ 續跑身分變 → 不吃舊 shard(error 拒;restart 重算)
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i:02d}.png", red=10 + 5 * i, blue=0) for i in range(4)]
+    ck = tmp_path / "ck"
+    _run_ret_lite(image_paths=xs, checkpoint_dir=ck,
+                  feature_extractor={"model": "dinov2_vits14", "target_res": 224},
+                  ref_vectors=[_E2], ref_labels=["X"], k=4, dataset_dirs=(ds,))
+    with pytest.raises(ValueError):     # 換 model 名 → 續跑身分不符
+        _run_ret_lite(image_paths=xs, checkpoint_dir=ck,
+                      feature_extractor={"model": "dinov2_vitb14", "target_res": 224},
+                      ref_vectors=[_E2], ref_labels=["X"], k=4, dataset_dirs=(ds,),
+                      on_identity_mismatch="error")
+    r2 = _run_ret_lite(image_paths=xs, checkpoint_dir=ck,
+                       feature_extractor={"model": "dinov2_vitb14", "target_res": 224},
+                       ref_vectors=[_E2], ref_labels=["X"], k=4, dataset_dirs=(ds,),
+                       on_identity_mismatch="restart")
+    assert r2["done"]
+
+
+def test_ac_rl5_requires_extractor_or_model_dir(tmp_path):
+    # AC-RL-5:retrieve 既無 model_dir 也無 feature_extractor → ValueError
+    import al_batch
+    ds = tmp_path / "ds"
+    xs = [_img(ds, f"x_{i}.png", red=10, blue=0) for i in range(2)]
+    with pytest.raises(ValueError):
+        al_batch.run_batched(image_paths=xs, model_dir=None, feature_extractor=None,
+                             objective="retrieve", ref_vectors=[_E2], ref_labels=["X"],
+                             checkpoint_dir=tmp_path / "ck", object_source="whole_image",
+                             dataset_dirs=(ds,), extractor=_graded_extractor(), embed_fn=_class_embed())

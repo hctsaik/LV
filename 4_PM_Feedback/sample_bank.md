@@ -17,3 +17,11 @@
 | AC-STHR-3 | 只 1 類(數量多也不夠)→ 未達標 | `test_ac_sthr_3_single_class` |
 | AC-STHR-4 | 空 labels → 全空、未達標 | `test_ac_sthr_4_empty` |
 | AC-STHR-5(衍生) | 門檻可調 + per_class/ready_classes 依類名排序 | `test_ac_sthr_5_threshold_param` |
+
+## 增補(M14 E1):樣本集自描述 object_source
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-OS-1 | build 回傳帶 object_source | `test_ac_os1_build_records_object_source` |
+| AC-OS-2 | save→load 往返保留 object_source | `test_ac_os2_object_source_roundtrip` |
+| AC-OS-3 | 舊集(meta 無此欄)load 回填 "yolo",不 raise | `test_ac_os3_load_legacy_defaults_yolo` |
+| AC-OS-4 | 不變量:既有 13 測無回歸 | 既有全綠(gate 判) |

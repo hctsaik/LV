@@ -36,7 +36,8 @@ def build_sample_bank(sample_dirs, *, model, target_res, class_names=None,
                    "bbox": [float(x) for x in m["bbox"]], "label": str(m.get("label") or "—")}
                   for m in meta]
     return {"vectors": vectors, "labels": labels, "provenance": provenance,
-            "model": str(model), "target_res": int(target_res)}
+            "model": str(model), "target_res": int(target_res),
+            "object_source": str(object_source)}   # M14:自描述特徵器身分的一部分
 
 
 def save_sample_bank(bank_dir, bank) -> None:
@@ -47,7 +48,9 @@ def save_sample_bank(bank_dir, bank) -> None:
     _atomic_npz(d / "emb.npz", vectors=np.asarray(bank["vectors"], dtype=np.float32),
                 labels=np.asarray(bank["labels"]))
     meta = {"schema_version": _SCHEMA, "model": str(bank["model"]),
-            "target_res": int(bank["target_res"]), "provenance": list(bank.get("provenance") or [])}
+            "target_res": int(bank["target_res"]),
+            "object_source": str(bank.get("object_source") or "yolo"),   # M14:自描述
+            "provenance": list(bank.get("provenance") or [])}
     _atomic_text(d / "meta.json", json.dumps(meta, ensure_ascii=False))
 
 
@@ -60,7 +63,8 @@ def load_sample_bank(bank_dir) -> dict:
     npz = np.load(d / "emb.npz", allow_pickle=False)
     return {"vectors": npz["vectors"].astype(np.float32), "labels": npz["labels"],
             "provenance": meta.get("provenance") or [],
-            "model": meta.get("model"), "target_res": int(meta.get("target_res"))}
+            "model": meta.get("model"), "target_res": int(meta.get("target_res")),
+            "object_source": meta.get("object_source") or "yolo"}   # M14:舊集缺 → 回填 yolo(向後相容)
 
 
 def append_sample(bank_dir, *, vectors, labels, provenance) -> dict:

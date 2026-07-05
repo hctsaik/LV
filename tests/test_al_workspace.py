@@ -67,6 +67,27 @@ def test_ac2_missing_or_bad_profile_raises(tmp_path):
     assert "schema" in str(e.value).lower()
 
 
+def test_ac_ws_dec_retrieve_model_dir_optional(tmp_path):
+    # AC-WS-DEC(M14):objective="retrieve" 時 model_dir 可空(特徵器身分改由 sample_bank 提供),不 raise
+    ws = _wsmod()
+    import yaml
+    d = tmp_path / "wsr"; d.mkdir()
+    (d / "profile.yaml").write_text(
+        yaml.safe_dump({"schema_version": 1, "name": "x", "watch_folders": ["a"],
+                        "model_dir": "", "objective": "retrieve",
+                        "sample_bank_dir": str(tmp_path / "sbd")}),
+        encoding="utf-8")
+    prof = ws.load_profile(d)   # 不因 model_dir 空而 raise
+    assert prof["objective"] == "retrieve" and prof.get("sample_bank_dir")
+    # 對照:非 retrieve(novelty)+ 空 model_dir 仍必填 → raise
+    (d / "profile.yaml").write_text(
+        yaml.safe_dump({"schema_version": 1, "name": "x", "watch_folders": ["a"],
+                        "model_dir": "", "objective": "novelty"}),
+        encoding="utf-8")
+    with pytest.raises(ValueError):
+        ws.load_profile(d)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 增量掃描
 # ══════════════════════════════════════════════════════════════════════

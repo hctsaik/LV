@@ -3,6 +3,7 @@
 設計:3_Architect_Design/13_sample_bank.md。持久化/append/相容用合成向量(不觸真模型);
 build 用小 YOLO 資料夾 + 注入 embed_fn。延遲匯入 sample_bank(先紅=failure 非 collection error)。
 """
+import json
 import numpy as np
 import pytest
 from pathlib import Path
@@ -158,3 +159,31 @@ def test_ac_sthr_5_threshold_param(tmp_path):  # AC-STHR-5 邊界:門檻可調 +
     # 衍生不變量:per_class / ready_classes 皆依類名排序(與輸入順序無關)
     r = sb.training_head_ready(["b"] * 8 + ["a"] * 8)
     assert list(r["per_class"].keys()) == ["a", "b"] and r["ready_classes"] == ["a", "b"]
+
+
+# ── M14 E1:樣本集自描述 object_source(特徵器身分的一部分)──────────────────
+def test_ac_os1_build_records_object_source(tmp_path):  # AC-OS-1:build 回傳帶 object_source
+    sb = _sb()
+    bank = sb.build_sample_bank([_yolo_samples(tmp_path)], model="dinov2_vits14",
+                                target_res=224, embed_fn=_fake_embed(), object_source="whole_image")
+    assert bank["object_source"] == "whole_image"
+
+
+def test_ac_os2_object_source_roundtrip(tmp_path):  # AC-OS-2:save→load 往返保留 object_source
+    sb = _sb()
+    bank = _bank([[1, 0, 0, 0], [0, 1, 0, 0]], ["a", "b"])
+    bank["object_source"] = "whole_image"
+    sb.save_sample_bank(tmp_path / "sb", bank)
+    assert sb.load_sample_bank(tmp_path / "sb")["object_source"] == "whole_image"
+
+
+def test_ac_os3_load_legacy_defaults_yolo(tmp_path):  # AC-OS-3:舊集(meta 無 object_source)→ 回填 "yolo"
+    sb = _sb()
+    d = tmp_path / "old"
+    d.mkdir()
+    np.savez(d / "emb.npz", vectors=np.zeros((2, 4), dtype=np.float32), labels=np.array(["a", "b"]))
+    (d / "meta.json").write_text(
+        json.dumps({"schema_version": 1, "model": "m", "target_res": 224, "provenance": []}),
+        encoding="utf-8")
+    got = sb.load_sample_bank(d)
+    assert got["object_source"] == "yolo"   # 向後相容,不 raise
