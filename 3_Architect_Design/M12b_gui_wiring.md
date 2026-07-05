@@ -47,3 +47,9 @@
 > M10 GUI 的 similar 以 **AC-SVC-SIM(al_service 單元)** 覆蓋核心(profile 存取 + run_once 排序),
 > GUI 接線沿用既有 watch E2E 骨架;不另立完整 M10-similar Playwright E2E(避免重複 + 控成本),
 > 但 GUI 仍須實作 §3 的 watch 參考挑選 + init 傳 reference_vector。
+
+---
+## 設計修正(2026-07-05):M9/M10 找同款改 by-example
+- 選單文字:「🔎 找同款(長得像你挑的那一顆)」;參考經共用挑選器 `_anomaly_pick_reference(prefix)`
+  (來源②/①切換 + `anomaly_batch_ref_idx`/`anomaly_watch_ref_idx` selectbox 挑一顆),不再有 ref_class。
+- g8 E2E 改:挑第一顆物件當範本 → 掃出佇列、reason 含「相似度」。

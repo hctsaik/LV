@@ -11,3 +11,10 @@
 
 真實行為鐵則:AC-S1/S2 斷言「最像參考的**真的**是同群物件」(用 label 多數決),非只查 element 存在;
 換參考觀察佇列翻群 = 排序確實依參考,非固定畫面。
+
+## 修正(2026-07-05):by-example 重設計後的對應
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC-S1' | 範本=scratch 物件 → 佇列 scratch 佔多數(真實 DINOv2) | `test_by_example_queue_follows_reference` |
+| AC-S2' | 換範本=stain 物件 → 佇列翻 stain(排序跟著範本) | 同上 |
+| — | 「像某一類」已移除(silent-wrong + 與預標重疊);class_centroid 純函式測試(AC9-11)保留 | `tests/test_similarity.py` |

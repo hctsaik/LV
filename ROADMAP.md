@@ -16,6 +16,16 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M13 — 以樣搜樣(小樣本海撈 + YOLO 預標 + 人工確認,新功能分類=第 9 工具)** — ⬜ **規格已定案,待開發**
+  (2026-07-05 使用者拍板 + 二輪問答**全部開放問題已定案**;待使用者下開發指令 → `/po` 收斂 PRD)—
+  需求:小量樣本(**4 類×每類 5~10 張**)→ 海掃大資料(**帶低信心六欄 YOLO 粗框;框位置可用、類別不可信**,
+  類別一律由樣本比對決定)→ YOLO 預標(沿用粗框幾何)+ **影像清單 CSV** → 人確認;確認回饋樣本集,
+  累積夠導流瑕疵偵測①訓分種類(bootstrapping 閉環)。**監看版 v1 一起做**(復用 M10)。
+  範圍:三步 wizard + 監看;multi-exemplar **max**-cosine;復用 al_batch(多參考加法擴充,21 測無回歸)/
+  prelabel 匯出/M10 架構;**Won't** 粗框自動修框、相似度校準、全自動標註。模組:13a similarity 擴充(A)、
+  13b `sample_bank`(B)、08 擴(B)、13c `retrieval_export`(A)、09/10 擴(B)、GUI(B)。
+  需求 [1_user_needs/fewshot_search_prelabel.md](1_user_needs/fewshot_search_prelabel.md);規格
+  [FEWSHOT_SEARCH_AND_PRELABEL_PLAN.md](FEWSHOT_SEARCH_AND_PRELABEL_PLAN.md)(§0 拍板決策表 + Task 1~7 順序)。
 - **M12 — 找相似選樣目標(長得像指定物件)** — ✅ **完成**(2026-07-05;A1+A3 全綠、既有無回歸)—
   A1:`gate.py similarity` 8 + ③ E2E 1/1;A3:`gate.py al_batch` **21**(17 既有+4 similar)、`al_service` **9**
   (8+svc_sim)、`al_workspace` 14、M9 similar E2E `test_g8` 綠、M9/M10 GUI E2E 6/6+3/3 無回歸。—
@@ -382,3 +392,22 @@
   回報(不受影響,只需前一輪的 callback→主體修復)。③ 四處長時操作加 `st.spinner`(動畫)+「首次先載入模型
   (約 10~30 秒)」文字,補冷啟動空窗的狀態提示。④ 監看佇列 ✅/🏷/⏭ 按鈕改「icon+字」且不再撐滿寬度。
   gate al_workspace 14 / al_service 9 綠、M10 GUI E2E 3/3 綠。
+- (2026-07-05) **/user 起 M13「以樣搜樣」候選**:使用者拍板核心工作流「小樣本 → 海掃大資料 → 撈同類 →
+  YOLO 預標 → 人確認」為主要日常,要求成**獨立功能分類**(第 9 工具,避免與瑕疵偵測「找異常」方向混淆——
+  M12「像某一類」重疊教訓)。定位=教會模型**之前**的 bootstrapping 撈資料工具,與 M11(有 head 後)分工、
+  確認累積導流回①訓頭。需求與設計素材已落檔(見 M13 條目);4 個開放問題(無標資料佔比/樣本規模/
+  監看版/匯出形式)待拍板後 `/po` 收斂。**只記錄、未開發。**
+- (2026-07-05) **M13 規格定案(二輪問答)**:①大資料**有低信心六欄 YOLO 粗框**(cls cx cy w h conf;
+  parse_yolo_boxes_conf 已支援)→ 框生成從 Won't 變不需要,粗框=proposal;②**粗框類別不可信,只用框位置**,
+  類別一律由樣本比對決定;③樣本=每類 5~10 張×約 4 類 → max-cosine + 「確認加回樣本集」滾大;
+  ④**監看版 v1 一起做**(profile 擴充 sample_bank_dir,復用 M10);⑤匯出=YOLO labels(沿用粗框幾何)
+  **+ retrieval_report.csv**(欄位已釘死)。規格全落 FEWSHOT_SEARCH_AND_PRELABEL_PLAN.md §0/§2/§4/§6,
+  含既有教訓(進度條 pending-flag 模式、術語人話、C6/C8)。**未開發,等指令。**
+- (2026-07-05) **M12 設計修正(多 agent 討論,使用者觸發)**:使用者質疑「找相似的參考該來自①而非②」→
+  4 視角 + 綜合裁決:**「像某一個物件」(by-example)對且是旗艦**(novel 物件只能來自②);
+  **「像某一類」錯**——(a) silent-wrong:class_centroid 吃②的 YOLO label,②常無標 → 全 '—' → 退化成全體平均
+  不報錯;(b) 與 M11 預標重疊(有 head 找已知類該用 head,centroid 是未校準弱版)。拍板:**移除「像某一類」**、
+  找已知種類導流「🏷️ 預標」;「找相似」改名「**🔎 找同款**」(by-example 專責);參考來源顯性切換
+  **② 這次掃描 / ① 建模範例**(①同 session 用 anomaly_train_result,免持久化;跨 session=候選)。
+  head coef_ 當類別代表 = 語義誤導,排除;PLAN A2「對 bank 向量加 provenance」= 誤規格(bank 是 patch coreset
+  非 obj_emb 空間),棄用。

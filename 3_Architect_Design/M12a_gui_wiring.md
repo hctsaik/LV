@@ -50,3 +50,15 @@ DOM 穩定標記:參考容器內含文字「參考:」;佇列容器渲染 ≥1 �
   - 具體物件:`anomaly_sim_ref_idx` 改成 **selectbox 顯示「第N · <label> · <檔名>」**(不再裸索引)+ 縮圖預覽。
 - M9/M10 同步:`anomaly_batch_ref_mode`/`anomaly_batch_ref_class`、`anomaly_watch_ref_mode`/`anomaly_watch_ref_class`。
 - E2E 改以「選類別」為主驗收(E2E 已知所選類別,免解析):選類別 scratch → 佇列多數 scratch;切 stain → 翻 stain。
+
+---
+## 設計修正(2026-07-05,多 agent 討論 + 使用者拍板;取代上方「參考依據切換」增補)
+- **移除「像某一類」**:class_centroid 吃②的 label 是 silent-wrong(②常無標→退化全體平均)且與 M11 預標重疊。
+  「找某已知瑕疵種類」一律導流「🏷️ 預標」。`similarity.class_centroid` 保留為純函式(已測),GUI 不再使用。
+- 「找相似」改名「**🔎 找同款**」= 純 by-example:挑**一顆**當範本 → cosine 排序。
+- **參考來源顯性切換**(>1 來源才出 radio):`anomaly_{prefix}_ref_src` =「② 這次掃描結果」(anomaly_apply_result)/
+  「① 建模已知範例」(anomaly_train_result,同 session 免持久化;載入舊模型則無①)。
+- widget 契約(新):`anomaly_sim_ref_src` / `anomaly_sim_ref_idx`(selectbox「第N·label·檔名」+ 縮圖)/
+  `anomaly_sim_queue`。佇列排除範本自身**僅當參考來自②**(①範本不在搜尋集,不排除)。
+- E2E 改驗 by-example:挑 scratch 物件 → 佇列 scratch 多數;換挑 stain 物件 → 翻 stain
+  (`test_by_example_queue_follows_reference`)。M9 同步:`anomaly_batch_ref_idx` selectbox 挑範本(g8)。

@@ -1908,7 +1908,7 @@ def _anomaly_batch_section(model: dict, target_folders: list) -> None:
     has_head = bool(model.get("head"))
     # 人話選樣目標(不寫 novelty/head/Top-K 術語)。引擎端 novelty≡pure,不列同義假選項(Task0)。+ 找相似。
     _OBJ = {"novelty": "抓沒看過的異常", "balanced": "又異常又難分種類(需會分種類的模型)",
-            "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找相似(長得像指定的東西)"}
+            "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找同款(長得像你挑的那一顆)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_batch_objective", default="novelty") or "novelty"
     _needs_head = obj in ("balanced", "confusion")
@@ -1917,13 +1917,8 @@ def _anomaly_batch_section(model: dict, target_folders: list) -> None:
                    "請改用『抓沒看過的異常』;或回到①,建模時**標明每個瑕疵是哪一種**"
                    "(每種至少 8 張範例),就能建出會分種類的模型。")
     _sim_ok = True
-    if obj == "similar":                              # M12b:參考來自②套用結果(共用挑選器)
-        _ar = st.session_state.get("anomaly_apply_result") or {}
-        if _ar.get("obj_emb") is None or not _ar.get("records"):
-            st.warning("「找相似」需先按上方 **(2) 套用偵測** 產生結果,再挑一個參考。")
-            _sim_ok = False
-        else:
-            _anomaly_pick_reference("batch", _ar["records"], _ar["obj_emb"])
+    if obj == "similar":                              # M12:by-example,參考來源②/①(共用挑選器)
+        _sim_ok = _anomaly_pick_reference("batch") is not None
     k = st.slider("要挑前幾個送標註", 10, 500, 100, 10, key="anomaly_batch_k")
     _disabled = ((not target_folders) or (_needs_head and not has_head)
                  or (obj == "similar" and not _sim_ok))
@@ -2086,7 +2081,7 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
                   label_visibility="collapsed",
                   help="設定/佇列/標註都存這;profile.yaml 可匯出給離線服務。")
     _OBJ = {"novelty": "抓沒看過的異常", "balanced": "又異常又難分種類(需會分種類的模型)",
-            "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找相似(長得像指定的東西)"}
+            "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找同款(長得像你挑的那一顆)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_watch_objective", default="novelty") or "novelty"
     # watch 也要「會分種類」閘(否則選前兩者但模型不會分種類 → 掃描時 raise;與批次一致,Task0)
@@ -2095,13 +2090,8 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
         st.warning("這個目標需要**會分辨瑕疵種類**的模型,但目前這個模型只會找異常、不會分種類。"
                    "請改用『抓沒看過的異常』;或回到①,建模時**標明每個瑕疵是哪一種**(每種至少 8 張範例)。")
     _wsim_ok = True
-    if obj == "similar":                              # M12b:參考來自②套用結果,存進 profile 給服務(共用挑選器)
-        _ar = st.session_state.get("anomaly_apply_result") or {}
-        if _ar.get("obj_emb") is None or not _ar.get("records"):
-            st.warning("「找相似」監看需先按上方 **(2) 套用偵測** 產生結果,再挑一個參考。")
-            _wsim_ok = False
-        else:
-            _anomaly_pick_reference("watch", _ar["records"], _ar["obj_emb"])
+    if obj == "similar":                              # M12:by-example,參考來源②/①(存進 profile 給服務)
+        _wsim_ok = _anomaly_pick_reference("watch") is not None
     k = st.slider("每次要挑前幾個", 10, 500, 100, 10, key="anomaly_watch_k")
     ws = (st.session_state.get("anomaly_watch_ws") or "").strip()
     _enabled = (bool(target_folders and ws)
@@ -2323,62 +2313,63 @@ def _anomaly_prelabel_section(model, result, scores, threshold, obj_emb) -> None
                        f"{_done['objects']} 個標註 → `{_done['out_dir']}`")
 
 
-def _anomaly_pick_reference(prefix: str, records, obj_emb):
-    """共用參考物件挑選器(③/M9/M10)。radio「像某一類 / 像某一個物件」→ 回 ref_vector(np)或 None,
-    並存 session[anomaly_{prefix}_ref_vec] 供 on_click 回呼取用。widget key 以 prefix 區隔三處。"""
-    import similarity
-    emb = np.asarray(obj_emb, dtype=float)
+def _anomaly_pick_reference(prefix: str):
+    """共用參考挑選器(③/M9/M10):選**參考來源**(② 這次掃描結果 / ① 建模已知範例)→ 挑**一顆**物件當範本
+    → 回 ref_vector 並存 session[anomaly_{prefix}_ref_vec]。這是『找長得像這一顆』的 by-example;
+    想找某種**已知瑕疵種類**請用『🏷️ 預標』(分類頭更準)。① 來源只在建模那一輪有(載入舊模型則只有②)。"""
+    _srcs = []
+    _ar = st.session_state.get("anomaly_apply_result") or {}
+    if _ar.get("obj_emb") is not None and _ar.get("records"):
+        _srcs.append(("apply", "② 這次掃描結果", _ar["records"], _ar["obj_emb"]))
+    _tr = st.session_state.get("anomaly_train_result") or {}
+    if _tr.get("obj_emb") is not None and _tr.get("records"):
+        _srcs.append(("train", "① 建模已知範例", _tr["records"], _tr["obj_emb"]))
+    if not _srcs:
+        st.session_state[f"anomaly_{prefix}_ref_vec"] = None
+        st.info("沒有可當範本的物件(先按②套用偵測;建模那一輪也會留下①的範例)。")
+        return None
+    _names = {s[0]: s[1] for s in _srcs}
+    src = (st.radio("參考來源", list(_names), horizontal=True, key=f"anomaly_{prefix}_ref_src",
+                    format_func=lambda k: _names[k]) if len(_srcs) > 1 else _srcs[0][0])
+    _sel = next(s for s in _srcs if s[0] == src)
+    records, emb = _sel[2], np.asarray(_sel[3], dtype=float)
     labels = [str(r.get("label") or "—") for r in records]
-    classes = sorted(set(labels))
-    mode = st.radio("要找像什麼", ["像某一類", "像某一個物件"], horizontal=True,
-                    key=f"anomaly_{prefix}_ref_mode",
-                    help="『像某一類』= 找長得像整個類別的(用該類平均);"
-                         "『像某一個物件』= 找長得像你挑的那一顆的。")
-    rv = None
-    if mode == "像某一類":
-        cls = st.selectbox("要找像哪一類的", classes, key=f"anomaly_{prefix}_ref_class")
-        try:
-            rv = similarity.class_centroid(emb, labels, cls)
-        except Exception:
-            rv = None
-    else:
-        pick = int(st.selectbox("要找像哪一個物件的", list(range(len(records))),
-                                key=f"anomaly_{prefix}_ref_idx",
-                                format_func=lambda i: f"第 {i} 個 · {labels[i]} · {_rec_fname(records[i])}"))
-        rv = emb[pick]
-        with st.container(key=f"anomaly_{prefix}_ref"):     # 具體物件:縮圖讓你看到挑的是什麼
-            _rr = records[pick]
-            _im = safe_open_image(_rr["image_path"])
-            if _im is not None:
-                st.image(crop_bbox(_im, *_rr["bbox"], pad=0.1), width=160)
-            st.caption(f"參考:{_rr.get('label') or '—'}｜{_rec_fname(_rr)}")
+    pick = int(st.selectbox("挑一顆當範本(找長得最像它的)", list(range(len(records))),
+                            key=f"anomaly_{prefix}_ref_idx",
+                            format_func=lambda i: f"第 {i} 個 · {labels[i]} · {_rec_fname(records[i])}"))
+    rv = emb[pick]
+    with st.container(key=f"anomaly_{prefix}_ref"):     # 縮圖讓你看到挑的是哪一顆
+        _rr = records[pick]
+        _im = safe_open_image(_rr["image_path"])
+        if _im is not None:
+            st.image(crop_bbox(_im, *_rr["bbox"], pad=0.1), width=160)
+        st.caption(f"範本:{_rr.get('label') or '—'}｜{_rec_fname(_rr)}")
     st.session_state[f"anomaly_{prefix}_ref_vec"] = rv
+    st.session_state[f"anomaly_{prefix}_ref_src_val"] = src
     return rv
 
 
 def _anomaly_similar_section(result, obj_emb) -> None:
-    """③「🔎 找相似」:挑參考(某一類 / 某一個物件)→ 依相似度把最像的排到最前面。
-    只需物件級特徵(不需會分種類的模型);無特徵 → 友善提示。"""
+    """③「🔎 找同款」:挑**一顆**當範本(來自②掃描結果或①建模範例)→ 依相似度把長得最像的排到最前面。
+    這是 by-example『找長得像這一顆』;想找某種**已知瑕疵種類**請用『🏷️ 預標』(分類頭更準)。"""
     import similarity
     st.divider()
-    with st.expander("🔎 找相似(長得像指定的東西)", expanded=False):
+    with st.expander("🔎 找同款(找長得像你挑的那一顆的)", expanded=False):
         records = result.get("records") or []
-        if obj_emb is None:
-            st.info("這個結果沒有物件特徵,無法找相似(先按②套用偵測產生結果)。")
-            return
-        if len(records) < 2:
-            st.info("至少要有 2 個物件才能找相似。")
+        if obj_emb is None or len(records) < 2:
+            st.info("這個結果沒有足夠物件(先按②套用偵測產生 ≥2 個物件)。")
             return
         emb = np.asarray(obj_emb, dtype=float)
-        st.caption("先選你想找同款的**參考**,整批就會把長得最像的排到最前面送你標註。")
-        rv = _anomaly_pick_reference("sim", records, emb)
+        st.caption("挑一顆當**範本**,整批就把長得最像它的排到最前面送你標註。"
+                   "想找某種**已知瑕疵種類**?用上面的『🏷️ 預標』選類別會更準。")
+        rv = _anomaly_pick_reference("sim")
         if rv is None:
-            st.info("無法取得參考,請換一個。")
             return
         k = st.slider("取幾個最像的送標註", 1, min(48, len(records) - 1),
                       min(12, len(records) - 1), key="anomaly_sim_k")
+        # 只有『參考來自②(=搜尋集)』時才排除範本自身;來自①的範本不在②裡,不用排除
         _excl = (int(st.session_state.get("anomaly_sim_ref_idx", -1))
-                 if st.session_state.get("anomaly_sim_ref_mode") == "像某一個物件" else -1)
+                 if st.session_state.get("anomaly_sim_ref_src_val") == "apply" else -1)
         pri = np.asarray(similarity.similarity_priority(emb, rv), dtype=float)
         order = [int(i) for i in np.argsort(-pri) if int(i) != _excl][:int(k)]
         with st.container(key="anomaly_sim_queue"):

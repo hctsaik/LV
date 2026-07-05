@@ -249,15 +249,15 @@ def test_g8_similar_objective_batch(app_server, browser, yolo_defect_at_nmin, tm
 
         click_tab(page, TAB_APPLY)
         page.locator('.st-key-anomaly_batch_objective').get_by_text(
-            "找相似", exact=False).first.click()
+            "找同款", exact=False).first.click()
         wait_idle(page)
         click_tab(page, TAB_APPLY)
-        # 參考依據預設「類別」→ 選一個類別當參考(baseweb selectbox)
-        _sb = page.locator('.st-key-anomaly_batch_ref_class [data-baseweb="select"]')
+        # 挑一顆物件當範本(by-example;參考來源預設 ②)
+        _sb = page.locator('.st-key-anomaly_batch_ref_idx [data-baseweb="select"]')
         _sb.wait_for(state="visible", timeout=30000)
         _sb.click()
         page.wait_for_selector('[role="option"]', timeout=6000)
-        page.get_by_role("option", name="scratch", exact=True).first.click()
+        page.get_by_role("option").first.click()   # 第一顆
         wait_idle(page)
         click_tab(page, TAB_APPLY)
         btn = page.locator('.st-key-anomaly_batch_scan_btn button')
