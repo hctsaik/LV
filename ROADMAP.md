@@ -16,9 +16,11 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
-- **M13 — 以樣搜樣(小樣本海撈 + YOLO 預標 + 人工確認,新功能分類=第 9 工具)** — 🔨 **開發中**
-  (2026-07-05 開工;PRD [2_PO_PRD/fewshot_search_prd.md](2_PO_PRD/fewshot_search_prd.md) 完成 → 放行 `/architect`,
-  Task 1~7 分段做)—
+- **M13 — 以樣搜樣(小樣本海撈 + YOLO 預標 + 人工確認,新功能分類=第 9 工具)** — ✅ **完成**
+  (2026-07-05~07-06;PRD [2_PO_PRD/fewshot_search_prd.md](2_PO_PRD/fewshot_search_prd.md) 完成 → Task 1~7 全綠:
+  gate `similarity` 19 / `sample_bank` 13 / `al_batch` 26 / `retrieval_export` 6 / `al_service` 10 / `al_workspace` 14,
+  **fewshot E2E 3/3**(含 AC-F4 加入樣本集迴圈真實長大)、AC-SVC-RET 監看綠,既有無回歸;
+  commit 5ce2d03 / e96b8c0 / 5eb01c9)—
   需求:小量樣本(**4 類×每類 5~10 張**)→ 海掃大資料(**帶低信心六欄 YOLO 粗框;框位置可用、類別不可信**,
   類別一律由樣本比對決定)→ YOLO 預標(沿用粗框幾何)+ **影像清單 CSV** → 人確認;確認回饋樣本集,
   累積夠導流瑕疵偵測①訓分種類(bootstrapping 閉環)。**監看版 v1 一起做**(復用 M10)。
@@ -412,3 +414,11 @@
   **② 這次掃描 / ① 建模範例**(①同 session 用 anomaly_train_result,免持久化;跨 session=候選)。
   head coef_ 當類別代表 = 語義誤導,排除;PLAN A2「對 bank 向量加 provenance」= 誤規格(bank 是 patch coreset
   非 obj_emb 空間),棄用。
+- (2026-07-06) **M13「以樣搜樣」Task 5~7 完成 → M13 里程碑達成**:Task5 第 9 工具三步 wizard(①樣本
+  ②海掃③確認/雙匯出;E2E 2/2,commit 5ce2d03)→ Task6 監看模式(`al_workspace._DEFAULTS` 加 `sample_bank_dir`、
+  `al_service.run_once` 支援 `objective="retrieve"` 載樣本集背景海撈、GUI「④監看」;gate al_service 10 / al_workspace 14、
+  AC-SVC-RET 綠;e96b8c0)→ Task7 加入樣本集迴圈(③確認物件重 embed→`append_sample` 滾大樣本集)+ 訓頭導流提示
+  (`sample_bank.training_head_ready`,達「≥2 類×每類≥8」→ 導回①訓頭;**C4 只導流不自動訓**;gate sample_bank 13、
+  fewshot E2E 3/3 含 **AC-F4 真實驗證樣本集長大 N1>N0 + 來源零寫入**;5eb01c9)。過程修:commit 訊息誤用 PowerShell
+  here-string 混入 `@` → 改 `-F 訊息檔`;E2E `_click` 取 `.first`(rerun 過場暫時雙 DOM)、加入樣本集 objmeta 補
+  `obj_index`(`embed_objects` 以 `stem__obj_index` 為快取鍵)。全部 push github/uihuang_dev。**M13 收斂,無剩餘 Should。**
