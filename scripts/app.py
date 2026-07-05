@@ -8632,6 +8632,245 @@ def _evaluation_ui() -> None:
             st.write(f"- {g} → {p}：{n}")
 
 
+def _fewshot_build_bank_execute() -> None:
+    """① 建樣本集(主體執行):用凍結模型 embed 樣本 → sample_bank.save 到 .lv_cache。"""
+    import sample_bank
+    from object_eval import dataset_cache_dir
+    st.session_state.pop("fewshot_bank_err", None)
+    model = st.session_state.get("anomaly_model") or {}
+    meta = model.get("meta") or {}
+    samples = list(st.session_state.get("fewshot_sample_folder") or [])
+    if not (model.get("_dir") and samples):
+        st.session_state["fewshot_bank_err"] = "需先有凍結模型(瑕疵偵測①)、並選樣本資料夾。"
+        return
+    try:
+        with st.spinner("建立樣本集…首次會先載入模型(約 10~30 秒),請稍候"):
+            bank = sample_bank.build_sample_bank(
+                [Path(s) for s in samples], model=meta.get("model"),
+                target_res=meta.get("target_res"),
+                object_source=meta.get("object_source", "yolo"))
+        bank_dir = dataset_cache_dir(Path(samples[0]), "fewshot_sample_bank")
+        sample_bank.save_sample_bank(bank_dir, bank)
+        st.session_state["fewshot_sample_bank_dir"] = str(bank_dir)
+        _labels = np.asarray(bank["labels"])
+        st.session_state["fewshot_sample_bank_summary"] = {
+            "n": int(len(_labels)),
+            "classes": {c: int(np.sum(_labels == c)) for c in sorted(set(_labels.tolist()))}}
+    except Exception as exc:
+        st.session_state["fewshot_bank_err"] = f"建立樣本集失敗:{exc}"
+
+
+def _fewshot_scan_execute() -> None:
+    """② 海掃(主體執行 → progress 串流):al_batch retrieve(多樣本比對,建議類別由樣本決定)。"""
+    import al_batch
+    import sample_bank
+    from anomaly_bank_store import load_bank
+    from object_eval import classes_for, dataset_cache_dir, list_images
+    st.session_state.pop("fewshot_scan_err", None)
+    _pending = st.session_state.pop("fewshot_scan_pending", None)
+    if _pending is None:
+        return
+    _k, _min_conf = _pending
+    bank_dir = st.session_state.get("fewshot_sample_bank_dir")
+    model = st.session_state.get("anomaly_model") or {}
+    mdir = model.get("_dir")
+    targets = list(st.session_state.get("fewshot_target_folder") or [])
+    if not (bank_dir and mdir and targets):
+        st.session_state["fewshot_scan_err"] = "需先①建樣本集、有凍結模型、選目標資料夾。"
+        return
+    try:
+        bank = sample_bank.load_sample_bank(bank_dir)
+        meta = load_bank(mdir).get("meta", {})
+        sample_bank.assert_model_compatible(bank, model=meta.get("model"),
+                                            target_res=meta.get("target_res"))
+        object_source = meta.get("object_source", "yolo")
+        roots = [Path(t) for t in targets]
+        image_paths, class_names = [], None
+        for r in roots:
+            image_paths.extend(list_images(r))
+            class_names = class_names or classes_for(r)
+        if not image_paths:
+            st.session_state["fewshot_scan_err"] = "目標資料夾找不到影像。"
+            return
+        ck = dataset_cache_dir(roots[0], "fewshot_retrieve")
+        _bar = st.progress(0.0, text=f"準備中…首次會先載入模型(約 10~30 秒),再開始海掃 {len(image_paths)} 張圖"
+                                     "(之後每 20 張更新)")
+
+        def _cb(d):
+            _tot = max(int(d.get("images_total") or 1), 1)
+            _proc = int(d.get("images_processed") or 0)
+            _bar.progress(min(max(_proc / _tot, 0.0), 1.0),
+                          text=f"海掃 {_proc}/{_tot}({_proc / _tot * 100:.0f}%)")
+
+        with st.spinner("海掃中…首次會先載入模型(約 10~30 秒),請稍候"):
+            res = al_batch.run_batched(
+                image_paths, model_dir=mdir, checkpoint_dir=ck, objective="retrieve",
+                ref_vectors=bank["vectors"], ref_labels=list(bank["labels"]), k=int(_k),
+                object_source=object_source, class_names=class_names, dataset_dirs=roots,
+                progress=_cb, resume=True, on_identity_mismatch="restart",
+                min_proposal_conf=float(_min_conf), batch_size=20)
+        _bar.empty()
+        st.session_state["fewshot_scan_result"] = res
+        st.session_state["fewshot_sample_classes"] = sorted(set(np.asarray(bank["labels"]).tolist()))
+        st.session_state.pop("fewshot_decisions", None)
+    except Exception as exc:
+        st.session_state["fewshot_scan_err"] = f"海掃失敗:{exc}"
+
+
+def _fewshot_export() -> None:
+    """③ 匯出(on_click 後主體呼叫):export_retrieval → YOLO(沿用粗框幾何)+ CSV。"""
+    import retrieval_export
+    st.session_state.pop("fewshot_export_err", None)
+    st.session_state.pop("fewshot_export_done", None)
+    res = st.session_state.get("fewshot_scan_result") or {}
+    records = res.get("topk_records") or []
+    out_dir = (st.session_state.get("fewshot_out_dir") or "").strip()
+    classes = st.session_state.get("fewshot_sample_classes") or []
+    dmap = st.session_state.get("fewshot_decisions") or {}
+    theta = float(st.session_state.get("fewshot_theta", 0.3))
+    decs = []
+    for i, r in enumerate(records):
+        if float(r.get("similarity", 0)) < theta:            # 未達門檻 → 不匯(視為 pending)
+            continue
+        d = dmap.get(r["item_id"])
+        if d is None:
+            decs.append({"item": i, "decision": "accepted", "final_class": r.get("suggested_class")})
+        else:
+            decs.append({"item": i, "decision": d["decision"], "final_class": d.get("final_class")})
+    source_dirs = [str(t) for t in (st.session_state.get("fewshot_target_folder") or [])]
+    try:
+        st.session_state["fewshot_export_done"] = retrieval_export.export_retrieval(
+            records, decs, out_dir, class_names=classes, source_dirs=source_dirs)
+    except Exception as exc:
+        st.session_state["fewshot_export_err"] = f"匯出失敗:{exc}"
+
+
+def _fewshot_render_queue(res, theta) -> None:
+    from interaction import crop_bbox
+    recs = [r for r in (res.get("topk_records") or []) if float(r.get("similarity", 0)) >= theta]
+    done = bool(res.get("done"))
+    st.markdown(f"{'✅ 以樣搜樣掃描完成' if done else '⏳ 掃描中'} · 命中 **{len(recs)}** 個"
+                f"(相似度 ≥ {theta:.2f};已評分 {res.get('objects_scored')})")
+    if not recs:
+        st.info("沒有命中 —— 調低相似度門檻,或多加樣本。")
+        return
+    with st.container(key="fewshot_queue"):
+        cols = st.columns(4)
+        for j, r in enumerate(recs[:40]):
+            with cols[j % 4]:
+                _im = safe_open_image(r["image_path"])
+                if _im is not None:
+                    st.image(crop_bbox(_im, *r["bbox"], pad=0.1), use_container_width=True)
+                st.caption(f"建議 **{r.get('suggested_class', '—')}** · 相似 {float(r.get('similarity', 0)):.2f}")
+
+
+def _fewshot_step_samples() -> None:
+    st.markdown("**① 樣本集**:丟一個小樣本資料夾(YOLO;想找的東西,約 4 類、每類 5~10 張)。")
+    samples = _folder_picker_list("fewshot_sample_folder", add_help="樣本 YOLO 資料夾:含 images/ 與 labels/")
+    st.button("▶ 建立樣本集", key="fewshot_build_bank_btn", type="primary", use_container_width=True,
+              disabled=not samples,
+              on_click=lambda: st.session_state.update(fewshot_build_pending=True))
+    if st.session_state.pop("fewshot_build_pending", False):
+        _fewshot_build_bank_execute()
+    if st.session_state.get("fewshot_bank_err"):
+        st.error(st.session_state["fewshot_bank_err"])
+    _sum = st.session_state.get("fewshot_sample_bank_summary")
+    with st.container(key="fewshot_bank_info"):
+        if _sum:
+            st.success(f"✅ 樣本集已建立:共 **{_sum['n']}** 顆樣本 · "
+                       + "、".join(f"{c} {n}" for c, n in _sum["classes"].items()))
+        else:
+            st.caption("尚未建立樣本集。")
+
+
+def _fewshot_step_scan() -> None:
+    if not st.session_state.get("fewshot_sample_bank_dir"):
+        st.info("請先到「① 樣本集」建立樣本集。")
+        return
+    st.markdown("**② 海掃**:選要撈的大資料夾(帶低信心 YOLO 粗框;無框則整張影像)。")
+    targets = _folder_picker_list("fewshot_target_folder", add_help="要海掃的大資料夾")
+    min_conf = st.slider("粗框信心預篩(低於此的粗框略過;0=不篩)", 0.0, 1.0, 0.0, 0.05, key="fewshot_min_conf")
+    theta = st.slider("相似度門檻(佇列只留 ≥ 此的)", 0.0, 1.0, 0.3, 0.05, key="fewshot_theta")
+    k = st.slider("取前幾個", 10, 500, 100, 10, key="fewshot_k")
+    st.button("▶ 海掃", key="fewshot_scan_btn", type="primary", use_container_width=True,
+              disabled=not targets,
+              on_click=lambda: st.session_state.update(
+                  fewshot_scan_pending=(int(k), float(min_conf))))
+    if st.session_state.get("fewshot_scan_pending"):
+        _fewshot_scan_execute()
+    if st.session_state.get("fewshot_scan_err"):
+        st.error(st.session_state["fewshot_scan_err"])
+    res = st.session_state.get("fewshot_scan_result")
+    if res:
+        _fewshot_render_queue(res, float(theta))
+
+
+def _fewshot_step_confirm() -> None:
+    from interaction import crop_bbox
+    res = st.session_state.get("fewshot_scan_result") or {}
+    theta = float(st.session_state.get("fewshot_theta", 0.3))
+    shown = [r for r in (res.get("topk_records") or []) if float(r.get("similarity", 0)) >= theta]
+    if not shown:
+        st.info("請先「② 海掃」產生命中(或調低相似度門檻)。")
+        return
+    st.markdown("**③ 確認 / 匯出**:預設全採納建議;可改類 / 略過。匯出 YOLO + CSV 到另選資料夾(不碰來源)。")
+    classes = st.session_state.get("fewshot_sample_classes") or []
+    st.session_state.setdefault("fewshot_decisions", {})
+    cols = st.columns(3)
+    for j, r in enumerate(shown[:30]):
+        _id = r["item_id"]
+        with cols[j % 3]:
+            _im = safe_open_image(r["image_path"])
+            if _im is not None:
+                st.image(crop_bbox(_im, *r["bbox"], pad=0.1), use_container_width=True)
+            _cur = st.session_state["fewshot_decisions"].get(_id)
+            _tag = _cur["decision"] if _cur else "採納建議"
+            st.caption(f"建議 {r.get('suggested_class', '—')} · 相似 {float(r.get('similarity', 0)):.2f} · {_tag}")
+            _rc = st.selectbox("改類", ["(採納建議)"] + list(classes),
+                               key=f"fewshot_relabel_{j}", label_visibility="collapsed")
+            if _rc != "(採納建議)":
+                st.session_state["fewshot_decisions"][_id] = {"decision": "relabeled", "final_class": _rc}
+            st.button("⏭ 略過", key=f"fewshot_skip_{j}",
+                      on_click=lambda _i=_id: st.session_state["fewshot_decisions"].update(
+                          {_i: {"decision": "skipped", "final_class": None}}))
+    _tf = st.session_state.get("fewshot_target_folder") or []
+    _def_out = _anomaly_bank_default_dir(str(_tf[0]), "fewshot_out") if _tf else ""
+    if not st.session_state.get("fewshot_out_dir") and _def_out:
+        st.session_state["fewshot_out_dir"] = _def_out
+    st.text_input("輸出資料夾(另存 YOLO+CSV;來源不動)", key="fewshot_out_dir")
+    out_dir = (st.session_state.get("fewshot_out_dir") or "").strip()
+    st.button("⬇ 匯出 YOLO + CSV", key="fewshot_export_btn", type="primary", use_container_width=True,
+              disabled=not out_dir,
+              on_click=lambda: st.session_state.update(fewshot_export_pending=True))
+    if st.session_state.pop("fewshot_export_pending", False):
+        _fewshot_export()
+    if st.session_state.get("fewshot_export_err"):
+        st.error(st.session_state["fewshot_export_err"])
+    _done = st.session_state.get("fewshot_export_done")
+    if _done:
+        st.success(f"✅ 以樣搜樣匯出完成 · {_done['objects']} 個標註 + CSV({_done['csv_rows']} 列) → "
+                   f"`{_done['out_dir']}`")
+
+
+def _fewshot_search_ui() -> None:
+    """🎯 以樣搜樣(第 9 工具):小樣本 → 海掃帶粗框大資料 → 建議類別 → YOLO+CSV 匯出 → 人確認。"""
+    st.subheader("🎯 以樣搜樣(小樣本海撈 → YOLO 預標 → 人工確認)")
+    model = st.session_state.get("anomaly_model")
+    if not model or not model.get("_dir"):
+        st.info("以樣搜樣需要一個**凍結模型**當特徵器。請先到『**瑕疵偵測**』① **建立或載入一個模型**"
+                "(並存到暫存目錄),再回來這裡。")
+        return
+    step = st.segmented_control("步驟", ["① 樣本集", "② 海掃", "③ 確認 / 匯出"],
+                                key="fewshot_step", default="① 樣本集") or "① 樣本集"
+    st.divider()
+    if step == "① 樣本集":
+        _fewshot_step_samples()
+    elif step == "② 海掃":
+        _fewshot_step_scan()
+    else:
+        _fewshot_step_confirm()
+
+
 def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
@@ -8664,7 +8903,7 @@ def main() -> None:
         st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🔧 瑕疵偵測　　📦 匯出　　📥 標註回饋")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "瑕疵偵測", "匯出", "📥 標註回饋"],
+                     "完整度熱力圖", "瑕疵偵測", "🎯 以樣搜樣", "匯出", "📥 標註回饋"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
@@ -8729,6 +8968,8 @@ def main() -> None:
         _completeness_ui()
     elif tool == "瑕疵偵測":
         _anomaly_ui()
+    elif tool == "🎯 以樣搜樣":
+        _fewshot_search_ui()
     elif tool == "組考卷":
         _quiz_ui()
     elif tool == "灰帶覆核":
