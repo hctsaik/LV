@@ -66,3 +66,25 @@ def test_ac8_ref_aligned_is_max():  # AC8 衍生:與參考同向者優先分數�
     X = [[0.0, 1.0], [2.0, 0.0], [0.5, 0.5]]   # 第 1 列 = 2×參考方向
     p = np.asarray(s.similarity_priority(X, [1, 0]), dtype=float)
     assert int(np.argmax(p)) == 1 and abs(float(p[1]) - 1.0) < 1e-6
+
+
+# ── class_centroid(依類別當參考,UX 精修)──────────────────────────────────────
+def test_ac9_class_centroid():  # AC9:類別平均向量
+    s = _sim()
+    ca = np.asarray(s.class_centroid([[1, 0], [0, 1], [1, 0]], ["a", "b", "a"], "a"), dtype=float)
+    cb = np.asarray(s.class_centroid([[1, 0], [0, 1], [1, 0]], ["a", "b", "a"], "b"), dtype=float)
+    assert np.allclose(ca, [1, 0], atol=1e-6) and np.allclose(cb, [0, 1], atol=1e-6)
+
+
+def test_ac10_class_centroid_missing():  # AC10:不存在的類別 → raise
+    s = _sim()
+    with pytest.raises(ValueError):
+        s.class_centroid([[1, 0], [0, 1]], ["a", "b"], "c")
+
+
+def test_ac11_centroid_similarity_same_class():  # AC11 衍生:同類物件對該類 centroid 最像
+    s = _sim()
+    X = [[1.0, 0.02], [0.98, 0.0], [0.0, 1.0], [0.02, 0.98]]   # a,a,b,b(兩群可分)
+    labs = ["a", "a", "b", "b"]
+    p = np.asarray(s.similarity_priority(X, s.class_centroid(X, labs, "a")), dtype=float)
+    assert int(np.argmax(p)) in (0, 1), "屬於 a 的物件應對 a-centroid 最像"

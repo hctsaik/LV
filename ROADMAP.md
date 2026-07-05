@@ -362,3 +362,11 @@
   無②結果友善降級;`_AL_ENGINE_OBJ` 加 similar;批次每個參考各自 checkpoint。**M9 similar 真實 E2E `test_g8` 綠**
   (reason 含相似度、無例外),M9/M10 既有 GUI E2E 6/6+3/3 無回歸。M10 similar 核心以 al_service 單元 AC-SVC-SIM 覆蓋。
   **M12(找相似 A1+A3)收斂。**
+- (2026-07-05) **M12 UX 精修 + 選樣目標人話化(使用者回饋)**:使用者反映「參考物件索引」裸數字看不懂、
+  且 novelty/N_min/含 head 等術語難懂。改:(1)新純函式 `similarity.class_centroid`(gate similarity **11 綠**);
+  (2)③/M9/M10 共用參考挑選器 `_anomaly_pick_reference`——「參考依據」切換**像某一類**(用該類平均向量)/
+  **像某一個物件**(下拉顯示「第N·類別·檔名」+縮圖,不再裸索引);(3)選樣目標/警告/取樣矩陣/N_min 全改人話
+  (novelty→「抓沒看過的異常」、需分類頭→「需會分辨瑕疵種類的模型/每種至少 8 張」)。E2E:③ 類別模式
+  `test_s1_s2_class_reference_follows` 綠、M9 g8 改類別模式綠、g7 標籤更新綠;wizard/prelabel/M9(6)/M10(3)
+  全回歸綠(「無分類頭」提示來自未改的取樣佇列行)。**誠實界定**:①建模狀態列「含/無分類頭」因被 ~10 條
+  E2E 斷言依賴,本輪未改(留候選,要動需連同更新那批測試)。

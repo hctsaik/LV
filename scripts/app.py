@@ -1561,8 +1561,8 @@ def _anomaly_queue_labels(sel, records, scores, head, gthr, min_conf, obj_emb):
             gated = {int(i): _g[int(i)] for i in sel}
         except Exception as _exc:
             gated = None
-            st.warning(f"⚠️ 分類頭(head)閘控判定失敗,本次退回無閘控的「可疑 / 正常」判定;"
-                       f"head 暫不作用。({type(_exc).__name__}: {_exc})")
+            st.warning(f"⚠️ 瑕疵種類判定失敗,本次改用「可疑 / 正常」二分;分種類功能暫不作用。"
+                       f"({type(_exc).__name__}: {_exc})")
     for i in sel:
         r = records[int(i)]
         if gated is not None:
@@ -1667,7 +1667,7 @@ def _anomaly_tab_build() -> None:
         if st.session_state["anomaly_train_semantic"] == "defect" and _hint["suggested"] == "object":
             st.warning("⚠ " + _hint["hint"] + " 確定是瑕疵類別嗎?")
         with st.expander("⚙ 進階(N_min:每類最少樣本才納入分類頭)"):
-            st.slider("N_min(每類最少樣本才納入 head;**暫定·未經敏感度掃描驗證**)", 2, 30, 8,
+            st.slider("每種瑕疵最少幾張才拿來訓練分種類(暫定 8;尚未完整驗證)", 2, 30, 8,
                       key="anomaly_n_min")
     else:
         st.session_state["anomaly_active_semantic"] = "object"
@@ -1759,15 +1759,12 @@ def _anomaly_batch_run(objective: str, k: int, resume: bool) -> None:
     st.session_state.pop("anomaly_batch_err", None)
     objective = _AL_ENGINE_OBJ.get(objective, objective)   # GUI 詞彙 → 引擎 objective(Task0)
     ref_vector = None
-    if objective == "similar":                             # M12b:參考向量取自②結果 obj_emb[ref_idx]
-        _ar = st.session_state.get("anomaly_apply_result") or {}
-        _oe = _ar.get("obj_emb")
-        if _oe is None:
-            st.session_state["anomaly_batch_err"] = "「找相似」需先②套用偵測產生參考物件。"
+    if objective == "similar":                             # M12b:參考向量由挑選器存進 session
+        ref_vector = st.session_state.get("anomaly_batch_ref_vec")
+        if ref_vector is None:
+            st.session_state["anomaly_batch_err"] = "「找相似」需先②套用偵測並挑一個參考。"
             return
-        _oe = np.asarray(_oe, dtype=float)
-        _ri = int(st.session_state.get("anomaly_batch_ref_idx", 0))
-        ref_vector = _oe[max(0, min(_ri, len(_oe) - 1))]
+        ref_vector = np.asarray(ref_vector, dtype=float)
     model = st.session_state.get("anomaly_model")
     folders = list(st.session_state.get("anomaly_target_folder") or [])
     if not model or not folders:
@@ -1878,25 +1875,25 @@ def _anomaly_batch_section(model: dict, target_folders: list) -> None:
     st.divider()
     st.markdown("**⚡ 大資料分批掃描**(物件很多時用這條:可續跑、只給 Top-K 佇列不卡)")
     has_head = bool(model.get("head"))
-    # 誠實選單:引擎端 novelty≡pure(純 minmax),不列同義的「純 novelty」假選項(Task0)。+ M12b 找相似。
-    _OBJ = {"novelty": "抓沒看過的異常(novelty)", "balanced": "三訊號均衡(需分類頭)",
-            "confusion": "模型最拿不準(需分類頭)", "similar": "🔎 找相似(長得像指定物件)"}
+    # 人話選樣目標(不寫 novelty/head/Top-K 術語)。引擎端 novelty≡pure,不列同義假選項(Task0)。+ 找相似。
+    _OBJ = {"novelty": "抓沒看過的異常", "balanced": "又異常又難分種類(需會分種類的模型)",
+            "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找相似(長得像指定的東西)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_batch_objective", default="novelty") or "novelty"
     _needs_head = obj in ("balanced", "confusion")
     if _needs_head and not has_head:
-        st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常(novelty)』,"
-                   "或到①用**瑕疵類別**標籤(每類達 N_min)建含 head 的模型。")
+        st.warning("這個目標需要**會分辨瑕疵種類**的模型,但目前這個模型只會找異常、不會分種類。"
+                   "請改用『抓沒看過的異常』;或回到①,建模時**標明每個瑕疵是哪一種**"
+                   "(每種至少 8 張範例),就能建出會分種類的模型。")
     _sim_ok = True
-    if obj == "similar":                              # M12b:參考物件來自②套用結果
+    if obj == "similar":                              # M12b:參考來自②套用結果(共用挑選器)
         _ar = st.session_state.get("anomaly_apply_result") or {}
         if _ar.get("obj_emb") is None or not _ar.get("records"):
-            st.warning("「找相似」需先按上方 **(2) 套用偵測** 產生結果,再挑一顆參考物件。")
+            st.warning("「找相似」需先按上方 **(2) 套用偵測** 產生結果,再挑一個參考。")
             _sim_ok = False
         else:
-            st.number_input("參考物件索引(②結果裡的第幾個物件)", 0, len(_ar["records"]) - 1, 0, 1,
-                            key="anomaly_batch_ref_idx")
-    k = st.slider("Top-K(挑幾個送標註)", 10, 500, 100, 10, key="anomaly_batch_k")
+            _anomaly_pick_reference("batch", _ar["records"], _ar["obj_emb"])
+    k = st.slider("要挑前幾個送標註", 10, 500, 100, 10, key="anomaly_batch_k")
     _disabled = ((not target_folders) or (_needs_head and not has_head)
                  or (obj == "similar" and not _sim_ok))
     _b1, _b2 = st.columns(2)
@@ -1946,15 +1943,12 @@ def _anomaly_watch_init(objective: str, k: int) -> None:
             return
         objective = _AL_ENGINE_OBJ.get(objective, objective)   # GUI 詞彙 → 引擎 objective(Task0)
         _init_kw = {}
-        if objective == "similar":                             # M12b:參考向量存進 workspace(可攜給服務)
-            _ar = st.session_state.get("anomaly_apply_result") or {}
-            _oe = _ar.get("obj_emb")
-            if _oe is None:
-                st.session_state["anomaly_watch_err"] = "「找相似」監看需先②套用偵測產生參考物件。"
+        if objective == "similar":                             # M12b:參考向量由挑選器存進 session(存 workspace 可攜)
+            _rv = st.session_state.get("anomaly_watch_ref_vec")
+            if _rv is None:
+                st.session_state["anomaly_watch_err"] = "「找相似」監看需先②套用偵測並挑一個參考。"
                 return
-            _oe = np.asarray(_oe, dtype=float)
-            _ri = int(st.session_state.get("anomaly_watch_ref_idx", 0))
-            _init_kw["reference_vector"] = _oe[max(0, min(_ri, len(_oe) - 1))]
+            _init_kw["reference_vector"] = np.asarray(_rv, dtype=float)
         al_service.init_workspace(ws, name=Path(target[0]).name,
                                   watch_folders=[str(t) for t in target],
                                   model_dir=str(model_dir), objective=objective, k=int(k),
@@ -2056,25 +2050,24 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
     st.text_input("工作區目錄(.lv_cache;存 profile / 佇列 / 標註)", key="anomaly_watch_ws",
                   label_visibility="collapsed",
                   help="設定/佇列/標註都存這;profile.yaml 可匯出給離線服務。")
-    _OBJ = {"novelty": "抓沒看過的異常(novelty)", "balanced": "三訊號均衡(需 head)",
-            "confusion": "模型最拿不準(需 head)", "similar": "🔎 找相似(長得像指定物件)"}
+    _OBJ = {"novelty": "抓沒看過的異常", "balanced": "又異常又難分種類(需會分種類的模型)",
+            "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找相似(長得像指定的東西)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_watch_objective", default="novelty") or "novelty"
-    # watch 也要 head 閘(否則 balanced/confusion 無 head → 掃描時 run_batched raise;與批次區塊一致,Task0)
+    # watch 也要「會分種類」閘(否則選前兩者但模型不會分種類 → 掃描時 raise;與批次一致,Task0)
     _watch_needs_head = obj in ("balanced", "confusion")
     if _watch_needs_head and not bool(model.get("head")):
-        st.warning("此目標需**分類頭**;此模型無 head。請改『抓沒看過的異常(novelty)』,"
-                   "或到①用**瑕疵類別**標籤(每類達 N_min)建含 head 的模型。")
+        st.warning("這個目標需要**會分辨瑕疵種類**的模型,但目前這個模型只會找異常、不會分種類。"
+                   "請改用『抓沒看過的異常』;或回到①,建模時**標明每個瑕疵是哪一種**(每種至少 8 張範例)。")
     _wsim_ok = True
-    if obj == "similar":                              # M12b:參考物件來自②套用結果,存進 profile 給服務
+    if obj == "similar":                              # M12b:參考來自②套用結果,存進 profile 給服務(共用挑選器)
         _ar = st.session_state.get("anomaly_apply_result") or {}
         if _ar.get("obj_emb") is None or not _ar.get("records"):
-            st.warning("「找相似」監看需先按上方 **(2) 套用偵測** 產生結果,再挑一顆參考物件。")
+            st.warning("「找相似」監看需先按上方 **(2) 套用偵測** 產生結果,再挑一個參考。")
             _wsim_ok = False
         else:
-            st.number_input("參考物件索引(②結果裡的第幾個物件)", 0, len(_ar["records"]) - 1, 0, 1,
-                            key="anomaly_watch_ref_idx")
-    k = st.slider("Top-K(每次挑幾個)", 10, 500, 100, 10, key="anomaly_watch_k")
+            _anomaly_pick_reference("watch", _ar["records"], _ar["obj_emb"])
+    k = st.slider("每次要挑前幾個", 10, 500, 100, 10, key="anomaly_watch_k")
     ws = (st.session_state.get("anomaly_watch_ws") or "").strip()
     _enabled = (bool(target_folders and ws)
                 and not (_watch_needs_head and not bool(model.get("head")))
@@ -2247,7 +2240,8 @@ def _anomaly_prelabel_section(model, result, scores, threshold, obj_emb) -> None
     with st.expander("🏷️ 預標(分類頭代填,人工最終確認)", expanded=False):
         head = model.get("head")
         if not head:
-            st.info("此模型**無分類頭**,無法預標。請到①用**瑕疵類別**標籤(每類達 N_min)重建含 head 的模型。")
+            st.info("這個模型**不會分辨瑕疵種類**,無法預標。請回到①,建模時**標明每個瑕疵是哪一種**"
+                    "(每種至少 8 張範例)重建。")
             return
         records = result.get("records") or []
         if obj_emb is None or not records:
@@ -2289,35 +2283,64 @@ def _anomaly_prelabel_section(model, result, scores, threshold, obj_emb) -> None
                        f"{_done['objects']} 個標註 → `{_done['out_dir']}`")
 
 
+def _anomaly_pick_reference(prefix: str, records, obj_emb):
+    """共用參考物件挑選器(③/M9/M10)。radio「像某一類 / 像某一個物件」→ 回 ref_vector(np)或 None,
+    並存 session[anomaly_{prefix}_ref_vec] 供 on_click 回呼取用。widget key 以 prefix 區隔三處。"""
+    import similarity
+    emb = np.asarray(obj_emb, dtype=float)
+    labels = [str(r.get("label") or "—") for r in records]
+    classes = sorted(set(labels))
+    mode = st.radio("要找像什麼", ["像某一類", "像某一個物件"], horizontal=True,
+                    key=f"anomaly_{prefix}_ref_mode",
+                    help="『像某一類』= 找長得像整個類別的(用該類平均);"
+                         "『像某一個物件』= 找長得像你挑的那一顆的。")
+    rv = None
+    if mode == "像某一類":
+        cls = st.selectbox("要找像哪一類的", classes, key=f"anomaly_{prefix}_ref_class")
+        try:
+            rv = similarity.class_centroid(emb, labels, cls)
+        except Exception:
+            rv = None
+    else:
+        pick = int(st.selectbox("要找像哪一個物件的", list(range(len(records))),
+                                key=f"anomaly_{prefix}_ref_idx",
+                                format_func=lambda i: f"第 {i} 個 · {labels[i]} · {_rec_fname(records[i])}"))
+        rv = emb[pick]
+        with st.container(key=f"anomaly_{prefix}_ref"):     # 具體物件:縮圖讓你看到挑的是什麼
+            _rr = records[pick]
+            _im = safe_open_image(_rr["image_path"])
+            if _im is not None:
+                st.image(crop_bbox(_im, *_rr["bbox"], pad=0.1), width=160)
+            st.caption(f"參考:{_rr.get('label') or '—'}｜{_rec_fname(_rr)}")
+    st.session_state[f"anomaly_{prefix}_ref_vec"] = rv
+    return rv
+
+
 def _anomaly_similar_section(result, obj_emb) -> None:
-    """③「🔎 找相似」:從②結果挑一顆參考物件 → cosine 相似度降冪佇列(排除參考自身)。
-    找相似只需物件級 embedding(不需 head);無 obj_emb → 友善提示。"""
+    """③「🔎 找相似」:挑參考(某一類 / 某一個物件)→ 依相似度把最像的排到最前面。
+    只需物件級特徵(不需會分種類的模型);無特徵 → 友善提示。"""
     import similarity
     st.divider()
-    with st.expander("🔎 找相似(長得像指定物件)", expanded=False):
+    with st.expander("🔎 找相似(長得像指定的東西)", expanded=False):
         records = result.get("records") or []
         if obj_emb is None:
-            st.info("此結果無物件 embedding,無法找相似(需②套用產生含 embedding 的結果)。")
+            st.info("這個結果沒有物件特徵,無法找相似(先按②套用偵測產生結果)。")
             return
-        n = len(records)
-        if n < 2:
-            st.info("至少需 2 個物件才能找相似。")
+        if len(records) < 2:
+            st.info("至少要有 2 個物件才能找相似。")
             return
         emb = np.asarray(obj_emb, dtype=float)
-        st.caption("挑一顆你想找同款的物件當**參考**,整批依 cosine 相似度把最像的排到最前面。")
-        ref_idx = int(st.number_input("參考物件索引(②結果裡的第幾個物件)", min_value=0,
-                                      max_value=n - 1, value=0, step=1, key="anomaly_sim_ref_idx"))
-        k = st.slider("取幾個最像的送標註", 1, min(48, n - 1), min(12, n - 1), key="anomaly_sim_k")
-        with st.container(key="anomaly_sim_ref"):
-            _rr = records[ref_idx]
-            _c = st.columns([1, 3])
-            with _c[0]:
-                _im = safe_open_image(_rr["image_path"])
-                if _im is not None:
-                    st.image(crop_bbox(_im, *_rr["bbox"], pad=0.1), use_container_width=True)
-            _c[1].markdown(f"**參考:{_rr.get('label') or '—'}**｜{_rec_fname(_rr)}")
-        pri = np.asarray(similarity.similarity_priority(emb, emb[ref_idx]), dtype=float)
-        order = [int(i) for i in np.argsort(-pri) if int(i) != ref_idx][:int(k)]
+        st.caption("先選你想找同款的**參考**,整批就會把長得最像的排到最前面送你標註。")
+        rv = _anomaly_pick_reference("sim", records, emb)
+        if rv is None:
+            st.info("無法取得參考,請換一個。")
+            return
+        k = st.slider("取幾個最像的送標註", 1, min(48, len(records) - 1),
+                      min(12, len(records) - 1), key="anomaly_sim_k")
+        _excl = (int(st.session_state.get("anomaly_sim_ref_idx", -1))
+                 if st.session_state.get("anomaly_sim_ref_mode") == "像某一個物件" else -1)
+        pri = np.asarray(similarity.similarity_priority(emb, rv), dtype=float)
+        order = [int(i) for i in np.argsort(-pri) if int(i) != _excl][:int(k)]
         with st.container(key="anomaly_sim_queue"):
             _cols = st.columns(4)
             for j, i in enumerate(order):
@@ -2370,8 +2393,8 @@ def _anomaly_tab_sample() -> None:
             _pred, _, _proba = predict_head(head, np.asarray(obj_emb, dtype=float))
         except Exception as _exc:
             _proba = _pred = None
-            st.warning(f"⚠️ 分類頭(head)預測失敗,取樣退回 cluster 分群、2×2 僅留純 novelty;"
-                       f"head 暫不作用。({type(_exc).__name__}: {_exc})")
+            st.warning(f"⚠️ 瑕疵種類預測失敗,取樣改用分群、四格只留『純異常分數』;分種類功能暫不作用。"
+                       f"({type(_exc).__name__}: {_exc})")
     _div = (_pred if _pred is not None else (result.get("cluster") or {}).get("labels"))
 
     # gated 門檻(供徽章/標籤的閘控判定)。沿用 gate_threshold(quantile;有 head 才實際拆 Unknown)。
@@ -2385,8 +2408,8 @@ def _anomaly_tab_sample() -> None:
         _gthr = threshold
 
     # 2×2 模式(固定順序對齊舊 radio):偏novelty / 弱類定向 / 三訊號均衡 / 純novelty
-    _modes = [("novelty", "偏 novelty(稀有/未知更強)"), ("confusion", "弱類定向(分類頭最混淆)"),
-              ("balanced", "三訊號均衡"), ("pure", "純 novelty")]
+    _modes = [("novelty", "偏異常(稀有/沒看過的更優先)"), ("confusion", "最難分辨是哪一種的"),
+              ("balanced", "又異常又難分種類"), ("pure", "純異常分數")]
     # 偏novelty/弱類定向/均衡 的差異全靠 head 的「邊界 / 分歧 / 混淆」訊號;無 head 時這些訊號=0,
     # 三者與純 novelty 變成完全相同的排序 → 反灰它們,避免顯示「其實一模一樣」的假選項,只留純 novelty 可點。
     _HEAD_DEP = {"novelty", "confusion", "balanced"}
@@ -2418,8 +2441,8 @@ def _anomaly_tab_sample() -> None:
 
     st.markdown("**取樣模式(點一格 → 右下出大圖牆)**")
     if _no_signal:
-        st.caption("🔒 偏novelty / 弱類定向 / 三訊號均衡 需有可用的**瑕疵分類頭**訊號"
-                   "(①用瑕疵類別標籤、每類達 N_min 建模)才與純 novelty 有差異;目前只用純 novelty 排序。")
+        st.caption("🔒 前三種要有**會分辨瑕疵種類**的模型(①用瑕疵種類標籤、每種至少 8 張建模)"
+                   "才和『純異常分數』有差別;目前只用異常分數排序。")
     _sel_cache = {}
     r0 = st.columns(2)
     r1 = st.columns(2)
@@ -2428,7 +2451,7 @@ def _anomaly_tab_sample() -> None:
         _disabled = _no_signal and mid in _HEAD_DEP
         with _col:
             if _disabled:
-                st.button(f"{mname}\n\n🔒 需分類頭", key=f"anomaly_qmode_{mid}",
+                st.button(f"{mname}\n\n🔒 需會分種類的模型", key=f"anomaly_qmode_{mid}",
                           use_container_width=True, disabled=True)
             else:
                 _sel_cache[mid] = _sel_for(mid)

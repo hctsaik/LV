@@ -48,3 +48,24 @@ def similarity_priority(obj_emb, ref_vec) -> np.ndarray:
   **逐元素相等**(cosine 對正尺度不變 → 排序與分數不變)。
 - **AC8(衍生:參考同向者最像)**:X 含一列 = ref 的正倍數 → 該列 `similarity_priority` 為最大值(==1.0),
   即 `argmax(similarity_priority(X, r))` 指向與 r 同向那列。
+
+---
+
+## 增補(M12 UX 精修):`class_centroid`(依類別當參考)
+
+> 使用者回饋:裸索引 UX 差。加「參考依據:類別 / 具體物件」切換。類別參考 = 該類別所有物件 embedding 平均。
+
+### 契約
+```python
+def class_centroid(obj_emb, labels, class_name) -> np.ndarray:
+    """回 labels==class_name 的所有物件 embedding 平均向量(未正規化;cosine 內部會正規化),float32 (D,)。
+    無此類別 / 空 → ValueError。"""
+```
+- `obj_emb`:(N, D);`labels`:長度 N 的類別字串序列;`class_name`:字串。
+- 供 GUI「參考依據=類別」時算參考向量,再交給 `similarity_priority` / `al_batch(ref_vector=)`。
+
+### AC
+- **AC9**:`class_centroid([[1,0],[0,1],[1,0]], ["a","b","a"], "a")` == `[1,0]`(逐元素);`"b"` == `[0,1]`。
+- **AC10**:`class_centroid(..., "c")`(不存在的類別)→ `ValueError`。
+- **AC11(衍生)**:`similarity_priority(X, class_centroid(X, labs, c))` 對「屬於 c 的物件」給高分
+  (centroid 與同類同向)—— 用可分兩類驗 argmax 落在該類。

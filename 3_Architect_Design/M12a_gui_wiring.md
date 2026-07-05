@@ -42,3 +42,11 @@ DOM 穩定標記:參考容器內含文字「參考:」;佇列容器渲染 ≥1 �
 - **AC-S3(無 embedding 友善)**:(可選,若易構造)無 obj_emb 的結果 → 顯示「無物件 embedding」提示、無 stException。
 
 > 真實行為鐵則:AC-S1/S2 斷言「最像參考的**真的**是同群物件」,非只查 element 存在。
+
+---
+## 增補(UX 精修):參考依據切換(③/M9/M10 一致)
+- 新 widget:`anomaly_sim_ref_mode`(radio「類別 / 具體物件」)。
+  - 類別:`anomaly_sim_ref_class`(selectbox 類別名)→ ref = `class_centroid(obj_emb, labels, class)`。
+  - 具體物件:`anomaly_sim_ref_idx` 改成 **selectbox 顯示「第N · <label> · <檔名>」**(不再裸索引)+ 縮圖預覽。
+- M9/M10 同步:`anomaly_batch_ref_mode`/`anomaly_batch_ref_class`、`anomaly_watch_ref_mode`/`anomaly_watch_ref_class`。
+- E2E 改以「選類別」為主驗收(E2E 已知所選類別,免解析):選類別 scratch → 佇列多數 scratch;切 stain → 翻 stain。

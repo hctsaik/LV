@@ -45,3 +45,14 @@ def similarity_priority(obj_emb, ref_vec) -> np.ndarray:
     """= _minmax(cosine_similarity_to_ref(...)),float32 (N,) ∈ [0,1];降冪=最像。
     N==0 → (0,);單一/全等 → 全 0(minmax 退化)。ref 全零/維度不符 → 由 cosine 拋 ValueError。"""
     return _minmax(cosine_similarity_to_ref(obj_emb, ref_vec))
+
+
+def class_centroid(obj_emb, labels, class_name) -> np.ndarray:
+    """回 labels==class_name 的所有物件 embedding 平均向量(未正規化;cosine 內部會正規化),float32 (D,)。
+    無此類別 → ValueError(列出可選類別)。供 GUI「參考依據=類別」算參考向量。"""
+    emb = np.asarray(obj_emb, dtype=np.float32)
+    labs = np.asarray([str(l) for l in labels])
+    mask = labs == str(class_name)
+    if not mask.any():
+        raise ValueError(f"找不到類別 '{class_name}' 的物件(可選:{sorted(set(labs.tolist()))})")
+    return emb[mask].mean(axis=0).astype(np.float32)

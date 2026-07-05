@@ -15,3 +15,10 @@
 
 雙向覆蓋:AC1–AC6 皆有對應;AC7/8 為 PM 自加的不變量(正尺度不變、同向最大),
 逼 cosine 的幾何性質而非只轉抄。GUI 接線 E2E 見 [M12a_gui_wiring.md](M12a_gui_wiring.md)。
+
+## 增補(UX 精修):class_centroid
+| AC | 說明 | 測試 |
+|----|------|------|
+| AC9 | 類別平均向量 | `test_ac9_class_centroid` |
+| AC10 | 不存在的類別 → ValueError | `test_ac10_class_centroid_missing` |
+| AC11(衍生) | 同類物件對該類 centroid 最像 | `test_ac11_centroid_similarity_same_class` |
