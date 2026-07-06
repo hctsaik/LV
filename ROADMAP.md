@@ -442,3 +442,17 @@
   推薦 B(零設定預設特徵器 UX)+ E(引擎 retrieve 自足),棄 C(全域,回歸成本過高)與 D(墊檔留死 projection)。
   PRD 落 `2_PO_PRD/fewshot_extractor_decouple_prd.md`(Must E1/E2/E3/B1),放行 `/architect`。**這是 M13 完成後的
   再架構增量,走完整 U-Net;E2 動 al_batch 26 測契約為最高風險,objective-guarded 加法 + snapshot 重建。**
+- (2026-07-06) **維護:功能重疊盤點(多 agent)+ ② 分頁重排收尾 + 對抗審查揪修 1 silent-wrong**:使用者問「功能是否
+  重複/該合併」→ 多 agent 6 家族盤點 + 對抗辯論(`wf_c4a478e2`),結論:**工具/使用者面幾乎都是刻意分開(M12/M13/M14),
+  不該合併;重複在底層 plumbing/scaffolding**。使用者選修其中「② 選樣目標同名不同義」:② `balanced` 用 entropy
+  (C8 無固定門檻)vs ③ 用 disagreement、② `novelty`=純異常分數(≠③『偏異常』混合)——執行層照 M9 C8 **維持分開不併公式**,
+  改加 `st.caption` 揭露(批次+監看 ×2 = 4 句;動 al_batch 屬 /architect reverse-gate、未走)。同時收尾**先前未提交的
+  ② 分頁 UX 重排**(掃描選樣提為主路徑 / 套用偵測降級「散點探索·門檻校準」primary→secondary / 監看服務收摺疊 expander,
+  拆 `_anomaly_watch_body` / 佇列加異常分數過濾+分佈圖)。**提交前多 agent 對抗審查(`wf_17f64912`,4 維度+驗證)揪出並修
+  1 個 [med] silent-wrong**:`_anomaly_batch_render_queue` 新增的無條件 `sorted(key=score)` 覆蓋引擎 priority 排序 →
+  找同款/balanced/confusion 佇列排序與分頁截斷點錯(只 novelty 因 priority≡score 巧合無恙、故容易漏測);修=移除重排
+  (恢復引擎優先序)+ 異常分數過濾/分佈圖**只留給 novelty**(唯一以異常分數為排序軸的目標)。**已知限制(low,有逃生
+  路徑、記錄不迴避)**:重排後 ② 找同款參考挑選器在按「套用偵測」的同一 rerun 讀到空 `anomaly_apply_result`、需再動
+  一下自癒(該期間掃描鈕 disabled 故無法誤用)。驗證:單元 gate al_batch 31 / al_service 11 / al_workspace 15 /
+  anomaly_tool 25 / sample_bank 16 全 **GREEN**;真實 E2E 監看 3/3 + 批次 6/6(修後重跑)+ wizard 2/2 = **11/11 綠**。
+  只動 `scripts/app.py`(+ 既有 2 個 E2E 檔配合重排)。維護模式(無 role)。

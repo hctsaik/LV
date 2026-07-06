@@ -144,7 +144,7 @@ def build_model(page, train_root, semantic_text: str | None = None):
 
 
 def apply_model(page, target_root):
-    """② 切 tab → 加目標資料夾 → 按「▶ (2) 套用偵測」→ 等散點圖出現。"""
+    """② 切 tab → 加目標資料夾 → 按「▶ 套用偵測(散點 / 校準)」→ 等散點圖出現。"""
     click_tab(page, TAB_APPLY)
     _add_folder(page, "anomaly_target_folder", str(target_root))
     wait_idle(page)

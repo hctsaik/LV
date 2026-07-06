@@ -77,12 +77,27 @@ def _setup_watch(page, yolo_ds, model_dir, *, save=True):
     wait_idle(page); click_tab(page, TAB_APPLY)
 
 
+def _open_watch(page):
+    """展開『🛰 持續監看服務』摺疊區(M14b 起預設收合)——已展開則不動作(idempotent)。"""
+    init_btn = page.locator('.st-key-anomaly_watch_init_btn button')
+    if init_btn.count() and init_btn.first.is_visible():
+        return
+    hdr = page.get_by_text("持續監看服務", exact=False).first
+    hdr.wait_for(state="visible", timeout=15000)
+    hdr.click()
+    wait_idle(page)
+    page.wait_for_timeout(400)
+
+
 def _actual_ws(page):
     """從 anomaly_watch_ws input 讀『實際生效』的工作區路徑(做檔案系統斷言)。"""
+    _open_watch(page)
     return Path(page.locator('.st-key-anomaly_watch_ws input').first.input_value())
 
 
 def _click(page, key):
+    if key.startswith("anomaly_watch"):   # 監看區已摺疊 → 操作前先展開
+        _open_watch(page)
     b = page.locator(f'.st-key-{key} button')
     b.wait_for(state="visible", timeout=30000)
     page.wait_for_function(
@@ -107,6 +122,7 @@ def test_w1_w2_init_export_scan_queue(app_server, browser, yolo_ds, tmp_path):
         # AC-W2:立即掃描 → 佇列渲染 + reason
         _click(page, "anomaly_watch_scan_btn")
         _wait_scan_done(page)
+        _open_watch(page)
         q = page.locator('.st-key-anomaly_watch_queue')
         expect(q.locator('[data-testid="stImage"]').first).to_be_visible(timeout=30000)
         assert any(w in q.inner_text() for w in ("很不像正常", "拿不準", "邊界")), \
@@ -128,6 +144,7 @@ def test_w3_label_removes_next_round(app_server, browser, yolo_ds, tmp_path):
         ws_dir = _actual_ws(page)
         _click(page, "anomaly_watch_scan_btn")
         _wait_scan_done(page)
+        _open_watch(page)
         # 標第一張為正常 → labels.jsonl 多一行
         good = page.locator('[class*="st-key-anomaly_watch_good_"] button').first
         good.wait_for(state="visible", timeout=30000)
@@ -160,6 +177,7 @@ def test_w5_autosave(app_server, browser, yolo_ds, tmp_path):
         ws_dir = _actual_ws(page)
         _click(page, "anomaly_watch_scan_btn")
         _wait_scan_done(page)
+        _open_watch(page)
         # 佇列渲染=掃描成功=al_service 讀到磁碟凍結模型(load_frozen_model 缺 meta.json 會 raise)
         expect(page.locator('.st-key-anomaly_watch_queue [data-testid="stImage"]').first
                ).to_be_visible(timeout=30000)

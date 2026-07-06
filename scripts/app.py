@@ -1851,20 +1851,36 @@ def _anomaly_batch_execute() -> None:
 
 
 def _anomaly_batch_render_queue(res: dict) -> None:
-    """標註模式:Top-K 縮圖佇列(用 al_batch 自帶 reason)+ 分數分佈 + 分頁 + 購物車。**不渲染散點**(scale-safe)。"""
+    """標註模式:Top-K 縮圖佇列(依選樣目標優先序,用 al_batch 自帶 reason)+ 分頁 + 購物車。
+    novelty 目標額外給異常分數分佈圖 + 範圍過濾(該目標下異常分數=排序軸);其餘目標排序軸非異常分數,不套用以免依錯維度過濾。"""
     from interaction import crop_bbox
+    # 引擎已依 priority 排好(novelty=異常分數 / similar=相似度 / balanced·confusion=複合分數+多樣性交錯);
+    # 不可再依 score 重排——會覆蓋非-novelty 目標的正確排序(找同款=最像的應排第一,非最異常的)。
     recs = res.get("topk_records") or []
     done = bool(res.get("done"))
     n = int(res.get("objects_scored") or 0)
     _warn_skipped(res.get("skipped") or [])
+    _obj = res.get("objective")
     st.markdown(f"{'✅ 分批掃描完成' if done else '⏳ 暫定(掃描中)'} · 已評分 **{n}** 物件 · "
-                f"佇列 Top-**{len(recs)}**(目標:{res.get('objective')}"
-                f"{' · 已套用多樣性' if res.get('diversity_applied') else ''})")
+                f"佇列 Top-**{len(recs)}**(目標:{_obj}"
+                f"{' · 已套用多樣性' if res.get('diversity_applied') else ''};依選樣目標優先序)")
     if not recs:
         st.info("佇列空(此目標/資料夾未選出物件)。")
         return
-    st.caption("分數分佈(佇列各物件的異常分數;標註模式不畫全量散點):")
-    st.bar_chart([float(r.get("score", 0.0)) for r in recs], height=140)
+    if _obj == "novelty":   # 只有 novelty 排序軸=異常分數 → 才給分數分佈圖+範圍過濾;其餘目標依此過濾=錯維度,故不套用
+        # 頂部:兩邊「異常分數範圍」滑桿做過濾(只顯示落在區間內的物件)
+        _all_scores = [float(r.get("score", 0.0)) for r in recs]
+        _smin, _smax = float(min(_all_scores)), float(max(_all_scores))
+        if _smax > _smin:
+            _lo, _hi = st.slider("篩選:異常分數範圍 [低 – 高]", _smin, _smax, (_smin, _smax), step=0.01,
+                                 key="anomaly_batch_score_filter")
+            recs = [r for r in recs if _lo <= float(r.get("score", 0.0)) <= _hi]
+            st.caption(f"符合區間的物件:**{len(recs)}** 個(異常分數 {_lo:.2f}–{_hi:.2f})")
+            if not recs:
+                st.info("此分數區間沒有物件 —— 放寬上面的範圍。")
+                return
+        st.caption("分數分佈(佇列各物件的異常分數;標註模式不畫全量散點):")
+        st.bar_chart([float(r.get("score", 0.0)) for r in recs], height=140)
     _c1, _c2 = st.columns(2)
     _cols = _c1.slider("每列張數", 2, 6, 3, key="anomaly_batch_cols")
     _th = _c2.slider("縮圖高度(px)", 120, 400, 200, 10, key="anomaly_batch_th")
@@ -1903,14 +1919,19 @@ def _anomaly_batch_load_more(total: int) -> None:
 
 def _anomaly_batch_section(model: dict, target_folders: list) -> None:
     """② 內的「大資料分批掃描」區塊:目標選單 + K + 掃描/續跑 + 標註佇列(不出散點)。"""
-    st.divider()
-    st.markdown("**⚡ 大資料分批掃描**(物件很多時用這條:可續跑、只給 Top-K 佇列不卡)")
+    st.markdown("**⚡ 掃描選樣 · 挑物件送標註**(**任何大小的資料夾都用這條** · 可續跑、只給 Top-K 佇列;資料再多也不卡)")
     has_head = bool(model.get("head"))
     # 人話選樣目標(不寫 novelty/head/Top-K 術語)。引擎端 novelty≡pure,不列同義假選項(Task0)。+ 找相似。
     _OBJ = {"novelty": "抓沒看過的異常", "balanced": "又異常又難分種類(需會分種類的模型)",
             "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找同款(長得像你挑的那一顆)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_batch_objective", default="novelty") or "novelty"
+    if obj == "novelty":
+        st.caption("ℹ️『抓沒看過的異常』純用異常分數排序,相當於③互動版的『純異常分數』格"
+                   "(③的『偏異常』會再摻一點邊界/分歧訊號,大資料版不採用)。")
+    elif obj == "balanced":
+        st.caption("ℹ️ 大資料版的『難分種類』改用**模型不確定度**近似(續跑引擎無固定異常門檻、"
+                   "不採用③互動版『異常且模型沒把握』的分歧訊號)——方向一致,排序可能與③略有出入。")
     _needs_head = obj in ("balanced", "confusion")
     if _needs_head and not has_head:
         st.warning("這個目標需要**會分辨瑕疵種類**的模型,但目前這個模型只會找異常、不會分種類。"
@@ -2067,11 +2088,17 @@ def _anomaly_watch_render_queue(ws: str, items: list) -> None:
 
 
 def _anomaly_watch_section(model: dict, target_folders: list) -> None:
-    """② 內「🛰 持續監看服務」:工作區設定 + 初始化/匯出 + 立即掃描 + 狀態卡 + 佇列消費。"""
+    """② 內「🛰 持續監看服務」:摺疊起來(預設收合),展開才顯示設定/掃描/狀態卡/佇列。"""
+    st.divider()
+    with st.expander("🛰 持續監看服務(設定一個資料夾 → 自動選出最該標的;可匯出設定給離線服務跑)",
+                     expanded=False):
+        _anomaly_watch_body(model, target_folders)
+
+
+def _anomaly_watch_body(model: dict, target_folders: list) -> None:
+    """持續監看服務的實際內容:工作區設定 + 初始化/匯出 + 立即掃描 + 狀態卡 + 佇列消費。"""
     import al_service
     import al_workspace
-    st.divider()
-    st.markdown("**🛰 持續監看服務**(設定一個資料夾 → 自動選出最該標的;可**匯出設定**給離線服務跑)")
     _def_ws = (_anomaly_bank_default_dir(str(target_folders[0]), "al_watch")
                if target_folders else "")
     # ws 空且有目標 → 補預設(不可只 setdefault:watch 區塊可能在目標未加時先渲染 → 鎖住空字串)
@@ -2084,6 +2111,12 @@ def _anomaly_watch_section(model: dict, target_folders: list) -> None:
             "confusion": "最難分辨是哪一種(需會分種類的模型)", "similar": "🔎 找同款(長得像你挑的那一顆)"}
     obj = st.segmented_control("選樣目標", list(_OBJ), format_func=lambda o: _OBJ[o],
                                key="anomaly_watch_objective", default="novelty") or "novelty"
+    if obj == "novelty":
+        st.caption("ℹ️『抓沒看過的異常』純用異常分數排序,相當於③互動版的『純異常分數』格"
+                   "(③的『偏異常』會再摻一點邊界/分歧訊號,大資料版不採用)。")
+    elif obj == "balanced":
+        st.caption("ℹ️ 大資料版的『難分種類』改用**模型不確定度**近似(續跑引擎無固定異常門檻、"
+                   "不採用③互動版『異常且模型沒把握』的分歧訊號)——方向一致,排序可能與③略有出入。")
     # watch 也要「會分種類」閘(否則選前兩者但模型不會分種類 → 掃描時 raise;與批次一致,Task0)
     _watch_needs_head = obj in ("balanced", "confusion")
     if _watch_needs_head and not bool(model.get("head")):
@@ -2152,7 +2185,7 @@ def _anomaly_tab_apply() -> None:
     st.caption(f":violet[🔒 用模型鎖定的 **{_m.get('model')}@{_m.get('target_res')}** · {_m.get('score_mode')} "
                f"· 來源={_osrc_txt} 評分(非側欄現值;側欄改 model/res 只作用於下次①建模)。]")
 
-    st.markdown("**(1) 選異常目標資料夾**")
+    st.markdown("**選目標資料夾**")
     target_folders = _folder_picker_list("anomaly_target_folder",
                                          add_help="要偵測異常的 YOLO 資料夾:含 images/ 與 labels/")
     # 換目標資料夾 → 清 apply 索引空間的殘留標記/篩選(避免殘留索引污染就地重評/門檻)
@@ -2161,16 +2194,20 @@ def _anomaly_tab_apply() -> None:
         st.session_state["_anomaly_target_sig"] = _gsig
         for _k in ("anomaly_confirmed_apply", "anomaly_heat_filter_apply", "anomaly_class_filter_apply"):
             st.session_state.pop(_k, None)
-    st.button("▶ (2) 套用偵測", key="anomaly_apply_btn", type="primary",
+    st.divider()
+    # 主路徑:掃描選樣(任何大小都用這條,scale-safe)——先呈現
+    _anomaly_batch_section(model, target_folders)
+    # 次要:套用偵測(散點探索 / 門檻校準;想看全量散點或校準門檻時用)
+    st.divider()
+    st.markdown("**🔬 散點探索 / 門檻校準**(想看**全量散點**或**校準門檻**時用這條;要挑物件送標註 → 用上面的**掃描選樣**)")
+    st.button("▶ 套用偵測(散點 / 校準)", key="anomaly_apply_btn", type="secondary",
               use_container_width=True, disabled=not target_folders,
               on_click=_anomaly_apply_request)
     if st.session_state.pop("anomaly_apply_pending", False):   # 主體執行 → progress 即時串流
         _anomaly_apply_model()
     if st.session_state.get("_anomaly_apply_err"):
         st.error(st.session_state["_anomaly_apply_err"])
-
-    _anomaly_batch_section(model, target_folders)   # M9:大資料分批掃描(標註佇列,scale-safe)
-    _anomaly_watch_section(model, target_folders)    # M10:持續監看服務(設定/匯出/掃描/佇列消費)
+    _anomaly_watch_section(model, target_folders)    # M10:持續監看服務(摺疊)
 
     result = st.session_state.get("anomaly_apply_result")
     if not result:
