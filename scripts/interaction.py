@@ -949,6 +949,44 @@ def draw_yolo_boxes(
     return img
 
 
+def draw_two_sources(
+    image_path: Path,
+    gt: list[tuple],
+    pred: list[tuple],
+    class_names: list[str] | None = None,
+) -> Image.Image | None:
+    """同一張圖上疊 **GT(紅框)** 與 **模型預測(藍框,帶 conf)** —— 一眼看出模型錯在哪。
+
+    ``gt``   = ``[(cid, cx, cy, w, h), …]``;``pred`` = ``[(cid, cx, cy, w, h, conf|None), …]``。
+    影像壞掉回 ``None``(由呼叫端守)。新函式,不動 :func:`draw_yolo_boxes` 既有簽名。
+    """
+    img = safe_open_image(image_path)
+    if img is None:
+        return None
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+
+    def _name(cid):
+        if class_names and cid is not None and 0 <= cid < len(class_names):
+            return class_names[cid]
+        return f"class_{cid}" if cid is not None else "?"
+
+    def _rect(box, color, tag):
+        cx, cy, bw, bh = box[1:5]
+        x0, y0 = (cx - bw / 2) * w, (cy - bh / 2) * h
+        x1, y1 = (cx + bw / 2) * w, (cy + bh / 2) * h
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+        draw.text((x0 + 2, max(0, y0 - 12)), tag, fill=color)
+
+    for b in gt:
+        _rect(b, "#e74c3c", f"GT {_name(b[0])}")          # 紅 = 人標的真值
+    for b in pred:
+        conf = b[5] if len(b) > 5 and b[5] is not None else None
+        tag = f"pred {_name(b[0])}" + (f" {conf:.2f}" if conf is not None else "")
+        _rect(b, "#3498db", tag)                           # 藍 = 模型說的
+    return img
+
+
 # ── embedding-space coverage / gap-filling (defect-mechanisms 嵌入覆蓋圖) ──
 # The honest counterpart to the attribute-axis completeness grid: density is
 # measured HERE, in raw cosine embedding space (k-NN distance), and a 2-D

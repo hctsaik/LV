@@ -161,6 +161,8 @@ def send_to_labeling(
     skin_fn: Callable | None = None,
     skins: dict[int, str] | None = None,
     instructions: str = "",
+    seed_source: str = "gt",
+    pred_root=None,
     log_dir=None,
 ) -> Path | None:
     """Materialise a content-addressed handoff folder Labeling can ingest as a
@@ -169,7 +171,18 @@ def send_to_labeling(
     Returns None when ``indices`` is empty (caller shows a guard) — never writes
     an empty/phantom folder. Idempotent: re-sending the same (source, sha-set)
     while still open reuses the existing folder instead of duplicating it.
+
+    ``seed_source="pred"`` pre-draws the model's predicted boxes (read from
+    ``pred_root``) into each image's sidecar, so the annotator *adjusts* boxes
+    instead of drawing them from scratch. The seed's own hash is recorded, and
+    read-back ignores any sidecar still byte-identical to it — an untouched
+    pre-annotation is NOT a human label, and must never be fed back as one.
     """
+    if seed_source not in ("gt", "pred"):
+        raise ValueError(f"seed_source must be 'gt' or 'pred', got {seed_source!r}")
+    if seed_source == "pred" and pred_root is None:
+        raise ValueError("seed_source='pred' requires pred_root")
+
     idxs = [i for i in indices if 0 <= i < len(records)]
     if not idxs:
         return None
@@ -214,6 +227,7 @@ def send_to_labeling(
     spec_sig = json.dumps({
         "task": task, "class_options": list(class_options),
         "instructions": instructions, "payload": payload or {},
+        "seed_source": seed_source, "pred_root": str(pred_root or ""),
         "labels": [[it["item_id"], it.get("original_label"), it.get("golden_label"),
                     it.get("candidate_labels")] for it in items],
     }, ensure_ascii=False, sort_keys=True)
@@ -231,7 +245,7 @@ def send_to_labeling(
     img_dir.mkdir(parents=True, exist_ok=True)
 
     for it in items:
-        src = Path(it.pop("_src"))
+        src = Path(it["_src"])   # kept until after seeding; popped before the spec is written
         ext = src.suffix.lower() if src.suffix.lower() in (".jpg", ".jpeg", ".png") else ".jpg"
         dst = img_dir / f"{it['sha256']}{ext}"
         try:
@@ -256,6 +270,11 @@ def send_to_labeling(
         shutil.rmtree(out, ignore_errors=True)
         return None
 
+    if seed_source == "pred":
+        _write_pred_seeds(items, img_dir, class_options, Path(pred_root))
+    for it in items:
+        it.pop("_src", None)     # internal only — never lands in _handoff.json
+
     (out / "classes.txt").write_text("\n".join(class_options) + "\n", encoding="utf-8")
     spec = {
         "handoff_id": hid, "version": 1, "source": source, "task": task,
@@ -273,6 +292,71 @@ def send_to_labeling(
                    created_at=spec["created_at"], status=STATUS_SENT,
                    n_total=len(items), set_hash=set_hash, spec_hash=spec_hash)
     return out
+
+
+# ── pre-annotation seed (seed_source="pred") ────────────────────────────────
+def _file_sha(path: Path) -> str | None:
+    import hashlib as _hl
+    try:
+        return _hl.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _write_pred_seeds(items: list[dict], img_dir: Path,
+                      class_options: Sequence[str], pred_root: Path) -> None:
+    """Pre-draw the model's predicted boxes into each item's xAnyLabeling sidecar,
+    so the annotator adjusts boxes instead of drawing them from scratch.
+
+    Images with no prediction get no sidecar at all (= draw from scratch); a missing
+    pred file is not an error. The seed's content hash is stored on the item so
+    read-back can tell an untouched pre-annotation from a real human label.
+
+    Imports are local: this module is vendored into the Labeling app and its
+    import graph stays stdlib-light — the box parsers are only needed when seeding.
+    """
+    from interaction import parse_yolo_boxes_conf
+    from safe_io import safe_open_image
+
+    from gt_pred_diff import pred_label_path_for
+
+    classes = list(class_options)
+    for it in items:
+        img = img_dir / Path(it["image"]).name
+        pim = safe_open_image(img)
+        if pim is None:
+            continue
+        W, H = pim.size
+        boxes = parse_yolo_boxes_conf(pred_label_path_for(Path(it["_src"]), pred_root))
+        if not boxes:
+            continue
+        shapes = [{
+            "label": classes[cid] if 0 <= cid < len(classes) else str(cid),
+            "points": [[round((cx - w / 2) * W, 2), round((cy - h / 2) * H, 2)],
+                       [round((cx + w / 2) * W, 2), round((cy + h / 2) * H, 2)]],
+            "group_id": None,
+            "shape_type": "rectangle",
+            "flags": {},
+            "score": conf,
+        } for cid, cx, cy, w, h, conf in boxes]
+        ann = img.with_suffix(".json")
+        ann.write_text(json.dumps({
+            "version": "0.3.3", "flags": {}, "shapes": shapes,
+            "imagePath": img.name, "imageData": None,
+            "imageHeight": H, "imageWidth": W,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        it["seed_sha"] = _file_sha(ann)
+
+
+def _is_untouched_seed(item: dict, ann_path: Path) -> bool:
+    """True when the sidecar is still byte-identical to the pre-annotation we wrote.
+
+    A model prediction no human has reviewed is NOT a label. Counting it as annotated —
+    or reading it back as ground truth — would let the model feed its own errors back
+    in as truth, the exact failure mode active learning exists to avoid.
+    """
+    seed = item.get("seed_sha")
+    return bool(seed) and _file_sha(ann_path) == seed
 
 
 # ── read-back ───────────────────────────────────────────────────────────────
@@ -303,7 +387,7 @@ def _count_annotated(handoff_dir: Path) -> int:
     n = 0
     for it in spec.get("items", []):
         ann = (img_dir / Path(it["image"]).name).with_suffix(".json")
-        if ann.exists():
+        if ann.exists() and not _is_untouched_seed(it, ann):
             lbl, _ = _label_from_sidecar(ann)
             if lbl:
                 n += 1
@@ -333,7 +417,10 @@ def read_labeling_results(handoff_dir: str | os.PathLike) -> dict[str, dict]:
     for it in spec.get("items", []):
         sha = it["sha256"]
         ann = (img_dir / Path(it["image"]).name).with_suffix(".json")
-        label, annotator = (_label_from_sidecar(ann) if ann.exists() else (None, None))
+        # 人沒動過的預標(seed)不是標註 —— 不讀回,免得模型把自己的預測當成真值吃回去
+        label, annotator = (_label_from_sidecar(ann)
+                            if ann.exists() and not _is_untouched_seed(it, ann)
+                            else (None, None))
         if not label and sha in csv_map:
             label = csv_map[sha]
         out[sha] = {

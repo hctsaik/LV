@@ -39,6 +39,21 @@ def synthetic_dataset(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="session")
+def single_class_dataset(tmp_path_factory) -> Path:
+    """1 class x 12 JPGs — probe_eval AC-G3: 類別不足時要誠實 warning、不入帳、不崩潰。"""
+    root = tmp_path_factory.mktemp("ds_single")
+    train = root / "train"
+    rng = np.random.default_rng(7)
+    d = train / "onlyclass"
+    d.mkdir(parents=True)
+    for i in range(12):
+        arr = rng.integers(0, 255, (64, 64, 3)).astype("uint8")
+        arr[:, :, 0] = 255
+        Image.fromarray(arr).save(d / f"only_{i:02d}.jpg", quality=85)
+    return train
+
+
+@pytest.fixture(scope="session")
 def app_server(synthetic_dataset, tmp_path_factory) -> str:
     port = _free_port()
     # 隔離持久化狀態:E2E 用乾淨的 UI-state 檔與 cache 目錄,不共用/不殘留開發者本機狀態,
@@ -195,3 +210,156 @@ def app_page(app_server, page):
     page.set_default_timeout(20000)
     load_app(page, app_server)
     return page
+
+
+# ── AL-loop (M9) isolated server ─────────────────────────────────────────────
+# pool_registry / round_ledger / labeling_handoff persist to disk keyed off
+# LV_CACHE_DIR / LV_OUTPUT_DIR / CIM_LOG_DIR. The shared app_server deliberately
+# does NOT isolate those (dev-machine .lv_cache is real), so AL-loop E2E needs a
+# dedicated server whose three durable roots are per-test temp dirs — otherwise
+# "second send blocked" and "round survives restart" would be polluted by (and
+# pollute) real state. This server also supports .restart() for AC-G3.
+class _ManagedServer:
+    def __init__(self, env: dict, cache_dir: Path, output_dir: Path, log_dir: Path):
+        self.env = env
+        self.cache_dir = cache_dir      # LV_CACHE_DIR   → pool_registry.jsonl
+        self.output_dir = output_dir    # LV_OUTPUT_DIR  → rounds.jsonl
+        self.log_dir = log_dir          # CIM_LOG_DIR    → lv_labeling_handoff/
+        self._proc = None
+        self._log = None
+        self.base_url = ""
+
+    @property
+    def registry_path(self) -> Path:
+        return self.cache_dir / "pool_registry.jsonl"
+
+    @property
+    def rounds_path(self) -> Path:
+        return self.output_dir / "rounds.jsonl"
+
+    @property
+    def handoff_root(self) -> Path:
+        return self.log_dir / "lv_labeling_handoff"
+
+    def start(self) -> str:
+        port = _free_port()
+        self._log = open(REPO_ROOT / "tests" / "e2e" / "_server_al.log", "w",
+                         encoding="utf-8")
+        self._proc = subprocess.Popen(
+            [sys.executable, "-m", "streamlit", "run", "scripts/app.py",
+             "--server.port", str(port), "--server.headless", "true",
+             "--server.fileWatcherType", "none",
+             "--browser.gatherUsageStats", "false"],
+            cwd=REPO_ROOT, env=self.env, stdout=self._log,
+            stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        base = f"http://localhost:{port}"
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if self._proc.poll() is not None:
+                self._log.close()
+                raise RuntimeError(
+                    "streamlit (AL) exited early:\n"
+                    + (REPO_ROOT / "tests" / "e2e" / "_server_al.log")
+                    .read_text(encoding="utf-8")[-3000:])
+            try:
+                with urllib.request.urlopen(f"{base}/_stcore/health", timeout=2) as r:
+                    if r.read().decode().strip() == "ok":
+                        break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            raise RuntimeError("streamlit (AL) did not become healthy in 60s")
+        self.base_url = base
+        return base
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
+                           capture_output=True)
+            self._proc = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
+
+    def restart(self) -> str:
+        self.stop()
+        return self.start()
+
+
+@pytest.fixture(scope="session")
+def _al_dirs(tmp_path_factory) -> dict:
+    # LV_CACHE_DIR is SHARED across AL tests so the DINOv2 embedding cache is
+    # computed once (first test) and reused — otherwise a fresh cache per test
+    # means a cold ~90s recompute every time, blowing the E2E timeouts. Per-test
+    # isolation of the AL state (pool_registry.jsonl / rounds.jsonl / handoffs) is
+    # done by al_isolated_server deleting just those files, leaving the cache.
+    return {
+        "cache": tmp_path_factory.mktemp("al_cache"),
+        "output": tmp_path_factory.mktemp("al_output"),
+        "cim": tmp_path_factory.mktemp("al_cimlog"),
+        "state": tmp_path_factory.mktemp("al_state"),
+    }
+
+
+@pytest.fixture(scope="module")
+def al_server(_al_dirs) -> "_ManagedServer":
+    env = {
+        **os.environ,
+        "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
+        "STREAMLIT_SERVER_HEADLESS": "true",
+        "LV_CACHE_DIR": str(_al_dirs["cache"]),
+        "LV_OUTPUT_DIR": str(_al_dirs["output"]),
+        "CIM_LOG_DIR": str(_al_dirs["cim"]),
+        # disable folder/option persistence (parent no_persist/ intentionally absent)
+        "LV_UI_STATE": str(_al_dirs["state"] / "no_persist" / "ui_state.json"),
+    }
+    srv = _ManagedServer(env, _al_dirs["cache"], _al_dirs["output"], _al_dirs["cim"])
+    srv.start()
+    yield srv
+    srv.stop()
+
+
+@pytest.fixture()
+def al_isolated_server(al_server) -> "_ManagedServer":
+    """Per-test clean slate for the AL durable state (pool registry / round ledger
+    / handoff folders) while preserving the shared embedding cache. The server
+    reads these files fresh on every render, so deleting them between tests is a
+    genuine reset without a restart."""
+    import shutil
+    srv = al_server
+    srv.registry_path.unlink(missing_ok=True)
+    srv.rounds_path.unlink(missing_ok=True)
+    # readback overlay persists across Run by design — reset it per test too, or a
+    # prior test's corrections would pre-apply and make this test's read-back a no-op.
+    (srv.cache_dir / "readback_changelog.jsonl").unlink(missing_ok=True)
+    shutil.rmtree(srv.cache_dir / "readback_versions", ignore_errors=True)
+    if srv.handoff_root.exists():
+        shutil.rmtree(srv.handoff_root, ignore_errors=True)
+    yield srv
+
+
+def newest_handoff_dir(server: "_ManagedServer") -> Path:
+    """The handoff folder just created by a send (newest under CIM_LOG_DIR)."""
+    root = server.handoff_root
+    dirs = [d for d in root.iterdir() if d.is_dir()] if root.exists() else []
+    assert dirs, f"no handoff folder created under {root}"
+    return max(dirs, key=lambda d: d.stat().st_mtime)
+
+
+def write_annotation_sidecars(handoff_dir: Path, label: str) -> int:
+    """Simulate Labeling finishing the batch: write an xAnyLabeling sidecar
+    (images/<sha>.json with shapes[0].label) next to every exported image, so
+    read_labeling_results/apply_readback see a completed annotation. Returns the
+    number of items annotated."""
+    import json as _json
+    spec = _json.loads((handoff_dir / "_handoff.json").read_text(encoding="utf-8"))
+    img_dir = handoff_dir / "images"
+    n = 0
+    for it in spec.get("items", []):
+        ann = (img_dir / Path(it["image"]).name).with_suffix(".json")
+        ann.write_text(_json.dumps({"shapes": [{"label": label}]}),
+                       encoding="utf-8")
+        n += 1
+    return n

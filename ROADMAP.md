@@ -4,6 +4,12 @@
 > 提醒:狀態是人的判斷,不可由「檔案存在」自動標 ✅。模組表/測試數請定期用
 > `python verify/unet_status.py` 核對是否漂移。
 
+> **🏁 全局狀態(2026-07-12):ROADMAP 上已無未完成模組。** M1–M12 全數 ✅;20 個模組 gate 全 GREEN
+> (單元 449 綠)、AL Loop 真實 E2E **23/23 併跑穩定綠**。主動學習迴圈四段(選樣 → 送標 → 回讀 → 評估)
+> 已閉合。後續只走**維護迴圈**;新能力須從新的 `/user` 需求重新起輪。
+> 已知可接受分歧:M5–M7 走 `*_DESIGN_NOTES.md` + 里程碑追蹤、無 `4_PM_Feedback/` 對應表(測試與 gate 皆在);
+> `verify/unet_status.py` 因此仍會報 M5 的 AC 覆蓋缺口,那是**文件缺口不是測試缺口**。
+>
 > **🏁 Feature 狀態(2026-06-30):瑕疵偵測(AnomalyDINO 風格物件級瑕疵偵測)已宣告收斂。**
 > M1–M7 涵蓋 PRD 全部 Must/Should/Could,並在真實瑕疵資料(`C:\code\dataset\fruit`)端到端驗證;
 > 無待辦 user_needs。後續只走**維護迴圈**(只動 `scripts/app.py` + E2E、不受 appetite 約束);
@@ -13,7 +19,44 @@
 > 維護收斂結論不變,M8 是受 appetite 約束的新能力增量。
 
 ## 里程碑
-- **M8 — 整張影像級瑕疵偵測(無 YOLO 標籤)** — 📝 **進行中(PRD→設計)**(2026-06-30) — feature 收斂後第一個
+- **M9–M12 — AL Loop Infrastructure(把主動學習串成迴圈)** — ✅ **全部完成**(2026-07-12) —
+  M9(08 pool_registry + 09 round_ledger)、**M10(10 gt_pred_diff + 13 heatmap_to_boxes)**、
+  **M11(11 hybrid_sampler + 12 probe_eval)**、M12(14 readback_store)六個模組**全數落地**:
+  單元 gate 全 GREEN + **真實 E2E 23/23 併跑穩定綠**。迴圈四段(選樣 → 送標 → 回讀 → 評估)閉合。
+  - **M10 模型參與迴圈**:`gt_pred_diff`(GT×預測比對 → 漏抓/誤抓/類別混淆/低信心四佇列 + 預測框當
+    **預標 seed**)+ `heatmap_to_boxes`(anomaly patch 熱力圖 → YOLO 6 欄預標框)。**回答了「很強的
+    embedding / anomaly DINO 能不能像 YOLO 做預標」= 能,但要經定位橋接** —— E2E 用真實 DINOv2 實證
+    產出的框確實框在植入的瑕疵上(IoU 0.535 ≥ 0.3),良品 conf 0.000 vs 瑕疵 0.653 完全分離。
+    GUI:Visualize 側欄「模型預測資料夾」→「🧪 挖錯」面板;瑕疵偵測 ②「⚡ 由熱力圖產生預標」。
+  - **M11 聰明化**:`hybrid_sampler`(top-(oversample×K) 不確定 → 其上跑 FPS,修掉「最不確定前 K 張
+    其實是同一群近重複」的批次 AL 陷阱;接 08 剔除已送標、接 09 帶策略名)+ `probe_eval`(linear probe
+    代理評估掛進回合 + 報酬遞減建議)。**不做自動停**是產品紀律(plateau 只給建議)。
+  - 需求 [1_user_needs/al_loop_infrastructure.md](1_user_needs/al_loop_infrastructure.md);
+    PRD [2_PO_PRD/al_loop_infrastructure_prd.md](2_PO_PRD/al_loop_infrastructure_prd.md);
+    設計 `3_Architect_Design/08…14`;對應表 `4_PM_Feedback/`(六份齊)。
+- **M12 — 讀回落地層(Read-back Persistence)** — ✅ **完成**(2026-07-12) — 迴圈「回讀」段真正閉合:
+  新模組 14 `readback_store`(純 stdlib,append-only 變更日誌 + 折疊覆蓋層,sha256 為鍵,落 `.lv_cache`
+  絕不寫使用者資料集)。GUI 三接點:讀回成功記入修正、Visualize Run 建 records 後套用覆蓋層(修正跨
+  Run/重啟復現)、📥「🩹 讀回修正」稽核+匯出版本清單。單元 gate 11 綠 + 真實 E2E 3(跨重啟存活/不寫
+  資料集/稽核匯出)。需求 [1_user_needs/readback_persistence.md](1_user_needs/readback_persistence.md);
+  PRD [2_PO_PRD/readback_persistence_prd.md](2_PO_PRD/readback_persistence_prd.md);設計
+  [3_Architect_Design/14_readback_store.md](3_Architect_Design/14_readback_store.md)。
+  — User 明示「先寫到弱 AI 可接手、不開工」。缺口分析:LV 選樣訊號豐富,但迴圈無記憶(重複送標無防呆、
+  回合歷史蒸發)、模型不參與(預測/熱力圖不能當預標)、無混合選樣與便宜的回合效益估計。
+  模組(設計含 AC 全數已落 `3_Architect_Design/08…13`):
+  **M9(地基)**=08 `pool_registry`(sha 全域狀態機,永不重複送標)+09 `round_ledger`(回合帳本+時間軸);
+  **M10(模型參與)**=10 `gt_pred_diff`(GT×預測 FN/FP/混淆/低conf 佇列+預測框預標 seed)+13 `heatmap_to_boxes`
+  (anomaly patch 熱力圖→YOLO 6 欄預標,回答「anomaly DINO 能否像 YOLO 做預標」=能,經定位橋接);
+  **M11(聰明化)**=11 `hybrid_sampler`(不確定×多樣×類配額)+12 `probe_eval`(linear probe 代理評估+
+  報酬遞減建議,不自動停)。Won't:gold 品質哨兵/漂移哨兵/多標註者/LV 內訓重模型。
+  需求 [1_user_needs/al_loop_infrastructure.md](1_user_needs/al_loop_infrastructure.md);
+  PRD [2_PO_PRD/al_loop_infrastructure_prd.md](2_PO_PRD/al_loop_infrastructure_prd.md)。
+  放行程序:PO 核 PRD → `/pm` 依 08/09 落紅測(先 M9)→ `python verify/gate.py --snapshot` → `/pg`。
+- **M8 — 整張影像級瑕疵偵測(無 YOLO 標籤)** — ✅ **完成**(狀態於 2026-07-12 校正:先前標「進行中」
+  是**漂移**——實作其實早已落地。模組 07 `whole_image_source` = `interaction.discover_whole_images`
+  (全幅記錄,欄位與 `discover_yolo_objects` 同形 → 下游 embedding/分群/bank/patch/評分/散點/排序/看圖/
+  匯出全部不變)+ `run_pipeline` 依 `object_source` 分流 + GUI ① 物件來源切換。
+  `python verify/gate.py whole_image_source` → **GREEN(11 測)**。) — feature 收斂後第一個
   新能力增量(走精簡 U-Net 新輪)。需求:手上只有「無標註圖片資料夾」的人,要把**整張影像當對象**做異常偵測、不必先標框
   (現況無 `labels/` 直接跳「找不到 YOLO 物件」=完全不能用)。範圍(MoSCoW):**Must** 新「物件來源=整張影像」路徑
   (每張可讀圖→一筆**全幅記錄**,欄位對齊 `discover_yolo_objects`、下游 embedding/分群/bank/patch/評分/散點/排序/看圖/匯出
@@ -80,8 +123,19 @@
 | 04 | anomaly_classify | A | Must | ✅ | v | v | v | 吃分數+少量確認標籤 | gate 綠(6 測) |
 | 05 | anomaly_heatmap | A | Should | ✅ | v | v | v | 吃 patch 分數圖+裁切圖 | gate 綠(5 測);零依賴 jet |
 | 06 | anomaly_tool | B | Must | ✅ | v | v | v | 01–05 + 既有 viz/cart/export | 單元綠;GUI 第8工具接好;真實 E2E 4/4 綠 |
+| 08 | pool_registry | A+B | Must | ✅ | v | v | v | sha256 全域狀態機 | gate 9 綠 + E2E 3/3(M9) |
+| 09 | round_ledger | A+B | Must | ✅ | v | v | v | 08 | gate 8 綠 + E2E 4/4(M9) |
+| 10 | gt_pred_diff | B | Must | ✅ | v | v | v | label_formats/interaction + 09 | gate 12 綠 + E2E 4/4(M10) |
+| 11 | hybrid_sampler | A+B | Must | ✅ | v | v | v | interaction.FPS + 08/09 | gate 10 綠 + E2E 3/3(M11) |
+| 12 | probe_eval | B | Must | ✅ | v | v | v | sklearn + 09 | gate 10 綠 + E2E 3/3(M11) |
+| 13 | heatmap_to_boxes | A+B | Must | ✅ | v | v | v | scipy.ndimage;產物直通 10 | gate 11 綠 + E2E 3/3(M10) |
+| 14 | readback_store | A+B | Must | ✅ | v | v | v | 純 stdlib;落 .lv_cache | gate 11 綠 + E2E 3/3(M12) |
 
 相依無環:06→{01..05};02/03/04/05 只吃陣列、彼此不 import。✅
+AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction.FPS, 08, 09};
+12→{sklearn, 09};13→scipy(產物**餵給** 10,但 13 不 import 10 —— 只在測試層 import `iou_cxcywh`,
+產品程式碼無循環);14 純 stdlib。✅
+(07 `whole_image_source` 落在 `interaction.discover_whole_images`,走里程碑 M8 追蹤;gate GREEN 11 測。)
 進度:**M1 完成** — 6 模組單元 gate 全綠 + 第 8 工具 GUI 接線 + 真實 Playwright E2E 4/4 綠
 (done 定義「整合模組=單元綠 AND E2E 綠」已滿足)。E2E 由 multi-agent workflow 跑+對抗驗證:
 真實 DINOv2 確實把缺陷排到前段(real_pass,非 false-green)。
@@ -163,6 +217,94 @@
   分類 / 報表 / 批次 CLI 等當初 Won't/Could)須由新 `/user` 需求重新起輪、不在本 feature 內擴張。未蓋棺
   尾巴 `N_min=8` 三 split 敏感度掃描列維護候選、非阻擋。(模組進度表仍為 M1 範圍;M2–M7 模組改以
   `*_DESIGN_NOTES.md`+里程碑追蹤,屬已知可接受分歧,補表為獨立 doc 整理、未排程。)
+- (2026-07-04) **反向閘門 /pm →/architect(M9 開工前)**:PM 轉抄 08/09 AC 時發現兩處設計自我矛盾——
+  08 的 `load_states` 同時被要求「空時 == {}」(AC6)又「回傳帶 `_corrupt_lines`」(2.1);09 的 `load_rounds`
+  宣告回 `list` 又被 AC4 要求有 `_orphans` 鍵(list 不能有鍵)。architect 修:主回傳保持乾淨(load_states 回純
+  {sha:state}、load_rounds 回純 list),診斷下沉獨立函式 `corrupt_line_count()` / `orphan_events()`;AC5/AC4 同步改寫。
+  在 gate `--snapshot` 前修完,無竄改風險。
+- (2026-07-04) **M9–M11 規格先行(未開工)**:User 看過 AL 缺口分析(HTML 提案)後指示「把實作與驗收寫到
+  弱 AI 可接手,先不開工」→ 產出需求/PRD/六份設計(08 pool_registry、09 round_ledger、10 gt_pred_diff、
+  11 hybrid_sampler、12 probe_eval、13 heatmap_to_boxes),AC 全數含釘死數值與 E2E 真實行為斷言。
+  User 追問「強 embedding/anomaly DINO 能否像 YOLO 預標」→ 答案設計成 13 號模組(pmap→連通區域→框,
+  輸出與 YOLO 預測同形,直通 10 號管線)。開發放行點與順序見里程碑 M9–M11 條目。
+- (2026-07-12) **T0 gate 治理(M9 開工前 baseline 校正)**:snapshot(2026-07-04)後唯一漂移的契約檔是
+  `3_Architect_Design/10_gt_pred_diff.md`——architect 修正 AC1 IoU 算例(聯集 0.4375→0.3125,IoU 3/7→**0.6**,
+  見該檔第 120 行自述)。屬**未實作模組(M10,`gt_pred_diff.py` 尚不存在)的動工前設計修正**,非下游為過綠竄改。
+  PO 判定合法 → 重跑 `python verify/gate.py --snapshot` 重建 baseline(非掩蓋)。決策依據:`5_active_learning_product_review_2026-07-12/06_開發交接指南.md` T0。
+- (2026-07-12) **T3/M12 讀回落地層完成(新需求走完整 U-Net 立案)**:5_.../0_discussion 一致認定的 #1
+  P0——讀回只改記憶體、重 Run 蒸發——已閉合。走完 `/user`→`/po`→`/architect`(14 設計含 AC)→`/pm`
+  (11 單元紅測+3 E2E AC-G+對應表,snapshot)→`/pg`(`scripts/readback_store.py` + app.py 三接點)。
+  單元 11 綠 + E2E 3 綠(跨重啟/不寫資料集/稽核匯出);與 M9 併跑全套 10/10 穩定。關鍵設計:覆蓋層
+  由 append-only 日誌折疊(最新勝、歷史留痕可稽核)、sha256 為鍵、Run 時零成本短路(無修正不算 sha)、
+  絕不寫使用者資料夾(overlay 進 `.lv_cache`)。**本輪只落分類標籤**;框幾何讀回配 M13 另議(設計 §範圍)。
+- (2026-07-12) **T4 ANnoTation closeout 語意修正(另一 repo 的 P0 資料完整性 bug)**:`ANnoTation/modules/
+  module_014/014_process.py` 的 `_retire_lv_handoffs()` 原本匯出時把**所有** open LV handoff 一次標
+  `read_back`(誤關其他仍在標的批次)。修為**只關這次匯出來源的 handoff**——用本 manifest 的 item 路徑
+  比對各 handoff 的 `images_dir`(LV 批次由 module_026 `_run_local` 就地 scan,item 路徑必落在來源
+  `images_dir` 內)。改寫契約測 `tests/test_lv_handoff_closeout.py`(核心新測=兩 open 批,匯出 A→B 仍
+  open)。**測試環境注記**:ANnoTation 測試需在 nativeApp 平台樹(submodule `plugins/labeling/`)下
+  跑(`npm run test:python`);本機 standalone 因 `parents[3]` 平台路徑不成立無法直跑,故以抽函式隔離
+  exec 驗證邏輯 4 情境全 PASS。唯一 active 副本即此(nativeApp_Management 舊副本無此功能,不需 sync)。
+- (2026-07-12) **T6 review 真相唯讀調查(產出 `5_.../07_review_truth_trace.md`)**:證實 05 文件標的
+  「P0:Review 兩套真相」**不是數值漂移 bug**——`.review.json` sidecar(Streamlit 唯一權威)與 DB
+  `ReviewDecision`(僅 MCP 入口、全 repo 只寫不讀的稽核層)**從不雙寫、無同步、無交集**。真正的問題是
+  module_014 匯出**完全不 gate 於 review**(rejected 影像照樣匯出)——屬新需求,另立案。建議把「P0 收斂
+  canonical truth」降級為「待確認:是否有資料同時走兩條審查路」。
+- (2026-07-12) **T5 送標顯性化 + 瑕疵③直送**(維護增量,依 06_開發交接指南 T5):`_send_to_labeling_ui`
+  加 opt-in `show_task_picker`——viz 選樣送標長出「標註任務」selectbox(fresh/verify/relabel/adjudicate,
+  預設沿用排序推導值、可改、寫入 handoff),其餘送標站不受擾。瑕疵③挑樣佇列補「📤 直送 Labeling」鈕
+  (復用送標元件,送**原圖**非 crop、依 sha 去重、strategy 帶 `anomaly:模式`、記入回合)。
+  gate anomaly_tool 25/pool 9/round 8 綠;AL E2E 7/7 無回歸;app boot 200。瑕疵直送的完整 wizard E2E
+  屬重 harness,留 /ux-test(直送邏輯純復用已驗證的 `_send_to_labeling_ui`)。
+- (2026-07-12) **M9 GUI 接線完成(pool_registry + round_ledger 進 app.py)**:`_send_to_labeling_ui`
+  送出前以 sha 查帳 `partition_new`、預設攔已送/已標(「仍包含」可覆寫)、送出後 `mark_sent`+開/續回合
+  `start_round`/`attach_batch`;📥 標註回饋擴為迴圈中樞:套用讀回後 `mark_labeled`+`record_readback`(以帳本
+  反查批次所屬回合)、新增「🔁 回合」時間軸卡(策略/送出·回讀·變更/掛指標)+ 學習曲線。單元 gate
+  pool_registry 9 + round_ledger 8 綠;真實 E2E 7/7 綠(3 pool AC-G + 4 round AC-G),連兩次全套穩定。
+  **E2E 教訓**(見 4_PM_Feedback 對應表註記):散點 on_select 全頁 rerun 會複製 `@st.fragment` 送標鈕
+  →改走 cart 送標路徑;所有點擊驗證後果並重試以吸收 rerun 時序;`al_isolated_server` 隔離三個 durable 根、
+  共用 embedding 快取。
+- (2026-07-12) **M9 放行開發(User `/goal` 指示「開發 + E2E,全部階段做完再叫我,依 long-term solution 決策」)**:
+  解除 2026-07-04「先不開工」凍結。開發範圍 = `06_開發交接指南.md` 任務卡 T0–T6(可信閉環優先:pool/round GUI
+  接線 + 讀回落地層),**不含 M10/M11 複雜取樣**(review 明示「閉環前不投入複雜 acquisition function」)。
+  順序:T0 治理 → T1 文案/死碼 → T2 M9 接線(+E2E)→ T3 讀回落地層(新需求走完整 /user→/pg,+E2E)→ T5 → T4 → T6。
+- (2026-07-12) **M10 + M11 開工放行並完成(User `/goal`「請把所有的 roadmap 都完成」)**:解除
+  2026-07-04「規格先行、不開工」凍結。PM 的紅測(40 個)早已落地且忠實對照設計 → PG 直接實作四個模組
+  (`gt_pred_diff` / `heatmap_to_boxes` / `hybrid_sampler` / `probe_eval`)+ GUI 接線 + 補四份對應表 +
+  補 13 個真實 E2E。結果:單元 449 綠 / 20 個模組 gate 全 GREEN / AL E2E **23/23 併跑穩定綠**。
+- (2026-07-12) **反向閘門 /pg →/architect(1):未經人手的預標不得被當人工標註讀回(silent-wrong)**。
+  PG 落 seed 時發現設計與既有回讀端**語義衝突**:xAnyLabeling 靠 `images/<sha>.json` 自動載入預標,
+  所以 seed **必須**寫在該路徑;但 `_count_annotated()` / `read_labeling_results()` 正是「該檔有 label
+  ⇒ 已標註」。天真實作 = 送標當下就顯示全部已標註,且回讀會把**模型自己的預測當成人工答案**套回
+  records —— 模型把自己的錯誤當真值餵回自己,正是主動學習最該避免的失敗模式。
+  **裁決**:seed 內容 sha 記進 `_handoff.json`,回讀兩入口一律跳過「內容仍等於 seed」的 sidecar。
+  新增設計 10-AC9 + 測試 `test_ac9_untouched_seed_is_not_a_label`(釘死:送標當下 n_annotated==0、
+  `apply_readback` 一個 label 都不准改;人動過後才計入)。
+- (2026-07-12) **反向閘門 /pg →/architect(2):裁切座標 → 原圖座標的合成缺口(加法式補設計)**。
+  13 初版契約假設「一圖一 pmap」,但物件模式的 pmap 是**單一物件裁切圖**的分數圖(`embed_objects_patch`
+  以 pad=0.12 裁切後才抽特徵)→ ① 框落在裁切座標系,直接寫出去與原圖 GT 對不上(下游 10 比 IoU 必錯);
+  ② 一圖多物件時舊簽名容不下。整張影像模式(裁切==全圖)兩問題都退化不見,故初版沒踩到。
+  **裁決(純加法,AC1–AC7 不動)**:新增 `box_to_image_space` / `boxes_by_image` / `write_boxes`,
+  `write_pred_labels` 改為薄包裝。新增 13-AC8 + 測試。**呼叫端契約:region 必須與抽特徵時的裁切完全一致**。
+- (2026-07-12) **校準發現(實測,非 bug)**:`heatmap_to_boxes` 的 `quantile` 預設 0.98 只保留最熱的
+  2% patch。E2E fixture 的瑕疵佔物件約 **25%** 面積 → 0.98 下框**落在瑕疵內(定位正確)**但只框到最熱的
+  一小塊,對整塊瑕疵區的 IoU 僅 **0.116**,達不到設計釘死的 0.3;分位調到 **0.90 → IoU 0.535**。
+  「瑕疵佔比越大、分位要調越低」是真實的物理關係 → 已寫進 slider 的 help 文案,E2E 明確拉到 0.90。
+  良品 conf 0.000 vs 瑕疵 conf 0.653(完全分離)證明訊號真的來自異常、不是到處亂框。
+- (2026-07-12) **修 GUI 真 bug:挖錯面板用錯了 path(同 [[object-export-crop-bug]] 家族)**。
+  物件級 viz 記錄的 `rec["path"]` 是 **.lv_cache 的裁切圖**,`image_path` 才是原圖(見 `_rec_fname`)。
+  初版 `_render_pred_diff_view` 拿 `path` 去找 GT/預測 → 全找不到 → 佇列永遠空;且送標會送出**裁切圖**
+  而非原圖。修:挖錯是**整圖**的事 → 先把記錄折成「每張原圖一筆」的 pseudo records,scan/購物車/送標
+  一律走原圖。由 E2E(佇列真實性)揪出。
+- (2026-07-12) **修 UX 真 bug:代理評估的錯誤訊息會憑空消失**。`_probe_msg` 原本用 `st.session_state.pop`
+  (只顯示一次)→ 任何一次無關的 rerun 都會把它吃掉,使用者看不到「是哪一類樣本不足」。改 `get`,
+  保留到下次執行才覆寫。由 E2E(AC-G3 類不足誠實)揪出。
+- (2026-07-12) **修稽核工具誤報**:`verify/unet_status.py` 的 AC regex 會把**跨模組引用**當成本模組的 AC
+  ——09 設計寫「AC7(無重依賴):同 **08-AC8**」被誤判成「09 的 AC8 無對應測試」。加負向後查 `(?<!\d-)` 排除。
+  (先前 ROADMAP 曾據此誤以為 round_ledger 有 AC 缺口;實際 09 只有 AC1–AC7,全部有測試。)
+- (2026-07-12) **ROADMAP 漂移校正**:M8 先前標「📝 進行中(PRD→設計)」,但實作其實早已落地
+  (`interaction.discover_whole_images`,gate GREEN 11 測)→ 改標 ✅。**再次印證「狀態是人的判斷、
+  不可由檔案存在自動推斷」這條鐵則要靠 `verify/unet_status.py` 定期核對,否則會反向漂移(做完了卻沒標)。**
 - (2026-06-30) **M8 起輪(新能力)**:收斂後使用者提「整張影像級瑕疵偵測(無 YOLO 標籤)」→ 依「新能力起新輪」
   開 `/user`→`/po`。需求:無 `labels/` 圖片資料夾要把整張圖當對象做異常偵測(現況跳「找不到 YOLO 物件」不能用)。
   PO 拆 1 模組 `whole_image_source`(Tier B):`discover_whole_images` 全幅記錄 + `run_pipeline` `object_source` routing +

@@ -23,7 +23,10 @@ for m in mods:
     f = lambda d: "v" if m in d else "X"
     print("%-22s  %s    %s" % (m, f(designs), f(maps)))
 
-AC = re.compile(r"\bAC[-_ ]?[A-Za-z]?\d\w*")   # 需含數字:AC1/AC10/AC-F4a;不誤抓 LV_CACHE_DIR 的 ACHE
+# 需含數字:AC1/AC10/AC-F4a;不誤抓 LV_CACHE_DIR 的 ACHE。
+# `(?<!\d-)` 排除**跨模組引用**:設計裡寫「AC7(無重依賴):同 08-AC8」時,那個 AC8 是 08 號模組的,
+# 不是本模組的 AC —— 沒排除的話會誤報「AC8 無對應測試」(2026-07-12 實際踩過的假缺口)。
+AC = re.compile(r"(?<!\d-)\bAC[-_ ]?[A-Za-z]?\d\w*")
 print("\n== AC <-> 測試 雙向覆蓋(只驗掛名,不驗行為正確)==")
 for m in mods:
     d_ac = set(AC.findall(open(designs[m], encoding="utf-8").read())) if m in designs else set()

@@ -48,6 +48,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     compute_outlier_scores,
     cross_class_nn_pairs,
     draw_yolo_boxes,
+    draw_two_sources,
     ensure_thumbnails,
     find_duplicate_pairs_embedding,
     find_duplicate_pairs_phash,
@@ -65,6 +66,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     neighbor_hit_density,
     neighbor_label_entropy,
     parse_folder_paths,
+    parse_yolo_boxes_conf,
     sparsity_scores,
     records_to_csv,
     selection_points_to_indices,
@@ -1793,6 +1795,8 @@ def _anomaly_tab_apply() -> None:
         st.warning("⚠ 全部被判為可疑 = 門檻無法校準。可在下方散點**框選你確定正常的那一團點 →「✅ 框選標為正常範例」**"
                    "→ 按「🔁 就地重評」用乾淨參考重算(不動模型;正式重建走①)。")
 
+    _anomaly_pred_label_panel(result)
+
     left, right = st.columns([3, 2], gap="medium")
     with left:
         _anomaly_render_scatter(result, context="apply")
@@ -1968,6 +1972,19 @@ def _anomaly_tab_sample() -> None:
     st.button(f"🛒 把「{_active_name}」佇列 {len(_sel)} 個加入購物車(送標註)",
               key="anomaly_q_cart", disabled=not _sel, use_container_width=True,
               on_click=_anomaly_add_to_cart, args=(records, _sel))
+
+    # 直送 Labeling:瑕疵挑樣是「最該送標」的頁,補一個不必先進購物車的直接出口。
+    # 送**原圖**(非 crop;物件級 export 的既知地雷,見 [[object-export-crop-bug]]);
+    # 同圖多物件由 send_to_labeling 依 sha 去重。送出即記入回合(策略帶 anomaly:模式)。
+    import labeling_handoff as LH
+    _send_recs = [{"path": records[i]["image_path"],
+                   "label": records[i].get("label", ""),
+                   "split": records[i].get("split", "")} for i in _sel]
+    _send_to_labeling_ui(
+        _send_recs, range(len(_send_recs)), source="anomaly",
+        task=LH.TASK_VERIFY, key="anomaly_q_send", strategy=f"anomaly:{_active}",
+        label="📤 直送 Labeling 標註",
+        help="把這批高風險物件的原圖直送 Labeling 覆核;送出即記入主動學習回合。")
 
 
 def _anomaly_render_scatter(result: dict, *, context: str) -> None:
@@ -2162,6 +2179,127 @@ def _anomaly_render_inspector(result: dict, scores) -> None:
                          " ·(無監督模式;確認正常範例後可看熱力圖)")
         except (OSError, Image.DecompressionBombError, IndexError) as e:
             st.caption(f":gray[無法顯示:{e}]")
+
+
+def _set_viz_pred_root(path: str) -> None:
+    """把 13 的產物填進 Visualize 的「模型預測資料夾」(跨工具)。
+
+    寫**持久的非 widget key**,並 pop 掉輸入框的 widget key 讓它從 `value=` 重新初始化 ——
+    只寫 widget key 的話,從瑕疵偵測走到 Visualize 的路上會被 Streamlit 清成空字串(見 _PRED_ROOT)。"""
+    st.session_state[_PRED_ROOT] = str(path)
+    st.session_state.pop(_PRED_ROOT_INPUT, None)
+    st.session_state["_anomaly_pred_filled"] = str(path)
+    st.toast("已填入 Visualize 的「模型預測資料夾」", icon="➡")
+
+
+def _anomaly_make_pred_labels(quantile: float, min_area_frac: float) -> None:
+    """② 熱力圖 → YOLO 6 欄預標框(寫進 `.lv_cache`,**絕不碰使用者的資料集**)。
+
+    回答「很強的 embedding / anomaly DINO 能不能像 YOLO 一樣做預標」——**能,但要經定位橋接**:
+    DINOv2 embedding 本身只會分類/檢索,可是 patch 分數圖帶空間資訊 → 閾值 → 連通區域 → 框。
+    產物與模型預測完全同形,可直通「🧪 挖錯」面板或當送標預標。
+    """
+    from anomaly_score import score_object
+    from interaction import bbox_to_pixels
+    from object_eval import _adaptive_pad_px, dataset_cache_dir
+    from patch_features import embed_objects_patch
+
+    import heatmap_to_boxes as HTB
+
+    st.session_state.pop("_anomaly_pred_err", None)
+    result = st.session_state.get("anomaly_apply_result") or {}
+    records = result.get("records") or []
+    bank = result.get("bank")
+    targets = st.session_state.get("anomaly_target_folder") or []
+    if bank is None or not records or not targets:
+        st.session_state["_anomaly_pred_err"] = (
+            "沒有 Normal Bank / 套用結果 / 目標資料夾,無法產生預標。")
+        return
+
+    meta = (st.session_state.get("anomaly_model") or {}).get("meta", {}) or {}
+    sig = (f"{meta.get('model', 'm')}_{meta.get('target_res', 'r')}"
+           f"_q{quantile:.3f}_a{min_area_frac:.4f}")
+    out_root = dataset_cache_dir(Path(targets[0]), f"pred_from_anomaly_{sig}")
+
+    # records 本身就是 embed_objects_patch 要的 meta 形(image_path/bbox/obj_index),
+    # 直接餵它 → 索引天然對齊,且整張影像模式(bbox=全幅)同一條路走得通。
+    pfs = embed_objects_patch(records, model=result.get("_model", "dinov2_vits14"),
+                             target_res=result.get("_target_res", 224),
+                             cache_dir=Path(result["_cache"]))
+    sizes: dict[str, tuple[int, int]] = {}
+    objs: list[dict] = []
+    for r, pf in zip(records, pfs):
+        ip = str(r["image_path"])
+        if ip not in sizes:
+            im = safe_open_image(ip)
+            if im is None:      # 壞圖:跳過,不寫半份預標
+                continue
+            sizes[ip] = im.size
+        iw, ih = sizes[ip]
+        _, pmap = score_object(pf["feats"], pf["grid"], bank)
+        # region 必須與 embed_objects_patch 算特徵時的裁切**完全一致**(pad=0.12),
+        # 否則框會系統性偏移 —— pmap 的座標系就是那個裁切。
+        region = bbox_to_pixels(*r["bbox"], iw, ih,
+                                pad_px=_adaptive_pad_px(r["bbox"], iw, ih, 0.12))
+        objs.append({"image_path": ip, "pmap": pmap,
+                     "image_size": (iw, ih), "region": region})
+    if not objs:
+        st.session_state["_anomaly_pred_err"] = "所有來源影像都讀不到,沒有產出。"
+        return
+
+    stats = HTB.write_boxes(
+        HTB.boxes_by_image(objs, quantile=quantile, min_area_frac=min_area_frac),
+        out_root)
+    st.session_state["anomaly_pred_out"] = stats
+    _log_usage("anomaly_pred_labels", n=stats["n_boxes"], source=meta.get("score_mode"))
+
+
+def _anomaly_pred_label_panel(result: dict) -> None:
+    """② 結果區:「⚡ 由熱力圖產生預標」。object 模式無 pmap → 按鈕反灰。"""
+    meta = (st.session_state.get("anomaly_model") or {}).get("meta", {}) or {}
+    is_patch = (meta.get("score_mode") or result.get("_score_mode")) == "patch"
+    with st.container(border=True, key="anomaly_pred_panel"):
+        pc1, pc2 = st.columns([4, 1], vertical_alignment="bottom")
+        with pc1:
+            st.markdown("**⚡ 由熱力圖產生預標（YOLO 格式）**")
+            st.caption(
+                "把 patch 異常熱力圖轉成 YOLO 6 欄預測框，產出與模型預測**完全同形**的"
+                "「預測資料夾」，可直接餵 Visualize 的「🧪 挖錯」面板，或當送標的預標。"
+                " :gray[誠實界線：框粒度受 **patch 網格**限制、只有**單一類別 `defect`**、"
+                "只適用**瑕疵型**資料；一般多類物件偵測請用真的偵測器。]")
+        with pc2:
+            with st.popover("參數", use_container_width=True):
+                st.slider("quantile（閾值分位）", 0.90, 0.999, 0.98, 0.001,
+                          key="anomaly_pred_q", format="%.3f",
+                          help="分數高於此分位的 patch 才算異常區。"
+                               "**瑕疵佔物件面積越大，這個值要調越低**，否則只會框到最熱的一小塊"
+                               "（位置仍對，但框不住整塊瑕疵）。例：瑕疵約佔 1/4 面積時用 0.90 左右。")
+                st.slider("min_area_frac（最小區域佔比）", 0.0001, 0.02, 0.001, 0.0001,
+                          key="anomaly_pred_area", format="%.4f",
+                          help="小於此佔比的連通區域視為雜點濾掉。")
+        st.button(
+            "⚡ 產生預標", key="anomaly_make_pred", use_container_width=True,
+            disabled=not is_patch,
+            help=("目前模型的分數依據是 **object**，沒有 patch 熱力圖可轉框。"
+                  "要用這個功能請在 ① 以 **patch** 模式建模。" if not is_patch
+                  else "產物寫進 .lv_cache，不會碰你的資料集。"),
+            on_click=_anomaly_make_pred_labels,
+            args=(float(st.session_state.get("anomaly_pred_q", 0.98)),
+                  float(st.session_state.get("anomaly_pred_area", 0.001))))
+        if st.session_state.get("_anomaly_pred_err"):
+            st.error(st.session_state["_anomaly_pred_err"])
+        out = st.session_state.get("anomaly_pred_out")
+        if out:
+            st.success(f"產出 **{out['n_images']}** 張 / **{out['n_boxes']}** 框 → "
+                       f"`{out['out_root']}`")
+            st.button("➡ 填入 Visualize 的模型預測資料夾", key="anomaly_pred_to_viz",
+                      use_container_width=True,
+                      on_click=_set_viz_pred_root, args=(out["out_root"],),
+                      help="填進去之後：Visualize 會長出「🧪 挖錯」面板，"
+                           "送標時也能選「模型預測」當預標來源。")
+            if st.session_state.get("_anomaly_pred_filled") == out["out_root"]:
+                st.caption("✅ 已填入 Visualize 的「模型預測資料夾」——切到 "
+                           "**Visualize → Object Detector**，就會看到「🧪 挖錯」面板。")
 
 
 def _anomaly_ui() -> None:
@@ -2406,10 +2544,11 @@ def _render_select_view(
         _send_to_labeling_ui(
             records, sel_indices, source="selection", task=_sel_task,
             label="📤 送到 Labeling 標註", key="viz_sel_to_labeling",
+            show_task_picker=True,
             original_labels={i: records[i].get("label", "") for i in sel_indices},
             payload={"scores": _scores} if _scores else None,
             help="把框選的這批（分歧／離群／重複皆可）送到 Labeling 逐張標／改類別；"
-                 "分歧／離群分數隨件帶過。標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
+                 "分歧／離群分數隨件帶過。標完在 Labeling 端「匯出 / 回傳」，再回 LV『📥 標註回饋』套用讀回。")
 
     outlier = st.session_state.get("viz_outlier_scores", {}).get(model_name)
     disagreement = st.session_state.get("viz_label_disagreement", {}).get(model_name)
@@ -2709,7 +2848,7 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
             payload={"pairs": [[int(i), int(j), (d if isinstance(d, int) else float(d))]
                                for i, j, d in pairs]},
             help="把疑似重複／跨 split 洩漏『對』成對送到 Labeling 覆核（保留/丟棄）；"
-                 "配對關係與距離隨件帶過，去重決策在 Labeling 端完成（不自動刪），不用回 LV。")
+                 "配對關係與距離隨件帶過，去重決策在 Labeling 端完成（不自動刪）；標完回 LV『📥 標註回饋』套用讀回。")
         with st.container(height=480, key="viz_dup_list"):
             for row, (i, j, d) in enumerate(shown_pairs):
                 dd = f"{d}" if isinstance(d, int) else f"{d:.4f}"
@@ -2733,58 +2872,341 @@ def _render_dup_view(records: list[dict], model_name: str) -> None:
                               on_click=_add_one, args=(records, j, "duplicate"))
 
 
-def _run_sampling(model_name: str, n: int, seed_from_list: bool) -> None:
-    """F6: pick the N most diverse unlabeled images to label next."""
+_SAMP_FPS = "多樣性（FPS）"
+_SAMP_HYBRID = "混合（不確定×多樣）"
+_UNC_DISAGREE, _UNC_OUTLIER, _UNC_LOWCONF = "標籤分歧", "離群度", "低信心"
+
+
+def _uncertainty_for(model_name: str, source: str, records: list[dict]):
+    """不確定分數（越大越該標）。三個來源都是**既有訊號**，不另造新分數。
+    訊號不存在 → None（呼叫端誠實顯示原因，不靜默退化成別的策略）。"""
+    if source == _UNC_DISAGREE:
+        d = st.session_state.get("viz_label_disagreement", {}).get(model_name)
+        return np.asarray(d, dtype=float) if d is not None else None
+    if source == _UNC_OUTLIER:
+        o = st.session_state.get("viz_outlier_scores", {}).get(model_name)
+        return np.asarray(o, dtype=float) if o is not None else None
+    if source == _UNC_LOWCONF:
+        pred_root = _pred_root_path()
+        if pred_root is None:
+            return None
+        import gt_pred_diff as GPD
+        unc = np.zeros(len(records), dtype=float)
+        for i, r in enumerate(records):
+            boxes = parse_yolo_boxes_conf(
+                GPD.pred_label_path_for(Path(r["path"]), pred_root))
+            confs = [b[5] for b in boxes if b[5] is not None]
+            unc[i] = 1.0 - (max(confs) if confs else 0.0)   # 完全沒預測 → 最不確定
+        return unc
+    return None
+
+
+def _handled_indices(records: list[dict]) -> set[int]:
+    """pool_registry 裡已送標／已標的樣本索引 —— 迴圈的「永不重複送標」記憶。"""
+    import pool_registry as PR
+    manifest = st.session_state.get("viz_manifest")
+    sha_by_idx: dict[int, str] = {}
+    for i, r in enumerate(records):
+        try:
+            sha_by_idx[i] = LH._sha_for(r, manifest)
+        except Exception:  # noqa: BLE001  無法取 sha 的檔案沒有池身分,不算已處理
+            pass
+    if not sha_by_idx:
+        return set()
+    new_shas, _ = PR.partition_new(list(dict.fromkeys(sha_by_idx.values())))
+    new_set = set(new_shas)
+    return {i for i, s in sha_by_idx.items() if s not in new_set}
+
+
+def _run_sampling(model_name: str, n: int, seed_from_list: bool,
+                  strategy: str = _SAMP_FPS, unc_source: str = _UNC_OUTLIER,
+                  oversample: int = 3, weak_quota: bool = False,
+                  skip_handled: bool = True) -> None:
+    """F6 / M11: pick the N images most worth labeling next.
+
+    ``多樣性（FPS）``＝純 farthest-point（現況行為）。
+    ``混合（不確定×多樣）``＝先取 top-(oversample×K) 最不確定，再在其中跑 FPS——
+    修掉「最不確定前 K 張其實是同一群近重複」的批次主動學習陷阱。"""
     raw = st.session_state.get("viz_raw_embeddings", {}).get(model_name)
     if raw is None:
         return
     records = st.session_state["viz_records"]
+    token = st.session_state.get("viz_data_token")
     seeds = None
     if seed_from_list:
         elist = st.session_state.get("viz_export_list", {})
         by_path = {str(Path(r["path"]).resolve()): i for i, r in enumerate(records)}
         seeds = [by_path[k] for k in elist if k in by_path] or None
-    picks = farthest_point_sampling(raw, int(n), seed_indices=seeds)
-    st.session_state["viz_sampling"] = {"token": st.session_state.get("viz_data_token"),
-                                        "picks": picks, "seeded": bool(seeds)}
-    st.toast(f"已選出 {len(picks)} 張多樣性樣本", icon="🎯")
-    _log_usage("sampling", n=len(picks), seeded=bool(seeds))
+
+    if strategy != _SAMP_HYBRID:
+        picks = farthest_point_sampling(raw, int(n), seed_indices=seeds)
+        st.session_state["viz_sampling"] = {"token": token, "picks": picks,
+                                            "seeded": bool(seeds), "strategy": _SAMP_FPS}
+        st.toast(f"已選出 {len(picks)} 張多樣性樣本", icon="🎯")
+        _log_usage("sampling", n=len(picks), seeded=bool(seeds))
+        return
+
+    import hybrid_sampler as HS
+    unc = _uncertainty_for(model_name, unc_source, records)
+    if unc is None:
+        st.session_state["viz_sampling"] = {
+            "token": token, "picks": [], "seeded": False, "strategy": _SAMP_HYBRID,
+            "error": f"目前沒有「{unc_source}」訊號可用。"
+                     "（標籤分歧／離群度需 Run 時算出；低信心需先在側欄填模型預測資料夾。）"}
+        return
+
+    exclude = _handled_indices(records) if skip_handled else set()
+    labels = [r.get("label") or "" for r in records]
+    quota = None
+    if weak_quota:
+        from collections import Counter
+        cnt = Counter(l for l in labels if l)
+        if cnt:
+            weakest = min(cnt, key=lambda c: cnt[c])   # 樣本最少的類 → 保底名額
+            quota = {weakest: max(1, int(n) // max(len(cnt), 1))}
+
+    picks = HS.hybrid_select(raw, unc, int(n), oversample=int(oversample),
+                             exclude=exclude, labels=labels, class_quota=quota,
+                             seed_idx=seeds)
+    top_k = [int(i) for i in np.argsort(-unc, kind="stable")][:int(n)]
+    st.session_state["viz_sampling"] = {
+        "token": token, "picks": picks, "seeded": bool(seeds), "strategy": _SAMP_HYBRID,
+        "unc_source": unc_source, "quota": quota, "n_excluded": len(exclude),
+        "dups": HS.near_duplicate_pairs(raw, picks),
+        "dups_topk": HS.near_duplicate_pairs(raw, top_k),
+    }
+    st.toast(f"混合選樣：選出 {len(picks)} 張", icon="🎯")
+    _log_usage("sampling_hybrid", n=len(picks), source=unc_source)
+
+
+# 模型預測資料夾要能**跨工具**帶值(瑕疵偵測「➡ 填入」→ Visualize),但 Streamlit 會在
+# 「某個 widget 沒被 render 的那些 run」把它的 key **重設回 widget 預設值**。若直接拿
+# widget key 當真相來源,從瑕疵偵測走到 Visualize 的路上值就被清成空字串(踩過)。
+# 故:`viz_pred_root` = 持久的**非 widget** key(真相來源);widget 另用 `_INPUT` key,
+# 外部改值時 pop 掉 widget key 讓它從 value= 重新初始化。
+_PRED_ROOT = "viz_pred_root"
+_PRED_ROOT_INPUT = "viz_pred_root_input"
+
+
+def _pred_root_path() -> Path | None:
+    """目前的模型預測資料夾（存在才回 Path）。空字串／不存在 → None。"""
+    raw = (st.session_state.get(_PRED_ROOT) or "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.is_dir() else None
+
+
+def _pick_pred_root() -> None:
+    """📁 原生對話框選預測資料夾 → 寫持久 key 並讓輸入框重新初始化。"""
+    from tkinter import filedialog
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        picked = filedialog.askdirectory()
+    finally:
+        root.destroy()
+    if picked:
+        st.session_state[_PRED_ROOT] = picked
+        st.session_state.pop(_PRED_ROOT_INPUT, None)
+
+
+_PRED_QUEUES = [("漏抓 FN", "fn"), ("誤抓 FP", "fp"),
+                ("類別混淆", "confused"), ("低信心", "low_conf")]
+
+
+def _render_pred_diff_view(records: list[dict]) -> None:
+    """🧪 模型錯誤挖掘：GT × 模型預測比對 → 漏抓／誤抓／類別混淆／低信心四個佇列。
+
+    讓「模型自己」指出該標哪些圖：與其隨機翻資料，不如先看模型錯得最兇的那幾張。
+    送標時策略名帶 ``pred_diff:<佇列>``，直通回合帳本（09）。"""
+    import gt_pred_diff as GPD
+
+    pred_root = _pred_root_path()
+    if pred_root is None:
+        st.error("模型預測資料夾不存在。請在側欄重新指定。")
+        return
+
+    # ⚠ 物件級記錄的 `rec["path"]` 是 **.lv_cache 的裁切圖**，`image_path` 才是使用者資料夾裡的
+    # 原圖（見 _rec_fname）。挖錯是**整圖**的事（GT 與預測都在原圖座標系），而且送標必須送
+    # **原圖**而不是裁切圖。故先把記錄折成「每張原圖一筆」的 pseudo records。
+    img_recs: list[dict] = []
+    idx_of_img: dict[str, int] = {}
+    first_rec_of_img: dict[str, int] = {}
+    for i, r in enumerate(records):
+        p = str(Path(r.get("image_path") or r["path"]))
+        if p not in idx_of_img:
+            idx_of_img[p] = len(img_recs)
+            first_rec_of_img[p] = i
+            img_recs.append({"path": p, "label": r.get("label", ""),
+                             "split": r.get("split", "")})
+
+    with st.container(key="viz_pred_diff_panel"):
+        st.caption("拿模型的預測跟現有標註（GT）逐框比對，挑出模型**錯得最兇**的圖優先送標。"
+                   "紅框＝GT，藍框＝模型預測。（以**整張圖**為單位，送標送的是原圖。）")
+        c1, c2 = st.columns(2)
+        iou_thr = c1.slider("IoU 門檻（多重疊才算同一個框）", 0.1, 0.9, 0.5, 0.05,
+                            key="pd_iou_thr")
+        low_conf = c2.slider("低信心門檻（conf 低於此值進低信心佇列）", 0.05, 0.95, 0.5, 0.05,
+                             key="pd_low_conf")
+
+        sig = (str(pred_root), round(iou_thr, 3), round(low_conf, 3),
+               st.session_state.get("viz_data_token"))
+        if st.session_state.get("_pd_sig") != sig:
+            with st.spinner("比對 GT 與模型預測中…"):
+                st.session_state["_pd_rows"] = GPD.scan_dataset(
+                    img_recs, pred_root, iou_thr=iou_thr, low_conf=low_conf)
+            st.session_state["_pd_sig"] = sig
+        rows = st.session_state.get("_pd_rows") or []
+        if not rows:
+            st.info("沒有可比對的圖：GT 與預測都是空的（或預測資料夾裡沒有對應檔名的 txt）。")
+            return
+
+        path_to_idx = idx_of_img
+        st.session_state.setdefault("pd_queue", _PRED_QUEUES[0][0])
+        counts = {key: sum(1 for r in rows if r["report"][key]) for _, key in _PRED_QUEUES}
+        labels = [f"{name}（{counts[key]}）" for name, key in _PRED_QUEUES]
+        label_to_key = dict(zip(labels, [k for _, k in _PRED_QUEUES]))
+        if st.session_state.get("pd_queue") not in labels:
+            st.session_state["pd_queue"] = labels[0]
+        qlabel = st.segmented_control("佇列", labels, key="pd_queue",
+                                      label_visibility="collapsed") or labels[0]
+        qkey = label_to_key[qlabel]
+
+        hits = [r for r in rows if r["report"][qkey]]      # rows 已依 score 降冪
+        if not hits:
+            st.success(f"「{qlabel}」佇列是空的 —— 這個面向模型沒出錯。")
+            return
+        st.caption(f"{len(hits)} 張圖落在此佇列（由錯得最兇排到最輕）。")
+
+        # 購物車 / 送標一律走 img_recs（原圖），不是物件裁切圖
+        idxs = [path_to_idx[r["path"]] for r in hits if r["path"] in path_to_idx]
+        st.button("⬇ 全部加入匯出清單", key="pd_addall", use_container_width=True,
+                  on_click=_batch_add, args=(img_recs, idxs, f"pred_diff_{qkey}"))
+        _send_to_labeling_ui(
+            img_recs, idxs, source="pred_diff", task=LH.TASK_VERIFY,
+            label="📤 送這個佇列到 Labeling 標註", key=f"pd_send_{qkey}",
+            strategy=f"pred_diff:{qkey}",
+            strategy_params={"iou_thr": iou_thr, "low_conf": low_conf, "queue": qkey},
+            help="把模型錯得最兇的這批送去人工覆核；標完回『📥 標註回饋』套用讀回。")
+
+        n_cols = st.slider("每列幾張", 1, 5, 3, key="pd_cols")
+        height = st.slider("圖片牆高度", 200, 1000, 520, 20, key="pd_gallery_h")
+        with st.container(height=height):
+            cols = st.columns(n_cols)
+            for j, r in enumerate(hits[:60]):
+                rep = r["report"]
+                with cols[j % n_cols]:
+                    gt = GPD._gt_boxes_for(Path(r["path"]))
+                    pred = parse_yolo_boxes_conf(
+                        GPD.pred_label_path_for(Path(r["path"]), pred_root))
+                    img = draw_two_sources(Path(r["path"]), gt, pred,
+                                           st.session_state.get("viz_classes"))
+                    if img is None:
+                        st.warning("⚠ 影像損壞")
+                        continue
+                    st.image(img, use_container_width=True,
+                             caption=f"{Path(r['path']).name} · 錯誤分 {rep['score']:.1f}"
+                                     f" · 漏{len(rep['fn'])}/誤{len(rep['fp'])}"
+                                     f"/混{len(rep['confused'])}/低信{len(rep['low_conf'])}")
+                    # 看圖跳回**真實** viz 記錄的索引(該原圖的第一個物件),不是 pseudo 索引
+                    rec_i = first_rec_of_img.get(r["path"])
+                    if rec_i is not None:
+                        st.button("看圖", key=f"pd_view_{rec_i}", use_container_width=True,
+                                  on_click=_set_active_image, args=(rec_i, [rec_i]))
+        if len(hits) > 60:
+            st.caption(f":gray[只顯示前 60 張（共 {len(hits)} 張）；送標／加清單仍涵蓋全部。]")
 
 
 def _render_sampling_view(records: list[dict], model_name: str) -> None:
     """F6 多樣性選樣 / 主動學習：farthest-point 從資料集挑最該標的 N 張。"""
     _render_viewer_slot(records, [])
     with st.container(key="viz_sampling_panel"):
-        st.caption("用 farthest-point（k-center greedy）挑出彼此最不像、"
-                   "最該優先標註的一批樣本。勾「避開匯出清單」＝把清單當已覆蓋，"
-                   "只挑沒被涵蓋到的新樣本（主動學習）。")
+        strategy = st.radio(
+            "選樣策略", [_SAMP_FPS, _SAMP_HYBRID], horizontal=True,
+            key="viz_samp_strategy",
+            help="多樣性＝只看「彼此最不像」。混合＝先取最不確定的一批候選，再在候選裡挑多樣的"
+                 "——避免「最不確定的前 K 張其實是同一群近重複」。")
+        is_hybrid = strategy == _SAMP_HYBRID
+        if is_hybrid:
+            st.caption("先取 top-(oversample×K) 最不確定，再在候選池上跑 FPS 取 K。"
+                       "解決批次主動學習的經典陷阱：純 top-K 不確定常常選到一堆近重複。")
+        else:
+            st.caption("用 farthest-point（k-center greedy）挑出彼此最不像、"
+                       "最該優先標註的一批樣本。勾「避開匯出清單」＝把清單當已覆蓋，"
+                       "只挑沒被涵蓋到的新樣本（主動學習）。")
+
         c1, c2 = st.columns([1, 2])
         n = c1.number_input("選幾張", min_value=1, max_value=min(200, len(records)),
                             value=min(12, len(records)), key="viz_sampling_n")
         seed = c2.toggle("避開匯出清單（主動學習）", key="viz_sampling_seed",
                          help="把目前匯出清單視為『已標/已覆蓋』，只挑離它最遠的新樣本。")
-        st.button("🎯 挑選多樣性樣本", key="viz_sampling_btn", use_container_width=True,
-                  on_click=_run_sampling, args=(model_name, n, seed))
+
+        unc_source, oversample, weak_quota, skip_handled = _UNC_OUTLIER, 3, False, True
+        if is_hybrid:
+            sources = [_UNC_DISAGREE, _UNC_OUTLIER]
+            if _pred_root_path() is not None:
+                sources.append(_UNC_LOWCONF)     # 吃 10 號的預測 conf
+            if st.session_state.get("viz_unc_source") not in sources:
+                st.session_state["viz_unc_source"] = _UNC_OUTLIER
+            h1, h2 = st.columns([2, 1])
+            unc_source = h1.selectbox(
+                "不確定來源", sources, key="viz_unc_source",
+                help="哪一種「模型沒把握」的訊號拿來當優先度。低信心來源需先在側欄填模型預測資料夾。")
+            oversample = h2.slider("候選倍率 oversample", 2, 10, 3, key="viz_samp_oversample",
+                                   help="候選池 = 最不確定的 oversample×K 張。越大越重多樣、越小越重不確定。")
+            weak_quota = st.checkbox(
+                "弱類自動配額（最少的類保底 K÷類數 張）", value=False, key="viz_samp_quota",
+                help="樣本最少的那一類保證拿到名額，免得它永遠選不進來。")
+            skip_handled = st.checkbox(
+                "剔除已送標／已標的樣本", value=True, key="viz_samp_skip_handled",
+                help="接主動學習池帳本（pool_registry）：預設不重複送同一張圖。")
+
+        st.button("🎯 挑選樣本", key="viz_sampling_btn", use_container_width=True,
+                  on_click=_run_sampling,
+                  args=(model_name, n, seed, strategy, unc_source, oversample,
+                        weak_quota, skip_handled))
 
         res = st.session_state.get("viz_sampling")
         if not res or res.get("token") != st.session_state.get("viz_data_token"):
-            st.info("設定數量後按「挑選」。結果按多樣性排序（越前越獨特）。")
+            st.info("設定數量後按「挑選」。")
+            return
+        if res.get("error"):
+            st.warning(res["error"])
             return
         picks = res["picks"]
         if not picks:
-            st.info("沒有可挑選的樣本（清單可能已覆蓋全部）。")
+            st.info("沒有可挑選的樣本"
+                    + ("（已送標／已標的樣本被剔除後就沒剩了；可取消勾選「剔除已送標」）。"
+                       if res.get("n_excluded") else "（清單可能已覆蓋全部）。"))
             return
+
+        was_hybrid = res.get("strategy") == _SAMP_HYBRID
         st.caption(f"選出 {len(picks)} 張"
-                   + ("（已避開匯出清單）" if res["seeded"] else "")
-                   + " · 多樣性排序，越前越該優先標")
+                   + ("（已避開匯出清單）" if res.get("seeded") else "")
+                   + (f" · 混合選樣（{res.get('unc_source')}）" if was_hybrid
+                      else " · 多樣性排序，越前越該優先標"))
+        if was_hybrid:
+            # 把改善攤在使用者眼前:同樣 K 張,混合選樣比純 top-K 少了多少近重複
+            st.caption(f"本批近重複對：**{res.get('dups', 0)}**"
+                       f"（純 top-K 不確定會是 {res.get('dups_topk', 0)} 對）"
+                       + (f" · 已剔除 {res['n_excluded']} 張已送標／已標"
+                          if res.get("n_excluded") else "")
+                       + (f" · 弱類配額 {res['quota']}" if res.get("quota") else ""))
+
         st.button("⬇ 全部加入匯出清單", key="viz_sampling_addall",
                   use_container_width=True,
                   on_click=_batch_add, args=(records, picks, "sampling"))
         _send_to_labeling_ui(
             records, list(picks), source="diversity", task=LH.TASK_FRESH,
             label="📤 送待標清單到 Labeling 標註", key="viz_sampling_to_lbl",
+            strategy=(f"hybrid:{res.get('unc_source')}" if was_hybrid else ""),
+            strategy_params=({"unc_source": res.get("unc_source"),
+                              "oversample": int(oversample), "k": int(n)}
+                             if was_hybrid else None),
             help="主動學習：把最多樣的未標樣本送到 Labeling 從頭標註（fresh）；"
-                 "標完在 Labeling 端「匯出 / 回傳」匯出即為新標籤，不用回 LV。")
+                 "標完在 Labeling 端「匯出 / 回傳」即為新標籤，再回 LV『📥 標註回饋』套用讀回。")
         with st.container(height=520):
             cols = st.columns(3)
             for j, i in enumerate(picks):
@@ -3286,7 +3708,7 @@ def _render_export_view() -> None:
         label="📤 送整車到 Labeling 標註", key="cart_to_labeling",
         original_labels={i: s.get("label", "") for i, s in enumerate(snapshots)},
         help="把整車影像送到 Labeling 工具逐張標/改類別；標完在 Labeling 端"
-             "「匯出 / 回傳」匯出即完成，不用回 LV。")
+             "「匯出 / 回傳」，再回 LV『📥 標註回饋』套用讀回。")
 
     d1, d2 = st.columns(2)
     d1.download_button(
@@ -3335,10 +3757,14 @@ def _render_right_panel(
     # 收到旗標時跳出 fragment 作 app 範圍 rerun，讓外層 segmented_control 換頁。
     if st.session_state.pop("_cart_app_rerun", False):
         st.rerun(scope="app")
-    st.session_state.setdefault("viz_panel_view", "選取")
+    panels = ["選取", "相似", "重複", "選樣", "體檢卡", "桶①佔比", "匯出清單"]
+    if _pred_root_path() is not None:      # 只在填了模型預測資料夾時長出挖錯面板
+        panels.insert(4, "挖錯")
+    # 面板消失時(清掉預測資料夾)舊選值會落在 options 外 → segmented_control 會炸,先歸位
+    if st.session_state.get("viz_panel_view") not in panels:
+        st.session_state["viz_panel_view"] = "選取"
     view = st.segmented_control(
-        "面板", ["選取", "相似", "重複", "選樣", "體檢卡", "桶①佔比", "匯出清單"],
-        key="viz_panel_view", label_visibility="collapsed",
+        "面板", panels, key="viz_panel_view", label_visibility="collapsed",
     ) or "選取"
 
     if view == "選取":
@@ -3349,6 +3775,8 @@ def _render_right_panel(
         _render_dup_view(records, model_name)
     elif view == "選樣":
         _render_sampling_view(records, model_name)
+    elif view == "挖錯":
+        _render_pred_diff_view(records)
     elif view == "體檢卡":
         _render_health_card(records, model_name)
     elif view == "桶①佔比":
@@ -3364,6 +3792,7 @@ _MODE_CLEAR_KEYS = (
     "viz_query_chain", "viz_outlier_scores", "viz_grid_limit",
     "viz_export_list", "viz_panel_view", "viz_manifest",
     "viz_phashes", "viz_label_disagreement", "viz_dup_result",
+    "_pd_rows", "_pd_sig",        # 挖錯面板的快取(記錄換了就 stale)
     "_bucket1_rows",
 )
 
@@ -3901,6 +4330,26 @@ def _visualize_embeddings_ui() -> None:
             _render_object_policy_ui(
                 [Path(f) for f in st.session_state["viz_folder_list"]])
 
+        if is_object_level:
+            # 模型預測資料夾(選填)。填了才長出「🧪 挖錯」面板,送標也才能改用預測框當預標。
+            # [輸入框|📁] 同列(全 app 一致樣式;📁 是原生對話框,文字輸入是 headless/E2E 可驅動的那條)。
+            _pr1, _pr2 = st.columns([5, 1], vertical_alignment="bottom")
+            with _pr1:
+                _pr_val = st.text_input(
+                    "模型預測資料夾（選填）", value=st.session_state.get(_PRED_ROOT, ""),
+                    key=_PRED_ROOT_INPUT,
+                    placeholder=r"例：runs/detect/predict",
+                    help="YOLO 6 欄預測 txt（class cx cy w h conf）所在資料夾，"
+                         "支援 <root>/labels/*.txt 或平鋪 <root>/*.txt。"
+                         "填了會多一個「🧪 挖錯」面板（漏抓／誤抓／類別混淆／低信心），"
+                         "送標時也可改用預測框當預標（標註者改框而非畫框）。")
+            with _pr2:
+                st.button("📁", key="browse_pred_root", use_container_width=True,
+                          on_click=_pick_pred_root,
+                          help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+            # widget → 持久 key(使用者自己清空欄位時,持久值也要跟著清)
+            st.session_state[_PRED_ROOT] = _pr_val
+
         st.markdown("**② 模型**")
         all_models = available_models()
         if not all_models:
@@ -4104,6 +4553,7 @@ def _visualize_embeddings_ui() -> None:
                         raw, rec_labels, k=k_out)
 
             data_token = uuid.uuid4().hex
+            _apply_readback_overlay(records, {})    # 14: 讀回修正跨 Run 復現(objects)
             st.session_state["viz_records"] = records
             st.session_state["viz_embeddings"] = o_proj
             st.session_state["viz_raw_embeddings"] = o_raw
@@ -4284,6 +4734,7 @@ def _visualize_embeddings_ui() -> None:
             for r in records
         ]
 
+        _apply_readback_overlay(records, manifest_lookup)   # 14: 讀回修正跨 Run 復現
         st.session_state["viz_records"] = records
         st.session_state["viz_embeddings"] = embeddings_per_model
         st.session_state["viz_raw_embeddings"] = raw_per_model
@@ -4584,60 +5035,6 @@ def _visualize_embeddings_ui() -> None:
 
     with col_panel:
         _render_right_panel(records, coords, selected_model, selected_split, scatter_key)
-
-
-def _set_cmp_active(idx: int | None, ctx: list[int] | None = None) -> None:
-    st.session_state["cmp_active_image"] = idx
-    if ctx is not None:
-        st.session_state["cmp_viewer_ctx"] = ctx
-
-
-@st.fragment
-def _render_cmp_panel(cmp_paths: list[Path], cmp_groups: list[str]) -> None:
-    """Compare 的 linked view 右欄：框選的影像縮圖 + 檢視槽（同 Visualize 的
-    互動模型；fragment 隔離，點縮圖不重繪散點）。"""
-    sel_state = st.session_state.get("cmp_selection") or {}
-    sel = (sel_state.get("indices", [])
-           if sel_state.get("token") == st.session_state.get("cmp_data_token") else [])
-    with st.container(height=500, border=True, key="cmp_image_viewer"):
-        idx = st.session_state.get("cmp_active_image")
-        if idx is None or not (0 <= idx < len(cmp_paths)):
-            st.caption("檢視槽 — 在左圖框選資料點後，點下方縮圖在此檢視大圖。")
-        else:
-            p = Path(cmp_paths[idx])
-            ctx = st.session_state.get("cmp_viewer_ctx") or [idx]
-            pos = ctx.index(idx) if idx in ctx else 0
-            h1, h2, h3, h4 = st.columns([5, 1, 1, 1])
-            h1.markdown(f"**{p.name}** — {cmp_groups[idx]} · {pos + 1}/{len(ctx)} · #{idx}")
-            h2.button("◀", key="cmp_img_prev", disabled=pos <= 0,
-                      on_click=_set_cmp_active, args=(ctx[max(pos - 1, 0)],))
-            h3.button("▶", key="cmp_img_next", disabled=pos >= len(ctx) - 1,
-                      on_click=_set_cmp_active, args=(ctx[min(pos + 1, len(ctx) - 1)],))
-            h4.button("✕", key="cmp_img_close", on_click=_set_cmp_active, args=(None,))
-            if p.exists():
-                st.image(str(p), use_container_width=True)
-            else:
-                st.warning(f"找不到檔案：{p}")
-    with st.container(height=560, key="cmp_grid"):
-        if not sel:
-            st.info("在左圖以點選、框選（box）或套索（lasso）圈出資料點，"
-                    "對應影像會立即顯示在這裡。")
-            return
-        shown = sel[:60]
-        st.caption(f"已選取 {len(sel)} 張" +
-                   (f" · 顯示前 {len(shown)}" if len(sel) > len(shown) else ""))
-        cols = st.columns(3)
-        for j, i in enumerate(shown):
-            with cols[j % 3]:
-                p = Path(cmp_paths[i])
-                thumb = _thumb_or_none(p)
-                if thumb is not None:
-                    st.image(thumb, use_container_width=True)
-                else:
-                    st.warning("⚠ 檔案遺失")
-                st.button(f"{cmp_groups[i]}｜{Path(cmp_paths[i]).name}",
-                          key=f"cmp_card_{i}", use_container_width=True,
-                          on_click=_set_cmp_active, args=(i, list(shown)))
 
 
 _CMP_DEMO_A = Path(__file__).parent.parent / "demo" / "imagenette" / "train" / "cassette_player"
@@ -6333,7 +6730,7 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
             payload={"kind": cart_src,
                      "scores": {str(i): float(work_score[i]) for i in picks}},
             help="把補洞／未覆蓋候選送到 Labeling 從頭標註（fresh，未標新樣本）；"
-                 "標完在 Labeling 端「匯出 / 回傳」匯出即完成，不用回 LV。")
+                 "標完在 Labeling 端「匯出 / 回傳」，再回 LV『📥 標註回饋』套用讀回。")
         st.caption(":gray[候選無標籤——暫定類別取自最近鄰，到 Labeling 盲標即為新標籤。]")
         with st.container(height=480):
             cols = st.columns(3)
@@ -7189,41 +7586,128 @@ def _lv_class_opts() -> list[str]:
 
 def _send_to_labeling_ui(records: list[dict], indices, *, source: str, task: str,
                          class_opts: list[str] | None = None, label: str = "📤 送到 Labeling 標註",
-                         key: str | None = None, help: str | None = None, **kw) -> None:
+                         key: str | None = None, help: str | None = None,
+                         strategy: str = "", strategy_params: dict | None = None,
+                         show_task_picker: bool = False, **kw) -> None:
     """One shared button every LV feature drops in: export the subset to a
-    content-addressed handoff folder and switch to Labeling. The hand-over is
-    one-way (LV → Labeling): annotation and feedback complete on the Labeling
-    side, with no return to LV. State lives on disk (_pending.json) and is
-    consumed by Labeling (module_026 auto-prefills the source; module_014 marks
-    the batch done after export)."""
+    content-addressed handoff folder and switch to Labeling. Send state lives on
+    disk (_pending.json) and is consumed by Labeling (module_026 auto-prefills the
+    source; module_014 marks the batch exported). Annotated results return to LV
+    through the 「📥 標註回饋」 tab (apply_readback), closing the active-learning loop.
+
+    M9 bookkeeping (08 pool_registry + 09 round_ledger): before sending, the batch
+    is partitioned by image sha256 against the global pool registry — already
+    sent/labeled samples are excluded by default (a 「仍包含」 checkbox overrides),
+    so no sample is re-sent across tools/rounds. On send it records `mark_sent`
+    and opens/continues a round with `attach_batch`, giving the 📥 timeline a
+    durable, restart-proof memory of what went out and why."""
     import labeling_handoff as LH
+    import pool_registry as PR
+    import round_ledger as RL
+    base_key = key or f"send_lbl_{source}"
     idxs = sorted(set(int(i) for i in indices))
-    n = len(idxs)
-    if st.button(f"{label}（{n}）", key=key or f"send_lbl_{source}",
-                 use_container_width=True, disabled=(n == 0),
+    manifest = st.session_state.get("viz_manifest")
+
+    # sha for each record = identity key for the pool registry. manifest hit →
+    # dict lookup; miss → file hash. Unreadable/missing files get no pool identity
+    # (skipped from accounting) but are still allowed through the send guard.
+    sha_by_idx: dict[int, str] = {}
+    for i in idxs:
+        try:
+            sha_by_idx[i] = LH._sha_for(records[i], manifest)
+        except Exception:  # noqa: BLE001
+            pass
+    uniq_shas = list(dict.fromkeys(sha_by_idx.values()))
+    new_shas, handled = PR.partition_new(uniq_shas)
+    new_set = set(new_shas)
+    n_handled = len(handled)
+
+    # 顯式化標註任務(標註者在 ANnoTation 端會看到):預設沿用來源推導值,可改。只在
+    # 呼叫端 opt-in(如 viz 選樣送標——task 原本靠排序語境隱式推導)時顯示,不打擾
+    # 已有明確 task 的其他送標站。選定值覆寫傳入的 task,送出時寫入 handoff spec。
+    if show_task_picker:
+        _task_labels = {LH.TASK_FRESH: "fresh — 從頭標(未標新樣本)",
+                        LH.TASK_VERIFY: "verify — 覆核(這張對不對)",
+                        LH.TASK_RELABEL: "relabel — 改類別",
+                        LH.TASK_ADJUDICATE: "adjudicate — 爭議裁決"}
+        _task_opts = [LH.TASK_FRESH, LH.TASK_VERIFY, LH.TASK_RELABEL, LH.TASK_ADJUDICATE]
+        _di = _task_opts.index(task) if task in _task_opts else 2
+        task = st.selectbox("標註任務", _task_opts, index=_di,
+                            format_func=lambda t: _task_labels[t], key=f"{base_key}_task",
+                            help="標註者會看到的任務類型;預設依送標來源自動選,可改。")
+
+    # 預標來源(10 gt_pred_diff):填了模型預測資料夾才出現。選「模型預測」→ handoff 內先把
+    # 預測框畫好,標註者是「改框」而不是「從零畫框」。人沒動過的預標不會被當成人工標註讀回
+    # (labeling_handoff 以 seed 內容 hash 辨識),免得模型把自己的預測餵回自己當真值。
+    _pred_root = _pred_root_path()
+    if _pred_root is not None and "seed_source" not in kw:
+        _seed = st.radio(
+            "預標來源", ["gt", "pred"], index=0, horizontal=True,
+            format_func=lambda s: "GT（現有標註）" if s == "gt" else "模型預測（改框）",
+            key=f"{base_key}_seed",
+            help="選「模型預測」會把預測框預先畫進標註檔，標註者只需修正；"
+                 "未被人修改過的預標不算標註，不會被讀回。")
+        if _seed == "pred":
+            kw["seed_source"] = "pred"
+            kw["pred_root"] = _pred_root
+
+    include_handled = False
+    if n_handled:
+        st.caption(f"本批 {len(idxs)} 張：{len(new_set)} 張新樣本；"
+                   f"{n_handled} 張已送標／已標，預設略過。")
+        include_handled = st.checkbox("仍包含已送標／已標的樣本", value=False,
+                                      key=f"{base_key}_include_handled")
+    new_round = st.checkbox("記為新回合", value=True, key=f"{base_key}_new_round",
+                            help="勾選＝這批算一個新的主動學習回合；取消＝掛到目前回合。")
+
+    if include_handled:
+        send_idxs = idxs
+    else:
+        send_idxs = [i for i in idxs
+                     if sha_by_idx.get(i) is None or sha_by_idx.get(i) in new_set]
+    n_send = len(send_idxs)
+
+    if st.button(f"{label}（{n_send}）", key=base_key,
+                 use_container_width=True, disabled=(n_send == 0),
                  help=help or "把這批影像送到 Labeling 工具標註；標完在 Labeling 端"
-                              "「匯出 / 回傳」匯出即完成，不用回 LV。"):
-        out = LH.send_to_labeling(records, idxs, source=source, task=task,
+                              "「匯出 / 回傳」，再回 LV『📥 標註回饋』套用讀回。"):
+        out = LH.send_to_labeling(records, send_idxs, source=source, task=task,
                                   class_options=class_opts or _lv_class_opts(),
-                                  manifest=st.session_state.get("viz_manifest"), **kw)
+                                  manifest=manifest, **kw)
         if out is None:
             st.warning("沒有可送出的影像。")
             return
-        _log_usage("send_to_labeling", source=source, n=n)
+        # what actually landed in the handoff (send_to_labeling dedups by content)
+        try:
+            spec = LH.load_spec(out)
+            sent_shas = [it["sha256"] for it in spec.get("items", [])]
+            batch_id = spec.get("handoff_id") or Path(out).name
+        except Exception:  # noqa: BLE001
+            sent_shas = [sha_by_idx[i] for i in send_idxs if i in sha_by_idx]
+            batch_id = Path(out).name
+        PR.mark_sent(sent_shas, batch_id, tool=source)          # 08: never re-pick
+        strat = strategy or source                              # 09: round memory
+        if new_round or not st.session_state.get("_al_active_round"):
+            rid = RL.start_round(strat, strategy_params or {}, source)
+            st.session_state["_al_active_round"] = rid
+        else:
+            rid = st.session_state["_al_active_round"]
+        RL.attach_batch(rid, batch_id, len(sent_shas))
+        _log_usage("send_to_labeling", source=source, n=n_send)
         # 不在這裡叫 engine 啟動 Labeling：單工具架構下 start(module_026) 會先 stop() 把
         # 正在跑的 LV 自己關掉（Streamlit 連線中斷）。改由 _render_send_confirmation 用
         # postMessage 請 portal 自動切到 Labeling——module_026 會自動帶入此批路徑。
-        # 單向交棒：標完在 Labeling 端匯出即完成，不回 LV。
-        st.session_state["_lv_just_sent"] = (n, source)
+        # 送標是非阻塞交棒（送出即切走）；標完的結果經「📥 標註回饋」回讀套用。
+        st.session_state["_lv_just_sent"] = (n_send, source)
         st.rerun()
 
 
 def _render_send_confirmation() -> None:
     """送出後的確認 + 自動切換到 Labeling。
 
-    LV 對 Labeling 是『單向交棒（送出即忘）』：標註與回饋都在 Labeling 端完成，
-    不需回 LV，所以這裡只負責「送出成功 + 切換」，不再有交接箱／待標清單／讀回。
-    批次狀態仍寫進磁碟 _pending.json，由 Labeling 端消費（module_026 自動帶入來源、
+    送標是非阻塞交棒（送出即切走）：這裡只負責「送出成功 + 切換到 Labeling」，
+    標註結果稍後由「📥 標註回饋」分頁回讀套用（apply_readback），閉合主動學習迴圈。
+    批次狀態寫進磁碟 _pending.json，由 Labeling 端消費（module_026 自動帶入來源、
     module_014 匯出後標記完成）。"""
     sent = st.session_state.pop("_lv_just_sent", None)
     if not sent:
@@ -7231,7 +7715,7 @@ def _render_send_confirmation() -> None:
     st.success(
         f"✅ 已送 {sent[0]} 張到 Labeling（{sent[1]}），正在切換到 Labeling 工具…\n\n"
         "在「資料來源」按「執行」載入此批（路徑已自動帶入）即可標註；"
-        "標完到「匯出 / 回傳」匯出即完成，**不用回 LV**。\n\n"
+        "標完到「匯出 / 回傳」匯出後，**回 LV『📥 標註回饋』套用讀回**。\n\n"
         ":gray[（若沒自動切換：請用上方「工作流程」下拉手動切到 Labeling。"
         "批次已存到磁碟，跨重啟不丟。）]")
     # 請 portal（最上層視窗）自動切到 Labeling 整張 sheet（sheet-annotation）——
@@ -7246,20 +7730,93 @@ def _render_send_confirmation() -> None:
         height=0)
 
 
-def _labeling_readback_ui() -> None:
-    """標註回饋：列出送去 Labeling 的批次，套用已完成的標籤變更回目前 records。
+def _round_for_batch(batch_id: str) -> str | None:
+    """回合帳本是唯一真相：反查哪個 round 收過這個 batch_id(不靠 session)。"""
+    import round_ledger as RL
+    for r in RL.load_rounds():
+        if any(b.get("batch_id") == batch_id for b in r.get("batches", [])):
+            return r["round_id"]
+    return None
 
-    LV 對此段路徑是無狀態重啟的（單一 active tool，切到 Labeling 時 LV 進程被
-    engine 砍掉重開），所以讀回是「使用者主動觸發」的一步，不是自動輪詢——
-    契約與 apply_readback() 見 labeling_handoff.py。"""
+
+def _record_readback_bookkeeping(row: dict, changes: list[dict]) -> None:
+    """套用讀回成功後的 M9 掛帳:08 把有結果的 sha 標 labeled;09 把回讀匯總記到
+    該批所屬回合(查不到 → 存成待補掛 orphan,由 UI 一鍵補掛,不靜默丟)。"""
     import labeling_handoff as LH
-    st.caption("列出送去 Labeling 標註的批次；標完、匯出後回來這裡按「套用讀回結果」，"
-               "把新標籤套進目前載入的資料。不用回 Labeling，也不會自動輪詢。")
-    pending = LH.list_pending()
-    if not pending:
-        st.info("目前沒有任何送出紀錄。到「Visualize Embeddings」送一批到 Labeling 後，"
-                "才會出現在這裡。")
+    import pool_registry as PR
+    import round_ledger as RL
+    from collections import Counter
+    batch_id = row.get("handoff_id") or Path(row["dir"]).name
+    results = LH.read_labeling_results(row["dir"])
+    labeled_shas = [sha for sha, r in results.items() if r.get("label")]
+    if labeled_shas:
+        PR.mark_labeled(labeled_shas, batch_id)                 # 08
+    summary = {"batch_id": batch_id, "n_labeled": len(labeled_shas),
+               "n_changed": len(changes),
+               "changed_by_class": dict(Counter(c["new_label"] for c in changes))}
+    rid = _round_for_batch(batch_id)
+    if rid:
+        RL.record_readback(rid, summary)                        # 09
+        st.session_state.pop("_readback_orphan", None)
+    else:
+        st.session_state["_readback_orphan"] = summary
+
+    # 14 M12: 讀回修正落地(append-only 變更日誌 + 覆蓋層),跨 Run/重啟存活、可稽核、
+    # 不寫使用者資料夾。每筆 change 補算 sha(與 Run 套用覆蓋時同一把 sha),annotator 取結果眾數。
+    import readback_store as RB
+    recs = st.session_state.get("viz_records") or []
+    manifest = st.session_state.get("viz_manifest")
+    annotator = next((r.get("annotator") for r in results.values() if r.get("annotator")), "")
+    corr = []
+    for c in changes:
+        i = c.get("lv_index")
+        if i is None or not (0 <= i < len(recs)):
+            continue
+        try:
+            corr.append({**c, "sha256": LH._sha_for(recs[i], manifest)})
+        except Exception:  # noqa: BLE001 unreadable/missing → skip from overlay
+            continue
+    if corr:
+        RB.record_corrections(corr, batch_id=batch_id, round_id=rid or "",
+                              annotator=annotator)
+
+
+def _apply_readback_overlay(records: list[dict], manifest: dict | None) -> int:
+    """Visualize Run 建完 records 後套用讀回覆蓋層:讓標註者改過的標籤跨 Run/重啟復現。
+    只改記憶體 records,**不寫使用者資料夾**。overlay 為空時零成本短路(不算 sha)。"""
+    import labeling_handoff as LH
+    import readback_store as RB
+    return RB.apply_overlay(records, sha_of=lambda r: LH._sha_for(r, manifest))
+
+
+def _render_readback_audit() -> None:
+    """📥「🩹 讀回修正(稽核)」:誰把哪張從什麼改成什麼、可匯出成版本修正清單。
+    讀自 .lv_cache 變更日誌,原始資料夾不受影響。"""
+    import readback_store as RB
+    summ = RB.corrections_summary()
+    if not summ.get("n_events"):
         return
+    st.markdown("---")
+    st.markdown("##### 🩹 讀回修正(稽核)")
+    st.caption(f"已修正 {summ['n_images']} 圖 · {summ['n_events']} 筆事件"
+               "(覆蓋層存 .lv_cache,跨 Run／重啟存活;原始資料夾不受影響)。")
+    with st.expander("變更日誌", expanded=False):
+        st.dataframe(
+            [{"檔名": e.get("filename", ""), "舊標籤": e.get("old_label", ""),
+              "新標籤": e.get("new_label", ""), "標註者": e.get("annotator", ""),
+              "回合": e.get("round_id", ""), "時間": e.get("ts", "")}
+             for e in reversed(RB.load_changelog())],
+            use_container_width=True, hide_index=True)
+    if st.button("⬇ 匯出修正清單(建立資料版本)", key="readback_export_version",
+                 use_container_width=True):
+        from datetime import datetime as _dt
+        ver_dir = Path(RB.changelog_path()).parent / "readback_versions"
+        out = RB.export_version(ver_dir, _dt.now().strftime("%Y%m%d_%H%M%S"))
+        st.success(f"已匯出修正清單(不可變版本 delta):{out}")
+
+
+def _render_readback_section(pending: list[dict]) -> None:
+    import labeling_handoff as LH
 
     def _row_label(row: dict) -> str:
         return (f"{row.get('source', '?')} · {row.get('task', '?')} · "
@@ -7278,7 +7835,9 @@ def _labeling_readback_ui() -> None:
         return
 
     if st.button("📥 套用讀回結果", key="readback_apply_btn", use_container_width=True):
-        st.session_state["readback_last_changes"] = LH.apply_readback(row["dir"], records)
+        changes = LH.apply_readback(row["dir"], records)
+        st.session_state["readback_last_changes"] = changes
+        _record_readback_bookkeeping(row, changes)
 
     changes = st.session_state.get("readback_last_changes")
     if changes is not None:
@@ -7290,6 +7849,149 @@ def _labeling_readback_ui() -> None:
                 use_container_width=True, hide_index=True)
         else:
             st.info("沒有新的標籤變更（可能還沒人標，或標籤沒變）。")
+
+    orphan = st.session_state.get("_readback_orphan")
+    if orphan:
+        st.warning("此批次不屬於任何回合（可能是舊批次或回合帳本被清）。")
+        if st.button("➕ 補掛為新回合", key="readback_attach_new_round"):
+            import round_ledger as RL
+            rid = RL.start_round("readback-recovered", {}, "readback")
+            RL.attach_batch(rid, orphan["batch_id"], orphan.get("n_labeled", 0))
+            RL.record_readback(rid, orphan)
+            st.session_state.pop("_readback_orphan", None)
+            st.rerun()
+
+
+def _run_probe_eval(round_id: str) -> None:
+    """M11/12：用目前載入的 embedding + 標籤訓 linear probe，把代理指標掛進回合帳本。
+
+    誠實界線：probe 是**方向性代理**，不是最終模型成績。**不做自動停** —— plateau 只給建議。"""
+    import probe_eval as PE
+    import round_ledger as RL
+
+    raws = st.session_state.get("viz_raw_embeddings") or {}
+    records = st.session_state.get("viz_records") or []
+    if not raws or not records:
+        st.session_state["_probe_msg"] = (
+            "warning", "目前沒有載入的 embedding。先到 Visualize 跑一次 Run，再回來跑代理評估。")
+        return
+    model = next(iter(raws))
+    emb = np.asarray(raws[model])
+
+    # unknown / 空標籤剔除在 GUI 端（核心函式單一職責，不替呼叫端猜哪些標籤不算數）
+    keep = [i for i, r in enumerate(records)
+            if (r.get("label") or "").strip() not in ("", "unknown")]
+    if len(keep) < 2 or len(emb) != len(records):
+        st.session_state["_probe_msg"] = (
+            "warning", "有標籤的記錄不足（或 embedding 與記錄不對齊），無法訓代理 probe。")
+        return
+    try:
+        res = PE.train_probe(emb[keep], [records[i]["label"] for i in keep])
+    except ValueError as e:
+        # insufficient_class:<類名> → 誠實說是哪一類不足，不靜默略過
+        st.session_state["_probe_msg"] = ("warning", f"跑不了代理評估：{e}")
+        return
+
+    RL.attach_metric(round_id, "probe_acc", round(res["acc"], 4), "probe")
+    RL.attach_metric(round_id, "probe_macro_f1", round(res["macro_f1"], 4), "probe")
+    st.session_state["_probe_msg"] = (
+        "success",
+        f"代理評估完成（{model}）：probe_acc={res['acc']:.3f} · "
+        f"macro-F1={res['macro_f1']:.3f}（train {res['n_train']} / test {res['n_test']}，"
+        f"{len(res['classes'])} 類）")
+
+
+def _render_learning_curve(rounds: list[dict]) -> None:
+    """≥2 個回合帶同名 metric 時,畫累積標註量 vs metric 的學習曲線 + 停止建議。"""
+    import probe_eval as PE
+    import round_ledger as RL
+    from collections import Counter
+    name_counts = Counter(m["name"] for r in rounds for m in r.get("metrics", [])
+                          if m.get("name"))
+    names = [n for n, c in name_counts.items() if c >= 2]
+    if not names:
+        return
+    st.markdown("**📈 學習曲線（x＝累積標註量）**")
+    name = (st.selectbox("指標", names, key="al_curve_metric")
+            if len(names) > 1 else names[0])
+    xs, ys = RL.learning_curve(rounds, name)
+    if len(xs) >= 2:
+        import plotly.graph_objects as go
+        fig = go.Figure(go.Scatter(x=xs, y=ys, mode="lines+markers", name=name))
+        fig.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10),
+                          xaxis_title="累積標註量", yaxis_title=name)
+        st.plotly_chart(fig, use_container_width=True, key="al_learning_curve")
+    adv = PE.plateau_advice(list(xs), list(ys))
+    st.caption(f"**停止建議**：{adv['reason']}")
+    st.caption(":gray[代理指標僅供方向；最終以外部模型驗證為準。"
+               "**是否停止由你決定** —— 本工具不會自動停。]")
+
+
+def _render_al_round_timeline() -> None:
+    """🔁 回合時間軸:每回合一張卡(策略／送出·回讀·變更／metrics)+掛指標表單。
+    讀自 output/rounds.jsonl,跨 app 重啟存活;是 M11/M12 學習曲線與停止判準的底座。"""
+    import round_ledger as RL
+    st.markdown("---")
+    st.markdown("##### 🔁 回合（主動學習迴圈時間軸）")
+    # 不 pop:任何一次無關的 rerun 都會把「只顯示一次」的訊息吃掉,使用者的錯誤原因就
+    # 莫名消失了。留到下次跑代理評估時被覆寫。
+    _pmsg = st.session_state.get("_probe_msg")
+    if _pmsg:
+        (st.success if _pmsg[0] == "success" else st.warning)(_pmsg[1])
+    rounds = RL.load_rounds()
+    if not rounds:
+        st.caption("還沒有任何回合。到探索工具選樣、送標後，這裡會長出回合卡。")
+        return
+    orphans = RL.orphan_events()
+    if orphans:
+        st.caption(f":orange[⚠ {len(orphans)} 筆孤兒事件（掛在不存在的回合上）]")
+    for r in reversed(rounds):
+        rid = r["round_id"]
+        with st.container(border=True, key=f"al_round_{rid}"):
+            st.markdown(f"**{rid}** · 策略：{r.get('strategy') or '—'}")
+            st.caption(f"送出 {r.get('n_sent', 0)} · 回讀 {r.get('n_labeled', 0)} · "
+                       f"變更 {r.get('n_changed', 0)}")
+            metrics = r.get("metrics", [])
+            if metrics:
+                st.caption("指標： " + " · ".join(
+                    f"{m['name']}={m['value']}" for m in metrics if m.get("name")))
+            mc1, mc2, mc3 = st.columns([2, 1, 1])
+            mname = mc1.text_input("指標名", value="", key=f"al_metric_name_{rid}",
+                                   label_visibility="collapsed",
+                                   placeholder="指標名（如 acc）")
+            mval = mc2.number_input("值", value=0.0, step=0.01, format="%.4f",
+                                    key=f"al_metric_val_{rid}",
+                                    label_visibility="collapsed")
+            if mc3.button("➕ 掛指標", key=f"al_metric_add_{rid}",
+                          use_container_width=True) and mname.strip():
+                RL.attach_metric(rid, mname.strip(), float(mval), "manual")
+                st.rerun()
+            st.button("🧪 跑代理評估", key=f"al_probe_{rid}", use_container_width=True,
+                      on_click=_run_probe_eval, args=(rid,),
+                      help="用目前載入的 embedding + 標籤訓一個 linear probe，把 acc / macro-F1 "
+                           "掛到這個回合。這是**方向性代理**，不是最終模型成績。")
+    _render_learning_curve(rounds)
+
+
+def _labeling_readback_ui() -> None:
+    """標註回饋 → 主動學習迴圈中樞：套用 Labeling 標好的結果、掛帳到回合、
+    看回合時間軸與學習曲線。
+
+    LV 對送標這段是無狀態重啟的（單一 active tool，切到 Labeling 時 LV 進程被
+    engine 砍掉重開），所以讀回是「使用者主動觸發」的一步，不是自動輪詢——
+    契約與 apply_readback() 見 labeling_handoff.py。回合／池狀態則落在磁碟
+    （rounds.jsonl／pool_registry.jsonl），跨重啟存活。"""
+    import labeling_handoff as LH
+    st.caption("列出送去 Labeling 標註的批次；標完、匯出後回來這裡按「套用讀回結果」，"
+               "把新標籤套進目前載入的資料並記入回合帳本。不用回 Labeling，也不會自動輪詢。")
+    pending = LH.list_pending()
+    if not pending:
+        st.info("目前沒有任何送出紀錄。到「Visualize Embeddings」送一批到 Labeling 後，"
+                "才會出現在這裡。")
+    else:
+        _render_readback_section(pending)
+    _render_al_round_timeline()
+    _render_readback_audit()
 
 
 def _quiz_ui() -> None:
@@ -8112,15 +8814,15 @@ def main() -> None:
             "  · **Visualize**＝框選看圖、標籤分歧、離群（看**一堆內部**的點）\n"
             "  · **Compare Distributions**＝**兩堆之間**像不像（A vs B 分布距離）\n"
             "  · **完整度熱力圖**＝這堆**內部**哪裡缺／假完整（單一資料集）\n"
-            "- **🏷 標註品質／評估**（量標註與模型好不好）：\n"
-            "  · **組考卷**＝量標註者一致性（**只量，不改資料**）\n"
-            "  · **灰帶覆核**＝對爭議做**有紀錄的裁決**（提議→雙簽→匯出；⚠ **改標只在這**）\n"
-            "  · **評估**＝在共識子集量逐型態 recall（**只讀報表**）\n"
-            "- **匯出清單（策展購物車）**＝跨工具收集 → 一鍵分流到組考卷／灰帶覆核／匯出\n"
-            "- **怎麼串**：探索看到可疑／缺口 → 框選或「加入清單」→ 一鍵送組考卷／"
-            "灰帶覆核 → 匯出。\n"
+            "- **🔧 瑕疵偵測**＝建 Normal Bank、算異常風險、挑高風險樣本送標\n"
+            "- **📦 匯出（策展購物車）**＝跨工具累積候選 → 匯出子集或送 Labeling\n"
+            "- **📥 標註回饋**＝送標後的迴圈中樞：回讀 Labeling 標好的結果、套用讀回\n"
+            "  （標註者一致性、爭議裁決、逐型態 recall 等『標註品質』能力正整併於此，"
+            "規劃見 `5_active_learning_product_review`；不再是獨立工具）\n"
+            "- **怎麼串**：探索看到可疑／缺口 → 框選或「加入清單」→ 送 Labeling 標 → "
+            "回「📥 標註回饋」套用讀回。\n"
             "- **最常搞混的兩對**：『**Compare**＝比兩堆之間』vs『**熱力圖**＝看一堆內部』；"
-            "『**標籤分歧**＝探索哪些點可疑』vs『**灰帶覆核**＝裁決每一點』。\n"
+            "『**標籤分歧**＝Visualize 探索哪些點可疑』vs『**送標**＝送去 Labeling 逐點改』。\n"
             "\n---\n"
             "- **框選看圖**：左圖拖曳框選／套索 → 右欄「選取」縮圖牆\n"
             "- **以文搜圖**：Model 選 *chinese-clip* → 右欄「相似」tab 輸入中文查詢\n"
@@ -8130,7 +8832,7 @@ def main() -> None:
             "- **離群度・標籤分歧**：Run 完自動計算，右欄排序選單切換\n"
             "- **多樣性選樣／主動學習**：右欄「選樣」tab，farthest-point 挑最該優先標的 N 張\n"
             "- **體檢卡 · 三訊號根因診斷**：選一張圖 → 右欄「體檢卡」tab，"
-            "用 S1 人類一致性（組考卷）× S2 覆蓋密度 × S3 模型不確定度 交叉定位 "
+            "用 S1 人類一致性（可手動輸入）× S2 覆蓋密度 × S3 模型不確定度 交叉定位 "
             "H1–H5 根因，直接回答『補資料有沒有用』，可匯出 HTML\n"
             "- **匯出清單**：跨視圖累積選取，匯出 CSV（含 sha256）／ZIP\n"
             "- **策展日誌**：選取面板底部 → 記錄『選了哪批＋為什麼』，跨重啟保存、"
@@ -8141,16 +8843,12 @@ def main() -> None:
             "- **完整度熱力圖**：把資料依兩屬性軸切格，看每格『不太多不太少』、"
             "整體 Coverage Health、缺格清單（紫＝假完整近重複）。可切「嵌入覆蓋圖」"
             "模式：在原始高維空間找稀疏盲區、投影新資料夾排補洞候選、H1–H5 判斷"
-            "補資料有沒有用、一鍵送進組考卷盲標\n"
-            "- **組考卷**：把爭議樣本變盲測考卷，量標註者自我一致率／vs golden／"
-            "多人 Fleiss kappa\n"
-            "- **灰帶覆核**：爭議樣本進覆核佇列，對照錨例 → 提議+品保覆核（雙簽）"
-            "→ 匯出決策（不直接寫回資料集）\n"
+            "補資料有沒有用、把候選一鍵送 Labeling 標註\n"
             "- **資料合約 manifest.jsonl**：每次 Run 自動寫入各資料夾"
             "（sha256／phash／embedding refs），供去重、回溯與下游工具使用"
         )
 
-    # 單向交棒：送出後顯示確認並自動切到 Labeling（不在 LV 端追蹤待標／讀回）
+    # 送出後顯示確認並自動切到 Labeling；批次／回合狀態記入磁碟，回讀在「📥 標註回饋」
     _render_send_confirmation()
 
     # 執行後左側設定列收起；點工具分頁(on_change)會展開，這顆是同分頁時的逃生口。
