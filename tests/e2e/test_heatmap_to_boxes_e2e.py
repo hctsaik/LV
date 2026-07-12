@@ -261,6 +261,13 @@ def test_object_mode_disabled_and_honest_caption_e2e(app_server, browser,
         click_tab(page, TAB_APPLY)
 
         _wait_pred_btn(page, want_enabled=False)   # object 模式無 pmap → 必須反灰
+        # 面板文字要**等它真的畫出來**再讀:滿載下 inner_text() 可能讀到還沒 render 完的空字串
+        # (讀一次就斷言 → 假失敗。踩過:單跑綠、全套紅)。
+        page.wait_for_function(
+            """() => { const p = [...document.querySelectorAll('.st-key-anomaly_pred_panel')]
+                          .find(e => e.offsetParent !== null);
+                       return !!p && (p.innerText || '').includes('patch'); }""",
+            timeout=30000)
         panel = page.locator('.st-key-anomaly_pred_panel:visible').first.inner_text()
         tip = page.locator(f'{_PRED_BTN}:visible').first.get_attribute("title") or ""
         assert "patch" in (panel + tip), "反灰理由必須點名 patch 模式"

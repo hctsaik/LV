@@ -3,7 +3,7 @@
 新流程:① 建模/載入 → ② 套用偵測(分開的目標資料夾)→ ③ 挑樣送人工標(2×2 取樣矩陣)。
 兩條核心真實行為斷言(非 element 存在):
   - test_build_apply_sample_flow:完整走完三步,③ 點一格真的出大圖牆 + 有意義標籤(判定/類別)。
-  - test_semantics_gate_object_no_head:語義=物件類別 → 不訓分類頭(模型狀態顯「無分類頭」、
+  - test_semantics_gate_object_no_head:語義=物件類別 → 不訓分類頭(模型狀態顯「只做異常偵測」、
     ③ 徽章退成 可疑·正常 二分,不含 未知/類別 三分)→ 證語義守門。
 """
 from __future__ import annotations
@@ -32,8 +32,8 @@ def test_build_apply_sample_flow(app_server, browser, yolo_defect_at_nmin):
         # ① 建模(語義=瑕疵類別 → defect)
         build_main = build_model(page, ds["root"], semantic_text="瑕疵類別")
         assert "模型已建立" in build_main, f"① 應建模成功;實際:\n{build_main[:1200]}"
-        # defect + 兩類各 8 ≥ N_min=8 → 含分類頭
-        assert "含分類頭" in build_main, \
+        # defect + 兩類各 8 ≥ N_min=8 → 能分辨瑕疵種類
+        assert "能分辨瑕疵種類" in build_main, \
             f"瑕疵類別且每類達 N_min 應訓出分類頭;實際:\n{build_main[:1200]}"
 
         # ② 套用偵測(目標資料夾用同一 root,測流程接線)
@@ -81,7 +81,7 @@ def test_build_apply_sample_flow(app_server, browser, yolo_defect_at_nmin):
 def test_semantics_gate_object_no_head(app_server, browser, yolo_object_2class):
     """語義守門:door/window 各 10(≥N_min=8)但語義=物件類別 → 不訓分類頭。
     證據(行為差異,非 element 存在):
-      1. ① 模型狀態顯示『無分類頭』(非『含分類頭』)。
+      1. ① 模型狀態顯示『只做異常偵測』(非『能分辨瑕疵種類』)。
       2. ② 套用 → ③ 的 2×2 徽章退成『可疑 N·正常 M』二分,不含『未知/類別』三分。
     資料量足夠、只有語義是 object → 證明 head 被『語義守門』擋掉,非『資料量不足』。"""
     ds = yolo_object_2class
@@ -93,10 +93,10 @@ def test_semantics_gate_object_no_head(app_server, browser, yolo_object_2class):
         # ① 建模,語義=物件類別 → object
         build_main = build_model(page, ds["root"], semantic_text="物件類別")
         assert "模型已建立" in build_main, f"① 應建模成功;實際:\n{build_main[:1200]}"
-        assert "無分類頭" in build_main, \
+        assert "只做異常偵測" in build_main, \
             f"語義=物件類別時不該訓分類頭(語義守門);實際:\n{build_main[:1200]}"
-        assert "含分類頭" not in build_main, \
-            "物件類別語義下絕不應出現『含分類頭』"
+        assert "能分辨瑕疵種類" not in build_main, \
+            "物件類別語義下絕不應出現『能分辨瑕疵種類』"
 
         # ② 套用偵測(同 root 當目標)
         apply_model(page, ds["root"])
@@ -114,15 +114,15 @@ def test_semantics_gate_object_no_head(app_server, browser, yolo_object_2class):
         page.wait_for_timeout(1000)
         sample_main = page.locator('[data-testid="stMain"]').inner_text()
         assert "可疑" in sample_main, \
-            f"無分類頭時徽章/標籤應為『可疑·正常』二分;實際:\n{sample_main[:1500]}"
+            f"只做異常偵測時徽章/標籤應為『可疑·正常』二分;實際:\n{sample_main[:1500]}"
         # ⚠「未知」會出現在模式名「稀有/未知更強」→ 用精確的「判定:Unknown」與三分徽章「類別 」驗證
         assert "判定:Unknown" not in sample_main and "判定:未知" not in sample_main, \
-            f"無分類頭時不該有 Unknown 判定(語義守門證據);實際:\n{sample_main[:1500]}"
+            f"只做異常偵測時不該有 Unknown 判定(語義守門證據);實際:\n{sample_main[:1500]}"
         assert "·類別 " not in sample_main, \
-            f"無分類頭時徽章不該是『正常·類別·未知』三分;實際:\n{sample_main[:1500]}"
-        # 說明文字也明示無分類頭 → 只用 novelty
-        assert "無分類頭" in sample_main, \
-            f"③ 應註明『無分類頭 → 只用 novelty』;實際:\n{sample_main[:1500]}"
+            f"只做異常偵測時徽章不該是『正常·類別·未知』三分;實際:\n{sample_main[:1500]}"
+        # 說明文字也明示只做異常偵測 → 只用 novelty
+        assert "只做異常偵測" in sample_main, \
+            f"③ 應註明『只做異常偵測 → 只用 novelty』;實際:\n{sample_main[:1500]}"
     finally:
         ctx.close()
 
