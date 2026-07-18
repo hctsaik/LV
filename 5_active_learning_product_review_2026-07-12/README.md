@@ -19,7 +19,7 @@
 7. [06_開發交接指南.md](06_開發交接指南.md)：給接手開發 AI 的任務卡（T0–T6）、已驗證現況快照、資料契約對表與硬規則；放行開發後從這份開工。
 8. [07_review_truth_trace.md](07_review_truth_trace.md)：T6 唯讀調查——ANnoTation review 權威真相追查。**修正 05 文件的「P0:Review 兩套真相」定性**：sidecar 與 DB 從不雙寫、不會漂移；真問題是匯出不 gate 於 review。
 9. [08_平台概念差距分析.md](08_平台概念差距分析.md)：比對平台策略補強稿與現有設計，區分已有、部分已有與真正缺少的概念，並裁決 Registry／Audit、Promotion Gate、Backbone、Storage 與治理的先後順序。**2026-07-19 更新**：合併第二份獨立分析（A/B/C 尺度分類、單機最小落地形態、反向盤點）＋第三方逐條程式碼查核附錄；修正 read-back 過時項。
-10. [09_半導體分析與Active_Learning下一階段功能.md](09_半導體分析與Active_Learning下一階段功能.md)：在 M15–M20 已完成的基線上，重新盤點半導體 entity、group/time split、selection bias、風險選樣、校準拒判、Unknown／taxonomy／bank 生命週期，以及 wafer／multi-view 等下一階段缺口。
+10. [09_半導體分析與Active_Learning下一階段功能.md](09_半導體分析與Active_Learning下一階段功能.md)：在 M15–M20 已完成的基線上，重新盤點半導體 entity、group/time split、selection bias、風險選樣、校準拒判、Unknown／taxonomy／bank 生命週期，以及 wafer／multi-view 等下一階段缺口。**2026-07-19 合併**：併入第二份獨立盤點（群組批次標註、Tool/Recipe 顯著性與成本工作點兩個 quick win、植入式驗證設計原則、最小版設計表）；兩份獨立收斂＝缺口可信。
 
 > **開發進度(2026-07-12,User `/goal` 放行後)**：T0 gate 治理、T1 文案/死碼、T2 M9 GUI 接線（pool+round
 > 進送標/📥,真實 E2E 7/7 綠）、T4 ANnoTation closeout 修正、T5 送標顯性化+瑕疵③直送、T6 review 調查、
