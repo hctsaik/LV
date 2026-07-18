@@ -337,27 +337,31 @@ Typed entity schema
 - 建議位階:**P0.5**(它與 selection-bias 控制互補:sentinel 保評估無偏,
   批次標註降成本——一省一保)。
 
-### B. 早期切片補充:兩個低成本 quick win(可與 P0 並行,不衝突)
+### B. 早期切片補充:兩個低成本切片(**exploratory 語意先行**;2026-07-19 依 10 修正)
 
-本文的 P0(typed entity/group split/sentinel)是對的根本順序;但有兩個
-**工程量極小、直接復用 M19/M20 現成件**的切片,可在 P0 進行中先交付價值:
+本文的 P0(typed entity/group split/sentinel)是對的根本順序;有兩個
+**工程量極小、直接復用 M19/M20 現成件**的切片可在 P0 進行中先交付價值——
+但依 [10](10_09功能盤點比較與修正建議.md) §2/§3 的裁決,兩者**先行版一律標
+exploratory**:結論寫「關聯線索/情境模擬」,不供製程歸因、不稱最佳門檻。
 
-1. **Tool/Recipe 差異顯著性檢定**:M20 分組現在只有描述性計數;加一節
-   「分組率 + permutation p 值 + 未達顯著明講」(M19 檢定框架直接複用,
-   多欄位用 max-統計量控多重比較)。回答「B 機台瑕疵率高,是真的還是雜訊?」。
-   驗證:同分佈分組判無差異;植入 tool=B 瑕疵率 ×3 → 判顯著且方向正確。
-2. **成本敏感工作點面板**:輸入 escape:overkill 相對成本 → 在既有分數分佈上
-   畫期望成本曲線、建議門檻(**只建議不自動套**)。它是本文 §5 risk-coverage 的
-   最小前哨,也是 Business Risk 治理的第一塊可觸摸拼圖。
-   驗證:合成已知分佈 → 建議點 == 解析解;成本 1:1 退化為現行對稱行為。
+1. **Tool/Recipe 差異顯著性(exploratory)**:M20 分組現在只有描述性計數;加
+   「分組率 + permutation p 值 + effect size + support + 未達顯著明講」。
+   guardrail(10 §2):文案明講**未控組內相依與混雜**;有 lot/wafer 欄位時自動改
+   **blocked permutation**;多欄位用 max-統計量控多重比較。正式歸因等 P0 基礎。
+   驗證:同分佈判無差異;植入 tool=B 瑕疵率 ×3 → 判顯著且方向正確;
+   另驗 false-positive 率與 power(依 10 §7 分級驗收)。
+2. **成本敏感工作點面板(情境模擬器)**:輸入 escape:overkill 相對成本 → 期望成本
+   曲線 what-if(**只模擬不自動套、不稱 production-optimal**)。正式門檻等
+   calibration + 代表性 audit set(順序見 10 §3)。
+   驗證:合成已知分佈 → 模擬曲線 == 解析解;成本 1:1 退化為對稱行為。
 
 ### C. 補充最小版設計(對應本文 P1/P2 項)
 
 | 本文項 | 補充的單機最小版 |
 |---|---|
-| §11 wafer spatial | metadata CSV 帶 die_x/die_y → 每 wafer 散點(色=類別/分數/分群)+ **空間聚集度 permutation 檢定**(隨機打散座標當 null,聚集不顯著就明講——M19 同款誠實手法)。驗證:植入 edge-ring/scratch pattern → 聚集顯著判定正確。**前提待使用者確認:資料是否有座標欄位。** |
+| §11 wafer spatial | metadata CSV 帶 die_x/die_y → 每 wafer 散點(色=類別/分數/分群)+ 空間聚集度 permutation 檢定。**null 依 10 §4 修正**:同 wafer、有效 die mask 內**受限混洗**、依 product/layout 分層(天真全域打散會假陽性);發現與確認用不同 wafer。驗證:植入 edge-ring/scratch pattern → 聚集顯著判定正確 + false-positive 率受控。**前提待使用者確認:資料是否有座標欄位。** |
 | §15 Similar Case 處置層 | 策展日誌條目升級為「案例」(附結案筆記+根因標籤);以樣搜樣結果旁顯示「命中歷史案例→看筆記」。純 `.lv_cache` JSON。驗證:建案例→海掃同型樣本連回;刪案例不再連。 |
-| 預算規劃器(小) | M5/probe 曲線外推:「輸入 500 張預算 → 預估 recall 增益區間+誠實免責」。 |
+| 預算規劃器(小) | 依 10 §6 降 **P2** 並限縮語意:只報**已觀測區間**邊際增益、best/expected/worst 區間(多 seed/bootstrap)、明示無法預測 Unknown,不做精確承諾。 |
 
 ### D. 驗證設計原則(此份補充的方法論貢獻)
 
@@ -371,8 +375,9 @@ M20(六訊號植入數字全對)已示範此模式,**後續所有缺口項沿用
 
 1. 本文 P0(typed entity → group/time split → sentinel/audit set → 風險受限選樣)
    為主軸——「資料與評估可信」先於一切新功能。
-2. B 節兩個 quick win(Tool/Recipe 顯著性、成本工作點)可**並行先行**(小、無衝突、
-   直接可交付價值)。
+2. B 節兩個切片(Tool/Recipe 顯著性、成本工作點)可**以 exploratory 語意並行先行**
+   (小、無衝突、直接可交付價值;guardrail 見 [10](10_09功能盤點比較與修正建議.md) §2/§3——
+   正式歸因與正式門檻仍等 P0 基礎)。
 3. 群組批次標註(A 節)排 P0.5,與 calibration/promotion gate 同層。
 4. wafer spatial 維持 P1,**但先向使用者確認座標欄位是否存在**——有,它的價值
    會顯著前移;沒有,則此項不成立。
@@ -383,6 +388,9 @@ M20(六訊號植入數字全對)已示範此模式,**後續所有缺口項沿用
 > 且本輪**雙方零事實錯誤**(抽驗:`quiz.py:156/173` 確有 Cohen/Fleiss kappa、
 > `dino_head.py:54` 確有 `fit_temperature`——本檔的「已有基線」宣稱屬實)。
 > 真正的差異在世界觀與四個具體點,記錄如下供後續裁決引用。
+> **後續**:[10_09功能盤點比較與修正建議.md](10_09功能盤點比較與修正建議.md) 對合併節
+> 逐項再審(2026-07-19),其修正(exploratory 語意、wafer null 受限混洗、驗收分級表、
+> 預算器降 P2)已回寫本檔;逐項裁決見該檔文末「作者的逐項回應」。
 
 ### 世界觀差異(所有分歧的根源)
 
