@@ -3192,7 +3192,8 @@ def _render_select_view(
             help="排序說明：空間順序＝縮圖位置模仿散點圖；離群度＝到鄰居的平均距離，"
                  "越高越「孤立」；標籤分歧＝k 近鄰中標籤不同的比例，越高越值得複查標註"
                  "（後兩者僅供排序參考，非品質判定）。卡片文字是「類別｜檔名」"
-                 "（物件級顯示來源原圖檔名），順序即目前排序。",
+                 "（物件級顯示來源原圖檔名），順序即目前排序。"
+                 "要整個資料集的一頁量化報告（重複／洩漏／離群…）→ 🩺 資料體檢。",
         )
 
     _render_viewer_slot(records, shown)
@@ -3992,7 +3993,8 @@ def _render_health_card(records: list[dict], model_name: str) -> None:
         c3.metric("S3 模型不確定度", f"{s3:.2f}", "猶豫" if diag["s3_high"] else "篤定",
                   help=f"量模型：來源＝{s3_src}。")
         st.caption(f":gray[S3 來源：{s3_src}。三訊號需彼此獨立——"
-                   "缺 S1（沒跑組考卷）時 H2 無法觸發，請補測人類一致性。]")
+                   "缺 S1（沒跑組考卷）時 H2 無法觸發，請補測人類一致性。"
+                   "（組考卷入口整併中，S1 目前以上方手動輸入為主。）]")
 
         # kNN 鄰居縮圖牆
         st.markdown("**最近鄰（它長得像誰）**")
@@ -6131,6 +6133,7 @@ def _compare_distributions_ui() -> None:
         else:
             st.caption("整圖 embedding 比 A↔B **整體**分佈：一個整體漂移分數＋A/B 散點"
                        "（框選看縮圖）。適合沒有標註、只想看兩堆影像像不像。")
+        st.caption(":gray[要問「兩堆差在**哪個位置**」（需拍攝對齊，附統計判定）→ 🧪 差異探索]")
         run = st.button("▶ Run", use_container_width=True, key="run_cmp", type="primary")
 
         if unit == _UNIT_OBJ:
@@ -9884,6 +9887,8 @@ def _groupdiff_ui() -> None:
             "比兩群的特徵分布差異，把「系統性不一樣的位置」畫回影像當**製程線索**。\n\n"
             "- 與「瑕疵偵測」不同：那邊是**單張 vs 正常群**（這張哪裡怪）；這裡回答"
             "「**Bad 們跟 Good 們差在哪**」。\n"
+            "- 與「Compare Distributions」不同：那邊比**整體**分布像不像（不需對齊）；"
+            "這裡是**逐位置**差異（需拍攝對齊，附統計判定）。\n"
             "- 前提：兩堆影像**拍攝大致對齊**（同站、同視角），同一位置才可比。\n"
             "- 誠實界線：先用隨機重分組做校準，統計上分不出兩群時會**明講、給警示**，"
             "不硬擠一張好看的熱圖；差異區旁附「幾成 Bad 在此處異於 Good」的穩定度。\n"
@@ -10058,7 +10063,8 @@ def _groupdiff_ui() -> None:
                               yaxis_title=f"PC2（{pc['evr'][1]:.0%}）")
             st.plotly_chart(fig, use_container_width=True, key="gpd_pca")
             st.caption("軸為**非監督** PCA（不吃 Good/Bad 標籤，避免人工推開兩群的假分離）。"
-                       "兩群在這裡也分開＝額外旁證；分不開＝局部差異要更保守解讀。")
+                       "兩群在這裡也分開＝額外旁證；分不開＝局部差異要更保守解讀。"
+                       "要框選看縮圖／整體漂移分數 → Compare Distributions（整張影像模式）。")
         except ValueError as e:
             st.caption(f":gray[樣本不足，略過旁證：{e}]")
 
@@ -10190,6 +10196,11 @@ def _dataset_audit_ui() -> None:
         st.markdown(f"#### {s['title']}：{val}")
         st.write(s["text"])
         st.caption(f":gray[{s['method']}]")
+        _xlink = {"exact_dup": "逐對互動檢視（縮圖對照）→ Visualize 右欄「重複」tab",
+                  "near_dup": "逐對互動檢視（縮圖對照）→ Visualize 右欄「重複」tab",
+                  "outliers": "要互動框選／送標 → Visualize 的「離群度」排序"}.get(s["key"])
+        if _xlink:
+            st.caption(f":gray[{_xlink}]")
         items = s.get("items") or []
         if not items:
             continue
@@ -10279,7 +10290,8 @@ def main() -> None:
             "- **🔍 資料探索／覆蓋**（看資料夠不夠、像不像；不改資料）：\n"
             "  · **Visualize**＝框選看圖、標籤分歧、離群（看**一堆內部**的點）\n"
             "  · **Compare Distributions**＝**兩堆之間**像不像（A vs B 分布距離）\n"
-            "  · **完整度熱力圖**＝這堆**內部**哪裡缺／假完整（單一資料集）\n"
+            "  · **完整度熱力圖**＝這堆**內部**哪裡缺／假完整（embedding 空間的覆蓋；"
+            "split 類別覆蓋缺口在 🩺 資料體檢）\n"
             "- **🔧 瑕疵偵測**＝建 Normal Bank、算異常風險、挑高風險樣本送標\n"
             "- **🧪 差異探索**＝Good 群 vs Bad 群逐 patch 位置比差異 → 差異熱圖＋"
             "Top-K 區域對照（找**製程線索**；與瑕疵偵測的「單張 vs 正常群」不同）\n"
@@ -10291,8 +10303,10 @@ def main() -> None:
             "規劃見 `5_active_learning_product_review`；不再是獨立工具）\n"
             "- **怎麼串**：探索看到可疑／缺口 → 框選或「加入清單」→ 送 Labeling 標 → "
             "回「📥 標註回饋」套用讀回。\n"
-            "- **最常搞混的兩對**：『**Compare**＝比兩堆之間』vs『**熱力圖**＝看一堆內部』；"
-            "『**標籤分歧**＝Visualize 探索哪些點可疑』vs『**送標**＝送去 Labeling 逐點改』。\n"
+            "- **最常搞混的三對**：『**Compare**＝比兩堆之間』vs『**熱力圖**＝看一堆內部』；"
+            "『**標籤分歧**＝Visualize 探索哪些點可疑』vs『**送標**＝送去 Labeling 逐點改』；"
+            "『**Compare**＝兩堆**整體**像不像（不需對齊）』vs『**🧪 差異探索**＝對齊前提下"
+            "差在**哪個位置**（有統計判定）』。\n"
             "\n---\n"
             "- **框選看圖**：左圖拖曳框選／套索 → 右欄「選取」縮圖牆\n"
             "- **以文搜圖**：Model 選 *chinese-clip* → 右欄「相似」tab 輸入中文查詢\n"

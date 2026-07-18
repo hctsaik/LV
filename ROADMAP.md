@@ -7,8 +7,8 @@
 > **🏁 AL Loop Infrastructure(M15–M18)已完成(2026-07-12)**:主動學習迴圈四段(選樣 → 送標 →
 > 回讀 → 評估)閉合。六模組 `pool_registry` / `round_ledger` / `gt_pred_diff` / `hybrid_sampler` /
 > `probe_eval` / `heatmap_to_boxes` / `readback_store` 全數落地,gate 全 GREEN + 真實 E2E 23/23 併跑綠。
-> 進行中的里程碑:**M14(以樣搜樣特徵器解耦,設計中)**。
-> M19(2026-07-18)與 M20(2026-07-19)皆當日走完 `/user`→`/po`→`/architect`→`/pm`→`/pg` **完成**。
+> **目前無進行中的里程碑**(M14 經 2026-07-19 漂移修正確認早已完成,見決策日誌;
+> M19/M20 亦於 2026-07-18/19 完成)。新能力請由新 `/user` 需求起輪;候選清單見 M20 決策日誌。
 >
 > ⚠️ **編號注意:本 repo 有兩條平行的里程碑/模組編號線**(2026-07-12 併軌時的既成事實,PO 決定不追溯重編):
 > - **anomaly / 以樣搜樣線**:M8–M14;模組 08 `al_batch`、09 `al_workspace`、10 `al_service`、
@@ -109,7 +109,14 @@
     [2_PO_PRD/readback_persistence_prd.md](2_PO_PRD/readback_persistence_prd.md);
     設計 `3_Architect_Design/{08_pool_registry, 09_round_ledger, 10_gt_pred_diff, 11_hybrid_sampler,
     12_probe_eval, 13_heatmap_to_boxes, 14_readback_store}.md`;對應表 `4_PM_Feedback/`(七份齊)。
-- **M14 — 以樣搜樣特徵器解耦(免整包建模,B+E)** — 📝 **設計中**
+- **M14 — 以樣搜樣特徵器解耦(免整包建模,B+E)** — ✅ **完成**
+  (實作於先前 session:commit `07d4b0e` 核心 B+E、`29e1b28` M14b UX 合併②③、
+  `641f5ea` M14c 匯出複製影像;**本條目原停留在「設計中」屬 ROADMAP 漂移,
+  2026-07-19 查證後修正**,詳見決策日誌。驗證現況:gate al_batch **31**(含 AC-RL-1~5
+  retrieve 免 bank/特徵器身分)/ sample_bank **16**(meta object_source 自描述)/
+  al_service **11**(retrieve 免 model_dir)全 GREEN;E2E `test_fewshot_scenarios_e2e.py`
+  10 情境(M14b)在套件中。設計 [3_Architect_Design/M14_extractor_decouple.md](3_Architect_Design/M14_extractor_decouple.md)
+  + [M14c_export_images.md](3_Architect_Design/M14c_export_images.md)。)— 📝 ~~設計中~~
   (2026-07-06 起;多 agent 討論 [wf_2da7ae02] + code 驗證確認「先建整包模型」是抽象副作用非真實依賴)—
   問題:M13 的以樣搜樣強迫使用者先到『瑕疵偵測』①建/存整包 anomaly 模型再回來選 dataset(14 步/3 夾/2 切換),
   但 retrieve 只需「特徵器身分(model 名+target_res+object_source)」,anomaly bank/coreset/projection/head 零消費。
@@ -712,3 +719,33 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
   M19 的 E2E 教訓直接複用(工具鈕去 emoji 定位/唯一完成訊號/檔案級斷言防 DOM 假綠),
   零重踩。**M20 後續候選**(依 08 文件,另輪立案):S1/S2/S3 統一語言、AL Promotion Gate、
   特徵版本治理、儲存 GC、兩資料夾距離、報告快照比較。
+- (2026-07-19) **ROADMAP 漂移修正:M14 早已完成,狀態回填 ✅**:準備開工 M14 時發現
+  引擎程式碼已含全部 M14 標記(al_batch `load_feature_extractor`/`_extractor_version`/
+  retrieve 免 bank 短路;sample_bank meta object_source;al_service retrieve 免 model_dir)、
+  git 有 `07d4b0e`(M14 核心 B+E)/`29e1b28`(M14b)/`641f5ea`(M14c)三個 feature commit、
+  設計文件與 AC-RL 單元測試、10 情境 E2E 俱在,三 gate 現跑全 GREEN(31/16/11)——
+  **實作在先前 session 完成但里程碑條目未回填**(同 2026-07-05 M8 漂移修正前例)。
+  PO 查證後回填 ✅,未重做任何工作。教訓再確認:「狀態是人的判斷」雙向適用——
+  檔案存在不能自動推 ✅,**條目停在設計中也不能推未做**,開工前先 `git log` + gate 核對。
+- (2026-07-19) **功能重疊/清晰度盤點(文件輪,無程式碼)**:M19/M20 兩新工具加入後
+  全 app 盤點(對照 2026-07-06 既有盤點)→ [FEATURE_CLARITY_REVIEW_2026-07-19.md](FEATURE_CLARITY_REVIEW_2026-07-19.md)。
+  結論:**無需合併的工具重複**(新工具延續刻意分開紀律、plumbing 正確共用);
+  真重複僅 1 處(M19 PCA 旁證=Compare 整張模式弱化子集,判定保留但指路);
+  待補 **7 句互指文案**(Compare↔差異探索、audit 離群/重複↔viz、coverage 兩義、
+  體檢卡 S1 指向已隱藏的組考卷)——列維護項,待全套 E2E 綠後施作。
+- (2026-07-19) **全套 E2E 蓋棺 + 歸因(87 過/10 紅→分類完畢)**:首次全套併跑(20 分鐘)
+  10 紅。排查:①「單獨重跑失敗清單」對 gui_flows **無效**——它是 module-scoped 測試鏈
+  (test_b 跑 Run、c-f 同頁接力),抽測必斷鏈假紅(**E2E 排查教訓,記入 pitfalls**);
+  ② 整模組重跑仍 7 紅(d/e/f/l/m/t/aa)→ ③ **worktree 1fd92f6(pre-M19)對照:同樣 7 紅
+  + s01/s02 也紅** → 判定 **9 條為既有壞損**(2026-07-02 test 適配綠燈後、07-12 merge 前
+  的某次改動造成;gui_flows/scenarios_r1 自 07-02 起無人跑過,今日才曝光),
+  **與 M19/M20 無關**;④ whole_image 兩版單跑皆綠 → 滿載 radio 時序 flaky。
+  **M19/M20 零 E2E 回歸**(新工具 E2E 3/3 綠、文案修後複驗綠)。
+  **修復候選(高)**:Visualize 選取鏈 7 紅 + s01/s02——建議專輪修復
+  (同 2026-06-26「12 紅→全綠」規模;失敗點=Run 後 viz_status_line 未渲染,
+  疑右欄面板預設/選取面板條件在 07-04~07-12 GUI 改動中變動)。
+- (2026-07-19) **7 句指路文案落地(維護,只動 app.py 文案)**:依 FEATURE_CLARITY_REVIEW——
+  功能地圖「最常搞混」擴為三對(+Compare vs 差異探索)、完整度標註 embedding 覆蓋 vs
+  🩺 split 覆蓋、Compare↔差異探索互指、差異探索 PCA 旁證指 Compare、🩺 離群/重複節指
+  Visualize 互動面、viz 離群 help 指 🩺、體檢卡 S1 註明組考卷整併中。
+  驗證:py_compile + M19/M20 E2E 3/3 綠(文案不含任何 E2E 唯一訊號字串)。
