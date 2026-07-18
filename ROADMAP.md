@@ -7,7 +7,8 @@
 > **🏁 AL Loop Infrastructure(M15–M18)已完成(2026-07-12)**:主動學習迴圈四段(選樣 → 送標 →
 > 回讀 → 評估)閉合。六模組 `pool_registry` / `round_ledger` / `gt_pred_diff` / `hybrid_sampler` /
 > `probe_eval` / `heatmap_to_boxes` / `readback_store` 全數落地,gate 全 GREEN + 真實 E2E 23/23 併跑綠。
-> 唯一仍在進行的里程碑是 **M14(以樣搜樣特徵器解耦,設計中)**。
+> 進行中的里程碑:**M14(以樣搜樣特徵器解耦,設計中)**。
+> M19(2026-07-18)與 M20(2026-07-19)皆當日走完 `/user`→`/po`→`/architect`→`/pm`→`/pg` **完成**。
 >
 > ⚠️ **編號注意:本 repo 有兩條平行的里程碑/模組編號線**(2026-07-12 併軌時的既成事實,PO 決定不追溯重編):
 > - **anomaly / 以樣搜樣線**:M8–M14;模組 08 `al_batch`、09 `al_workspace`、10 `al_service`、
@@ -35,6 +36,52 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M20 — Dataset Audit 報告化 + 製程 metadata 最小關聯(第 11 工具「🩺 資料體檢」)** —
+  ✅ **完成**(2026-07-19 立案並當日完成:gate `meta_join` 7 / `audit_report` 10 /
+  `audit_pipeline` 9 全 GREEN + 真實 DINOv2 E2E **1/1 綠**(AC-G1 植入數字逐項全對:
+  可讀 25/壞檔 1/完全重複 5/洩漏 1/異標 1/val 缺 [classB,classC]/CSV 未匹配列 5/無資料影像 2;
+  AC-G2 純色離群圖入前 10;AC-G3 來源零寫入)+ 全單元回歸 623 passed 零紅。
+  關鍵落地:六訊號全復用既有函式(manifest 增量 sha/phash、find_duplicate_pairs_*、
+  compute_outlier_scores)、embedding **內容定址快取**(sha 為鍵,同內容只算一次)、
+  每指標 **method line**(方法+門檻,G3)、匯出 HTML/JSON/issues.csv、
+  metadata CSV 雙鍵 join(sha 優先/檔名次之,未匹配雙向明講)+ 分組上限 20+"(其他)"。
+  無反向閘門,全程一次綠。)— 依 08_平台概念差距分析的優先序裁決
+  (P0-A 最小 metadata 前置 → P0-B 可重現 Audit)起的第一輪單機落地。需求:六種品質訊號
+  (重複/近重複、跨 split 洩漏、同內容異標、類別/split 覆蓋缺口、離群、壞檔)散在多畫面
+  → **一顆鈕彙總成量化報告**(每指標:數字+白話+**method line**=怎麼算+門檻,落實
+  「Audit 數字要帶校準」差異化)+ **metadata CSV 最小關聯**(檔名/sha256 雙鍵 join、
+  匹配率明講、per-tool/recipe 分組切片)+ 匯出 HTML/JSON/CSV(絕不寫來源)。
+  成功門檻 G1=**植入數字全對**(合成資料植入已知數量問題,報告逐項 ==)。
+  範圍:**Must** 六訊號+CSV 關聯+報告+匯出+進度+新工具分頁;**Should** 縮圖預覽、
+  問題清單進購物車;**Won't** 自動修復/MES 接線/severity 簽核流(C 類)/排程;
+  S1S2S3 語言、Promotion Gate、版本治理、儲存 GC **另輪立案**。
+  模組:**23 `meta_join`(B)**、**24 `audit_report`(A)**、**25 `audit_pipeline`(B)**+
+  GUI 接線(B)。復用:phash/embedding 重複、洩漏掃描、離群、類別發現、manifest、safe_io。
+  需求 [1_user_needs/dataset_audit_metadata.md](1_user_needs/dataset_audit_metadata.md);
+  PRD [2_PO_PRD/dataset_audit_prd.md](2_PO_PRD/dataset_audit_prd.md)。appetite ≤3 模組+GUI 一輪。
+- **M19 — Good/Bad 群組 patch 差異探索(製程線索發現,第 10 工具)** — ✅ **完成**
+  (2026-07-18 立案並當日完成:gate `group_patch_stats` 9 / `diff_regions` 8 / `groupdiff_pipeline` 9
+  全 GREEN + 真實 DINOv2 E2E **2/2 綠**(AC-G1 植入命中:rank1 區域中心落在植入區;AC-G2 null 誠實:
+  同源兩夾明講「未發現穩定差異」;AC-G3 來源零寫入)+ 全單元回歸 709 passed(僅既有 cov s07/s10 flaky)。
+  統計核心:Fisher 分離度(含群內散度)+ permutation max-z null 校準(控 256 patch 多重比較)+
+  穩定度=「幾成 Bad 落在 Good 自身分布外」。GUI=第 10 工具「🧪 差異探索」,主畫面配置(避側欄收合),
+  verdict 分流:顯著→熱圖+Top-K 區域 Good/Bad 對照放大;不顯著→警示+熱圖收合「僅供參考」。
+  一次反向閘門 /pg→/pm(E2E 工具鈕 emoji label `exact=True` 抓不到,沿 fewshot 既證解法修 locator,
+  斷言不變)。)— 需求:製程工程師有已分 Good/Bad 的**拍攝對齊**影像各百餘張,要「**群對群**」找
+  系統性局部差異當製程改善線索(非分類器:重點是**差在哪**、畫回原圖、穩定不是偶然)。現有瑕疵偵測是
+  「單張 vs Normal Bank、不看位置」,回答不了這題。範圍(MoSCoW):**Must** 雙資料夾(整張影像免標註,
+  復用 M8 `discover_whole_images`)+ 每 patch 位置群間差異分數/穩定度(公式 architect 定,**須含群內散度**)
+  + **null 校準誠實判定**(同源隨機分兩堆→明講「無穩定差異」=G2;植入固定位置擾動→Top-1 命中=G1;
+  兩者為硬驗收)+ 差異熱圖(復用 `anomaly_heatmap`)+ Top-K 區域 Good/Bad 對照放大 + 白話穩定度句 +
+  匯出(熱圖 PNG/排名 CSV/對照圖,絕不寫來源)+ 逐張進度;**Should** 散點旁證(**非監督投影**,
+  防 Good/Bad 監督假分離)、對齊性警示、熱圖底圖切換;**Could** ROI 傳統 CV 強化、YOLO 物件模式、進階參數;
+  **Won't** 自動配準/三群+/新圖打分/製程參數關聯/瑕疵類型判讀。模組:**20 `group_patch_stats`(A)**、
+  **21 `diff_regions`(A)**、**22 `groupdiff_pipeline`(B)** + GUI 接線(B,第 10 工具)。復用:
+  `patch_features`(patch token+`.lv_cache` 快取)/ `discover_whole_images` / `anomaly_heatmap` 疊圖 /
+  scipy 連通域慣例(`heatmap_to_boxes` 同款)。驗證注記:fruit 缺陷位置隨機、**不適合**本功能的位置型
+  情境驗證,質性驗證改用 MVTec pill 等對齊資料(非阻擋)。需求
+  [1_user_needs/goodbad_patch_diff.md](1_user_needs/goodbad_patch_diff.md);PRD
+  [2_PO_PRD/goodbad_patch_diff_prd.md](2_PO_PRD/goodbad_patch_diff_prd.md)。appetite ≤3 模組+GUI 一輪做完。
 - **M15–M18 — AL Loop Infrastructure(把主動學習串成迴圈)** — ✅ **全部完成**(2026-07-12) —
   ⚠️ 本輪原以 M9–M12 開發,併軌時發現與 anomaly 線的 M9–M12 撞號 → **重編為 M15–M18**
   (模組號碼 08–14 維持不動;模組以**名稱**對齊,見檔頭「編號注意」)。
@@ -210,6 +257,12 @@
 | 12 | probe_eval | B | Must | ✅ | v | v | v | sklearn + 09 | gate 10 綠 + E2E 3/3(M17) |
 | 13 | heatmap_to_boxes | A+B | Must | ✅ | v | v | v | scipy.ndimage;產物直通 10 | gate 11 綠 + E2E 3/3(M16) |
 | 14 | readback_store | A+B | Must | ✅ | v | v | v | 純 stdlib;落 .lv_cache | gate 11 綠 + E2E 3/3(M18) |
+| 20 | group_patch_stats | A | Must | ✅ | v | v | v | 只吃 numpy 陣列 | M19;gate 9 綠;Fisher+permutation null 校準 |
+| 21 | diff_regions | A | Must | ✅ | v | v | v | 20 的輸出陣列 | M19;gate 8 綠;8 連通 Top-K+代表樣本 |
+| 22 | groupdiff_pipeline | B | Must | ✅ | v | v | v | patch_features/interaction + 20/21 | M19;gate 9 綠 + 真實 E2E 2/2(含 GUI 第 10 工具) |
+| 23 | meta_join | B | Must | ✅ | v | v | v | csv/stdlib | M20;gate 7 綠;CSV 雙鍵 join+分組索引 |
+| 24 | audit_report | A | Must | ✅ | v | v | v | 只吃基本型別/numpy | M20;gate 10 綠;量化指標+method line |
+| 25 | audit_pipeline | B | Must | ✅ | v | v | v | 既有訊號函式 + 23/24 | M20;gate 9 綠 + 真實 E2E 1/1(含 GUI 第 11 工具) |
 
 > ⚠️ 本表的 08–14 是 **AL Loop Infrastructure 線(M15–M18)** 的模組。**anomaly / 以樣搜樣線
 > (M8–M14)的模組(`al_batch` / `al_workspace` / `al_service` / `prelabel` / `similarity` /
@@ -614,3 +667,48 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
   一下自癒(該期間掃描鈕 disabled 故無法誤用)。驗證:單元 gate al_batch 31 / al_service 11 / al_workspace 15 /
   anomaly_tool 25 / sample_bank 16 全 **GREEN**;真實 E2E 監看 3/3 + 批次 6/6(修後重跑)+ wizard 2/2 = **11/11 綠**。
   只動 `scripts/app.py`(+ 既有 2 個 E2E 檔配合重排)。維護模式(無 role)。
+- (2026-07-18) **/user→/po 立案 M19「Good/Bad 群組 patch 差異探索」**:使用者提完整需求(DINOv2 patch token
+  群對群比較 → 每位置差異分數 → 差異熱圖疊回原圖 → 製程改善線索)。PO 收斂:定位為**新獨立工具**(第 10 工具)
+  ——與瑕疵偵測「單張 vs 正常群」語義不同(沿 M13 第 9 工具獨立分類教訓);v1 只做整張影像模式(需求前提=
+  拍攝已對齊),YOLO 物件模式降 Could;**null 誠實判定入 Must**(使用者最高信任要求:同源隨機分兩堆須明講
+  「無穩定差異」,寧可說沒有、不可給假熱圖線索;與植入 Top-1 命中並列硬驗收 G1/G2);散點旁證限**非監督**
+  投影(Good/Bad 監督投影會人工推開兩群=假分離,沿 M-全域投影規格的例外邏輯);砍(Won't)自動配準/
+  三群+/分類器用途/製程參數關聯/類型判讀。拆 3 模組(20 `group_patch_stats` A / 21 `diff_regions` A /
+  22 `groupdiff_pipeline` B)+ GUI 接線(B);appetite ≤3 模組+GUI 一輪。使用者原話方法構想留需求文件附錄
+  (採不採由 architect 判斷)。PRD 完成,**待使用者放行 `/architect`**。
+- (2026-07-18) **M19 使用者放行開發 → 當日完成(五階段走完)**:`/architect` 三份設計
+  (20 統計核心=Fisher 分離度含群內散度 + permutation max-z null 校準控多重比較 + 穩定度%;
+  21 區域化=8 連通沿 heatmap_to_boxes 慣例;22 管線=整包復用 embed_objects_patch 含快取、
+  grid 多數決對齊、匯出防呆絕不寫來源)→ `/pm` 26 紅測(含 2 推導測試:score 群交換對稱、
+  峰在 bbox 內)+ 3 對應表 + E2E 3 條 + snapshot 66 契約檔 → `/pg` 三模組 gate 一次全綠
+  (9/8/9)+ GUI 第 10 工具「🧪 差異探索」(主畫面配置沿 M2 教訓;verdict banner=E2E 唯一
+  訊號紀律)。E2E:**合成植入影像**(答案已知才可客觀斷言:Bad 固定區塊瑕疵 / null 同源兩夾)
+  + 真實 DINOv2 → 2/2 綠(28 秒)。全單元回歸 709 passed。
+- (2026-07-18) **反向閘門 /pg → /pm(M19 E2E 首跑)**:E2E 進工具用
+  `get_by_text("🧪 差異探索", exact=True)` 逾時——Streamlit 把 label 的 emoji 拆成獨立
+  DOM 節點,`exact=True` 永遠 miss(fewshot E2E 同坑已證解法)。tests/ 歸 PM,PG 不動測試
+  → PM 修 locator 為去 emoji + `exact=False` + `.first`(僅點擊定位,**斷言全數不變**),
+  對應表記錄。app 端無錯。教訓已回寫 E2E pitfalls 記憶(第 7 陷阱)。
+- (2026-07-19) **平台概念差距分析定案(文件輪,無程式碼)**:使用者供「平台戰略補強稿」→
+  兩份獨立缺口分析(root GAP_ANALYSIS + 5_/08)互比 + 第三方 agent 逐條程式碼查核 →
+  **合併為唯一正典 5_/08**(root 檔降為指標)。查核修正雙方各自的錯:root 版把休眠 API
+  (`active_learning.risk_weights` 無人呼叫)誤判「已有 Business Risk」;08 版把已完成的
+  readback(M18)當未完成。README 過時 T3 註記一併修正。完整查核附錄(10 條宣稱×證據)
+  收在 08 文末。
+- (2026-07-19) **/user→/po 立案 M20「Dataset Audit 報告化 + metadata 最小關聯」**:
+  使用者指示「依 08 文件實作」→ PO 依該文件優先序裁決取**前兩項單機最小落地**
+  (P0-A 最小 metadata + P0-B 可重現 Audit)為本輪;S1S2S3 語言/Promotion Gate/
+  特徵版本治理/儲存 GC 同屬 B 類但**另輪立案**(appetite 紀律);severity/簽核/MES/
+  排程=C 類明砍;**組織性決策(Business Risk 擁有者、Platform/Scenario Owner)不可
+  程式化,屬使用者決策,不進任何 PG 輪**。拆 3 模組(23 `meta_join` B / 24 `audit_report` A /
+  25 `audit_pipeline` B)+ GUI(第 11 工具「🩺 資料體檢報告」,與單張「體檢卡」語義呼應)。
+  成功門檻=植入數字全對(G1)+ 每指標 method line(G3,落實「數字要帶校準」)。
+- (2026-07-19) **M20 當日完成(五階段,無反向閘門)**:`/architect` 三份設計(23 CSV 雙鍵
+  join 未匹配雙向明講/24 純彙總+method line 逐字契約+no-silent-caps/25 佈局辨識
+  train|val|valid|test 一級子目錄+manifest 增量取值不寫檔+embedding sha 內容定址快取)
+  → `/pm` 26 紅測(植入手算錨點:25/1/5/1/1/缺類清單/獨特 sha 20)+E2E 1 條+snapshot 72
+  → `/pg` 三 gate 一次全綠(7/10/9)+GUI 第 11 工具「🩺 資料體檢」(明細 expander 縮圖+
+  問題清單一鍵入策展購物車=Should 6/7 皆落)→ 全單元 623 passed → 真實 E2E 1/1(21s)。
+  M19 的 E2E 教訓直接複用(工具鈕去 emoji 定位/唯一完成訊號/檔案級斷言防 DOM 假綠),
+  零重踩。**M20 後續候選**(依 08 文件,另輪立案):S1/S2/S3 統一語言、AL Promotion Gate、
+  特徵版本治理、儲存 GC、兩資料夾距離、報告快照比較。

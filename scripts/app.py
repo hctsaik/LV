@@ -9869,6 +9869,373 @@ def _fewshot_search_ui() -> None:
         _fewshot_step_scan_confirm()
 
 
+# ═══════════════════════════ 🧪 差異探索（M19 群組 patch 差異） ═══════════════════════════
+# 設計:3_Architect_Design/22_groupdiff_pipeline.md §2.2。全部 UI 放主畫面（不進 sidebar，
+# 沿 M2 教訓避側欄收合）；keys 一律 gpd_*。verdict banner 文案是 E2E 唯一訊號，
+# 只准出現在 banner——說明/警示文字不得複用同字串。
+
+
+def _groupdiff_ui() -> None:
+    _hc1, _hc2 = st.columns([6, 1], vertical_alignment="center")
+    _hc1.subheader("🧪 Good/Bad 差異探索（群組 patch 差異）")
+    with _hc2.popover("❓", use_container_width=True):
+        st.markdown(
+            "**這是「群對群」的比較**：把 Good 資料夾與 Bad 資料夾各當一群，逐 patch 位置"
+            "比兩群的特徵分布差異，把「系統性不一樣的位置」畫回影像當**製程線索**。\n\n"
+            "- 與「瑕疵偵測」不同：那邊是**單張 vs 正常群**（這張哪裡怪）；這裡回答"
+            "「**Bad 們跟 Good 們差在哪**」。\n"
+            "- 前提：兩堆影像**拍攝大致對齊**（同站、同視角），同一位置才可比。\n"
+            "- 誠實界線：先用隨機重分組做校準，統計上分不出兩群時會**明講、給警示**，"
+            "不硬擠一張好看的熱圖；差異區旁附「幾成 Bad 在此處異於 Good」的穩定度。\n"
+            "- 匯出只寫你**另選**的輸出資料夾，絕不動來源資料夾。")
+
+    c_good, c_bad = st.columns(2)
+    with c_good:
+        _f1, _f2 = st.columns([5, 1], vertical_alignment="bottom")
+        with _f1:
+            st.text_input("Good（良品）資料夾", key="gpd_good_dir",
+                          placeholder=r"例：C:\data\good")
+        with _f2:
+            st.button("📁", key="gpd_browse_good", use_container_width=True,
+                      on_click=_pick_folder, args=("gpd_good_dir",),
+                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+    with c_bad:
+        _f3, _f4 = st.columns([5, 1], vertical_alignment="bottom")
+        with _f3:
+            st.text_input("Bad（不良品）資料夾", key="gpd_bad_dir",
+                          placeholder=r"例：C:\data\bad")
+        with _f4:
+            st.button("📁", key="gpd_browse_bad", use_container_width=True,
+                      on_click=_pick_folder, args=("gpd_bad_dir",),
+                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+
+    _mc1, _mc2 = st.columns([3, 2], vertical_alignment="bottom")
+    with _mc1:
+        all_models = available_models()
+        if not all_models:
+            st.error("No .pth models found in ./models/. Add a model file and restart.")
+            return
+        model = st.selectbox("Model", all_models, key="gpd_model",
+                             index=_default_model_index(all_models))
+    with _mc2:
+        with st.popover("⚙ 進階", use_container_width=True):
+            top_k = st.slider("Top-K 差異區域", 1, 10, 5, key="gpd_topk")
+            n_perm = st.select_slider("隨機重分組次數（null 校準）",
+                                      options=[100, 200, 500], value=200,
+                                      key="gpd_nperm")
+            alpha = st.select_slider("顯著水準 α", options=[0.01, 0.05, 0.10],
+                                     value=0.05, key="gpd_alpha")
+            seed = int(st.number_input("random seed", 0, 9999, 0, key="gpd_seed"))
+
+    good_dir = (st.session_state.get("gpd_good_dir") or "").strip()
+    bad_dir = (st.session_state.get("gpd_bad_dir") or "").strip()
+    sig = (good_dir, bad_dir, model, int(top_k), int(n_perm), float(alpha), seed)
+    run = st.button("🔬 分析差異", key="gpd_run", type="primary",
+                    use_container_width=True,
+                    disabled=not (os.path.isdir(good_dir) and os.path.isdir(bad_dir)))
+
+    if run:
+        from groupdiff_pipeline import run_groupdiff
+        prog = st.progress(0.0, text="準備中…")
+        try:
+            with st.spinner("分析中…（首次先載入模型，約 10~30 秒）"):
+                res = run_groupdiff(
+                    good_dir, bad_dir, model=model, n_perm=int(n_perm),
+                    alpha=float(alpha), top_k=int(top_k), seed=seed,
+                    progress=lambda f, t: prog.progress(min(float(f), 1.0), text=t))
+        except ValueError as e:
+            prog.empty()
+            st.error(f"無法分析：{e}")
+            return
+        prog.empty()
+        st.session_state["gpd_result"] = {"sig": sig, "res": res}
+
+    cell = st.session_state.get("gpd_result")
+    if not cell:
+        st.info("選好 Good / Bad 兩個資料夾後按「🔬 分析差異」。")
+        return
+    res = cell["res"]
+    if cell["sig"] != sig:
+        st.warning("⚠ 設定已變更——下方顯示的是**先前設定**的結果；按「🔬 分析差異」重新分析。")
+    for m in res["warn_msgs"]:
+        st.warning(f"⚠ {m}")
+    if res["verdict"]:
+        st.success(f"✅ 兩群存在穩定的局部差異（p={res['p_global']:.4f}；"
+                   f"Good {res['n_good']} 張 vs Bad {res['n_bad']} 張）")
+    else:
+        st.warning(f"⚠ 未發現穩定差異——目前兩群在局部特徵上無法可靠區分"
+                   f"（p={res['p_global']:.4f}；Good {res['n_good']} 張 vs "
+                   f"Bad {res['n_bad']} 張）。不建議把下方熱圖當製程線索。")
+
+    def _heat_block() -> None:
+        # 差異圖是「群 vs 群」共用一張（每個 patch 位置一個分數）——疊在哪張（對齊的）圖上
+        # 都成立。預設自動代表圖，也可自選任一張；原圖/疊圖並排，濃度、寬度可調。
+        from anomaly_heatmap import render_heatmap
+        _b1, _b2 = st.columns([2, 3], vertical_alignment="bottom")
+        with _b1:
+            base_choice = st.segmented_control("熱圖底圖", ["Bad 代表", "Good 代表"],
+                                               key="gpd_base", default="Bad 代表") or "Bad 代表"
+        opts = ["（自動代表圖）"]
+        opt_paths = [None]
+        for p in res["bad_paths"]:
+            opts.append(f"bad｜{Path(p).name}")
+            opt_paths.append(p)
+        for p in res["good_paths"]:
+            opts.append(f"good｜{Path(p).name}")
+            opt_paths.append(p)
+        with _b2:
+            pick_base = st.selectbox("或指定某一張當底圖", opts, key="gpd_base_pick",
+                                     help="兩群影像已對齊 → 同一張差異圖疊在任何一張上都成立。")
+        path = opt_paths[opts.index(pick_base)] if pick_base in opts else None
+        if path is None:
+            path = res["base_good"] if "Good" in base_choice else res["base_bad"]
+        base = safe_open_image(path)
+        if base is None:
+            st.error(f"底圖已無法讀取：{path}")
+            return
+        _s1, _s2 = st.columns(2)
+        with _s1:
+            ov_alpha = st.slider("熱力圖濃度", 0.0, 1.0, 0.55, 0.05, key="gpd_ov_alpha")
+        with _s2:
+            disp_w = st.slider("顯示寬度（px）", 320, 1200, 640, 20, key="gpd_disp_w")
+        vmax = float(max(float(res["z_map"].max()), res["threshold_z"], 1e-9))
+        img = render_heatmap(res["z_map"], base, alpha=float(ov_alpha),
+                             vmin=0.0, vmax=vmax)
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            st.image(base, width=disp_w, caption=f"原圖：{Path(path).name}")
+        with _c2:
+            st.image(img, width=disp_w,
+                     caption="疊上群差異熱力圖（越紅＝兩群在該位置**系統性**差越多；"
+                             "這是群 vs 群的位置圖，不是這一張圖自己的瑕疵圖）")
+
+    if res["verdict"]:
+        _heat_block()
+    else:
+        with st.expander("仍要看熱圖（統計未達顯著，僅供參考）", expanded=False):
+            _heat_block()
+
+    regs = res["regions"]
+    if regs:
+        st.markdown("#### 🏆 Top 差異區域")
+        opts = [f"第 {r['rank']} 名 · z={r['peak_z']:.2f} · Bad {r['pct']}%" for r in regs]
+        pick = st.selectbox("選擇區域（看 Good/Bad 對照放大圖）", opts, key="gpd_region")
+        r = regs[opts.index(pick) if pick in opts else 0]
+        st.markdown(f"**{r['text']}**（峰值 z={r['peak_z']:.2f}，顯著門檻 "
+                    f"{res['threshold_z']:.2f}；紅框=差異區域本體）")
+        from groupdiff_pipeline import region_compare_images
+        imgs = region_compare_images(res, r, n_each=3)
+        _cg, _cb = st.columns(2)
+        with _cg:
+            st.markdown("**Good（最典型長相）**")
+            for im in imgs["good"]:
+                st.image(im, use_container_width=True)
+            if not imgs["good"]:
+                st.caption(":gray[代表圖已無法讀取]")
+        with _cb:
+            st.markdown("**Bad（差異最明顯）**")
+            for im in imgs["bad"]:
+                st.image(im, use_container_width=True)
+            if not imgs["bad"]:
+                st.caption(":gray[代表圖已無法讀取]")
+    elif res["verdict"]:
+        st.info("統計顯著,但沒有連通區域超過門檻（差異分散）。可看上方熱圖找方向。")
+
+    with st.expander("📎 整體旁證（PCA，非監督）", expanded=False):
+        from groupdiff_pipeline import pca2d
+        try:
+            pc = pca2d(res["gmean_good"], res["gmean_bad"])
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=pc["xy_good"][:, 0], y=pc["xy_good"][:, 1],
+                                     mode="markers", name="Good",
+                                     marker=dict(color="#2b8a3e", size=7)))
+            fig.add_trace(go.Scatter(x=pc["xy_bad"][:, 0], y=pc["xy_bad"][:, 1],
+                                     mode="markers", name="Bad",
+                                     marker=dict(color="#c92a2a", size=7)))
+            fig.update_layout(height=380, margin=dict(l=10, r=10, t=24, b=10),
+                              xaxis_title=f"PC1（{pc['evr'][0]:.0%}）",
+                              yaxis_title=f"PC2（{pc['evr'][1]:.0%}）")
+            st.plotly_chart(fig, use_container_width=True, key="gpd_pca")
+            st.caption("軸為**非監督** PCA（不吃 Good/Bad 標籤，避免人工推開兩群的假分離）。"
+                       "兩群在這裡也分開＝額外旁證；分不開＝局部差異要更保守解讀。")
+        except ValueError as e:
+            st.caption(f":gray[樣本不足，略過旁證：{e}]")
+
+    st.markdown("#### 📦 匯出報告")
+    _e1, _e2, _e3 = st.columns([4, 1, 2], vertical_alignment="bottom")
+    with _e1:
+        st.text_input("輸出資料夾（另選；絕不寫來源）", key="gpd_out_dir",
+                      placeholder=r"例：C:\reports\goodbad")
+    with _e2:
+        st.button("📁", key="gpd_browse_out", use_container_width=True,
+                  on_click=_pick_folder, args=("gpd_out_dir",),
+                  help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+    with _e3:
+        do_exp = st.button("📦 匯出報告", key="gpd_export", use_container_width=True,
+                           disabled=not (st.session_state.get("gpd_out_dir") or "").strip())
+    if do_exp:
+        from groupdiff_pipeline import export_report
+        try:
+            ret = export_report(res, (st.session_state.get("gpd_out_dir") or "").strip())
+            st.success(f"已匯出 {len(ret['files'])} 個檔案 → {ret['out_dir']}")
+        except (ValueError, OSError) as e:
+            st.error(f"匯出失敗：{e}")
+
+
+# ═══════════════════════════ 🩺 資料體檢報告（M20 Dataset Audit） ═══════════════════════════
+# 設計:3_Architect_Design/25_audit_pipeline.md §2。主畫面配置;keys 一律 adt_*。
+# 「體檢報告完成」是 E2E 唯一完成訊號,只准出現在成功 banner。
+
+
+def _audit_issue_paths(section: dict) -> list[str]:
+    """從報告節的 items 收影像路徑(給縮圖與購物車);無路徑欄位的節回空。"""
+    out: list[str] = []
+    for it in section.get("items") or []:
+        if "paths" in it:
+            out.extend(it["paths"])
+        elif "path" in it:
+            out.append(it["path"])
+        elif "path_i" in it:
+            out.extend([it["path_i"], it["path_j"]])
+    seen: set[str] = set()
+    uniq = []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
+def _dataset_audit_ui() -> None:
+    _hc1, _hc2 = st.columns([6, 1], vertical_alignment="center")
+    _hc1.subheader("🩺 資料體檢報告（整資料集品質審計）")
+    with _hc2.popover("❓", use_container_width=True):
+        st.markdown(
+            "**一顆鈕把整個資料集的品質檢查彙總成量化報告**：完全重複、近重複、"
+            "train/val 洩漏、同內容異標、split 類別覆蓋缺口、離群影像、壞檔——"
+            "每一節都附「數字＋白話＋怎麼算的（方法與門檻）」，可匯出貼報告。\n\n"
+            "- 與單張「體檢卡」的關係：體檢卡看**一張圖**的根因，這裡看**整個資料集**。\n"
+            "- **製程 metadata CSV**（選填）：給一張含 `filename`（或 `sha256`）欄＋"
+            "任意欄位（tool／recipe／批號…）的 CSV，報告會依這些欄位分組切開看；"
+            "對不上的列與影像都會**明講數量**，不默默略過。\n"
+            "- 只讀來源資料夾，絕不寫入；匯出到你另選的資料夾。")
+
+    _f1, _f2 = st.columns([5, 1], vertical_alignment="bottom")
+    with _f1:
+        st.text_input("資料集資料夾（有 train/val 子目錄會自動辨識 split）",
+                      key="adt_root", placeholder=r"例：C:\data\mydataset")
+    with _f2:
+        st.button("📁", key="adt_browse_root", use_container_width=True,
+                  on_click=_pick_folder, args=("adt_root",),
+                  help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+    st.text_input("製程 metadata CSV（選填；需 filename 或 sha256 欄＋任意欄位如 tool/recipe）",
+                  key="adt_csv", placeholder=r"例：C:\data\meta.csv（留空＝不掛 metadata）")
+
+    _mc1, _mc2 = st.columns([3, 2], vertical_alignment="bottom")
+    with _mc1:
+        all_models = available_models()
+        if not all_models:
+            st.error("No .pth models found in ./models/. Add a model file and restart.")
+            return
+        model = st.selectbox("Model", all_models, key="adt_model",
+                             index=_default_model_index(all_models))
+    with _mc2:
+        use_emb = st.checkbox("含 embedding 訊號（離群／語意近重複）",
+                              value=True, key="adt_use_emb")
+
+    root = (st.session_state.get("adt_root") or "").strip()
+    csvp = (st.session_state.get("adt_csv") or "").strip()
+    sig = (root, csvp, model, bool(use_emb))
+    run = st.button("🩺 產生體檢報告", key="adt_run", type="primary",
+                    use_container_width=True, disabled=not os.path.isdir(root))
+
+    if run:
+        from audit_pipeline import run_audit
+        prog = st.progress(0.0, text="準備中…")
+        try:
+            with st.spinner("體檢中…（含 embedding 時首次要載模型，約 10~30 秒）"):
+                res = run_audit(
+                    root, model=model, metadata_csv=(csvp or None),
+                    use_embedding=bool(use_emb),
+                    progress=lambda f, t: prog.progress(min(float(f), 1.0), text=t))
+        except ValueError as e:
+            prog.empty()
+            st.error(f"無法體檢：{e}")
+            return
+        prog.empty()
+        st.session_state["adt_result"] = {"sig": sig, "res": res}
+
+    cell = st.session_state.get("adt_result")
+    if not cell:
+        st.info("選好資料夾（可選配 metadata CSV）後按「🩺 產生體檢報告」。")
+        return
+    res = cell["res"]
+    if cell["sig"] != sig:
+        st.warning("⚠ 設定已變更——下方是**先前設定**的報告；按「🩺 產生體檢報告」重跑。")
+
+    st.success(f"✅ 體檢報告完成（共 {res['n_images']} 張可讀影像，見下方各節）")
+    tt = res["report"]["totals"]
+    _m1, _m2, _m3 = st.columns(3)
+    _m1.metric("可讀影像", tt["n_images"])
+    _m2.metric("壞檔", tt["n_unreadable"])
+    _m3.metric("split 數", len(tt["split_counts"]))
+
+    recs = res["records"]
+    path_idx = {r["path"]: i for i, r in enumerate(recs)}
+    for s in res["report"]["sections"]:
+        if s["key"] == "overview":
+            continue
+        val = "—" if s["value"] is None else s["value"]
+        st.markdown(f"#### {s['title']}：{val}")
+        st.write(s["text"])
+        st.caption(f":gray[{s['method']}]")
+        items = s.get("items") or []
+        if not items:
+            continue
+        with st.expander(f"明細（{len(items)} 筆）", expanded=False):
+            if s["key"] in ("exact_dup", "outliers"):
+                thumbs = ([g["paths"][0] for g in items[:8]]
+                          if s["key"] == "exact_dup"
+                          else [it["path"] for it in items[:8]])
+                tcols = st.columns(max(len(thumbs), 1))
+                for c, p in zip(tcols, thumbs):
+                    im = safe_open_image(p)
+                    if im is not None:
+                        c.image(im, width=96, caption=Path(p).name)
+            st.dataframe([{k: str(v) for k, v in it.items()} for it in items[:50]],
+                         use_container_width=True)
+            if len(items) > 50:
+                st.caption(f":gray[僅列前 50/{len(items)}；完整清單見匯出 issues.csv]")
+            ipaths = _audit_issue_paths(s)
+            idxs = [path_idx[p] for p in ipaths if p in path_idx]
+            if idxs and st.button(f"➕ 把本節 {len(idxs)} 張影像加入策展購物車",
+                                  key=f"adt_cart_{s['key']}"):
+                added, skipped = _add_to_export(recs, idxs, source=f"體檢:{s['key']}")
+                st.success(f"已加入 {added} 張（略過已在車內 {skipped} 張）")
+
+    st.markdown("#### 📦 匯出報告")
+    _e1, _e2, _e3 = st.columns([4, 1, 2], vertical_alignment="bottom")
+    with _e1:
+        st.text_input("輸出資料夾（另選；絕不寫來源）", key="adt_out_dir",
+                      placeholder=r"例：C:\reports\audit")
+    with _e2:
+        st.button("📁", key="adt_browse_out", use_container_width=True,
+                  on_click=_pick_folder, args=("adt_out_dir",),
+                  help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+    with _e3:
+        do_exp = st.button("📦 匯出報告", key="adt_export", use_container_width=True,
+                           disabled=not (st.session_state.get("adt_out_dir") or "").strip())
+    if do_exp:
+        from audit_pipeline import export_audit
+        try:
+            ret = export_audit(res, (st.session_state.get("adt_out_dir") or "").strip())
+            st.success(f"已匯出 {len(ret['files'])} 個檔案 → {ret['out_dir']}"
+                       "（report.html 可直接貼報告；issues.csv 為完整問題清單）")
+        except (ValueError, OSError) as e:
+            st.error(f"匯出失敗：{e}")
+
+
 def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
@@ -9898,10 +10265,11 @@ def main() -> None:
     if st.session_state.get("tool_switch") in {"組考卷", "灰帶覆核", "評估"}:
         st.session_state["tool_switch"] = "Visualize Embeddings"
     with switch_col:
-        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🔧 瑕疵偵測　　📦 匯出　　📥 標註回饋")
+        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度 · 🩺 體檢　　🔧 瑕疵偵測 · 🧪 差異探索　　📦 匯出　　📥 標註回饋")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "瑕疵偵測", "🎯 以樣搜樣", "匯出", "📥 標註回饋"],
+                     "完整度熱力圖", "瑕疵偵測", "🎯 以樣搜樣", "🧪 差異探索",
+                     "🩺 資料體檢", "匯出", "📥 標註回饋"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
@@ -9913,6 +10281,10 @@ def main() -> None:
             "  · **Compare Distributions**＝**兩堆之間**像不像（A vs B 分布距離）\n"
             "  · **完整度熱力圖**＝這堆**內部**哪裡缺／假完整（單一資料集）\n"
             "- **🔧 瑕疵偵測**＝建 Normal Bank、算異常風險、挑高風險樣本送標\n"
+            "- **🧪 差異探索**＝Good 群 vs Bad 群逐 patch 位置比差異 → 差異熱圖＋"
+            "Top-K 區域對照（找**製程線索**；與瑕疵偵測的「單張 vs 正常群」不同）\n"
+            "- **🩺 資料體檢**＝整資料集一鍵量化審計（重複／洩漏／異標／覆蓋缺口／"
+            "離群＋metadata CSV 分組），每個數字附方法與門檻，可匯出\n"
             "- **📦 匯出（策展購物車）**＝跨工具累積候選 → 匯出子集或送 Labeling\n"
             "- **📥 標註回饋**＝送標後的迴圈中樞：回讀 Labeling 標好的結果、套用讀回\n"
             "  （標註者一致性、爭議裁決、逐型態 recall 等『標註品質』能力正整併於此，"
@@ -9964,6 +10336,10 @@ def main() -> None:
         _anomaly_ui()
     elif tool == "🎯 以樣搜樣":
         _fewshot_search_ui()
+    elif tool == "🧪 差異探索":
+        _groupdiff_ui()
+    elif tool == "🩺 資料體檢":
+        _dataset_audit_ui()
     elif tool == "組考卷":
         _quiz_ui()
     elif tool == "灰帶覆核":
