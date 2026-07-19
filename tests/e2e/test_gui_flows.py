@@ -95,9 +95,21 @@ def _click_marker(page, group_idx: int, path_idx: int, shift: bool = False) -> N
     The click → rerun → status-line update is asynchronous; wait for the
     status line to actually change before returning (clicking an already
     selected point legitimately changes nothing — swallow that timeout).
+
+    2026-07-19 修復輪:頁面頂部工具列/文案長高後,散點可能落在視窗摺疊線下;
+    裸 mouse.click 用的是 viewport 座標,打在視窗外=靜默 miss(box select 因
+    modebar 點擊會自動捲動所以沒事)。點前先把散點捲入視窗、再取 bbox。
+    另外 dim 2D↔3D 切換後,keyed container 會殘留一份「區塊數 K」空殼 ghost
+    (排 DOM 第一位、永久存在、data-stale 不會標)→ 不能裸 locator 也不能用
+    stale 過濾,要以「含散點」過濾挑出活的那份(diag_ghost.py 實測驗證)。
     """
+    wait_idle(page)
+    wrap = page.locator('.st-key-viz_scatter_wrap').filter(
+        has=page.locator('g.points path')).last
+    wrap.scroll_into_view_if_needed()
+    page.wait_for_timeout(200)
     before = _status_text(page)
-    groups = page.locator('.st-key-viz_scatter_wrap g.points')
+    groups = wrap.locator('g.points')
     g = groups.nth(min(group_idx, groups.count() - 1))
     paths = g.locator('path')
     p = paths.nth(min(path_idx, paths.count() - 1))
@@ -460,8 +472,14 @@ def test_m_selection_latency(flow_page):
         # (the SLA is about feedback once the click registers).
         elapsed = None
         for _ in range(4):
-            groups = page.locator('.st-key-viz_scatter_wrap g.points')
-            p = groups.nth(0).locator('path').nth(path_idx)
+            # 2026-07-19:清除鈕在右欄,點它會把散點捲出視窗 → 每次點擊前重新捲入
+            # (dim 切換殘留的空殼 ghost 不帶 data-stale → 以「含散點」過濾)
+            wait_idle(page)
+            wrap = page.locator('.st-key-viz_scatter_wrap').filter(
+                has=page.locator('g.points path')).last
+            wrap.scroll_into_view_if_needed()
+            page.wait_for_timeout(200)
+            p = wrap.locator('g.points').nth(0).locator('path').nth(path_idx)
             bb = p.bounding_box()
             t0 = time.perf_counter()
             page.mouse.click(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
@@ -782,10 +800,20 @@ def test_t_umap_reference_frame(app_page, tmp_path):
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()
     wait_idle(page)
     _add_folder(page, "viz_folder_list", str(train))
-    # the model multiselect now defaults to dinov2_vitb14 only (app.py:3126);
-    # the persistent UMAP frame is keyed per-model, so add dinov2_vits14 before
-    # Run for ref_path_for(train, "dinov2_vits14") to be fitted/persisted.
-    _select_option(page, "viz_models_sel", "dinov2_vits14")
+    # 2026-07 起全 app 預設模型=dinov2_vits14;multiselect 已選值不會出現在下拉
+    # 選項清單(BaseWeb),硬選會 timeout → 僅在尚未選取時才加選(2026-07-19 修復輪)。
+    if "dinov2_vits14" not in page.locator('.st-key-viz_models_sel').inner_text():
+        _select_option(page, "viz_models_sel", "dinov2_vits14")
+    # 2026-07-02 起預設投影=監督UMAP;「固定 UMAP 參考系」toggle 只在勾了
+    # 「UMAP」投影時渲染 → 先把 UMAP 加進多選(_select_option 用 role=option
+    # exact 匹配,不會誤點「監督UMAP」)。已選檢查看 chip 全文,避免
+    # 「監督UMAP」子字串誤判 UMAP 已選。
+    chips = page.eval_on_selector_all(
+        '.st-key-viz_methods [data-baseweb="tag"]',
+        "els => els.map(e => e.innerText.trim())")
+    if not any(t.replace("✕", "").strip() == "UMAP" for t in chips):
+        _select_option(page, "viz_methods", "UMAP")
+    page.wait_for_selector('.st-key-viz_umap_ref', timeout=15000)
     page.locator('.st-key-viz_umap_ref label').first.click()
     wait_idle(page)
     page.locator('.st-key-run_viz button').click()

@@ -749,3 +749,18 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
   🩺 split 覆蓋、Compare↔差異探索互指、差異探索 PCA 旁證指 Compare、🩺 離群/重複節指
   Visualize 互動面、viz 離群 help 指 🩺、體檢卡 S1 註明組考卷整併中。
   驗證:py_compile + M19/M20 E2E 3/3 綠(文案不含任何 E2E 唯一訊號字串)。
+- (2026-07-19) **修復輪:Visualize E2E 9 紅全數修復(gui_flows 25 綠/scenarios_r1 9 綠)**:
+  只動 `tests/e2e/`(測試漂移+harness 強韌化),app 零改動。三個獨立根因:
+  ① **摺疊線 miss**(7 紅主因):07-02~07-12 頂部工具列/文案累積長高,散點掉到 1080px
+  viewport 下,裸 `mouse.click`(viewport 座標)靜默打空——box select 沒事只因 modebar
+  點擊會自動捲動。修=`_click_marker` 點前 `scroll_into_view_if_needed`。
+  ② **keyed container 空殼 ghost**(修①時發現):dim 2D↔3D 切換後 `viz_scatter_wrap`
+  殘留一份只含「區塊數 K」slider 的副本——排 DOM 第一位、永久存在、`data-stale` 不標
+  (diag_ghost.py 實測),裸 locator strict violation、取 first 選到空殼。
+  修=以內容過濾 `filter(has=g.points path)`。**附帶發現 app 外觀 bug 候選**:此 ghost
+  使用者可見(3D 切回 2D 後殘留無作用 slider 條),留待後續輪(修法候選:per-dim key)。
+  ③ **預設模型漂移**(t/s01):2026-07 全 app 預設改 dinov2_vits14 後,test_t 直選
+  UMAP toggle(但預設投影已=監督UMAP,toggle 條件渲染不在)、s01 結尾還原 vitb14
+  (本輪 Run 沒算它,下拉不提供)。修=先把 UMAP 加進投影多選(exact 匹配防誤中監督UMAP)
+  /還原改 vits14。教訓入 pitfalls #10/#11:**摺疊線下裸 click 靜默 miss;空殼 ghost
+  要以內容過濾不能信 data-stale**。

@@ -104,8 +104,17 @@ def _run_and_collect_progress(page, timeout_s: int = 300) -> set[str]:
 
 
 def _click_marker(page, group_idx: int, path_idx: int, shift: bool = False) -> None:
+    # 2026-07-19 修復輪:散點可能在視窗摺疊線下,裸 mouse.click 會打在視窗外
+    # → 點前先捲入視窗再取 bbox(同 test_gui_flows._click_marker)。
+    # dim 2D↔3D 切換後 keyed container 會殘留空殼 ghost(不帶 data-stale、
+    # 排 DOM 第一位)→ 以「含散點」過濾挑活的那份(見 test_gui_flows 同名註記)。
+    wait_idle(page)
+    wrap = page.locator('.st-key-viz_scatter_wrap').filter(
+        has=page.locator('g.points path')).last
+    wrap.scroll_into_view_if_needed()
+    page.wait_for_timeout(200)
     before = _status(page)
-    groups = page.locator('.st-key-viz_scatter_wrap g.points')
+    groups = wrap.locator('g.points')
     g = groups.nth(min(group_idx, groups.count() - 1))
     p = g.locator('path').nth(min(path_idx, g.locator('path').count() - 1))
     bb = p.bounding_box()
@@ -176,7 +185,7 @@ def test_s01_detector_multimodel_cold_run(det_page, detector_dataset):
     page = det_page
     # 單一資料夾語義(2026-07 規格):選新的取代舊的 → 本鏈只載 train 一個資料夾
     _add_folder(page, "viz_folder_list", str(detector_dataset / "train"))
-    # the sidebar defaults to dinov2_vitb14 only; add the models this test
+    # 2026-07 起全 app 預設模型=dinov2_vits14;add the models this test
     # later switches to (s01 here + s03) so the Run computes their embeddings
     # and the post-Run Model selectbox actually offers them.
     _add_models(page, ["dinov2_vits14", "chinese-clip-vit-base-patch16"])
@@ -198,9 +207,11 @@ def test_s01_detector_multimodel_cold_run(det_page, detector_dataset):
         assert page.locator('.st-key-viz_scatter_wrap g.points path').count() > 0
         _no_exception(page)
     # restore the default model so the rest of the det_page chain (s02/s03/s04)
-    # runs on the dinov2_vitb14 scatter they were written against — chinese-clip
-    # on the tiny detector crops collapses the scatter, so point-clicks miss.
-    _select_option(page, "viz_model_select", "dinov2_vitb14")
+    # runs on the default-model scatter — chinese-clip on the tiny detector
+    # crops collapses the scatter, so point-clicks miss.
+    # 2026-07-19 修復輪:預設模型已改 dinov2_vits14,vitb14 不在本輪 Run 的
+    # 模型清單,post-Run 下拉不會提供它(硬選=timeout)。
+    _select_option(page, "viz_model_select", "dinov2_vits14")
     _no_exception(page)
 
 
