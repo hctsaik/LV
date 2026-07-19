@@ -7,8 +7,8 @@
 > **🏁 AL Loop Infrastructure(M15–M18)已完成(2026-07-12)**:主動學習迴圈四段(選樣 → 送標 →
 > 回讀 → 評估)閉合。六模組 `pool_registry` / `round_ledger` / `gt_pred_diff` / `hybrid_sampler` /
 > `probe_eval` / `heatmap_to_boxes` / `readback_store` 全數落地,gate 全 GREEN + 真實 E2E 23/23 併跑綠。
-> **目前無進行中的里程碑**(M14 經 2026-07-19 漂移修正確認早已完成,見決策日誌;
-> M19/M20 亦於 2026-07-18/19 完成)。新能力請由新 `/user` 需求起輪;候選清單見 M20 決策日誌。
+> **目前無進行中的里程碑**(最新完成:M21 於 2026-07-19 立案並當日完成)。
+> 新能力請由新 `/user` 需求起輪;候選清單見 M20 決策日誌。
 >
 > ⚠️ **編號注意:本 repo 有兩條平行的里程碑/模組編號線**(2026-07-12 併軌時的既成事實,PO 決定不追溯重編):
 > - **anomaly / 以樣搜樣線**:M8–M14;模組 08 `al_batch`、09 `al_workspace`、10 `al_service`、
@@ -36,6 +36,32 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M21 — 做法比較可信度 + 成本工作點試算(掛瑕疵偵測)** — ✅ **完成**
+  (2026-07-19 立案並當日完成:gate `paired_compare` 13 / `cost_curve` 11 /
+  `run_pairing` 11 全 GREEN(permutation 窮舉 exact 斷言:p==2/4096、批次混淆
+  天真 128/4096 誤判 vs blocked 1.0 誠實;成本曲線全陣列手算 ==、成本比 5:1↔1:10
+  best_idx 3↔5)+ 全單元回歸 770 passed 零新紅 + 真實 DINOv2 E2E **1/1 兩連綠**
+  (AC-E1 接線+G5、AC-E2 null deterministic「看不出來+無差異」、AC-E3 曲線反應性
+  (ratio 50→1 建議工作點 全標 cost12 → t=0.325 cost8,與手推吻合)、AC-E4 零副作用
+  (判定結果前後==+資料夾 sha256==)、AC-E5 門檻誠實、AC-E6 可達性)。
+  一次反向閘門 /pm→/architect(②散點 Scattergl 無法框選植入瑕疵+無分位控制 →
+  G1 方向性下沉 28 純函式鏈 AC7,E2E 改驗接線;見決策日誌)。
+  E2E 另揪出重大新陷阱:**JS 假開 expander 不能互動**(連燒 5 輪後以 10 行迷你
+  app 最小重現定案,pitfalls #12)。— 需求:①換模型/配方/校準後「數字比較高」分不清真差異或運氣,
+  且資料整批相關(晶圓/日期)會被批次效應騙;②漏檢與誤報代價懸殊,無處輸入成本比
+  試算鬆緊設定。上游裁決約束(09/10 文件定案):**顯著性=exploratory 語義**、
+  **有群組欄位→blocked permutation(整群同動)**、**成本工作點=what-if 只建議不自動套**。
+  硬驗收:G1 植入真差異→「可信」+方向對;G2 null/批次誠實(同源→「看不出來」;
+  效應全由批次造成→blocked 判無+天真法誤判的對照);G3 成本曲線手算小例 exact;
+  G4 零副作用(不動生效設定/零寫資料夾);G5 講人話(統計名詞收詳細、
+  分組與否明講)。範圍:**Must** 成對比較(效應量+支撐數+blocked permutation+三值結論
+  +method line)+成本曲線(成本比→代價曲線+最低點+工作量)+GUI 掛瑕疵偵測+真實 E2E;
+  **Should** 群組欄位自動帶入(M20 metadata join 優先)、確認樣本當 ground truth;
+  **Won't** 三方比較/歷史追蹤/自動套用/精確金額(user 明砍)。
+  模組:**26 `paired_compare`(A)**、**27 `cost_curve`(A)**、**28 `run_pairing`(A)**+
+  GUI 接線(B)。需求 [1_user_needs/recipe_compare_cost_workpoint.md](1_user_needs/recipe_compare_cost_workpoint.md);
+  PRD [2_PO_PRD/recipe_compare_cost_workpoint_prd.md](2_PO_PRD/recipe_compare_cost_workpoint_prd.md)。
+  appetite ≤3 模組+GUI 一輪。
 - **M20 — Dataset Audit 報告化 + 製程 metadata 最小關聯(第 11 工具「🩺 資料體檢」)** —
   ✅ **完成**(2026-07-19 立案並當日完成:gate `meta_join` 7 / `audit_report` 10 /
   `audit_pipeline` 9 全 GREEN + 真實 DINOv2 E2E **1/1 綠**(AC-G1 植入數字逐項全對:
@@ -270,6 +296,9 @@
 | 23 | meta_join | B | Must | ✅ | v | v | v | csv/stdlib | M20;gate 7 綠;CSV 雙鍵 join+分組索引 |
 | 24 | audit_report | A | Must | ✅ | v | v | v | 只吃基本型別/numpy | M20;gate 10 綠;量化指標+method line |
 | 25 | audit_pipeline | B | Must | ✅ | v | v | v | 既有訊號函式 + 23/24 | M20;gate 9 綠 + 真實 E2E 1/1(含 GUI 第 11 工具) |
+| 26 | paired_compare | A | Must | ✅ | v | v | v | 只吃陣列/numpy | M21;gate 13 綠;效應量+blocked permutation(≤12 單位窮舉 exact)+三值結論 |
+| 27 | cost_curve | A | Must | ✅ | v | v | v | 只吃陣列/numpy | M21;gate 11 綠;閾值掃描代價曲線+最低點 |
+| 28 | run_pairing | A | Must | ✅ | v | v | v | 只吃 dict/list | M21;gate 11 綠;對齊+compare_inputs(G1 方向鏈)+ GUI E2E 1/1 |
 
 > ⚠️ 本表的 08–14 是 **AL Loop Infrastructure 線(M15–M18)** 的模組。**anomaly / 以樣搜樣線
 > (M8–M14)的模組(`al_batch` / `al_workspace` / `al_service` / `prelabel` / `similarity` /
@@ -764,3 +793,26 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
   (本輪 Run 沒算它,下拉不提供)。修=先把 UMAP 加進投影多選(exact 匹配防誤中監督UMAP)
   /還原改 vits14。教訓入 pitfalls #10/#11:**摺疊線下裸 click 靜默 miss;空殼 ghost
   要以內容過濾不能信 data-stale**。
+- (2026-07-19) **/user→/po 立案 M21「做法比較可信度 + 成本工作點試算」**:修復輪(9 紅
+  全綠)後開的第一個新能力輪。收斂自 user 兩痛點:換做法憑單次數字被運氣/批次效應騙、
+  鬆緊設定無處輸入「漏檢比誤報貴很多」。承 09/10 文件裁決:exploratory 語義、
+  blocked permutation、what-if 不自動套。砍:三方比較/歷史追蹤/自動套用/精確金額
+  (user 第 5 節明說不要)。模組 26 `paired_compare`/27 `cost_curve`/28 `run_pairing`
+  (皆 Tier A 純引擎)+ GUI 接線(B),appetite ≤3 模組+GUI 一輪。放行 /architect。
+- (2026-07-19) **反向閘門 /pm→/architect(M21)**:PM 落驗收時發現 wiring E2E 場景
+  假設②有「分位鬆緊」slider——實際判定門檻來自 classify(confirmed 校準),無此控制;
+  且②散點是 Scattergl(WebGL 無 per-point DOM),E2E 無法可靠框選植入瑕疵。
+  Architect 修訂:G1 方向性下沉到 28 `run_pairing` 純函式鏈(新增 `compare_inputs`
+  契約+AC6-8,沿 M6「純函式下沉」先例;職責仍單句、Tier A 不變),GUI E2E 改驗
+  接線真實/null 方向(deterministic)/曲線反應性/零副作用;AC-E3 兩類樣本改走
+  「整圖框選標瑕疵+autoseed 覆寫正常」真 UI 路徑;AC-E3 argmin 移動斷言改
+  「y 軸刻度改變」(exact 移動已在 27-AC2,可分離資料上 argmin 不必動)。
+- (2026-07-19) **M21 當日完成(五階段,一次反向閘門)**:`/architect` 四份設計(26 窮舉
+  permutation exact/27 手算小例/28 對齊整形/M21 GUI 接線)→ `/pm` 35 條單元紅測試
+  (含 null 假陽性率統計驗收+3 模組各自 metamorphic 推導測試)+ 1 條 E2E 全流程 →
+  `/pg` 三引擎一次全綠、GUI 兩 expander 掛瑕疵偵測②。E2E 修到綠共 9 輪,收穫兩課:
+  ①**假訊號教訓**——synthetic 注值讓 DOM value 變了但 Streamlit 從未 commit,靠
+  「Streamlit 真渲染的建議句」當訊號才拆穿;②**JS 假開 expander**(pitfalls #12,
+  迷你 app 最小重現)。E2E 值與手推互證:ratio 50→全標(cost12)、ratio 1→分離點
+  t=0.325(cost8)。M21 後續候選(維持不擴):比較結果一鍵存圖(Could)、
+  群組欄位自動偵測建議(lot/wafer 欄位名啟發式)。

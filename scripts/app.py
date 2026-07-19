@@ -2272,6 +2272,192 @@ def _anomaly_tab_apply() -> None:
     with right:
         _anomaly_render_inspector(result, scores)
 
+    _m21_workpoint_section(result)
+
+
+# ── M21:⚖️ 做法比較(A/B)+ 💰 成本試算(what-if)──────────────────────
+# 設計:3_Architect_Design/M21_gui_wiring.md。G4 鐵則:本區塊只讀
+# anomaly_apply_result / anomaly_confirmed_apply / anomaly_model,絕不寫生效設定;
+# 判定邏輯零複製(單一真相源=run_pairing / paired_compare / cost_curve 引擎)。
+
+
+def _m21_pin_run(slot: str) -> None:
+    """on_click:把目前②套用結果快照進 A/B 槽(session 即可,不落地)。"""
+    res = st.session_state.get("anomaly_apply_result") or {}
+    records = res.get("records") or []
+    meta = (st.session_state.get("anomaly_model") or {}).get("meta") or {}
+    thr = res.get("threshold")
+    cfg = (f"{meta.get('model', '?')}·{meta.get('score_mode', '?')}"
+           + (f"·門檻 {thr:.3f}" if isinstance(thr, (int, float)) else ""))
+    slots = st.session_state.setdefault("rcmp_slots", {})
+    slots[slot] = {
+        "records": [{"path": r["path"], "obj_index": r["obj_index"],
+                     "verdict": r["verdict"], "score": r["score"]} for r in records],
+        "config": cfg,
+        "folder": st.session_state.get("_anomaly_target_sig") or "",
+        "n": len(records),
+    }
+    st.session_state.pop("rcmp_result", None)   # 槽變了 → 舊結論作廢
+
+
+def _m21_group_options() -> list[str]:
+    opts = ["不分組", "按上層資料夾"]
+    cell = st.session_state.get("adt_result") or {}
+    mi = (cell.get("res") or {}).get("meta_info") if cell else None
+    if mi and mi.get("fields"):
+        opts += [f"metadata:{f}" for f in mi["fields"]]
+    return opts
+
+
+def _m21_groups_for(ids: list, choice: str):
+    """item_id 清單 → 群組標籤清單(或 None=不分組)。metadata 欄位查 🩺 join 結果;
+    查無值歸 "(無資料)"(整形保守:查不到就不猜)。"""
+    if choice == "不分組":
+        return None
+    paths = [str(i).rsplit("#", 1)[0] for i in ids]
+    if choice == "按上層資料夾":
+        return [Path(p).parent.name for p in paths]
+    field = choice.split(":", 1)[1]
+    res = (st.session_state.get("adt_result") or {}).get("res") or {}
+    per = (res.get("meta_info") or {}).get("per_image") or []
+    recs = res.get("records") or []
+    lookup = {str(r["path"]): str(m[field])
+              for r, m in zip(recs, per) if m and field in m}
+    return [lookup.get(p, "(無資料)") for p in paths]
+
+
+def _m21_compare_now() -> None:
+    """on_click:跑 28→26 引擎鏈,結論落 session(rcmp_result);顯示在 render 端。"""
+    from paired_compare import paired_compare
+    from run_pairing import compare_inputs, pair_runs
+    slots = st.session_state.get("rcmp_slots") or {}
+    a, b = slots.get("A"), slots.get("B")
+    res = st.session_state.get("anomaly_apply_result") or {}
+    confirmed = st.session_state.get("anomaly_confirmed_apply") or {}
+    try:
+        ci = compare_inputs(a["records"], b["records"], confirmed,
+                            res.get("records") or [])
+        pr = pair_runs(ci["run_a_err"], ci["run_b_err"])
+        if pr["n_common"] == 0:
+            st.session_state["rcmp_result"] = {"kind": "empty"}
+            return
+        choice = st.session_state.get("rcmp_group_field") or "不分組"
+        groups = _m21_groups_for(pr["ids"], choice)
+        r = paired_compare(pr["a"], pr["b"], higher_is_better=False, groups=groups)
+        st.session_state["rcmp_result"] = {
+            "kind": "ok", "stats": r, "group_choice": choice,
+            "only_a": len(pr["only_a"]), "only_b": len(pr["only_b"]),
+            "dropped": len(pr["dropped"]),
+        }
+    except ValueError as e:                     # 引擎誠實報錯 → 顯訊息本文
+        st.session_state["rcmp_result"] = {"kind": "error", "msg": str(e)}
+
+
+def _m21_render_compare_card() -> None:
+    payload = st.session_state.get("rcmp_result")
+    if not payload:
+        return
+    with st.container(key="rcmp_card"):
+        if payload["kind"] == "empty":
+            st.info("請先在下方畫廊/散點確認一些瑕疵或正常樣本(比較用它們當基準)。")
+            return
+        if payload["kind"] == "error":
+            st.error(payload["msg"])
+            return
+        r = payload["stats"]
+        if r["verdict"] == "a_better":
+            st.markdown(f"**A 較好**:錯誤率低 {abs(r['mean_diff']):.0%}(N={r['n']})")
+        elif r["verdict"] == "b_better":
+            st.markdown(f"**B 較好**:錯誤率低 {abs(r['mean_diff']):.0%}(N={r['n']})")
+        else:
+            st.markdown("**看不出來** —— " + ";".join(r["reasons"]))
+        if r["blocked"]:
+            field = payload["group_choice"].replace("metadata:", "")
+            st.caption(f"已按〈{field}〉分組比較(整群同動,防批次效應)。")
+        else:
+            st.caption("未考慮批次,結論僅供探索(有批次/晶圓欄位時建議選群組)。")
+        skew = payload["only_a"] + payload["only_b"] + payload["dropped"]
+        if skew:
+            st.caption(f"⚠ 兩槽項目不完全一致:僅 A {payload['only_a']}、"
+                       f"僅 B {payload['only_b']}、無效值 {payload['dropped']}(已排除)。")
+        with st.expander("詳細(統計)", expanded=False):
+            st.markdown(f"- method:{r['method']}\n"
+                        f"- p={r['p']:.4g}(α={r['alpha']:g})、效應={r['mean_diff']:+.3f}、"
+                        f"勝率={r['win_rate']:.0%}、平手 {r['n_ties']}\n"
+                        f"- 支撐:N={r['n']}、單位數={r['n_units']}"
+                        f"({'群組' if r['blocked'] else '項目'})")
+
+
+def _m21_workpoint_section(result: dict) -> None:
+    records = result.get("records") or []
+    slots = st.session_state.get("rcmp_slots") or {}
+    st.divider()
+    with st.expander("⚖️ 做法比較(A/B)——換模型/配方後,差異可不可信", expanded=False):
+        st.caption("把一次套用結果存成 A、換做法再套用存成 B → 在**已確認樣本**上比錯誤率。"
+                   "探索性結論,只建議不改設定。")
+        c1, c2 = st.columns(2)
+        c1.button("📌 存目前結果為 A", key="rcmp_pin_a", use_container_width=True,
+                  on_click=_m21_pin_run, args=("A",))
+        c2.button("📌 存目前結果為 B", key="rcmp_pin_b", use_container_width=True,
+                  on_click=_m21_pin_run, args=("B",))
+        for name in ("A", "B"):
+            s = slots.get(name)
+            st.caption(f"{name}:{s['config']}·{s['n']} 項" if s else f"{name}:(未存)")
+        same_folder = bool(slots.get("A") and slots.get("B")
+                           and slots["A"]["folder"] == slots["B"]["folder"])
+        if slots.get("A") and slots.get("B") and not same_folder:
+            st.warning("A/B 來自不同資料夾,項目對不上 → 不可比。請在同一目標資料夾下存兩次結果。")
+        st.selectbox("批次分組(有晶圓/批號/日期欄位時選它,防整批效應假差異)",
+                     _m21_group_options(), key="rcmp_group_field")
+        st.button("⚖️ 開始比較", key="rcmp_go", type="primary", use_container_width=True,
+                  disabled=not same_folder, on_click=_m21_compare_now)
+        _m21_render_compare_card()
+
+    with st.expander("💰 成本試算(what-if)——漏檢和誤報代價不同時,鬆緊怎麼選", expanded=False):
+        st.caption("僅試算,不會改變任何設定——用哪個鬆緊最後由你決定。")
+        conf = st.session_state.get("anomaly_confirmed_apply") or {}
+        idx = [int(i) for i in conf if 0 <= int(i) < len(records)]
+        lab = [1 if conf[i] == "bad" else 0 for i in idx]
+        n_p, n_g = sum(lab), len(lab) - sum(lab)
+        with st.container(key="rcost_msg"):
+            if n_p < 5 or n_g < 5:
+                st.info(f"已確認樣本不足(瑕疵 {n_p}/5、正常 {n_g}/5)——"
+                        "請先在散點框選標記,或用「自動標正常範例」補正常。")
+                return
+        ratio = st.number_input("漏檢:誤報(相對成本比;例 50 = 漏一個等於誤報五十個)",
+                                min_value=1, max_value=1000, value=50, step=1,
+                                key="rcost_ratio")
+        from cost_curve import cost_curve
+        _thr = result.get("threshold")
+        try:
+            cc = cost_curve([float(records[i]["score"]) for i in idx], lab,
+                            cost_miss=float(ratio), cost_fa=1.0,
+                            current_threshold=(float(_thr)
+                                               if isinstance(_thr, (int, float))
+                                               else None))
+        except ValueError as e:
+            st.error(str(e))
+            return
+        import plotly.graph_objects as go
+        best = cc["best_idx"]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=cc["thresholds"], y=cc["cost"],
+                                 mode="lines+markers", name="預期相對代價"))
+        fig.add_trace(go.Scatter(x=[cc["thresholds"][best]], y=[cc["cost"][best]],
+                                 mode="markers", name="最低代價",
+                                 marker=dict(size=13, symbol="star", color="#e45756")))
+        if cc["current"] is not None:
+            fig.add_vline(x=cc["current"]["threshold"], line_dash="dash",
+                          line_color="#888", annotation_text="目前門檻")
+        fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10),
+                          xaxis_title="鬆緊(判異常門檻)", yaxis_title="預期相對代價")
+        with st.container(key="rcost_curve_wrap"):
+            st.plotly_chart(fig, use_container_width=True, key="rcost_curve")
+        st.markdown(f"**建議工作點**:t={cc['thresholds'][best]:.3f}"
+                    f"(預期相對代價 {cc['cost'][best]:g};"
+                    f"會標記 {cc['flagged'][best]}/{cc['n']} 個確認樣本)——僅供參考,不自動套用。")
+        st.caption(cc["method"])
+
 
 def _anomaly_prelabel_export(out_dir, lines_by_image, class_names, source_dirs) -> None:
     """on_click:匯出預標到 out_dir(prelabel.export_prelabels 內建 C6 安全檢查)。結果/錯誤落 session。"""
