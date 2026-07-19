@@ -10433,6 +10433,257 @@ def _dataset_audit_ui() -> None:
             st.error(f"匯出失敗：{e}")
 
 
+# ═══════════════════════════ 🧭 晶圓地圖(M22 wafer spatial signature) ═══════════════════════════
+# 設計:3_Architect_Design/M22_gui_wiring.md。keys 一律 wmap_*。
+# G6 鐵則:零欄位假設——缺哪層欄位就停在哪層並明講;「同屬一片」只能由使用者勾選。
+# 錨字紀律:「無 metadata CSV/缺座標欄位/無法分片/(單片)/對不到列/已匯出」只准出現在
+# 對應的狀態訊息,不得進說明文字(E2E body-wide 錨字)。
+
+_WMAP_NONE = "(無)"
+_WMAP_VERDICT_TEXT = {"clustered": "聚一團(可信)", "edge": "偏邊緣(可信)",
+                      "linear": "線狀(可信)"}
+
+
+def _wmap_safe_name(s: str) -> str:
+    return "".join(("_" if c in '<>:"/\\|?*' else c) for c in str(s))
+
+
+def _wafer_map_generate(rows, fields, records) -> None:
+    """on_click:join → 29 整形 → 逐片 30 簽名,結果落 session(顯示在 render 端)。"""
+    from meta_join import join_metadata
+    from spatial_sig import spatial_signature
+    from wafer_grid import build_wafer_grids
+    paths = sorted({str(r["path"]) for r in records})
+    joined = join_metadata(rows, paths)
+    # per_image 形態(meta_join 契約)={影像索引 → 欄位 dict},不是對齊 list
+    lookup = {paths[i]: row for i, row in joined["per_image"].items()}
+    items = [{"item_id": f"{r['path']}#{r['obj_index']}", "path": str(r["path"]),
+              "flag": 1 if r["verdict"] == "bad" else 0, "score": r.get("score")}
+             for r in records]
+    try:
+        grids = build_wafer_grids(
+            items, lookup, wafer_field=fields["wafer"], x_field=fields["x"],
+            y_field=fields["y"], lot_field=fields["lot"],
+            assume_single_wafer=fields["single"])
+        sigs = {w["wafer_id"]: spatial_signature(
+                    [{"x": d["x"], "y": d["y"], "flag": d["flag"]}
+                     for d in w["dies"]])
+                for w in grids["wafers"]}
+    except ValueError as e:
+        st.session_state["wmap_result"] = {"error": str(e)}
+        return
+    st.session_state["wmap_result"] = {"grids": grids, "sigs": sigs}
+
+
+def _wmap_render_wafer(i: int, w: dict, sig: dict) -> None:
+    import plotly.graph_objects as go
+    with st.container(key=f"wmap_wafer_{i}"):
+        st.markdown(f"**{w['wafer_id']}**(die {w['n']}·可疑 {w['k']})")
+        bad = [d for d in w["dies"] if d["flag"]]
+        good = [d for d in w["dies"] if not d["flag"]]
+        fig = go.Figure()
+        # 契約(M22_gui_wiring §5):flag=1(紅)為第一個 trace,E2E 據此數紅點。
+        # 用 SVG Scatter(非 Scattergl):點少、且 DOM path 可被驗證。
+        for group, color, name in ((bad, "#dc3c3c", "可疑"),
+                                   (good, "#78a0dc", "正常")):
+            fig.add_trace(go.Scatter(
+                x=[d["x"] for d in group], y=[d["y"] for d in group],
+                mode="markers", name=name, hoverinfo="text",
+                marker=dict(symbol="square", size=11, color=color),
+                text=[Path(d["path"]).name
+                      + (f"·{d['score']:.3f}" if d["score"] is not None else "")
+                      for d in group]))
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10),
+                          yaxis=dict(autorange="reversed"), showlegend=False)
+        st.plotly_chart(fig, use_container_width=True, key=f"wmap_chart_{i}")
+        if sig["verdict"] == "none":
+            extra = ("——" + "、".join(sig["reasons"])) if sig["reasons"] else ""
+            st.markdown(f"**看不出模式**{extra}")
+        else:
+            st.markdown(f"**{_WMAP_VERDICT_TEXT[sig['verdict']]}**")
+        with st.expander("詳細(統計)", expanded=False):
+            pline = ("、".join(f"{k}={v:.4g}" for k, v in sig["p"].items())
+                     if sig["p"] else "(門檻擋下,未計算)")
+            st.markdown(f"- {sig['method']}\n- p:{pline}")
+
+
+def _wafer_map_ui() -> None:
+    import os
+    _hc1, _hc2 = st.columns([6, 1], vertical_alignment="center")
+    _hc1.subheader("🧭 晶圓地圖（缺陷空間簽名）")
+    with _hc2.popover("❓", use_container_width=True):
+        st.markdown(
+            "**把瑕疵偵測②的判定攤回晶圓座標**：每片一張地圖＋空間模式誠實判定"
+            "（聚一團／偏邊緣／線狀；隨機就說隨機——within-wafer permutation 校準，"
+            "寧可說沒有）。空間模式是根因追查線索：邊緣→邊緣製程、線狀→機械刮傷、"
+            "同 lot 多片同模式→該批設備。\n\n"
+            "- 需要 CSV 提供 wafer／lot 與 die 座標欄位；**缺什麼欄位會逐層明講**，"
+            "不做任何假設。\n"
+            "- 同 lot 並排看；可匯出地圖 PNG＋結論表 CSV 到你另選的資料夾。\n"
+            "- 只讀來源資料夾，絕不寫入。")
+
+    res = st.session_state.get("anomaly_apply_result") or {}
+    records = res.get("records") or []
+    if not records:
+        st.info("請先在瑕疵偵測②執行套用，再回本工具把判定攤回晶圓座標。")
+        return
+
+    if "wmap_csv" not in st.session_state and (st.session_state.get("adt_csv") or "").strip():
+        st.session_state["wmap_csv"] = st.session_state["adt_csv"].strip()
+    st.text_input("製程 metadata CSV（需含 filename 欄＋wafer／die 座標欄位）",
+                  key="wmap_csv", placeholder=r"例：C:\data\wafer_meta.csv")
+    csvp = (st.session_state.get("wmap_csv") or "").strip()
+    if not csvp or not os.path.isfile(csvp):
+        st.info("無 metadata CSV，無法取得座標——請提供含 wafer／lot 與 die 座標欄位的 CSV。")
+        return
+    from meta_join import load_metadata_csv
+    try:
+        rows = load_metadata_csv(csvp)
+    except ValueError as e:
+        st.error(f"CSV 讀取失敗：{e}")
+        return
+    if not rows:
+        st.error("CSV 沒有資料列。")
+        return
+
+    from wafer_grid import guess_fields
+    fieldnames = list(rows[0].keys())
+    guess = guess_fields(fieldnames)
+    opts = [_WMAP_NONE] + fieldnames
+    # 換了 CSV = 新情境:欄位對應重置回猜測、舊結果作廢(否則前一份 CSV 留下的
+    # "(無)" 會蓋過新猜測 → 座標欄卡死;G6 的「不假設」也包含不沿用舊情境)。
+    # ⚠ 對「活著的 widget」session_state.pop() 無效(widget state 另存,pop 不會
+    # 重置)——必須**直接賦值**才會生效(在 widget 實例化之前)。
+    if st.session_state.get("_wmap_csv_sig") != csvp:
+        st.session_state["_wmap_csv_sig"] = csvp
+        st.session_state["wmap_wafer_col"] = guess["wafer"] or _WMAP_NONE
+        st.session_state["wmap_x_col"] = guess["x"] or _WMAP_NONE
+        st.session_state["wmap_y_col"] = guess["y"] or _WMAP_NONE
+        st.session_state["wmap_lot_col"] = guess["lot"] or _WMAP_NONE
+        st.session_state["wmap_single_wafer"] = False
+        st.session_state.pop("wmap_result", None)
+    for k in ("wmap_wafer_col", "wmap_x_col", "wmap_y_col", "wmap_lot_col"):
+        if k in st.session_state and st.session_state[k] not in opts:
+            st.session_state[k] = _WMAP_NONE   # 保底:殘值不在新欄位裡(賦值才會生效)
+    c1, c2, c3, c4 = st.columns(4)
+    for col, label, key, gval in ((c1, "wafer 欄", "wmap_wafer_col", guess["wafer"]),
+                                  (c2, "X 欄", "wmap_x_col", guess["x"]),
+                                  (c3, "Y 欄", "wmap_y_col", guess["y"]),
+                                  (c4, "lot 欄", "wmap_lot_col", guess["lot"])):
+        with col:
+            st.selectbox(label, opts, key=key,
+                         index=(opts.index(gval) if gval in opts else 0))
+
+    wafer_col = st.session_state.get("wmap_wafer_col", _WMAP_NONE)
+    x_col = st.session_state.get("wmap_x_col", _WMAP_NONE)
+    y_col = st.session_state.get("wmap_y_col", _WMAP_NONE)
+    lot_col = st.session_state.get("wmap_lot_col", _WMAP_NONE)
+
+    blocked = False
+    if x_col == _WMAP_NONE or y_col == _WMAP_NONE:
+        st.warning("缺座標欄位，無法做空間分析——請在上方指定 X／Y 欄。")
+        blocked = True
+    single_ok = False
+    if wafer_col == _WMAP_NONE:
+        single_ok = st.checkbox("這批影像同屬一片晶圓（我確認）", key="wmap_single_wafer")
+        if not single_ok:
+            st.warning("無法分片：沒有 wafer 欄位——請指定欄位，或勾選上面的確認框（工具不猜）。")
+            blocked = True
+    if lot_col == _WMAP_NONE:
+        st.caption("無 lot 欄位——同批並排收起。")
+
+    fields = {"wafer": (None if wafer_col == _WMAP_NONE else wafer_col),
+              "x": (None if x_col == _WMAP_NONE else x_col),
+              "y": (None if y_col == _WMAP_NONE else y_col),
+              "lot": (None if lot_col == _WMAP_NONE else lot_col),
+              "single": (wafer_col == _WMAP_NONE and single_ok)}
+    st.button("🧭 產生晶圓地圖", key="wmap_go", type="primary",
+              use_container_width=True, disabled=blocked,
+              on_click=_wafer_map_generate, args=(rows, fields, records))
+
+    payload = st.session_state.get("wmap_result")
+    if payload:
+        if payload.get("error"):
+            st.error(payload["error"])
+        else:
+            grids = payload["grids"]
+            sigs = payload["sigs"]
+            with st.container(key="wmap_gaps"):
+                st.caption(f"對不到列 {len(grids['unmatched'])} 張 · "
+                           f"缺座標 {len(grids['missing_coord'])} 張 · "
+                           f"缺 wafer 值 {len(grids['missing_wafer'])} 張")
+            wafers = grids["wafers"]
+            if not wafers:
+                st.warning("沒有任何影像對得上座標——請確認 CSV 的 filename 與欄位對應。")
+            else:
+                by_lot: dict = {}
+                for w in wafers:
+                    by_lot.setdefault(w["lot"], []).append(w)
+                i = 0
+                for lot, ws in by_lot.items():
+                    if lot is not None:
+                        st.markdown(f"**Lot {lot}**")
+                    shown = ws[:12]
+                    if len(ws) > 12:
+                        st.caption(f"共 {len(ws)} 片，顯示前 12 片。")
+                    for start in range(0, len(shown), 4):
+                        cols = st.columns(4)
+                        for col, w in zip(cols, shown[start:start + 4]):
+                            with col:
+                                _wmap_render_wafer(i, w, sigs[w["wafer_id"]])
+                                i += 1
+
+            st.divider()
+            e1, e2 = st.columns([4, 1], vertical_alignment="bottom")
+            with e1:
+                st.text_input("匯出目錄（另選；絕不寫來源資料夾）",
+                              key="wmap_export_dir")
+            outv = (st.session_state.get("wmap_export_dir") or "").strip()
+            do_exp = e2.button("📦 匯出", key="wmap_export_btn",
+                               use_container_width=True,
+                               disabled=not (outv and grids["wafers"]))
+            if do_exp:
+                import csv as _csv
+                src_roots = set()
+                for p in {str(r["path"]) for r in records}:
+                    rp = Path(p).resolve()
+                    src_roots.add(rp.parent)
+                    src_roots.add(rp.parent.parent)
+                out = Path(outv).resolve()
+                if any(out == r or r in out.parents for r in src_roots):
+                    st.error("匯出目錄不可在來源資料夾內，請另選其他位置。")
+                else:
+                    from wafer_grid import wafer_map_png
+                    try:
+                        out.mkdir(parents=True, exist_ok=True)
+                        n_files = 0
+                        for w in grids["wafers"]:
+                            wafer_map_png(w).save(
+                                out / f"wmap_{_wmap_safe_name(w['wafer_id'])}.png")
+                            n_files += 1
+                        with open(out / "wafer_signatures.csv", "w",
+                                  newline="", encoding="utf-8") as f:
+                            wcsv = _csv.DictWriter(f, fieldnames=[
+                                "wafer_id", "lot", "n", "k", "verdict",
+                                "p_clustered", "p_edge", "p_linear", "reasons"])
+                            wcsv.writeheader()
+                            for w in grids["wafers"]:
+                                s = sigs[w["wafer_id"]]
+                                p = s["p"] or {}
+                                wcsv.writerow({
+                                    "wafer_id": w["wafer_id"],
+                                    "lot": w["lot"] or "", "n": w["n"], "k": w["k"],
+                                    "verdict": s["verdict"],
+                                    "p_clustered": p.get("clustered", ""),
+                                    "p_edge": p.get("edge", ""),
+                                    "p_linear": p.get("linear", ""),
+                                    "reasons": "、".join(s["reasons"])})
+                        n_files += 1
+                        st.success(f"已匯出 {n_files} 個檔案 → {out}")
+                    except OSError as e:
+                        st.error(f"匯出失敗:{e}")
+
+
 def main() -> None:
     # sidebar 400px：layout 評審 R2 拍板（1.5x 原生支援整數寬度）
     st.set_page_config(page_title="Dataset Analysis", layout="wide",
@@ -10466,7 +10717,7 @@ def main() -> None:
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
                      "完整度熱力圖", "瑕疵偵測", "🎯 以樣搜樣", "🧪 差異探索",
-                     "🩺 資料體檢", "匯出", "📥 標註回饋"],
+                     "🩺 資料體檢", "🧭 晶圓地圖", "匯出", "📥 標註回饋"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
@@ -10540,6 +10791,8 @@ def main() -> None:
         _groupdiff_ui()
     elif tool == "🩺 資料體檢":
         _dataset_audit_ui()
+    elif tool == "🧭 晶圓地圖":
+        _wafer_map_ui()
     elif tool == "組考卷":
         _quiz_ui()
     elif tool == "灰帶覆核":

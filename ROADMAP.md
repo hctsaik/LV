@@ -7,7 +7,7 @@
 > **🏁 AL Loop Infrastructure(M15–M18)已完成(2026-07-12)**:主動學習迴圈四段(選樣 → 送標 →
 > 回讀 → 評估)閉合。六模組 `pool_registry` / `round_ledger` / `gt_pred_diff` / `hybrid_sampler` /
 > `probe_eval` / `heatmap_to_boxes` / `readback_store` 全數落地,gate 全 GREEN + 真實 E2E 23/23 併跑綠。
-> **目前無進行中的里程碑**(最新完成:M21 於 2026-07-19 立案並當日完成)。
+> **目前無進行中的里程碑**(最新完成:M22 於 2026-07-19 立案並當日完成)。
 > 新能力請由新 `/user` 需求起輪;候選清單見 M20 決策日誌。
 >
 > ⚠️ **編號注意:本 repo 有兩條平行的里程碑/模組編號線**(2026-07-12 併軌時的既成事實,PO 決定不追溯重編):
@@ -36,6 +36,31 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M22 — 晶圓空間簽名分析(wafer map 缺陷空間模式,第 12 工具「🧭 晶圓地圖」)** —
+  ✅ **完成**(2026-07-19 立案並當日完成:gate `wafer_grid` 11 / `spatial_sig` 11
+  全 GREEN(含 AC5 die-mask 對照=「全格點假設會誤判 edge、within-mask 誠實 none」
+  的機器證明;200-seed 隨機誤報率 ≤7.5%;PNG 像素 exact)+ 全單元回歸 792 passed
+  零新紅 + 真實 DINOv2 E2E **1/1 兩連綠**(降級鏈逐層語彙/單片確認/W1 偏邊緣+
+  紅點==8/W2 看不出模式/對不到列 2+缺座標 1/lot 並排/匯出 3 檔+CSV verdict==/
+  來源 sha256==)+ gui_flows 回歸 25 綠(工具列加按鈕零回歸)。
+  E2E 揪出兩個 app 真 bug 均修:①換 CSV 後欄位對應被 session 殘值卡死
+  (pop 對活 widget 無效 → 賦值重置,pitfalls #13);②meta_join per_image 形態
+  誤用(dict 非對齊 list)。PM 自揪一個假錨字(label「wafer 欄」讓 contain_text
+  恆真)。角色硬隔離 hook 本輪首次實戰攔截 PG 改 tests/(改走 /pm 反向閘門)。—
+  (2026-07-19 立案;使用者確認**部分情境有 die/wafer 座標與 lot 欄位、部分情境
+  沒有,「不要有任何假設」** → 依 09/10 裁決本題優先,但 G6 零欄位假設=硬約束:
+  缺哪層欄位就停在哪層並明講,絕不默默當同一片/畫偽地圖)— 需求:影像=die/
+  檢測點、CSV(若有)含 wafer/lot+座標;把②判定攤回
+  晶圓地圖,誠實判定**聚一團/偏邊緣/線狀/看不出模式**,同 lot 並排、匯出報告素材。
+  硬約束:null=**within-wafer/die-mask 受限重排**(嚴禁全域 shuffle);
+  G2=隨機資料從不報有模式(多 seed 假陽性率受控)+「全域 shuffle 會誤判」對照例。
+  範圍:**Must** 欄位對應(復用 meta_join)+每片地圖+三簽名誠實結論+lot 並排+
+  匯出 PNG/CSV;**Should** 點 die 看縮圖、score 連續著色;**Won't** 自動根因/
+  內插/擬真外觀(user 明砍)。模組:**29 `wafer_grid`(A)**、**30 `spatial_sig`(A)**
+  + GUI 接線(B,掛法由 architect 提案)。
+  需求 [1_user_needs/wafer_spatial_signature.md](1_user_needs/wafer_spatial_signature.md);
+  PRD [2_PO_PRD/wafer_spatial_signature_prd.md](2_PO_PRD/wafer_spatial_signature_prd.md)。
+  appetite ≤2 引擎+GUI 一輪。
 - **M21 — 做法比較可信度 + 成本工作點試算(掛瑕疵偵測)** — ✅ **完成**
   (2026-07-19 立案並當日完成:gate `paired_compare` 13 / `cost_curve` 11 /
   `run_pairing` 11 全 GREEN(permutation 窮舉 exact 斷言:p==2/4096、批次混淆
@@ -297,6 +322,8 @@
 | 24 | audit_report | A | Must | ✅ | v | v | v | 只吃基本型別/numpy | M20;gate 10 綠;量化指標+method line |
 | 25 | audit_pipeline | B | Must | ✅ | v | v | v | 既有訊號函式 + 23/24 | M20;gate 9 綠 + 真實 E2E 1/1(含 GUI 第 11 工具) |
 | 26 | paired_compare | A | Must | ✅ | v | v | v | 只吃陣列/numpy | M21;gate 13 綠;效應量+blocked permutation(≤12 單位窮舉 exact)+三值結論 |
+| 29 | wafer_grid | A | Must | ✅ | v | v | v | 只吃 dict/list+PIL | M22;gate 11 綠;欄名猜測+die 格點整形+PNG 點陣(像素 exact) |
+| 30 | spatial_sig | A | Must | ✅ | v | v | v | 只吃 dict/numpy | M22;gate 11 綠;三簽名+within-wafer 受限重排 null+四值結論 + GUI E2E 1/1(第 12 工具) |
 | 27 | cost_curve | A | Must | ✅ | v | v | v | 只吃陣列/numpy | M21;gate 11 綠;閾值掃描代價曲線+最低點 |
 | 28 | run_pairing | A | Must | ✅ | v | v | v | 只吃 dict/list | M21;gate 11 綠;對齊+compare_inputs(G1 方向鏈)+ GUI E2E 1/1 |
 
@@ -819,3 +846,22 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
 - (2026-07-19) **M21 後 anomaly 家族 E2E 回歸蓋棺**:tool/wizard/bank_ui/unified_al/
   fewshot_scenarios/prelabel_gui 六檔 **23/23 全綠**(5m42s)——M21 在②插入兩個
   expander 對既有流程零回歸。本輪(修復輪+M21)正式收束。
+- (2026-07-19) **/user→/po 立案 M22「晶圓空間簽名分析」+ G6 零欄位假設修正**:
+  使用者答覆「兩種都有——有的情境有座標/lot 欄位,有的沒有,不要有任何假設」→
+  PRD 即補 G6(誠實降級鏈:無 CSV/座標/wafer/lot 各層固定訊息+指引;「同屬一片」
+  只能由使用者顯式勾選;缺欄不 crash 不畫偽圖)。統計硬約束沿裁決:null=
+  within-wafer/die-mask 受限重排,G2 含「全域 shuffle 會誤判」對照例。
+  模組 29 `wafer_grid`/30 `spatial_sig`(皆 A)+GUI(B),appetite ≤2 引擎+GUI。
+  放行 /architect。
+- (2026-07-19) **M22 當日完成(五階段,一次反向閘門+一次 hook 實戰攔截)**:
+  `/architect` 三份設計(29 整形+PIL 點陣/30 三簽名+受限重排 null/M22 GUI 降級鏈)→
+  `/pm` 22 條紅單元(含 die-mask 對照機器證明+200-seed 誤報率+像素 exact+
+  metamorphic 剛體不變量)+ 1 條 E2E 全流程 → `/pg` 兩引擎一次全綠、GUI 第 12 工具。
+  E2E 修到綠 6 輪,收穫:①pop 對活 widget 無效(要賦值重置,pitfalls #13)+
+  label 文字=假錨字(#1 變體);②per_image 是 dict 非對齊 list(讀契約要讀實作
+  形態);③role_guard hook 首次實戰攔下 PG 改 tests/,反向閘門紀律由機器執行。
+  統計定案:三簽名=聚一團(mean pairwise)/偏邊緣(mean r/R)/線狀(λ1 比例),
+  MC 2000 seeded、Bonferroni /3、平手序 linear>edge>clustered(線狀最特異)、
+  n_min=20/k_min=5/無對比擋門;PNG 匯出=PIL 自繪(kaleido 不在,零新依賴,
+  像素反而可 exact 驗)。候選(維持不擴):die 點擊看縮圖已列 Should 未強制 E2E
+  (手動驗收)、教科書全模式/跨 lot 趨勢(user 明砍之外的 Could)。
