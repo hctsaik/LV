@@ -816,3 +816,6 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
   迷你 app 最小重現)。E2E 值與手推互證:ratio 50→全標(cost12)、ratio 1→分離點
   t=0.325(cost8)。M21 後續候選(維持不擴):比較結果一鍵存圖(Could)、
   群組欄位自動偵測建議(lot/wafer 欄位名啟發式)。
+- (2026-07-19) **M21 後 anomaly 家族 E2E 回歸蓋棺**:tool/wizard/bank_ui/unified_al/
+  fewshot_scenarios/prelabel_gui 六檔 **23/23 全綠**(5m42s)——M21 在②插入兩個
+  expander 對既有流程零回歸。本輪(修復輪+M21)正式收束。
