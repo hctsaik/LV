@@ -3378,8 +3378,7 @@ def _render_select_view(
             help="排序說明：空間順序＝縮圖位置模仿散點圖；離群度＝到鄰居的平均距離，"
                  "越高越「孤立」；標籤分歧＝k 近鄰中標籤不同的比例，越高越值得複查標註"
                  "（後兩者僅供排序參考，非品質判定）。卡片文字是「類別｜檔名」"
-                 "（物件級顯示來源原圖檔名），順序即目前排序。"
-                 "要整個資料集的一頁量化報告（重複／洩漏／離群…）→ 🩺 資料體檢。",
+                 "（物件級顯示來源原圖檔名），順序即目前排序。",
         )
 
     _render_viewer_slot(records, shown)
@@ -10710,14 +10709,16 @@ def main() -> None:
     # 否則 segmented_control 拿到非選項值會報錯。
     if st.session_state.get("tool_switch") == "匯出子集":
         st.session_state["tool_switch"] = "匯出"
-    if st.session_state.get("tool_switch") in {"組考卷", "灰帶覆核", "評估"}:
+    if st.session_state.get("tool_switch") in {"組考卷", "灰帶覆核", "評估",
+                                               "🩺 資料體檢", "🧭 晶圓地圖"}:
+        # 🩺/🧭:2026-07-19 使用者裁決下架(不適用);殘留 session 值正規化
         st.session_state["tool_switch"] = "Visualize Embeddings"
     with switch_col:
-        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度 · 🩺 體檢　　🔧 瑕疵偵測 · 🧪 差異探索　　📦 匯出　　📥 標註回饋")
+        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🔧 瑕疵偵測 · 🧪 差異探索　　📦 匯出　　📥 標註回饋")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
                      "完整度熱力圖", "瑕疵偵測", "🎯 以樣搜樣", "🧪 差異探索",
-                     "🩺 資料體檢", "🧭 晶圓地圖", "匯出", "📥 標註回饋"],
+                     "匯出", "📥 標註回饋"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
         ) or "Visualize Embeddings"
@@ -10727,13 +10728,10 @@ def main() -> None:
             "- **🔍 資料探索／覆蓋**（看資料夠不夠、像不像；不改資料）：\n"
             "  · **Visualize**＝框選看圖、標籤分歧、離群（看**一堆內部**的點）\n"
             "  · **Compare Distributions**＝**兩堆之間**像不像（A vs B 分布距離）\n"
-            "  · **完整度熱力圖**＝這堆**內部**哪裡缺／假完整（embedding 空間的覆蓋；"
-            "split 類別覆蓋缺口在 🩺 資料體檢）\n"
+            "  · **完整度熱力圖**＝這堆**內部**哪裡缺／假完整（embedding 空間的覆蓋）\n"
             "- **🔧 瑕疵偵測**＝建 Normal Bank、算異常風險、挑高風險樣本送標\n"
             "- **🧪 差異探索**＝Good 群 vs Bad 群逐 patch 位置比差異 → 差異熱圖＋"
             "Top-K 區域對照（找**製程線索**；與瑕疵偵測的「單張 vs 正常群」不同）\n"
-            "- **🩺 資料體檢**＝整資料集一鍵量化審計（重複／洩漏／異標／覆蓋缺口／"
-            "離群＋metadata CSV 分組），每個數字附方法與門檻，可匯出\n"
             "- **📦 匯出（策展購物車）**＝跨工具累積候選 → 匯出子集或送 Labeling\n"
             "- **📥 標註回饋**＝送標後的迴圈中樞：回讀 Labeling 標好的結果、套用讀回\n"
             "  （標註者一致性、爭議裁決、逐型態 recall 等『標註品質』能力正整併於此，"
@@ -10789,10 +10787,6 @@ def main() -> None:
         _fewshot_search_ui()
     elif tool == "🧪 差異探索":
         _groupdiff_ui()
-    elif tool == "🩺 資料體檢":
-        _dataset_audit_ui()
-    elif tool == "🧭 晶圓地圖":
-        _wafer_map_ui()
     elif tool == "組考卷":
         _quiz_ui()
     elif tool == "灰帶覆核":

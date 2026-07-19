@@ -18,7 +18,8 @@ from playwright.sync_api import expect
 from ._anomaly_wizard import TAB_APPLY, apply_model, build_model, click_tab, enter_anomaly
 from .conftest import wait_idle
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.e2e, pytest.mark.skip(
+    reason="2026-07-19 使用者裁決下架 🧭 晶圓地圖(不適用):工具已自 tool_switch 移除、分頁不可達;引擎與單元測試保留,若復用先把工具掛回再解除本 skip")]
 
 
 def _no_exception(page) -> None:

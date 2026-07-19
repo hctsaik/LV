@@ -18,7 +18,8 @@ from PIL import Image
 
 from .conftest import load_app, wait_idle
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.e2e, pytest.mark.skip(
+    reason="2026-07-19 使用者裁決下架 🩺 資料體檢(不適用):工具已自 tool_switch 移除、分頁不可達;引擎與單元測試保留,若復用先把工具掛回再解除本 skip")]
 
 DONE_TXT = "體檢報告完成"
 

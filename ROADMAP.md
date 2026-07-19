@@ -37,6 +37,9 @@
 
 ## 里程碑
 - **M22 — 晶圓空間簽名分析(wafer map 缺陷空間模式,第 12 工具「🧭 晶圓地圖」)** —
+  📴 **已下架**(2026-07-19 使用者裁決「不適用」:工具列移除、分頁不可達;
+  引擎 29/30 與單元測試保留在庫,E2E 標 skip;復用=掛回 tool_switch+解 skip)—
+  原完成紀錄如下:
   ✅ **完成**(2026-07-19 立案並當日完成:gate `wafer_grid` 11 / `spatial_sig` 11
   全 GREEN(含 AC5 die-mask 對照=「全格點假設會誤判 edge、within-mask 誠實 none」
   的機器證明;200-seed 隨機誤報率 ≤7.5%;PNG 像素 exact)+ 全單元回歸 792 passed
@@ -88,6 +91,9 @@
   PRD [2_PO_PRD/recipe_compare_cost_workpoint_prd.md](2_PO_PRD/recipe_compare_cost_workpoint_prd.md)。
   appetite ≤3 模組+GUI 一輪。
 - **M20 — Dataset Audit 報告化 + 製程 metadata 最小關聯(第 11 工具「🩺 資料體檢」)** —
+  📴 **已下架**(2026-07-19 使用者裁決「不適用」:工具列移除、分頁不可達;
+  引擎 23/24/25 與單元測試保留在庫,E2E 標 skip;復用=掛回 tool_switch+解 skip)—
+  原完成紀錄如下:
   ✅ **完成**(2026-07-19 立案並當日完成:gate `meta_join` 7 / `audit_report` 10 /
   `audit_pipeline` 9 全 GREEN + 真實 DINOv2 E2E **1/1 綠**(AC-G1 植入數字逐項全對:
   可讀 25/壞檔 1/完全重複 5/洩漏 1/異標 1/val 缺 [classB,classC]/CSV 未匹配列 5/無資料影像 2;
@@ -865,3 +871,12 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
   n_min=20/k_min=5/無對比擋門;PNG 匯出=PIL 自繪(kaleido 不在,零新依賴,
   像素反而可 exact 驗)。候選(維持不擴):die 點擊看縮圖已列 Should 未強制 E2E
   (手動驗收)、教科書全模式/跨 lot 趨勢(user 明砍之外的 Could)。
+- (2026-07-19) **使用者裁決:下架 🩺 資料體檢(M20)與 🧭 晶圓地圖(M22)——「不適用」**:
+  依 /user 直接指示移除兩工具。執行方式沿工具列瘦身慣例(319dd80):自 tool_switch
+  移除+dispatch 拔除+殘留 session 正規化+指路文案清理(功能地圖/工具列 caption/
+  viz 排序 help 的 🩺 指引全撤;「🩺 體檢卡」為 Visualize 單張功能,非同物,保留)。
+  **引擎與單元測試全數保留**(meta_join/audit_report/audit_pipeline/wafer_grid/
+  spatial_sig 五模組 gate 照跑),兩工具 E2E 標 skip(理由記在檔內);教學文件
+  docs/audit_guide、docs/wafer_map_guide 移除(git 歷史可回)。M21 做法比較的
+  「metadata 欄位分組」選項因 🩺 下架暫無資料來源,自動退回 不分組/按上層資料夾。
+  復用成本:掛回 tool_switch 兩行+解 skip 即可。
