@@ -151,6 +151,19 @@ def test_ac4_use_embedding_off(tmp_path):
     assert _sec(res, "exact_dup")["value"] == 5
 
 
+def test_multiple_dataset_roots_are_merged(tmp_path):
+    from audit_pipeline import export_audit, run_audit
+
+    root_a = _mk_tree(tmp_path / "ds_a")
+    root_b = _mk_tree(tmp_path / "ds_b")
+    res = run_audit([root_a, root_b], use_embedding=False,
+                    cache_root=tmp_path / "cache")
+    assert res["n_images"] == 50
+    assert res["roots"] == [str(root_a), str(root_b)]
+    with pytest.raises(ValueError):
+        export_audit(res, root_b / "out")
+
+
 def test_ac5_embedding_cache_by_sha(tmp_path):
     """# AC5:首輪呼叫==獨特 sha 數(20);同參數重跑 0 呼叫。"""
     from audit_pipeline import run_audit

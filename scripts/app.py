@@ -161,16 +161,33 @@ def _pick_file(session_key: str, title: str = "選擇檔案", filetypes: list | 
         st.session_state[session_key] = path
 
 
+def _folder_identity(path: str) -> str:
+    """資料夾去重鍵；路徑尚未存在時也可安全比較。"""
+    return os.path.normcase(os.path.abspath(os.path.expanduser(path.strip())))
+
+
+def _append_folder(existing: list[str] | None, path: str) -> list[str]:
+    """依加入順序累加一個非空路徑，等價路徑不重複加入。"""
+    value = path.strip()
+    out = [str(p).strip() for p in (existing or []) if str(p).strip()]
+    if not value:
+        return out
+    seen = {_folder_identity(p) for p in out}
+    if _folder_identity(value) not in seen:
+        out.append(value)
+    return out
+
+
 def _pick_folder_set(list_key: str) -> None:
-    """原生資料夾對話框 → 單一資料夾語義:選新的直接取代舊的。
-    session 值維持 list 型別(E2E harness 與 render 端都以 list 迭代)。"""
+    """原生資料夾對話框 → 把選擇累加到 session list。"""
     root = tk.Tk()
     root.withdraw()
     root.wm_attributes("-topmost", 1)
     path = filedialog.askdirectory(title="選擇資料夾")
     root.destroy()
     if path:
-        st.session_state[list_key] = [path]
+        st.session_state[list_key] = _append_folder(
+            st.session_state.get(list_key), path)
 
 
 def _pick_folder_into_text(text_key: str, replace: bool = False) -> None:
@@ -232,28 +249,25 @@ def _manual_class_names(prefix: str) -> list[str] | None:
 
 
 def _folder_add_cb(list_key: str, input_key: str) -> None:
-    """Set the typed/pasted path as THE folder (single-folder semantics —
-    a new pick replaces the old one), then clear the field. The session value
-    stays a list so render/E2E contracts are unchanged."""
+    """把輸入／貼上的路徑累加到 managed list，再清空輸入欄。"""
     v = (st.session_state.get(input_key) or "").strip()
     if v:
-        st.session_state[list_key] = [v]
+        st.session_state[list_key] = _append_folder(
+            st.session_state.get(list_key), v)
     st.session_state[input_key] = ""
 
 
 def _folder_add_input(list_key: str, *, help: str | None = None) -> None:
     """Small single-line '輸入路徑 → Enter' field — the only Playwright/headless-
-    driveable folder input (the 📁 picker is a native dialog). Single-folder
-    semantics: entering a path replaces the previous selection."""
-    st.text_input("或輸入路徑後 Enter（取代目前選擇）", key=f"{list_key}_add",
+    driveable folder input (the 📁 picker is a native dialog)."""
+    st.text_input("輸入路徑後 Enter（可連續新增）", key=f"{list_key}_add",
                   on_change=_folder_add_cb, args=(list_key, f"{list_key}_add"),
                   placeholder="例：demo/coco8/train", label_visibility="collapsed",
                   help=help)
 
 
 def _folder_picker_list(list_key: str, *, add_help: str | None = None) -> list:
-    """[輸入路徑|📁] 同列(輸入框左、📁 native picker 右)+ current folder (× remover)。
-    Returns paths (list 型別,單一資料夾語義:選新的取代舊的)。"""
+    """可累加的 [輸入路徑|📁] + 已選資料夾清單（逐項移除）。"""
     st.session_state.setdefault(list_key, [])
     _fc1, _fc2 = st.columns([5, 1], vertical_alignment="bottom")
     with _fc1:
@@ -5832,8 +5846,8 @@ _CMP_CACHE_DIRS = ("embeddings_", "object_crops", ".thumbs")
 def _load_cmp_demo() -> None:
     """一鍵填入兩個範例『直接含圖片』資料夾並自動跑（對齊其他工具的 demo）。"""
     a, b = _demo_compare_dirs()
-    st.session_state["cmp_folder_a"] = a
-    st.session_state["cmp_folder_b"] = b
+    st.session_state["cmp_folder_a_list"] = [a]
+    st.session_state["cmp_folder_b_list"] = [b]
     st.session_state["_cmp_autorun"] = True
     _log_usage("cmp_demo_load")
 
@@ -5856,9 +5870,26 @@ def _cmp_resolve_images(folder: Path) -> tuple[list[Path], str | None]:
     return [], None
 
 
+def _cmp_resolve_groups(folders: list[Path]) -> tuple[list[Path], list[str]]:
+    """合併一組資料夾的影像，保持順序並去除重複檔案。"""
+    paths: list[Path] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+    for folder in folders:
+        found, note = _cmp_resolve_images(folder)
+        if note:
+            notes.append(f"{folder}：{note}")
+        for path in found:
+            token = os.path.normcase(str(path.resolve()))
+            if token not in seen:
+                seen.add(token)
+                paths.append(path)
+    return paths, notes
+
+
 def _cmp_policy_token(model: str) -> str:
-    return (f"{st.session_state.get('cmp_folder_a','')}|"
-            f"{st.session_state.get('cmp_folder_b','')}|{model}")
+    return (f"{st.session_state.get('cmp_folder_a_list', [])}|"
+            f"{st.session_state.get('cmp_folder_b_list', [])}|{model}")
 
 
 def _cmp_autotune(paths_a, paths_b, model):
@@ -6281,27 +6312,16 @@ def _compare_distributions_ui() -> None:
     with st.sidebar:
         _is_whole = st.session_state.get("cmp_unit") == _UNIT_WHOLE
         _freq = "" if _is_whole else "（偵測資料夾，含 images/＋labels/）"
-        # [輸入框|📁] 同列（全 app 一致樣式）。📁 用 on_click 回呼：rerun 開始、
-        # widget 實例化前寫回同名 key（同 exp_dst 模式，見 app.py exp_dst 註解）。
-        _fa1, _fa2 = st.columns([5, 1], vertical_alignment="bottom")
-        with _fa1:
-            st.text_input(f"Folder A{_freq}", key="cmp_folder_a",
-                          placeholder=r"例：C:\data\setA")
-        with _fa2:
-            st.button("📁", key="browse_a", use_container_width=True,
-                      on_click=_pick_folder, args=("cmp_folder_a",),
-                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
-        folder_a = st.session_state.get("cmp_folder_a", "")
-
-        _fb1, _fb2 = st.columns([5, 1], vertical_alignment="bottom")
-        with _fb1:
-            st.text_input(f"Folder B{_freq}", key="cmp_folder_b",
-                          placeholder=r"例：C:\data\setB")
-        with _fb2:
-            st.button("📁", key="browse_b", use_container_width=True,
-                      on_click=_pick_folder, args=("cmp_folder_b",),
-                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
-        folder_b = st.session_state.get("cmp_folder_b", "")
+        # 舊 session 的單一路徑無痛升級為 list；後續一律允許累加。
+        for _list_key, _legacy_key in (("cmp_folder_a_list", "cmp_folder_a"),
+                                       ("cmp_folder_b_list", "cmp_folder_b")):
+            if _list_key not in st.session_state:
+                _legacy = (st.session_state.get(_legacy_key) or "").strip()
+                st.session_state[_list_key] = [_legacy] if _legacy else []
+        st.markdown(f"**Folder A{_freq}**")
+        folders_a = _folder_picker_list("cmp_folder_a_list")
+        st.markdown(f"**Folder B{_freq}**")
+        folders_b = _folder_picker_list("cmp_folder_b_list")
         all_models = available_models()
         if not all_models:
             st.error("No .pth models found in ./models/. Add a model file and restart.")
@@ -6328,23 +6348,21 @@ def _compare_distributions_ui() -> None:
         run = True
 
     if run:
-        path_a = Path(folder_a.strip()) if folder_a.strip() else None
-        path_b = Path(folder_b.strip()) if folder_b.strip() else None
-
-        if not path_a or not path_b:
-            st.error("請在左側填入 Folder A 與 Folder B 兩個資料夾路徑"
+        roots_a = [Path(p) for p in folders_a]
+        roots_b = [Path(p) for p in folders_b]
+        if not roots_a or not roots_b:
+            st.error("請在左側為 Folder A 與 Folder B 各加入至少一個資料夾"
                      "（或按下方「✨ 用範例資料試跑」）。")
             return
-        if not path_a.exists():
-            st.error(f"找不到 Folder A：{path_a}")
-            return
-        if not path_b.exists():
-            st.error(f"找不到 Folder B：{path_b}")
+        missing_a = [str(p) for p in roots_a if not p.is_dir()]
+        missing_b = [str(p) for p in roots_b if not p.is_dir()]
+        if missing_a or missing_b:
+            st.error("找不到資料夾：" + "、".join(missing_a + missing_b))
             return
         _collapse_sidebar()
 
-        paths_a, note_a = _cmp_resolve_images(path_a)
-        paths_b, note_b = _cmp_resolve_images(path_b)
+        paths_a, notes_a = _cmp_resolve_groups(roots_a)
+        paths_b, notes_b = _cmp_resolve_groups(roots_b)
 
         # 壞檔防呆:兩邊各自前置過濾，壞檔（連同其 label）排除在逐類別比較外
         paths_a, _bad_a = _partition_image_paths(paths_a, "cmp_a")
@@ -6355,24 +6373,27 @@ def _compare_distributions_ui() -> None:
                  "請選資料集根目錄（或其 images/ 子夾），例如 …/train、…/valid。"
                  if unit == _UNIT_OBJ else "")
         if not paths_a:
-            st.error(f"Folder A 找不到影像：{path_a}" + _hint); return
+            st.error("Folder A 的所有資料夾都找不到影像。" + _hint); return
         if not paths_b:
-            st.error(f"Folder B 找不到影像：{path_b}" + _hint); return
+            st.error("Folder B 的所有資料夾都找不到影像。" + _hint); return
         _ov = len(set(map(str, paths_a)) & set(map(str, paths_b)))
         if _ov:
             st.warning(f"Folder A 與 B 有 {_ov} 張重疊（A 可能是 B 的子集）；"
                        "分佈差異會偏低、參考價值低 — 建議選兩個不重疊的資料夾。")
-        if note_a:
-            st.info(f"Folder A：{note_a}")
-        if note_b:
-            st.info(f"Folder B：{note_b}")
+        for note in notes_a:
+            st.info(f"Folder A：{note}")
+        for note in notes_b:
+            st.info(f"Folder B：{note}")
+
+        name_a = roots_a[0].name if len(roots_a) == 1 else f"A（{len(roots_a)} 個資料夾）"
+        name_b = roots_b[0].name if len(roots_b) == 1 else f"B（{len(roots_b)} 個資料夾）"
 
         if unit == _UNIT_WHOLE:
-            if _compute_compare_whole(path_a, path_b, paths_a, paths_b,
-                                      path_a.name, path_b.name, selected_model):
+            if _compute_compare_whole(roots_a[0], roots_b[0], paths_a, paths_b,
+                                      name_a, name_b, selected_model):
                 st.rerun()
             return
-        if _compute_compare_by_class(paths_a, paths_b, path_a.name, path_b.name,
+        if _compute_compare_by_class(paths_a, paths_b, name_a, name_b,
                                      selected_model):
             st.rerun()
         return
@@ -6411,13 +6432,13 @@ def _cmp_object_settings_expander() -> None:
             if _mdl and not _mdl.startswith("dinov2"):
                 st.info("自動調 head（cls／meanpool）僅對 DINOv2 有意義；其他模型主要比 pad／解析度。")
             if st.button("🔄 重新量測", key="cmp_retune", use_container_width=True):
-                _fa = st.session_state.get("cmp_folder_a", "").strip()
-                _fb = st.session_state.get("cmp_folder_b", "").strip()
-                if not (_fa and _fb and Path(_fa).exists() and Path(_fb).exists()):
+                _fa = [Path(p) for p in st.session_state.get("cmp_folder_a_list", [])]
+                _fb = [Path(p) for p in st.session_state.get("cmp_folder_b_list", [])]
+                if not (_fa and _fb and all(p.is_dir() for p in _fa + _fb)):
                     st.warning("先在上方選好 Folder A 與 B。")
                 else:
-                    _ipa, _ = _cmp_resolve_images(Path(_fa))
-                    _ipb, _ = _cmp_resolve_images(Path(_fb))
+                    _ipa, _ = _cmp_resolve_groups(_fa)
+                    _ipb, _ = _cmp_resolve_groups(_fb)
                     st.session_state.pop("_cmp_objA", None)
                     st.session_state.pop("_cmp_objB", None)
                     # 設定變了 → 丟掉舊結果,逼使用者重新 Run(避免表格與設定不一致)
@@ -7409,10 +7430,9 @@ def _render_coverage_view(records: list[dict], emb: np.ndarray, model: str) -> N
 
     with col_side:
         st.markdown("**① 候選資料夾（選完自動投影）**")
-        # 單一資料夾語義:選新的取代舊的(與全域 picker 一致);後端仍吃多行
-        # (E2E harness 直寫 session 多資料夾的相容性不變)。
+        # 候選池可由多個資料夾合併；每次選擇累加且去重。
         st.button("📁 選擇候選資料夾", key="cov_cand_pick", use_container_width=True,
-                  on_click=_pick_folder_into_text, args=("cov_cand_text", True))
+                  on_click=_pick_folder_into_text, args=("cov_cand_text", False))
         _ctext = st.session_state.get("cov_cand_text", "").strip()
         for _l in [_x for _x in _ctext.splitlines() if _x.strip()]:
             st.caption(f"• {_l}")
@@ -8245,12 +8265,11 @@ def _completeness_ui() -> None:
             # (b) 缺格一鍵撈候選：候選池就地設定（popover），免回 sidebar
             with st.popover("🔎 撈候選補此格", use_container_width=True):
                 st.caption("候選池資料夾（通常是未標註的影像）")
-                # 單一資料夾語義:📁 選新的取代舊的。widget 維持 text_area
-                # (E2E 契約 .st-key-cov_pool_text textarea,headless 唯一入口)。
+                # widget 維持 text_area（E2E 契約），可貼上／累加多個候選池。
                 st.button("📁 選候選池資料夾", key="cov_pool_pick",
                           use_container_width=True,
-                          on_click=_pick_folder_into_text, args=("cov_pool_text", True))
-                st.text_area("或貼上候選池路徑（取代目前選擇）", key="cov_pool_text",
+                          on_click=_pick_folder_into_text, args=("cov_pool_text", False))
+                st.text_area("或貼上候選池路徑（每行一個）", key="cov_pool_text",
                              height=80, label_visibility="collapsed",
                              placeholder="例：demo/pool 或 C:/data/unlabeled")
                 if st.button("開始撈候選", key="cov_mine_btn",
@@ -9365,6 +9384,36 @@ def _eval_gt_by_image(folder: Path, names: list[str]) -> dict[str, list[dict]]:
     return gt
 
 
+def _eval_gt_for_folders(
+    folders: list[Path],
+) -> tuple[dict[str, list[dict]], dict[str, str], list[str]]:
+    """合併多個 YOLO root；回傳 GT、檔名到影像路徑、重複檔名。
+
+    評估 CSV 目前以 basename 當身分鍵，因此跨資料夾同名時必須拒絕，
+    不能把預測或 GT 靜默配到錯圖。
+    """
+    combined: dict[str, list[dict]] = {}
+    image_by_name: dict[str, str] = {}
+    duplicates: set[str] = set()
+    for folder in folders:
+        names = _classes_txt_nested(folder) or []
+        root_gt = _eval_gt_by_image(folder, names)
+        for img in sorted((folder / "images").rglob("*")):
+            if img.suffix.lower() not in _IMG_EXTS:
+                continue
+            if img.name in image_by_name and image_by_name[img.name] != str(img):
+                duplicates.add(img.name)
+            else:
+                image_by_name[img.name] = str(img)
+        for filename, boxes in root_gt.items():
+            if filename not in duplicates:
+                combined[filename] = boxes
+    for filename in duplicates:
+        combined.pop(filename, None)
+        image_by_name.pop(filename, None)
+    return combined, image_by_name, sorted(duplicates)
+
+
 def _eval_consensus_by_image(csv_text: str, gt_by_image: dict) -> tuple[dict, int, int]:
     """Parse a 組考卷 consensus CSV → per-GT-box consensus flags. Supports both
     image-level (filename,consensus,…) and box-level (…,cx,cy,w,h) CSVs via
@@ -9436,10 +9485,8 @@ def _evaluation_ui() -> None:
                "（重定義文件 §5.3）。")
     with st.sidebar:
         st.markdown("**① 資料夾（含 images/ 與 labels/）**")
-        # 評估後端只吃第一個資料夾(app 只讀 lines[0]) → 單一資料夾取代語義,避免誤導
-        st.button("📁 選擇資料夾", key="eval_pick", use_container_width=True,
-                  on_click=_pick_folder_into_text, args=("eval_folder_text", True))
-        _picked_paths_display("eval_folder_text")
+        eval_folders = _folder_picker_list(
+            "eval_folder_list", add_help="可加入多個 YOLO root；跨資料夾影像檔名不可重複。")
         st.markdown("**② 模型預測 CSV** `filename,class,cx,cy,w,h[,score]`")
         pred_file = st.file_uploader("predictions.csv", type="csv", key="eval_pred_file")
         st.markdown("**③（可選）組考卷共識子集 CSV**")
@@ -9450,16 +9497,17 @@ def _evaluation_ui() -> None:
         run = st.button("▶ 評估", type="primary", use_container_width=True, key="eval_run")
 
     if run:
-        lines = (st.session_state.get("eval_folder_text") or "").strip().splitlines()
-        folder = Path(lines[0].strip()) if lines and lines[0].strip() else None
-        if not folder or not (folder / "images").exists():
-            st.error("資料夾需含 images/（與 labels/）。"); return
+        folders = [Path(p) for p in eval_folders]
+        invalid = [str(p) for p in folders if not (p / "images").is_dir()]
+        if not folders or invalid:
+            st.error("每個資料夾都需含 images/（與 labels/）"
+                     + ("：" + "、".join(invalid) if invalid else "。")); return
         if pred_file is None:
             st.error("請上傳模型預測 CSV。"); return
-        # 巢狀佈局也找得到 classes.txt（…/[Small]/test → indoor/classes.txt），否則
-        # names=[] → GT 類別退化成 id，class-aware 比對假性全漏(recall=0)
-        names = _classes_txt_nested(folder) or []
-        gt_by_image = _eval_gt_by_image(folder, names)
+        gt_by_image, image_by_name, duplicate_names = _eval_gt_for_folders(folders)
+        if duplicate_names:
+            st.error("多個來源含相同影像檔名，predictions.csv 無法判定來源。請先重新命名："
+                     + "、".join(duplicate_names[:20])); return
         if not gt_by_image:
             st.error("labels/ 裡找不到任何 GT 框。"); return
         _collapse_sidebar()
@@ -9479,7 +9527,8 @@ def _evaluation_ui() -> None:
         _gtc = {str(b["cls"]) for bs in gt_by_image.values() for b in bs}
         _pdc = {str(b["cls"]) for bs in pred_by_image.values() for b in bs}
         st.session_state["_eval_result"] = {
-            "res": res, "folder": str(folder), "used_consensus": cons_by_image is not None,
+            "res": res, "folders": [str(p) for p in folders],
+            "image_by_name": image_by_name, "used_consensus": cons_by_image is not None,
             "n_cons_img": n_c, "n_gray_img": n_g, "n_pred_img": len(pred_by_image),
             "ns_mismatch": bool(class_aware and _gtc and _pdc and not (_gtc & _pdc))}
 
@@ -9521,12 +9570,16 @@ def _evaluation_ui() -> None:
     fns = res["false_negatives"]
     if fns:
         st.markdown(f"**漏抓畫廊（escape，共 {len(fns)}）** — 每張是被漏掉的缺陷區")
-        folder = Path(data["folder"])
+        image_by_name = data.get("image_by_name") or {}
+        legacy_folder = Path(data["folder"]) if data.get("folder") else None
         with st.container(height=520):
             cols = st.columns(4)
             for j, fn in enumerate(fns[:40]):
                 with cols[j % 4]:
-                    im = safe_open_image(folder / "images" / fn["filename"])  # 壞檔 None → 略過
+                    image_path = image_by_name.get(fn["filename"])
+                    if not image_path and legacy_folder is not None:
+                        image_path = legacy_folder / "images" / fn["filename"]
+                    im = safe_open_image(image_path) if image_path else None
                     if im is None:
                         st.warning(f'⚠ {fn["filename"]}')
                         continue
@@ -10081,23 +10134,17 @@ def _groupdiff_ui() -> None:
 
     c_good, c_bad = st.columns(2)
     with c_good:
-        _f1, _f2 = st.columns([5, 1], vertical_alignment="bottom")
-        with _f1:
-            st.text_input("Good（良品）資料夾", key="gpd_good_dir",
-                          placeholder=r"例：C:\data\good")
-        with _f2:
-            st.button("📁", key="gpd_browse_good", use_container_width=True,
-                      on_click=_pick_folder, args=("gpd_good_dir",),
-                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+        if "gpd_good_dirs" not in st.session_state:
+            _legacy = (st.session_state.get("gpd_good_dir") or "").strip()
+            st.session_state["gpd_good_dirs"] = [_legacy] if _legacy else []
+        st.markdown("**Good（良品）資料夾**")
+        good_dirs = _folder_picker_list("gpd_good_dirs")
     with c_bad:
-        _f3, _f4 = st.columns([5, 1], vertical_alignment="bottom")
-        with _f3:
-            st.text_input("Bad（不良品）資料夾", key="gpd_bad_dir",
-                          placeholder=r"例：C:\data\bad")
-        with _f4:
-            st.button("📁", key="gpd_browse_bad", use_container_width=True,
-                      on_click=_pick_folder, args=("gpd_bad_dir",),
-                      help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+        if "gpd_bad_dirs" not in st.session_state:
+            _legacy = (st.session_state.get("gpd_bad_dir") or "").strip()
+            st.session_state["gpd_bad_dirs"] = [_legacy] if _legacy else []
+        st.markdown("**Bad（不良品）資料夾**")
+        bad_dirs = _folder_picker_list("gpd_bad_dirs")
 
     _mc1, _mc2 = st.columns([3, 2], vertical_alignment="bottom")
     with _mc1:
@@ -10117,12 +10164,12 @@ def _groupdiff_ui() -> None:
                                      value=0.05, key="gpd_alpha")
             seed = int(st.number_input("random seed", 0, 9999, 0, key="gpd_seed"))
 
-    good_dir = (st.session_state.get("gpd_good_dir") or "").strip()
-    bad_dir = (st.session_state.get("gpd_bad_dir") or "").strip()
-    sig = (good_dir, bad_dir, model, int(top_k), int(n_perm), float(alpha), seed)
+    sig = (tuple(good_dirs), tuple(bad_dirs), model, int(top_k), int(n_perm), float(alpha), seed)
+    valid_sources = (good_dirs and bad_dirs
+                     and all(Path(p).is_dir() for p in good_dirs + bad_dirs))
     run = st.button("🔬 分析差異", key="gpd_run", type="primary",
                     use_container_width=True,
-                    disabled=not (os.path.isdir(good_dir) and os.path.isdir(bad_dir)))
+                    disabled=not valid_sources)
 
     if run:
         from groupdiff_pipeline import run_groupdiff
@@ -10130,7 +10177,7 @@ def _groupdiff_ui() -> None:
         try:
             with st.spinner("分析中…（首次先載入模型，約 10~30 秒）"):
                 res = run_groupdiff(
-                    good_dir, bad_dir, model=model, n_perm=int(n_perm),
+                    good_dirs, bad_dirs, model=model, n_perm=int(n_perm),
                     alpha=float(alpha), top_k=int(top_k), seed=seed,
                     progress=lambda f, t: prog.progress(min(float(f), 1.0), text=t))
         except ValueError as e:
@@ -10142,7 +10189,7 @@ def _groupdiff_ui() -> None:
 
     cell = st.session_state.get("gpd_result")
     if not cell:
-        st.info("選好 Good / Bad 兩個資料夾後按「🔬 分析差異」。")
+        st.info("為 Good / Bad 各選至少一個資料夾後按「🔬 分析差異」。")
         return
     res = cell["res"]
     if cell["sig"] != sig:
@@ -10312,14 +10359,11 @@ def _dataset_audit_ui() -> None:
             "對不上的列與影像都會**明講數量**，不默默略過。\n"
             "- 只讀來源資料夾，絕不寫入；匯出到你另選的資料夾。")
 
-    _f1, _f2 = st.columns([5, 1], vertical_alignment="bottom")
-    with _f1:
-        st.text_input("資料集資料夾（有 train/val 子目錄會自動辨識 split）",
-                      key="adt_root", placeholder=r"例：C:\data\mydataset")
-    with _f2:
-        st.button("📁", key="adt_browse_root", use_container_width=True,
-                  on_click=_pick_folder, args=("adt_root",),
-                  help="開啟系統的『選擇資料夾』視窗；也可直接在左邊貼上路徑。")
+    if "adt_roots" not in st.session_state:
+        _legacy = (st.session_state.get("adt_root") or "").strip()
+        st.session_state["adt_roots"] = [_legacy] if _legacy else []
+    st.markdown("**資料集資料夾**（有 train/val 子目錄會自動辨識 split）")
+    roots = _folder_picker_list("adt_roots")
     st.text_input("製程 metadata CSV（選填；需 filename 或 sha256 欄＋任意欄位如 tool/recipe）",
                   key="adt_csv", placeholder=r"例：C:\data\meta.csv（留空＝不掛 metadata）")
 
@@ -10335,11 +10379,11 @@ def _dataset_audit_ui() -> None:
         use_emb = st.checkbox("含 embedding 訊號（離群／語意近重複）",
                               value=True, key="adt_use_emb")
 
-    root = (st.session_state.get("adt_root") or "").strip()
     csvp = (st.session_state.get("adt_csv") or "").strip()
-    sig = (root, csvp, model, bool(use_emb))
+    sig = (tuple(roots), csvp, model, bool(use_emb))
+    valid_roots = roots and all(Path(p).is_dir() for p in roots)
     run = st.button("🩺 產生體檢報告", key="adt_run", type="primary",
-                    use_container_width=True, disabled=not os.path.isdir(root))
+                    use_container_width=True, disabled=not valid_roots)
 
     if run:
         from audit_pipeline import run_audit
@@ -10347,7 +10391,7 @@ def _dataset_audit_ui() -> None:
         try:
             with st.spinner("體檢中…（含 embedding 時首次要載模型，約 10~30 秒）"):
                 res = run_audit(
-                    root, model=model, metadata_csv=(csvp or None),
+                    roots, model=model, metadata_csv=(csvp or None),
                     use_embedding=bool(use_emb),
                     progress=lambda f, t: prog.progress(min(float(f), 1.0), text=t))
         except ValueError as e:

@@ -74,11 +74,11 @@ def export_audit(result, out_dir) -> dict
   (整資料集量化體檢,與單張「體檢卡」呼應)。
 - `_dataset_audit_ui()`(主畫面,不進 sidebar):
   - 標題 + ❓ popover(定位/六訊號/CSV 格式說明——**不得**含成功 banner 字串)。
-  - 輸入:資料夾 [輸入框|📁](`adt_root`/`adt_browse_root`);
+  - 輸入:可累加、去重、逐項移除的資料夾清單(`adt_roots`);
     metadata CSV [輸入框|📁](`adt_csv`/`adt_browse_csv`,選填,caption 說明鍵欄);
     Model selectbox(`adt_model`,預設 dinov2_vits14)+
     checkbox「含 embedding 訊號(離群/語意近重複)」(`adt_use_emb`,預設開)。
-  - 「🩺 產生體檢報告」(`adt_run`,primary,root 非資料夾時 disabled)→
+  - 「🩺 產生體檢報告」(`adt_run`,primary,任一 root 非資料夾時 disabled)→
     st.progress + spinner(首次載模型提示慣例)→ 結果存
     `st.session_state["adt_result"]`(簽章=root/csv/model/use_emb;變更顯提醒)。
   - 完成 banner(唯一訊號):`st.success("✅ 體檢報告完成(共 N 張,見下方各節)")`;

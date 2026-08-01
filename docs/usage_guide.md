@@ -120,7 +120,7 @@ streamlit run scripts/app.py                  # 開在 http://localhost:8501
 > 與「完整度熱力圖」的根本差別：**Compare 比兩堆之間（A 對 B）；完整度熱力圖看單一堆內部哪裡缺/假完整。**
 
 ### 怎麼操作
-側欄依序：**Folder A / Folder B**（各填**直接含圖片**的資料夾，例如 `dataset/train/images`、`goal/images`）→ **Model** → **Output name prefix** → 可勾「**僅視覺化（跳過指標計算）**」→ **Pairwise metric samples**（預設 500，LPIPS/SSIM/PSNR 隨機配對數）→ **▶ Run**。
+側欄依序：**Folder A / Folder B**（A、B 各自都可連續加入多個資料夾；同一側的影像會合併成一群）→ **Model** → **比較單位** → **▶ Run**。所有影像來源／候選來源都可重複按 📁 或輸入路徑後 Enter 來累加，並可用各列的 ✕ 單獨移除；輸出、模型與工作區目錄仍維持單一目的地。
 跑完上方出指標卡；下方左欄投影疊圖（**Method** 切 PCA/t-SNE/UMAP、維度 2D/3D，2D 可框選）；再下面 **Coverage Gap Analysis**。
 
 ### 指標怎麼讀（箭頭＝好的方向）

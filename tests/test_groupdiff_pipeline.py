@@ -81,6 +81,24 @@ def test_ac1_end_to_end_synthetic(tmp_path):
     assert res["n_good"] == 8 and res["n_bad"] == 8
 
 
+def test_multiple_source_folders_are_merged_per_group(tmp_path):
+    """每個 Good/Bad 群可由多個資料夾合併，統計與來源守衛涵蓋全部 root。"""
+    from groupdiff_pipeline import export_report, run_groupdiff
+
+    g1, g2 = tmp_path / "g1", tmp_path / "g2"
+    b1, b2 = tmp_path / "b1", tmp_path / "b2"
+    _mk_imgs(g1, 4, seed0=0); _mk_imgs(g2, 4, seed0=20)
+    _mk_imgs(b1, 4, marker="bad", seed0=100)
+    _mk_imgs(b2, 4, marker="bad", seed0=120)
+    res = run_groupdiff([g1, g2], [b1, b2], extractor=_mk_extractor([]),
+                        cache_root=tmp_path / "cache", n_perm=100, seed=0)
+    assert res["n_good"] == 8 and res["n_bad"] == 8
+    assert res["good_dirs"] == [str(g1), str(g2)]
+    assert res["bad_dirs"] == [str(b1), str(b2)]
+    with pytest.raises(ValueError):
+        export_report(res, g2 / "out")
+
+
 def test_ac2_null_honest(tmp_path):
     """# AC2:同分布兩夾(3 組)→ verdict True 至多 1 組。"""
     from groupdiff_pipeline import run_groupdiff

@@ -84,8 +84,8 @@ def _fill(page, key: str, value):
 
 def _analyze(page, good_dir, bad_dir) -> str:
     """填兩夾 → 按「🔬 分析差異」→ 等 verdict banner(成功或 null 警示,唯一訊號)。"""
-    _fill(page, "gpd_good_dir", good_dir)
-    _fill(page, "gpd_bad_dir", bad_dir)
+    _fill(page, "gpd_good_dirs_add", good_dir)
+    _fill(page, "gpd_bad_dirs_add", bad_dir)
     btn = page.locator('.st-key-gpd_run button')
     btn.wait_for(state="visible", timeout=30000)
     page.wait_for_function(

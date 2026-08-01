@@ -611,9 +611,6 @@ def leakage_dataset(tmp_path):
     return root
 
 
-@pytest.mark.skip(reason="單一資料夾語義(2026-07 規格):UI 一次僅能載一個資料夾,"
-                         "跨 split(train+val 同載)洩漏掃描經 UI 已不可達;"
-                         "demo 按鈕仍會程式化載入兩個資料夾,該路徑不在本測試範圍")
 def test_p_duplicate_leakage_scan(app_page, leakage_dataset):
     page = app_page
     page.locator('.st-key-viz_mode').get_by_text("Image Classifier").click()

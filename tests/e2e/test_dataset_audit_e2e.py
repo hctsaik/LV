@@ -108,7 +108,7 @@ def test_audit_g1_g2_g3_end_to_end(app_server, browser, audit_tree, tmp_path):
         wait_idle(page)
         page.wait_for_timeout(400)
 
-        _fill(page, "adt_root", root)
+        _fill(page, "adt_roots_add", root)
         _fill(page, "adt_csv", csvf)
         btn = page.locator('.st-key-adt_run button')
         btn.wait_for(state="visible", timeout=30000)

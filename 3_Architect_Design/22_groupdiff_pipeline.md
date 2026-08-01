@@ -4,7 +4,7 @@
 
 ## 1. 目的(Purpose)
 
-把 M19 串成一次可跑完的分析:兩個影像資料夾 → 整張影像記錄(復用 M8)→
+把 M19 串成一次可跑完的分析:Good/Bad 各一組影像資料夾 → 整張影像記錄(復用 M8)→
 DINOv2 patch 特徵(復用 `patch_features`,含 `.lv_cache` 快取)→ grid 對齊檢查 →
 20(統計)→ 21(區域/代表)→ **單一結果包 dict**;外加**匯出報告**(熱圖 PNG /
 regions.csv / 對照圖 / summary.json)。GUI 只做薄呈現,一切可斷言邏輯下沉本模組。
@@ -100,8 +100,8 @@ def export_report(result, out_dir) -> dict
 - 新 `_groupdiff_ui()`;所有 key 前綴 **`gpd_`**:
   - 標題「🧪 Good/Bad 差異探索」+ ❓ `st.popover`:一句定位(**群對群**、與瑕疵偵測
     「單張 vs 正常群」不同)、前提(拍攝對齊)、誠實界線(無穩定差異就明講)。
-  - 輸入:Good/Bad 兩列 [輸入框|📁] 同列慣例(仿 Compare `browse_a/b`;
-    keys `gpd_good_dir`/`gpd_bad_dir` + `gpd_browse_good`/`gpd_browse_bad`)。
+  - 輸入:Good/Bad 各一個可累加、去重、逐項移除的資料夾清單
+    (keys `gpd_good_dirs`/`gpd_bad_dirs`);每群合併後需至少 2 張可讀影像。
     模型 selectbox(既有模型清單 helper,預設 `dinov2_vits14`)。
     進階 popover:top_k / n_perm / alpha / seed(預設同 §2.1)。
   - 「🔬 分析差異」按鈕 → `run_groupdiff`(`st.progress` 接 progress;spinner 提示

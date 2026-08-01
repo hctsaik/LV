@@ -21,19 +21,33 @@ def _progress(cb, frac: float, text: str) -> None:
         cb(min(float(frac), 1.0), text)
 
 
-def _load_group(folder, name, *, model, target_res, extractor, cache_dir,
+def _as_roots(value) -> list[Path]:
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return [Path(v) for v in values]
+
+
+def _load_group(folders, name, *, model, target_res, extractor, cache_dir,
                 progress, base_frac, span):
     from interaction import discover_whole_images
     from object_eval import list_images
     from patch_features import embed_objects_patch
     from safe_io import partition_readable
 
-    folder = Path(folder)
-    if not folder.is_dir():
-        raise ValueError(f"資料夾不存在:{folder}")
-    readable, bad_files = partition_readable(list_images(folder))
+    roots = _as_roots(folders)
+    missing = [str(folder) for folder in roots if not folder.is_dir()]
+    if missing:
+        raise ValueError("資料夾不存在:" + "、".join(missing))
+    image_paths = []
+    seen = set()
+    for folder in roots:
+        for path in list_images(folder):
+            token = str(path.resolve())
+            if token not in seen:
+                seen.add(token)
+                image_paths.append(path)
+    readable, bad_files = partition_readable(image_paths)
     if len(readable) < 2:
-        raise ValueError(f"資料夾可讀影像不足(至少 2 張):{folder}(現 {len(readable)} 張)")
+        raise ValueError(f"{name} 群合計可讀影像不足(至少 2 張；現 {len(readable)} 張)")
     meta = discover_whole_images(readable, label=name)
     pf = embed_objects_patch(
         meta, model, target_res=target_res, cache_dir=cache_dir, extractor=extractor,
@@ -62,21 +76,23 @@ def run_groupdiff(good_dir, bad_dir, *, model: str = "dinov2_vits14",
     from diff_regions import extract_regions, pick_representatives, region_summary
     from group_patch_stats import group_diff_stats
 
-    good_dir, bad_dir = Path(good_dir), Path(bad_dir)
+    good_dirs, bad_dirs = _as_roots(good_dir), _as_roots(bad_dir)
+    if not good_dirs or not bad_dirs:
+        raise ValueError("Good / Bad 各需至少一個資料夾")
     if cache_root is None:
         from object_eval import dataset_cache_dir
-        cdir_g = dataset_cache_dir(good_dir, f"groupdiff_{model}_{target_res}")
-        cdir_b = dataset_cache_dir(bad_dir, f"groupdiff_{model}_{target_res}")
+        cdir_g = dataset_cache_dir(good_dirs[0], f"groupdiff_{model}_{target_res}")
+        cdir_b = dataset_cache_dir(bad_dirs[0], f"groupdiff_{model}_{target_res}")
     else:
         cdir_g = Path(cache_root) / "good"
         cdir_b = Path(cache_root) / "bad"
 
     _progress(progress, 0.01, "列舉影像…")
     meta_g, pf_g, unread_g = _load_group(
-        good_dir, "good", model=model, target_res=target_res, extractor=extractor,
+        good_dirs, "good", model=model, target_res=target_res, extractor=extractor,
         cache_dir=cdir_g, progress=progress, base_frac=0.02, span=0.40)
     meta_b, pf_b, unread_b = _load_group(
-        bad_dir, "bad", model=model, target_res=target_res, extractor=extractor,
+        bad_dirs, "bad", model=model, target_res=target_res, extractor=extractor,
         cache_dir=cdir_b, progress=progress, base_frac=0.42, span=0.40)
 
     # grid 多數決:同 grid 才可逐位置比較;壞圖 (1,1) fallback 也在此自然剔除
@@ -144,7 +160,9 @@ def run_groupdiff(good_dir, bad_dir, *, model: str = "dinov2_vits14",
         "threshold_z": stats["threshold_z"],
         "regions": regions,
         "good_paths": good_paths, "bad_paths": bad_paths,
-        "good_dir": str(good_dir), "bad_dir": str(bad_dir),
+        "good_dir": str(good_dirs[0]), "bad_dir": str(bad_dirs[0]),
+        "good_dirs": [str(p) for p in good_dirs],
+        "bad_dirs": [str(p) for p in bad_dirs],
         "base_good": good_paths[typical_good], "base_bad": bad_paths[showcase_bad],
         "gmean_good": feats_g.mean(axis=1), "gmean_bad": feats_b.mean(axis=1),
         "n_good": len(keep_g), "n_bad": len(keep_b),
@@ -203,8 +221,10 @@ def export_report(result: dict, out_dir) -> dict:
     from safe_io import safe_open_image
 
     out = Path(out_dir).resolve()
-    for label in ("good_dir", "bad_dir"):
-        src = Path(result[label]).resolve()
+    sources = result.get("good_dirs", [result["good_dir"]]) + result.get(
+        "bad_dirs", [result["bad_dir"]])
+    for source in sources:
+        src = Path(source).resolve()
         if out == src or src in out.parents:
             raise ValueError(f"匯出目錄不得在來源資料夾內:{out}(來源 {src})")
     out.mkdir(parents=True, exist_ok=True)

@@ -3,12 +3,57 @@ import numpy as np
 import pytest
 from PIL import Image
 from app import (
+    _append_folder,
     _build_cmp_figure,
     _build_viz_figure,
+    _cmp_resolve_groups,
     _cmp_resolve_images,
+    _eval_gt_for_folders,
     parse_folder_paths,
     read_classes_txt,
 )
+
+
+def test_append_folder_accumulates_and_deduplicates(tmp_path):
+    a = str(tmp_path / "a")
+    b = str(tmp_path / "b")
+    values = _append_folder([], a)
+    values = _append_folder(values, b)
+    values = _append_folder(values, a)
+    assert values == [a, b]
+
+
+def test_cmp_resolve_groups_merges_roots_without_duplicates(tmp_path):
+    a = tmp_path / "a"; b = tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    Image.new("RGB", (8, 8)).save(a / "a.jpg")
+    Image.new("RGB", (8, 8)).save(b / "b.jpg")
+    paths, notes = _cmp_resolve_groups([a, b, a])
+    assert [p.name for p in paths] == ["a.jpg", "b.jpg"]
+    assert notes == []
+
+
+def test_eval_gt_for_folders_merges_and_rejects_duplicate_basenames(tmp_path):
+    roots = []
+    for name, image_name in (("a", "a.jpg"), ("b", "b.jpg")):
+        root = tmp_path / name
+        (root / "images").mkdir(parents=True)
+        (root / "labels").mkdir()
+        Image.new("RGB", (8, 8)).save(root / "images" / image_name)
+        (root / "labels" / f"{Path(image_name).stem}.txt").write_text(
+            "0 0.5 0.5 0.5 0.5\n", encoding="utf-8")
+        roots.append(root)
+    gt, image_map, duplicates = _eval_gt_for_folders(roots)
+    assert set(gt) == {"a.jpg", "b.jpg"}
+    assert set(image_map) == set(gt)
+    assert duplicates == []
+
+    Image.new("RGB", (8, 8)).save(roots[1] / "images" / "a.jpg")
+    (roots[1] / "labels" / "a.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n", encoding="utf-8")
+    gt, image_map, duplicates = _eval_gt_for_folders(roots)
+    assert duplicates == ["a.jpg"]
+    assert "a.jpg" not in gt and "a.jpg" not in image_map
 
 
 def test_cmp_resolve_images_flat_recurse_empty(tmp_path):

@@ -9,7 +9,7 @@ A Streamlit web app for visualising and comparing image dataset distributions us
 | Tool | Description |
 |---|---|
 | **Visualize Embeddings** | Extract features from one or more image folders, reduce to 2-D with PCA / t-SNE / UMAP, colour by class label |
-| **Compare Distributions** | Compare two image folders via FID, KID, LPIPS, and SSIM scores, visualise the joint embedding space |
+| **Compare Distributions** | Compare two groups of image folders and visualise their joint embedding space |
 
 Both tools run **fully offline** — model architectures and weights are loaded from local files only.
 
@@ -103,6 +103,10 @@ App opens at `http://localhost:8501`.
 ---
 
 ## Tool 1 — Visualize Embeddings
+
+All image-source selectors support multiple folders: choose or enter folders repeatedly to
+append them, and use the per-row ✕ button to remove one source. Output, model, and workspace
+directories remain single-value destinations.
 
 1. Enter one or more folder paths (one per line) in the sidebar, e.g.:
    ```

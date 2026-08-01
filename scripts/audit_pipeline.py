@@ -52,13 +52,24 @@ def run_audit(root, *, model: str = "dinov2_vits14", metadata_csv=None,
     from manifest import rel_key, update_manifest
     from safe_io import partition_readable
 
-    root = Path(root)
-    if not root.is_dir():
-        raise ValueError(f"資料夾不存在:{root}")
+    roots = [Path(p) for p in (root if isinstance(root, (list, tuple, set)) else [root])]
+    missing = [str(p) for p in roots if not p.is_dir()]
+    if not roots or missing:
+        raise ValueError("資料夾不存在:" + "、".join(missing))
     _progress(progress, 0.02, "掃描佈局…")
-    folders, records = _discover(root)
+    folders: list[Path] = []
+    records: list[dict] = []
+    seen_paths: set[str] = set()
+    for source in roots:
+        source_folders, source_records = _discover(source)
+        folders.extend(source_folders)
+        for record in source_records:
+            token = str(Path(record["path"]).resolve())
+            if token not in seen_paths:
+                seen_paths.add(token)
+                records.append(record)
     if not records:
-        raise ValueError(f"資料夾內找不到影像:{root}")
+        raise ValueError("所選資料夾內找不到影像")
 
     _progress(progress, 0.05, "檢查影像可讀性…")
     ok_paths, bad_paths = partition_readable([r["path"] for r in records])
@@ -66,7 +77,7 @@ def run_audit(root, *, model: str = "dinov2_vits14", metadata_csv=None,
     recs = [r for r in records if str(Path(r["path"])) in ok_set]
     n_unreadable = len(bad_paths)
     if len(recs) < 2:
-        raise ValueError(f"可讀影像不足(至少 2 張):{root}(現 {len(recs)} 張)")
+        raise ValueError(f"可讀影像不足(至少 2 張；現 {len(recs)} 張)")
 
     # sha256/phash:manifest 增量計算(只取值,不寫檔——不動 viz 的簿記)
     sha_of_path: dict[str, str] = {}
@@ -107,7 +118,7 @@ def run_audit(root, *, model: str = "dinov2_vits14", metadata_csv=None,
         cdir = Path(cache_root) if cache_root else None
         if cdir is None:
             from object_eval import dataset_cache_dir
-            cdir = dataset_cache_dir(root, f"audit_{model}")
+            cdir = dataset_cache_dir(roots[0], f"audit_{model}")
         cdir.mkdir(parents=True, exist_ok=True)
         cfile = cdir / "emb_cache.npz"
         cache: dict[str, np.ndarray] = {}
@@ -184,7 +195,8 @@ def run_audit(root, *, model: str = "dinov2_vits14", metadata_csv=None,
             "records": [{"path": p, "split": s, "label": lb, "sha": h}
                         for p, s, lb, h in zip(paths, splits, labels, shas)],
             "n_images": len(paths), "n_unreadable": n_unreadable,
-            "root": str(root), "meta_info": meta_info}
+            "root": str(roots[0]), "roots": [str(p) for p in roots],
+            "meta_info": meta_info}
 
 
 def _jsonable(o):
@@ -197,9 +209,10 @@ def _jsonable(o):
 
 def export_audit(result: dict, out_dir) -> dict:
     out = Path(out_dir).resolve()
-    src = Path(result["root"]).resolve()
-    if out == src or src in out.parents:
-        raise ValueError(f"匯出目錄不得在來源資料夾內:{out}(來源 {src})")
+    for source in result.get("roots", [result["root"]]):
+        src = Path(source).resolve()
+        if out == src or src in out.parents:
+            raise ValueError(f"匯出目錄不得在來源資料夾內:{out}(來源 {src})")
     out.mkdir(parents=True, exist_ok=True)
     report = result["report"]
     files: list[str] = []
@@ -207,7 +220,8 @@ def export_audit(result: dict, out_dir) -> dict:
     jf = out / "report.json"
     jf.write_text(json.dumps({"sections": report["sections"],
                               "totals": report["totals"],
-                              "root": result["root"]},
+                              "root": result["root"],
+                              "roots": result.get("roots", [result["root"]])},
                              ensure_ascii=False, indent=2, default=_jsonable),
                   encoding="utf-8")
     files.append(str(jf))
@@ -262,7 +276,7 @@ def export_audit(result: dict, out_dir) -> dict:
     parts = ["<!doctype html><html><head><meta charset='utf-8'>",
              "<title>資料體檢報告</title><style>", style, "</style></head><body>",
              "<h1>🩺 資料體檢報告</h1>",
-             f"<p>{_html.escape(result['root'])} · "
+              f"<p>{_html.escape('、'.join(result.get('roots', [result['root']])))} · "
              f"{datetime.now().isoformat(timespec='seconds')} · "
              f"共 {report['totals']['n_images']} 張可讀影像</p>"]
     for s in report["sections"]:
