@@ -88,6 +88,71 @@ def predict_head(head: dict, obj_emb):
     return pred, proba.max(axis=1).astype(np.float32), proba.astype(np.float32)
 
 
+def evaluate_head_oof(obj_emb, labels, *, source_ids=None, C: float = 1.0,
+                      seed: int = 42, l2norm: bool = True,
+                      max_splits: int = 5) -> dict:
+    """Sample-level stratified OOF audit for an ephemeral classification head.
+
+    This is deliberately labelled as an audit rather than a production
+    holdout: near-duplicates or samples from the same acquisition batch can
+    still leak across folds when group metadata is unavailable.
+    """
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+    from sklearn.model_selection import StratifiedKFold
+
+    X = np.asarray(obj_emb, dtype=np.float32)
+    y = np.asarray(labels)
+    if X.ndim != 2 or len(X) != len(y):
+        raise ValueError("OOF audit 的 embedding 與 labels 長度不符")
+    classes, counts = np.unique(y, return_counts=True)
+    n_splits = min(int(max_splits), int(counts.min()) if len(counts) else 0)
+    base = {
+        "available": False,
+        "kind": "sample_stratified_oof",
+        "n_samples": int(len(y)),
+        "n_splits": int(n_splits),
+        "classes": [str(c) for c in classes],
+        "limitations": "非 grouped holdout；近重複或同批次資料仍可能跨 fold。",
+    }
+    if len(classes) < 2 or n_splits < 2:
+        return {**base, "reason": "每類至少需要 2 筆樣本才能做 OOF"}
+
+    oof_pred = np.empty(len(y), dtype=object)
+    oof_conf = np.zeros(len(y), dtype=np.float32)
+    oof_prob = np.zeros((len(y), len(classes)), dtype=np.float32)
+    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    class_to_col = {str(c): i for i, c in enumerate(classes)}
+    for train_idx, test_idx in splitter.split(X, y):
+        fold = train_head(X[train_idx], y[train_idx], C=C, seed=seed, l2norm=l2norm)
+        pred, conf, prob = predict_head(fold, X[test_idx])
+        oof_pred[test_idx] = pred
+        oof_conf[test_idx] = conf
+        for j, name in enumerate(fold["classes"]):
+            oof_prob[test_idx, class_to_col[str(name)]] = prob[:, j]
+
+    samples = {}
+    ids = list(source_ids) if source_ids is not None else [str(i) for i in range(len(y))]
+    if len(ids) != len(y):
+        raise ValueError("OOF audit 的 source_ids 與 labels 長度不符")
+    for i, source_id in enumerate(ids):
+        probs = {str(c): float(oof_prob[i, j]) for j, c in enumerate(classes)}
+        samples[str(source_id)] = {
+            "actual": str(y[i]),
+            "predicted": str(oof_pred[i]),
+            "confidence": float(oof_conf[i]),
+            "correct": bool(str(oof_pred[i]) == str(y[i])),
+            "probabilities": probs,
+        }
+    return {
+        **base,
+        "available": True,
+        "accuracy": float(accuracy_score(y, oof_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, oof_pred)),
+        "macro_f1": float(f1_score(y, oof_pred, average="macro", zero_division=0)),
+        "samples": samples,
+    }
+
+
 def gated_predict(head: dict, obj_emb, anomaly_scores, *,
                   anomaly_threshold: float, min_conf: float = 0.5) -> list:
     """閘控級聯:Normal Bank 異常分數先分流,只有離正常遠才信任 head 的已知類別。

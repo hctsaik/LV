@@ -1316,8 +1316,11 @@ def _anomaly_build_model() -> None:
     from anomaly_bank_store import confirmed_to_fewshot
     from anomaly_project import fit_projector
     from anomaly_tool import head_unlock_state, run_pipeline
+    from dino_explain import checkpoint_identity
     from dino_head import train_head
-    from object_eval import classes_for, dataset_cache_dir, list_images
+    from head_adapter import attach_provenance
+    from object_eval import DEFAULT_POLICY, classes_for, dataset_cache_dir, list_images
+    from _utils import _DEFAULT_MODELS_DIR
     st.session_state.pop("_anomaly_model_err", None)
     st.session_state.pop("_anomaly_model_saved", None)
     folders = list(st.session_state.get("anomaly_train_folder") or [])
@@ -1383,17 +1386,36 @@ def _anomaly_build_model() -> None:
         head = None
         labels = [r.get("label", "") for r in res["records"]]
         unlock = head_unlock_state(label_semantic=semantic, labels=labels, n_min=n_min)
+        ckpt = _DEFAULT_MODELS_DIR / model / f"{model}.pth"
+        if not ckpt.exists():
+            ckpt = _DEFAULT_MODELS_DIR / f"{model}.pth"
+        # Object embeddings in anomaly_tool always use object_eval.DEFAULT_POLICY,
+        # not the patch-bank scoring resolution selected in the sidebar.
+        embedding_recipe = {
+            "model_id": model,
+            "checkpoint_id": checkpoint_identity(ckpt if ckpt.exists() else None),
+            "embedding_dim": int(obj_emb.shape[1]),
+            "keep_aspect": True,
+            "target_res": int(DEFAULT_POLICY["target_res"]),
+            "pooling": str(DEFAULT_POLICY["head"]),
+            "l2norm": True,
+            "scope": "object_crop",
+            "pad": float(DEFAULT_POLICY["pad"]),
+        }
         if semantic == "defect" and unlock["unlocked"]:
             elig = set(unlock["eligible_classes"])
             keep = [i for i, l in enumerate(labels) if l in elig]
             head = train_head(obj_emb[keep], [labels[i] for i in keep])
             head["_model_name"] = model
             head["_eligible"] = sorted(elig)
+            embedding_recipe["l2norm"] = bool(head.get("l2norm", True))
+            head = attach_provenance(head, **embedding_recipe)
         meta = {
             "model": model, "target_res": target_res, "score_mode": score_mode,
             "object_source": object_source,
             "patch_dim": int(bank_vectors.shape[1]) if bank_vectors is not None else None,
             "obj_dim": int(obj_emb.shape[1]), "n_objects": len(res["records"]),
+            "embedding_recipe": embedding_recipe,
         }
         st.session_state["anomaly_model"] = {
             "source": "built", "ref_folder": str(folders[0]), "_built_at": _time.time(),
@@ -1404,6 +1426,10 @@ def _anomaly_build_model() -> None:
         }
         st.session_state["anomaly_train_result"] = res     # ①框選標 good 用
         st.session_state.pop("anomaly_apply_result", None)  # 模型換了 → 舊套用結果 stale
+        for key in ("anomaly_explain_result", "anomaly_explain_pending",
+                    "anomaly_explain_error", "anomaly_explain_info",
+                    "_anomaly_inspector_patch_feats"):
+            st.session_state.pop(key, None)
         _log_usage("anomaly_build", n=len(res["records"]), source=score_mode,
                    semantic=semantic, head=bool(head))
     except Exception as exc:
@@ -1474,6 +1500,10 @@ def _anomaly_apply_model() -> None:
             result["_fewshot_aligned"] = _aligned
             result["_fewshot_unmatched"] = int(_un)
         st.session_state["anomaly_apply_result"] = result
+        for key in ("anomaly_explain_result", "anomaly_explain_pending",
+                    "anomaly_explain_error", "anomaly_explain_info",
+                    "_anomaly_inspector_patch_feats"):
+            st.session_state.pop(key, None)
         _collapse_sidebar()
         _log_usage("anomaly_apply", n=len(result["records"]), source=score_mode)
     except Exception as exc:
@@ -1552,7 +1582,7 @@ def _anomaly_load_model(model_dir: str) -> None:
             "source": "loaded", "ref_folder": "", "_built_at": built_at,
             "meta": {k: _m.get(k) for k in
                      ("model", "target_res", "score_mode", "object_source",
-                      "patch_dim", "obj_dim", "n_objects")},
+                      "patch_dim", "obj_dim", "n_objects", "embedding_recipe")},
             "label_semantic": semantic,
             "bank_vectors": b.get("vectors"), "projection": b.get("projection"),
             "fewshot": b.get("fewshot"), "head": head, "_dir": str(model_dir),
@@ -2914,9 +2944,9 @@ def _anomaly_render_inspector(result: dict, scores) -> None:
 
     from anomaly_heatmap import render_heatmap
     from anomaly_score import score_object
-    from interaction import crop_bbox, discover_yolo_objects
-    from object_eval import _adaptive_pad_px
-    from patch_features import embed_objects_patch
+    from interaction import crop_bbox
+    from object_eval import DEFAULT_POLICY, _adaptive_pad_px
+    from patch_features import extract_patch_grid
     records = result["records"]
     ranking = result["ranking"]
     smin, smax = float(scores.min()), float(scores.max())
@@ -2961,14 +2991,22 @@ def _anomaly_render_inspector(result: dict, scores) -> None:
                 raise OSError("來源影像損壞或格式錯誤")
             iw, ih = img.size
             crop = crop_bbox(img, *r["bbox"],
-                             pad_px=_adaptive_pad_px(r["bbox"], iw, ih, 0.15))
+                             pad_px=_adaptive_pad_px(r["bbox"], iw, ih, DEFAULT_POLICY["pad"]))
             if result.get("bank") is not None and result.get("_image_paths"):
-                meta = discover_yolo_objects([Path(p) for p in result["_image_paths"]],
-                                             result.get("_class_names"))
-                pf = embed_objects_patch(
-                    [meta[pick]], model=result.get("_model", "dinov2_vits14"),
-                    target_res=result.get("_target_res", 224),
-                    cache_dir=Path(result["_cache"]))[0]
+                # The inspector used to write a patch .npz on every newly
+                # viewed object.  Keep a small session-only cache instead:
+                # inspection must not mutate the batch cache/pipeline.
+                mem = st.session_state.setdefault("_anomaly_inspector_patch_feats", {})
+                pf_key = (id(result), str(r.get("image_path") or r.get("path")),
+                          int(r.get("obj_index", 0)), result.get("_model"),
+                          int(result.get("_target_res", 224)))
+                pf = mem.get(pf_key)
+                if pf is None:
+                    pf = extract_patch_grid(
+                        crop, model=result.get("_model", "dinov2_vits14"),
+                        target_res=int(result.get("_target_res", 224)),
+                    )
+                    mem[pf_key] = pf
                 _, pmap = score_object(pf["feats"], pf["grid"], result["bank"])
                 st.image(render_heatmap(pmap, crop), use_container_width=True,
                          caption=f"{r['label']}｜{_rec_fname(r)}"
@@ -2977,6 +3015,18 @@ def _anomaly_render_inspector(result: dict, scores) -> None:
                 st.image(crop, use_container_width=True,
                          caption=f"{r['label']}｜{_rec_fname(r)} · {r['score']:.3f}"
                          " ·(無監督模式;確認正常範例後可看熱力圖)")
+            st.caption("紅＝相對 Normal Bank 不相似，不是 DINO attention。")
+            from explain_ui import render_explainability_panel
+            _am_state = st.session_state.get("anomaly_model") or {}
+            _am = _am_state.get("meta", {}) or {}
+            render_explainability_panel(
+                r, model_name=_am.get("model") or result.get("_model") or "dinov2_vits14",
+                key_prefix="anomaly_explain",
+                classifier_head=_am_state.get("head"),
+                embedding_recipe=_am.get("embedding_recipe"),
+                anomaly_map_available=result.get("bank") is not None,
+                context_token=(result.get("_model_built_at"), id(result.get("bank"))),
+            )
         except (OSError, Image.DecompressionBombError, IndexError) as e:
             st.caption(f":gray[無法顯示:{e}]")
 
@@ -3274,6 +3324,17 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
                 if refs:
                     st.caption("embedding refs：" +
                                "、".join(f"{m} → 列 {r}" for m, r in refs.items()))
+        from explain_ui import render_explainability_panel
+        _viz_model = st.session_state.get("viz_model_select") or _DEFAULT_MODEL
+        render_explainability_panel(
+            r, model_name=_viz_model, key_prefix="viz_explain",
+            classifier_head=st.session_state.get("explain_session_head"),
+            session_records=records,
+            session_embeddings=(st.session_state.get("viz_raw_embeddings") or {}).get(_viz_model),
+            session_head_key="explain_session_head",
+            anomaly_map_available=False,
+            context_token=st.session_state.get("viz_data_token"),
+        )
 
 
 def _render_grid(records: list[dict], shown: list[int]) -> None:
@@ -4554,9 +4615,11 @@ def _render_right_panel(
     its box/lasso selection state. Selection itself is read from
     session_state inside（見 _current_selection）.
     """
-    # 購物車「分流」鈕在 fragment 內，其 callback 只重跑 fragment、切不了主工具——
-    # 收到旗標時跳出 fragment 作 app 範圍 rerun，讓外層 segmented_control 換頁。
-    if st.session_state.pop("_cart_app_rerun", False):
+    # fragment 內的 callback 只重跑右欄、切不了主工具。收到跨工具導覽旗標時
+    # 跳出 fragment 作 app 範圍 rerun，讓外層 segmented_control 真正換頁。
+    _needs_app_rerun = bool(st.session_state.pop("_cart_app_rerun", False))
+    _needs_app_rerun |= bool(st.session_state.pop("_explain_app_rerun", False))
+    if _needs_app_rerun:
         st.rerun(scope="app")
     panels = ["選取", "相似", "重複", "選樣", "體檢卡", "桶①佔比", "匯出清單"]
     if _pred_root_path() is not None:      # 只在填了模型預測資料夾時長出挖錯面板
@@ -4595,6 +4658,9 @@ _MODE_CLEAR_KEYS = (
     "viz_phashes", "viz_label_disagreement", "viz_dup_result",
     "_pd_rows", "_pd_sig",        # 挖錯面板的快取(記錄換了就 stale)
     "_bucket1_rows",
+    "viz_explain_result", "viz_explain_pending", "viz_explain_error", "viz_explain_info",
+    "anomaly_explain_result", "anomaly_explain_pending", "anomaly_explain_error",
+    "anomaly_explain_info", "explain_session_head", "_anomaly_inspector_patch_feats",
 )
 
 _DEMO_DIR = Path(__file__).parent.parent / "demo" / "coco8"
@@ -5364,6 +5430,9 @@ def _visualize_embeddings_ui() -> None:
             st.session_state["viz_label_disagreement"] = label_disagreement
             st.session_state.pop("viz_dup_result", None)
             st.session_state["viz_data_token"] = data_token
+            for key in ("explain_session_head", "viz_explain_result", "viz_explain_pending",
+                        "viz_explain_error", "viz_explain_info"):
+                st.session_state.pop(key, None)
             st.session_state["viz_nn_index"] = {}
             st.session_state["viz_classes"] = class_names
             st.session_state["viz_selection"] = {"token": data_token, "indices": []}
@@ -5545,6 +5614,9 @@ def _visualize_embeddings_ui() -> None:
         st.session_state["viz_label_disagreement"] = label_disagreement
         st.session_state.pop("viz_dup_result", None)
         st.session_state["viz_data_token"] = uuid.uuid4().hex
+        for key in ("explain_session_head", "viz_explain_result", "viz_explain_pending",
+                    "viz_explain_error", "viz_explain_info"):
+            st.session_state.pop(key, None)
         st.session_state["viz_nn_index"] = {}
         st.session_state["viz_classes"] = class_names
         st.session_state["viz_selection"] = {

@@ -7,7 +7,7 @@
 import numpy as np
 import pytest
 
-from dino_head import (fit_temperature, gated_predict, load_head,
+from dino_head import (evaluate_head_oof, fit_temperature, gated_predict, load_head,
                        predict_head, save_head, train_head)
 
 D = 16
@@ -104,3 +104,22 @@ def test_calibration_gated_uses_calibrated_conf():  # AC8:閘控吃校準後信�
     _, c_raw, _ = predict_head(head, boundary)
     _, c_cal, _ = predict_head(cal, boundary)
     assert c_cal[0] <= c_raw[0] + 1e-6               # 高溫 → 信心被壓低(過度自信修正方向)
+
+
+def test_oof_audit_reports_generalization_and_per_sample_result():
+    X, y = _data(n=12)
+    source_ids = [f"sample-{i}" for i in range(len(y))]
+    audit = evaluate_head_oof(X, y, source_ids=source_ids)
+    assert audit["available"] is True
+    assert audit["balanced_accuracy"] >= 0.95
+    assert audit["macro_f1"] >= 0.95
+    assert set(audit["samples"]) == set(source_ids)
+    assert audit["samples"]["sample-0"]["actual"] == y[0]
+    assert "非 grouped holdout" in audit["limitations"]
+
+
+def test_oof_audit_unavailable_when_a_class_has_one_sample():
+    X = np.zeros((3, D), dtype=np.float32)
+    audit = evaluate_head_oof(X, np.array(["a", "a", "b"]))
+    assert audit["available"] is False
+    assert audit["n_splits"] == 1

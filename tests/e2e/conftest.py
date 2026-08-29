@@ -54,6 +54,12 @@ def single_class_dataset(tmp_path_factory) -> Path:
 
 
 @pytest.fixture(scope="session")
+def e2e_cache_dir(tmp_path_factory) -> Path:
+    """All ordinary E2E cache artifacts live outside the developer worktree."""
+    return tmp_path_factory.mktemp("lv_cache")
+
+
+@pytest.fixture(scope="session")
 def app_server(synthetic_dataset, tmp_path_factory) -> str:
     port = _free_port()
     # 隔離持久化狀態:E2E 用乾淨的 UI-state 檔與 cache 目錄,不共用/不殘留開發者本機狀態,
@@ -66,8 +72,6 @@ def app_server(synthetic_dataset, tmp_path_factory) -> str:
         # 父目錄 no_persist/ 刻意不建立 → _ui_state_path 的讀(load)寫(save)皆 OSError→no-op,
         # 等於 E2E 關閉「記住上次資料夾/選項」的持久化:每個測試(獨立 browser context)從乾淨
         # session_state 起跑,folder list 不會經由磁碟檔在測試之間殘留(跨測試/跨 run 汙染根因)。
-        # 註:不隔離 LV_CACHE_DIR —— 有測試(test_b/test_t)在「測試行程」用 manifest_path_for/
-        # ref_path_for(無此 env)直接驗證 .lv_cache 內容,隔離只會讓測試與 server 看不同目錄。
         "LV_UI_STATE": str(_state / "no_persist" / "ui_state.json"),
     }
     log = open(REPO_ROOT / "tests" / "e2e" / "_server.log", "w", encoding="utf-8")
@@ -100,6 +104,61 @@ def app_server(synthetic_dataset, tmp_path_factory) -> str:
     subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                    capture_output=True)
     log.close()
+
+
+@pytest.fixture(scope="session")
+def explain_app_server(synthetic_dataset, tmp_path_factory, e2e_cache_dir) -> str:
+    """Dedicated server for on-demand explainability E2E.
+
+    The ordinary ``app_server`` intentionally shares the developer cache for
+    legacy browser tests.  This one isolates just the new test so its cache
+    non-mutation assertion neither reads nor changes that shared state.
+    """
+    port = _free_port()
+    state = tmp_path_factory.mktemp("lv_explain_state")
+    log_path = tmp_path_factory.mktemp("lv_explain_log") / "streamlit.log"
+    env = {
+        **os.environ,
+        "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
+        "STREAMLIT_SERVER_HEADLESS": "true",
+        "LV_CACHE_DIR": str(e2e_cache_dir),
+        "LV_UI_STATE": str(state / "no_persist" / "ui_state.json"),
+    }
+    log = open(log_path, "w", encoding="utf-8")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "streamlit", "run", "scripts/app.py",
+         "--server.port", str(port), "--server.headless", "true",
+         "--server.fileWatcherType", "none",
+         "--browser.gatherUsageStats", "false"],
+        cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    base = f"http://localhost:{port}"
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            log.close()
+            raise RuntimeError(
+                "streamlit (explainability) exited early:\n"
+                + log_path.read_text(encoding="utf-8")[-3000:]
+            )
+        try:
+            with urllib.request.urlopen(f"{base}/_stcore/health", timeout=2) as r:
+                if r.read().decode().strip() == "ok":
+                    break
+        except OSError:
+            time.sleep(0.5)
+    else:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
+        log.close()
+        raise RuntimeError("streamlit (explainability) did not become healthy in 60s")
+    try:
+        yield base
+    finally:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
+        log.close()
 
 
 def wait_idle(page, timeout: int = 30000) -> None:
