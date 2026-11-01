@@ -11,6 +11,10 @@ function colorMap(points: EmbeddingPoint[]) {
   return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
 }
 
+function objectDescription(point: EmbeddingPoint) {
+  return point.obj_index == null ? "" : `, object ${point.obj_index + 1}`;
+}
+
 export default function ScatterPlot3D({ points, selectedIndex, onSelect, viewKey }: {
   points: EmbeddingPoint[];
   selectedIndex: number | null;
@@ -24,15 +28,15 @@ export default function ScatterPlot3D({ points, selectedIndex, onSelect, viewKey
     x: points.map((point) => point.x),
     y: points.map((point) => point.y),
     z: points.map((point) => point.z),
-    text: points.map((point) => point.filename),
-    customdata: points.map((point) => [point.index, point.filename, point.label, point.split]),
+    text: points.map((point) => point.filename + objectDescription(point)),
+    customdata: points.map((point) => [point.index, point.filename, objectDescription(point), point.label, point.split]),
     marker: {
       size: points.map((point) => point.index === selectedIndex ? 7 : 5),
       color: points.map((point) => colors.get(point.label) || labelColors[0]),
       opacity: 0.9,
       line: { color: "#ffffff", width: 0.5 },
     },
-    hovertemplate: "%{customdata[1]}<br>Class: %{customdata[2]}<br>Split: %{customdata[3]}<br>X: %{x:.3f}<br>Y: %{y:.3f}<br>Z: %{z:.3f}<extra></extra>",
+    hovertemplate: "%{customdata[1]}%{customdata[2]}<br>Class: %{customdata[3]}<br>Split: %{customdata[4]}<br>X: %{x:.3f}<br>Y: %{y:.3f}<br>Z: %{z:.3f}<extra></extra>",
   }];
   const layout: Partial<Layout> = {
     autosize: true,
@@ -71,7 +75,7 @@ export default function ScatterPlot3D({ points, selectedIndex, onSelect, viewKey
             key={point.index}
             type="button"
             data-testid="embedding-point"
-            aria-label={"Select " + point.filename + ", " + point.label + ", " + point.split}
+            aria-label={"Select " + point.filename + objectDescription(point) + ", " + point.label + ", " + point.split}
             aria-pressed={selectedIndex === point.index}
             onClick={() => onSelect(point.index)}
           />

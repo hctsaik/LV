@@ -464,6 +464,24 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             expect(page.get_by_test_id("selected-object-box")).to_have_text("0.500, 0.500, 0.200, 0.200")
             expect(page.get_by_test_id("selected-object-bbox")).to_be_visible()
             expect(page.get_by_test_id("selected-image")).to_have_js_property("naturalWidth", 32)
+
+            page.get_by_test_id("dimension-3d").click()
+            expect(page.get_by_test_id("embedding-plot-3d")).to_be_visible()
+            points_3d = page.get_by_test_id("embedding-point")
+            expect(points_3d).to_have_count(2)
+            expect(points_3d.nth(0)).to_have_attribute("aria-pressed", "true")
+            expect(points_3d.nth(0)).to_have_attribute("aria-label", "Select 02.png, object 2, stain, train")
+
+            points_3d.nth(1).focus()
+            page.keyboard.press("Enter")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("03.png")
+            expect(page.get_by_test_id("selected-object-index")).to_have_text("1")
+            expect(page.get_by_test_id("selected-object-bbox")).to_be_visible()
+
+            page.get_by_test_id("dimension-2d").click()
+            expect(page.locator('[data-testid="embedding-point"][data-index="3"]')).to_have_class("point point-active")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("03.png")
+            expect(page.get_by_test_id("selected-object-index")).to_have_text("1")
             browser.close()
     finally:
         if server is not None:
