@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的本機 React UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions 及 LV-WEB-03-IMG-01 image-level coverage 的局部流程；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
+> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions 及 LV-WEB-03 image/object-level coverage 的局部流程；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
 
 ## 1. 邊界
 
@@ -20,12 +20,13 @@
 | `GET /api/v1/health` | worker readiness | API 版本、模型目錄狀態、可用模型數 |
 | `GET /api/v1/models` | 讀取模型清單 | model ID、名稱、可用狀態；不載入所有權重 |
 | `POST /api/v1/visualize/jobs` | 建立 Image Classifier 整圖或 Object Detector 整圖／物件級 run | job ID、queued 狀態 |
-| `POST /api/v1/coverage/jobs` | 獨立建立 image-level embedding coverage run | folders、model、初始投影／維度／k、job ID |
+| `POST /api/v1/coverage/jobs` | 獨立建立 image-level 或 YOLO object-level embedding coverage run | folders、model、unit、初始投影／維度／k、job ID |
 | `GET /api/v1/coverage/jobs/{job_id}` / `DELETE ...` | 讀取或取消 coverage job | 共用單一 active-job gate、進度及結果 ID |
-| `GET /api/v1/coverage/runs/{run_id}` | 讀取 image-level coverage 結果 | records、投影點、稀疏分數與 percentile 門檻；不回傳路徑或 raw embedding |
+| `GET /api/v1/coverage/runs/{run_id}` | 讀取 coverage 結果 | records、投影點、稀疏分數與 percentile 門檻；物件粒度附 class、confidence、bbox、short edge；不回傳路徑或 raw embedding |
 | `POST /api/v1/coverage/runs/{run_id}/projections` | 切換 coverage 投影 | PCA、t-SNE、UMAP、LDA、Supervised UMAP；2D／3D |
 | `POST /api/v1/coverage/runs/{run_id}/sparsity` | 變更稀疏度近鄰數 k | 原始高維 cosine 稀疏分數及前 10% 門檻 |
-| `GET /api/v1/coverage/runs/{run_id}/images/{index}/thumbnail` | 讀取選中資料集影像縮圖 | 僅依 run record index 解析已登錄檔案 |
+| `POST /api/v1/coverage/runs/{run_id}/object-view` | 對 object run 套用 class/confidence/source-pixel filters，重算投影、稀疏度與區塊 | 過濾後 records/points 保留來源全域 index；類別摘要及 tiny-class 警示 |
+| `GET /api/v1/coverage/runs/{run_id}/images/{index}/thumbnail` | 讀取選中資料集縮圖 | 僅依 run record index 解析已登錄檔案；object run 回傳依 bbox 裁切的縮圖 |
 | `POST /api/v1/compare/jobs` | 建立 A/B 比較 run | folders A/B、模型、粒度、可選 object policy、job ID |
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
@@ -69,7 +70,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 - 手動路徑欄只供本機開發及測試。React build 與 API 可由單一本機 FastAPI 預覽；NativeApp 交付仍須使用平台 host bridge 和 worker 管理流程。
 - Visualize classifier、detector 整圖與物件級的固定 DINOv2-small 可見 UI 路徑已在 Windows ARM64 通過；Compare 的 deterministic API 與整圖／物件 UI E2E 使用 fixture embedder。來源 Streamlit 數值逐項對照、完整 object candidate workflow、NativeApp folder grant／lifecycle 及 Compare 真實模型仍未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
 - Curation cart 的 fixture API 與可見 Chromium E2E（含不同 worker PID 重開）已通過；這只完成 Visualize 到 cart 的 case slice，不代表跨工具統一收集器、legacy state import、subset folder export 或 NativeApp cache-root 接線完成。
-- Image-level coverage 現以獨立 coverage job 保留舊工具「自己選資料夾／模型並開始分析」流程。高維 cosine 稀疏度與顯示投影分開計算；React 可切換 5 種投影、2D／3D、類別／稀疏上色，2D 框選與 3D 點選可讀回縮圖並明確清除。Fixture API 與可見 Chromium E2E 已通過；真實模型數值對照、NativeApp picker／grant／package 與 OBJ／REF／ATTR case 仍未完成。
+- Image-level coverage 以獨立 job 保留舊工具「自己選資料夾／模型並開始分析」流程；object-level coverage 使用相同 job 和 YOLO crop path。高維 cosine 稀疏度與顯示投影分開計算；object view 可按 class、confidence、source short edge 篩選並保持來源索引對齊，顯示類別計數／稀疏度、tiny-class 警示與 class blocks，選取後讀回 bbox crop。兩個 coverage slice 的 fixture API 與可見 Chromium E2E 已通過；真實模型數值對照、NativeApp picker／grant／package，以及 object reference/candidate workflow 仍未完成。
 
 ## 5. React 驗收契約
 
@@ -86,4 +87,4 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 
 ## 6. 未涵蓋
 
-Object Detector 整圖及物件級已有 React/API 可見流程與固定 DINOv2-small 的 ARM64 UI run；物件級 candidate handoff、policy autotune、與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。Image-level coverage fixture API／可見 UI 已涵蓋獨立啟動、投影／維度／顏色切換、框選、縮圖讀回及清除；真實模型數值 parity、NativeApp host bridge、OBJ／REF／ATTR 和其他 nested workflows 尚待完成。固定 UMAP reference 的 React 控制、快取座標沿用、增刪圖片與重建有 deterministic API／UI 覆蓋，實際 `umap-learn` 0.5.12 integration 在隔離 CPython 3.11 AMD64 驗證通過；Windows ARM64 runtime 和 legacy 座標數值 parity 尚未驗；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖及物件級已有 React/API 可見流程與固定 DINOv2-small 的 ARM64 UI run；物件級 candidate handoff、policy autotune、與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。Image-level coverage fixture API／可見 UI 已涵蓋獨立啟動、投影／維度／顏色切換、框選、縮圖讀回及清除。Object-level coverage fixture API／可見 UI 已涵蓋 class/object 篩選、confidence 與 source-pixel 門檻、來源索引及監督式 projection 對齊、tiny-class guard、class blocks 和 bbox-cropped thumbnail；真實模型數值 parity、NativeApp host bridge、reference/candidate coverage、屬性棋盤及其他 nested workflows 尚待完成。固定 UMAP reference 的 React 控制、快取座標沿用、增刪圖片與重建有 deterministic API／UI 覆蓋，實際 `umap-learn` 0.5.12 integration 在隔離 CPython 3.11 AMD64 驗證通過；Windows ARM64 runtime 和 legacy 座標數值 parity 尚未驗；本設計不縮小全產品 PRD 範圍。

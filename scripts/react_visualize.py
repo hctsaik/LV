@@ -225,6 +225,7 @@ def run_image_visualization(
     umap_rebuild: bool = False,
     model_loader: Callable[[str], Callable[[Path], np.ndarray]] = load_model,
     object_model_loader: Callable[..., Callable] | None = None,
+    include_raw_embeddings: bool = False,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict:
@@ -397,7 +398,7 @@ def run_image_visualization(
                 / f"object_embeddings_{selected_model}_{policy_tag(resolved_object_policy)}"
                 / "embeddings.npz"
             )
-            raw, _short_px = embed_objects(
+            raw, short_px = embed_objects(
                 object_records,
                 selected_model,
                 resolved_object_policy,
@@ -406,6 +407,8 @@ def run_image_visualization(
                 model_loader=object_model_loader or model_loader,
                 cache_keys=cache_keys,
             )
+            for record, value in zip(records, short_px):
+                record["short_px"] = int(round(float(value)))
             completed += len(records)
         else:
             embed_fn = model_loader(selected_model)
@@ -476,6 +479,7 @@ def run_image_visualization(
                 "bbox": record["bbox"],
                 "obj_index": record["obj_index"],
                 "score": record["score"],
+                "short_px": record["short_px"],
             } if unit == "object" else {}),
         }
         for index, record in enumerate(records)
@@ -558,6 +562,7 @@ def run_image_visualization(
         "_phashes": record_phashes,
         # Kept only in the local worker for the legacy classifier 3D block
         # drilldown. The HTTP run response deliberately omits this field.
-        "_raw_embeddings": embeddings_by_model if mode == "classifier" and unit == "image" else {},
+        "_raw_embeddings": embeddings_by_model
+        if (mode == "classifier" and unit == "image") or include_raw_embeddings else {},
         "_ranking_scores": ranking_scores,
     }

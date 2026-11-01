@@ -80,12 +80,20 @@ def _fake_embedder(calls: list[str] | None = None):
     return embed
 
 
-def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, embedder=None, models=None):
+def _client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    embedder=None,
+    models=None,
+    object_model_loader=None,
+):
     cache_root = tmp_path.parent / f"{tmp_path.name}-lv-cache"
     monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
     return TestClient(create_app(
         model_catalog=lambda: models if models is not None else ["dinov2_vits14"],
         model_loader=lambda _model: embedder or _fake_embedder(),
+        object_model_loader=object_model_loader,
     ))
 
 
@@ -111,6 +119,7 @@ def _run_coverage(
     folders: list[Path],
     *,
     model: str = "dinov2_vits14",
+    unit: str = "image",
     method: str = "pca",
     dimension: int = 2,
     k: int = 10,
@@ -118,6 +127,7 @@ def _run_coverage(
     response = client.post("/api/v1/coverage/jobs", json={
         "folders": [str(folder) for folder in folders],
         "model_id": model,
+        "unit": unit,
         "method": method,
         "dimension": dimension,
         "k": k,
@@ -193,6 +203,164 @@ def test_case_lv_web_03_img_01_coverage_sparsity_projection_selection_inputs(
 
     assert source_hashes == {
         path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
+def _object_coverage_fixture(root: Path) -> tuple[list[Path], dict[str, str]]:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "classes.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    train, test = root / "train", root / "test"
+    specs = [
+        (train, "01.png", 0, 0.50, 0.50, 0.95),
+        (train, "02.png", 0, 0.10, 0.10, 0.40),
+        (train, "03.png", 0, 0.40, 0.40, 0.85),
+        (train, "04.png", 0, 0.08, 0.08, 0.75),
+        (train, "05.png", 0, 0.60, 0.60, 0.92),
+        (train, "06.png", 0, 0.45, 0.45, 0.70),
+        (test, "07.png", 0, 0.70, 0.70, 0.88),
+        (test, "08.png", 1, 0.50, 0.50, 0.90),
+    ]
+    hashes: dict[str, str] = {}
+    for index, (folder, filename, class_id, width, height, confidence) in enumerate(specs):
+        image_dir, label_dir = folder / "images", folder / "labels"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        image_path = image_dir / filename
+        Image.new("RGB", (64, 64), (25 + index * 23, 55 + index * 17, 180 - index * 13)).save(image_path)
+        label_path = label_dir / f"{Path(filename).stem}.txt"
+        label_path.write_text(
+            f"{class_id} 0.5 0.5 {width} {height} {confidence}\n",
+            encoding="utf-8",
+        )
+        hashes[str(image_path)] = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        hashes[str(label_path)] = hashlib.sha256(label_path.read_bytes()).hexdigest()
+    hashes[str(root / "classes.txt")] = hashlib.sha256((root / "classes.txt").read_bytes()).hexdigest()
+    return [train, test], hashes
+
+
+def test_case_lv_web_03_obj_01_object_coverage_filters_keep_global_alignment(
+    monkeypatch, tmp_path,
+):
+    """Object filters preserve global indices, supervised labels, class guards, and cropped readback."""
+    folders, source_hashes = _object_coverage_fixture(tmp_path / "object-coverage")
+
+    def object_loader(_model_id: str, **_kwargs):
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            vector[4] = crop.height / 100.0
+            return vector
+        return embed
+
+    original_projection = __import__("react_web_shell").coverage_projection
+    projected_labels: list[list[str]] = []
+
+    def capture_projection(embeddings, labels, method, dimension):
+        assert len(embeddings) == len(labels)
+        projected_labels.append(list(labels))
+        return original_projection(embeddings, labels, method, dimension)
+
+    monkeypatch.setattr("react_web_shell.coverage_projection", capture_projection)
+    source_root = folders[0].parent
+    with _client(
+        monkeypatch,
+        tmp_path / "object-coverage-run",
+        object_model_loader=object_loader,
+    ) as client:
+        job = _run_coverage(client, folders, unit="object", method="pca", k=10)
+        assert job["state"] == "completed", job
+        run_response = client.get(f"/api/v1/coverage/runs/{job['run_id']}")
+        assert run_response.status_code == 200
+        run = run_response.json()
+        assert run["unit"] == "object"
+        assert run["object_policy"] == {"pad": 0.12, "target_res": 224, "head": "cls"}
+        assert len(run["records"]) == len(run["points"]) == 8
+        assert [record["index"] for record in run["records"]] == list(range(8))
+        assert [record["score"] for record in run["records"]] == pytest.approx(
+            [0.95, 0.40, 0.85, 0.75, 0.92, 0.70, 0.88, 0.90]
+        )
+        assert [record["short_px"] for record in run["records"]] == [32, 6, 26, 5, 38, 29, 45, 32]
+
+        filtered_response = client.post(
+            f"/api/v1/coverage/runs/{job['run_id']}/object-view",
+            json={
+                "class_label": None,
+                "min_short_px": 10,
+                "confidence_min": 0.8,
+                "confidence_max": 0.95,
+                "method": "lda",
+                "dimension": 2,
+                "k": 10,
+                "block_k": 8,
+            },
+        )
+        assert filtered_response.status_code == 200, filtered_response.text
+        filtered = filtered_response.json()
+        assert [record["index"] for record in filtered["records"]] == [0, 2, 4, 6, 7]
+        assert [point["index"] for point in filtered["points"]] == [0, 2, 4, 6, 7]
+        assert [record["label"] for record in filtered["records"]] == [
+            "alpha", "alpha", "alpha", "alpha", "beta",
+        ]
+        assert filtered["method"] == "lda"
+        assert projected_labels[-1] == ["alpha", "alpha", "alpha", "alpha", "beta"]
+        assert filtered["k"] == 4
+        assert [row["label"] for row in filtered["class_summary"]] == ["beta", "alpha"]
+        assert [(row["label"], row["count"], row["analyzable"]) for row in filtered["class_summary"]] == [
+            ("beta", 1, False), ("alpha", 4, True),
+        ]
+
+        alpha_response = client.post(
+            f"/api/v1/coverage/runs/{job['run_id']}/object-view",
+            json={
+                "class_label": "alpha",
+                "min_short_px": 10,
+                "confidence_min": 0.8,
+                "confidence_max": 0.95,
+                "method": "pca",
+                "dimension": 2,
+                "k": 10,
+                "block_k": 8,
+            },
+        )
+        alpha = alpha_response.json()
+        assert [record["index"] for record in alpha["records"]] == [0, 2, 4, 6]
+        assert alpha["block_k"] == 4
+        assert len(alpha["blocks"]) == 4
+        assert all(point.get("block_id") is not None for point in alpha["points"])
+
+        beta_response = client.post(
+            f"/api/v1/coverage/runs/{job['run_id']}/object-view",
+            json={
+                "class_label": "beta",
+                "min_short_px": 10,
+                "confidence_min": 0.8,
+                "confidence_max": 0.95,
+                "method": "pca",
+                "dimension": 2,
+                "k": 10,
+                "block_k": 8,
+            },
+        )
+        beta = beta_response.json()
+        assert [record["index"] for record in beta["records"]] == [7]
+        assert beta["blocks"] == []
+        assert any("fewer than two objects" in warning for warning in beta["warnings"])
+
+        thumbnail = client.get(f"/api/v1/coverage/runs/{job['run_id']}/images/0/thumbnail")
+        assert thumbnail.status_code == 200
+        cropped = Image.open(BytesIO(thumbnail.content))
+        assert cropped.size[0] < 64 and cropped.size[1] < 64
+        invalid = client.post(
+            f"/api/v1/coverage/runs/{job['run_id']}/object-view",
+            json={"confidence_min": 0.9, "confidence_max": 0.1},
+        )
+        assert invalid.status_code == 422
+
+    assert source_hashes == {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
         for path in source_hashes
     }
 

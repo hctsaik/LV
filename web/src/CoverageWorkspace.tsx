@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
-import type { CoverageRun, JobStatus, ModelOption, ProjectionMethod } from "./api";
+import type {
+  CoverageObjectView,
+  CoverageObjectViewInput,
+  CoverageRun,
+  JobStatus,
+  ModelOption,
+  ProjectionMethod,
+  VisualizeUnit,
+} from "./api";
 import { api } from "./api";
 import ScatterPlot2D from "./ScatterPlot2D";
 import ScatterPlot3D from "./ScatterPlot3D";
@@ -42,11 +50,18 @@ export default function CoverageWorkspace({
   const [folders, setFolders] = useState<string[]>([]);
   const [folderDraft, setFolderDraft] = useState("");
   const [modelId, setModelId] = useState("");
+  const [unit, setUnit] = useState<VisualizeUnit>("image");
   const [method, setMethod] = useState<ProjectionMethod>("sumap");
   const [dimension, setDimension] = useState<2 | 3>(2);
   const [k, setK] = useState(10);
+  const [blockK, setBlockK] = useState(8);
+  const [classFilter, setClassFilter] = useState("");
+  const [minShortPx, setMinShortPx] = useState(0);
+  const [confidenceMin, setConfidenceMin] = useState(0);
+  const [confidenceMax, setConfidenceMax] = useState(1);
   const [colorMode, setColorMode] = useState<"class" | "sparsity">("class");
   const [run, setRun] = useState<CoverageRun | null>(null);
+  const [objectView, setObjectView] = useState<CoverageObjectView | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const [busy, setBusy] = useState(false);
@@ -56,6 +71,7 @@ export default function CoverageWorkspace({
   const [notice, setNotice] = useState("");
   const projectionRequest = useRef(0);
   const sparsityRequest = useRef(0);
+  const objectViewRequest = useRef(0);
 
   useEffect(() => {
     if (models.some((model) => model.model_id === modelId && model.available)) return;
@@ -64,7 +80,9 @@ export default function CoverageWorkspace({
     if (preferred) setModelId(preferred.model_id);
   }, [models, modelId]);
 
-  const labels = useMemo(() => run ? [...new Set(run.records.map((record) => record.label))].sort() : [], [run]);
+  const visiblePoints = run?.unit === "object" ? (objectView?.points || []) : (run?.points || []);
+  const visibleScores = run?.unit === "object" ? (objectView?.sparsity || []) : (run?.sparsity || []);
+  const labels = useMemo(() => [...new Set(visiblePoints.map((point) => point.label))].sort(), [visiblePoints]);
   const classColors = useMemo(() => run ? labelColors(run.points) : new Map<string, string>(), [run]);
   const effectiveColorMode = labels.length > 1 ? colorMode : "sparsity";
   const selectedRecords = useMemo(() => {
@@ -73,6 +91,40 @@ export default function CoverageWorkspace({
       .filter((index) => Number.isInteger(index) && run.records[index] !== undefined)
       .map((index) => run.records[index]);
   }, [run, selectedIndices]);
+
+  function objectViewInput(overrides: Partial<CoverageObjectViewInput> = {}): CoverageObjectViewInput {
+    return {
+      class_label: classFilter || null,
+      min_short_px: minShortPx,
+      confidence_min: confidenceMin,
+      confidence_max: confidenceMax,
+      method,
+      dimension,
+      k,
+      block_k: blockK,
+      ...overrides,
+    };
+  }
+
+  async function refreshObjectView(overrides: Partial<CoverageObjectViewInput> = {}) {
+    if (!run || run.unit !== "object") return;
+    const requestId = ++objectViewRequest.current;
+    setProjectionBusy(true);
+    setError("");
+    try {
+      const result = await api.coverageObjectView(run.run_id, objectViewInput(overrides));
+      if (objectViewRequest.current !== requestId) return;
+      setObjectView(result);
+      setK(result.k);
+      setSelectedIndices([]);
+    } catch (reason) {
+      if (objectViewRequest.current === requestId) {
+        setError(reason instanceof Error ? reason.message : "Could not update the object coverage view.");
+      }
+    } finally {
+      if (objectViewRequest.current === requestId) setProjectionBusy(false);
+    }
+  }
 
   function addFolder(value = folderDraft) {
     const path = value.trim();
@@ -118,10 +170,11 @@ export default function CoverageWorkspace({
 
     setBusy(true);
     setRun(null);
+    setObjectView(null);
     setJob(null);
     setSelectedIndices([]);
     try {
-      const created = await api.createCoverageJob(folders, modelId, method, dimension, k);
+      const created = await api.createCoverageJob(folders, modelId, unit, method, dimension, k);
       let status: JobStatus | null = null;
       const deadline = Date.now() + 10 * 60_000;
       while (Date.now() < deadline) {
@@ -136,13 +189,32 @@ export default function CoverageWorkspace({
         throw new Error("Coverage analysis did not finish. Retry after checking the local worker.");
       }
       const coverageRun = await api.coverageRun(status.run_id);
+      let initialObjectView: CoverageObjectView | null = null;
+      if (coverageRun.unit === "object") {
+        initialObjectView = await api.coverageObjectView(coverageRun.run_id, {
+          class_label: null,
+          min_short_px: 0,
+          confidence_min: 0,
+          confidence_max: 1,
+          method: coverageRun.requested_method,
+          dimension: coverageRun.dimension,
+          k: coverageRun.k,
+          block_k: blockK,
+        });
+      }
       setRun(coverageRun);
+      setObjectView(initialObjectView);
+      setUnit(coverageRun.unit);
       setMethod(coverageRun.requested_method);
       setDimension(coverageRun.dimension);
-      setK(coverageRun.k);
-      setColorMode(coverageRun.records.some((record) => record.label !== coverageRun.records[0]?.label)
+      setK(initialObjectView?.k || coverageRun.k);
+      setClassFilter("");
+      setMinShortPx(0);
+      setConfidenceMin(0);
+      setConfidenceMax(1);
+      setColorMode(coverageRun.unit === "object" ? "sparsity" : coverageRun.records.some((record) => record.label !== coverageRun.records[0]?.label)
         ? "class" : "sparsity");
-      setNotice(`${coverageRun.records.length} images analyzed with ${coverageRun.model_id}.`);
+      setNotice(`${coverageRun.records.length} ${coverageRun.unit === "object" ? "objects" : "images"} analyzed with ${coverageRun.model_id}.`);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Coverage analysis failed.");
     } finally {
@@ -164,6 +236,10 @@ export default function CoverageWorkspace({
     setMethod(nextMethod);
     setDimension(nextDimension);
     if (!run || projectionBusy) return;
+    if (run.unit === "object") {
+      await refreshObjectView({ method: nextMethod, dimension: nextDimension });
+      return;
+    }
     const requestId = ++projectionRequest.current;
     setProjectionBusy(true);
     setError("");
@@ -190,6 +266,10 @@ export default function CoverageWorkspace({
   async function changeK(nextK: number) {
     setK(nextK);
     if (!run || !Number.isFinite(nextK) || nextK < 1 || sparsityBusy) return;
+    if (run.unit === "object") {
+      await refreshObjectView({ k: nextK });
+      return;
+    }
     const requestId = ++sparsityRequest.current;
     setSparsityBusy(true);
     setError("");
@@ -230,14 +310,22 @@ export default function CoverageWorkspace({
     setSelectedIndices([]);
   }
 
-  const colorValues = effectiveColorMode === "sparsity" ? run?.sparsity : undefined;
-  const pointSizes = effectiveColorMode === "class" && run ? (() => {
-    const min = Math.min(...run.sparsity);
-    const max = Math.max(...run.sparsity);
+  function selectBlock(blockId: number) {
+    if (!objectView) return;
+    const indices = objectView.points
+      .filter((point) => point.block_id === blockId)
+      .map((point) => point.index);
+    if (indices.length) setSelectedIndices(indices);
+  }
+
+  const colorValues = effectiveColorMode === "sparsity" ? visibleScores : undefined;
+  const pointSizes = effectiveColorMode === "class" && visibleScores.length ? (() => {
+    const min = Math.min(...visibleScores);
+    const max = Math.max(...visibleScores);
     const span = max - min;
     const base = dimension === 2 ? 6 : 4;
     const sizeRange = dimension === 2 ? 8 : 4;
-    return run.sparsity.map((score) => base + (span > 1e-12 ? sizeRange * (score - min) / span : 0));
+    return visibleScores.map((score) => base + (span > 1e-12 ? sizeRange * (score - min) / span : 0));
   })() : undefined;
 
   return (
@@ -297,6 +385,17 @@ export default function CoverageWorkspace({
                 <option value={model.model_id} key={model.model_id}>{model.name}</option>
               ))}
             </select>
+            <label className="field-label field-label-spaced" htmlFor="coverage-unit">Analysis unit</label>
+            <select
+              id="coverage-unit"
+              data-testid="coverage-unit"
+              value={unit}
+              onChange={(event) => setUnit(event.target.value as VisualizeUnit)}
+              disabled={busy}
+            >
+              <option value="image">Whole image</option>
+              <option value="object">Object level (YOLO)</option>
+            </select>
             <label className="field-label field-label-spaced" htmlFor="coverage-method">Projection method</label>
             <select
               id="coverage-method"
@@ -322,10 +421,10 @@ export default function CoverageWorkspace({
                   data-testid="coverage-k"
                   type="number"
                   min={1}
-                  max={run ? Math.max(1, run.records.length - 1) : 1000}
+                  max={run ? Math.max(1, (run.unit === "object" ? objectView?.records.length || run.records.length : run.records.length) - 1) : 1000}
                   value={k}
                   onChange={(event) => void changeK(event.target.valueAsNumber)}
-                  disabled={sparsityBusy || busy}
+                  disabled={sparsityBusy || projectionBusy || busy}
                 />
               </div>
             </div>
@@ -348,9 +447,11 @@ export default function CoverageWorkspace({
       <main className="results-area coverage-results">
         <div className="coverage-heading">
           <div>
-            <div className="eyebrow">IMAGE-LEVEL WORKSPACE</div>
+            <div className="eyebrow">{run?.unit === "object" ? "OBJECT-LEVEL WORKSPACE" : "IMAGE-LEVEL WORKSPACE"}</div>
             <h2>Embedding coverage map</h2>
-            <p>Sparsity uses cosine distance in the original feature space; projection only positions points on this map.</p>
+            <p>{run?.unit === "object"
+              ? "Object sparsity uses cosine distance in the original feature space; projection only positions points on this map."
+              : "Sparsity uses cosine distance in the original feature space; projection only positions points on this map."}</p>
           </div>
         </div>
         {error && <div className="error-banner" role="alert">{error}</div>}
@@ -362,11 +463,139 @@ export default function CoverageWorkspace({
         {run ? (
           <>
             {run.warnings.map((warning, index) => <div className="coverage-warning" role="status" key={`${warning}-${index}`}>{warning}</div>)}
+            {objectView?.warnings.map((warning, index) => <div className="coverage-warning" role="status" key={`object-${warning}-${index}`}>{warning}</div>)}
+            {run.unit === "object" && objectView && (
+              <section className="coverage-object-panel" aria-label="Object coverage filters and blocks">
+                <div className="coverage-object-panel-heading">
+                  <div><h3>Object coverage by class</h3><p>Class, confidence and source-pixel filters are applied together to records, labels, embeddings and boxes.</p></div>
+                </div>
+                <div className="coverage-object-filters">
+                  <div className="coverage-object-field">
+                    <label className="field-label" htmlFor="coverage-object-class">Object class</label>
+                    <select
+                      id="coverage-object-class"
+                      data-testid="coverage-object-class"
+                      value={classFilter}
+                      onChange={(event) => setClassFilter(event.target.value)}
+                    >
+                      <option value="">All classes</option>
+                      {[...new Set(run.records.map((record) => record.label))].sort().map((label) => (
+                        <option key={label} value={label}>{label}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="coverage-object-field">
+                    <label className="field-label" htmlFor="coverage-min-short-px">Hide objects smaller than (px)</label>
+                    <input
+                      id="coverage-min-short-px"
+                      data-testid="coverage-min-short-px"
+                      type="number"
+                      min={0}
+                      max={4096}
+                      value={minShortPx}
+                      onChange={(event) => setMinShortPx(Math.max(0, Math.min(4096, event.target.valueAsNumber || 0)))}
+                    />
+                  </div>
+                  {objectView.has_confidence && (
+                    <>
+                      <div className="coverage-object-field">
+                        <label className="field-label" htmlFor="coverage-confidence-min">Confidence minimum</label>
+                        <input
+                          id="coverage-confidence-min"
+                          data-testid="coverage-confidence-min"
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={confidenceMin}
+                          onChange={(event) => setConfidenceMin(Math.max(0, Math.min(1, event.target.valueAsNumber || 0)))}
+                        />
+                      </div>
+                      <div className="coverage-object-field">
+                        <label className="field-label" htmlFor="coverage-confidence-max">Confidence maximum</label>
+                        <input
+                          id="coverage-confidence-max"
+                          data-testid="coverage-confidence-max"
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={confidenceMax}
+                          onChange={(event) => setConfidenceMax(Number.isNaN(event.target.valueAsNumber)
+                            ? 1 : Math.max(0, Math.min(1, event.target.valueAsNumber)))}
+                        />
+                      </div>
+                    </>
+                  )}
+                  <div className="coverage-object-field">
+                    <label className="field-label" htmlFor="coverage-block-k">Object block count K</label>
+                    <input
+                      id="coverage-block-k"
+                      data-testid="coverage-block-k"
+                      type="number"
+                      min={3}
+                      max={20}
+                      value={blockK}
+                      onChange={(event) => setBlockK(Math.max(3, Math.min(20, event.target.valueAsNumber || 3)))}
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    data-testid="coverage-apply-object-filters"
+                    className="apply-object-filters"
+                    onClick={() => void refreshObjectView()}
+                    disabled={projectionBusy || confidenceMin > confidenceMax}
+                  >Apply object filters</button>
+                </div>
+                {confidenceMin > confidenceMax && <p className="coverage-warning" role="alert">Confidence minimum must not exceed its maximum.</p>}
+                <div className="coverage-object-summary">
+                  <h4>Class counts and sparse samples</h4>
+                  <div className="coverage-object-table-wrap">
+                    <table data-testid="coverage-class-summary">
+                      <thead><tr><th>Class</th><th>Objects</th><th>Block analysis</th><th>Top 20% sparse</th><th>Max sparsity</th></tr></thead>
+                      <tbody>
+                        {objectView.class_summary.map((summary) => (
+                          <tr key={summary.label} data-testid="coverage-class-summary-row" data-label={summary.label}>
+                            <td>{summary.label}</td><td>{summary.count}</td>
+                            <td>{summary.analyzable ? "Ready" : `Small class (${summary.count})`}</td>
+                            <td>{summary.sparse_count}</td><td>{summary.max_sparsity.toFixed(3)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {classFilter && objectView.blocks.length > 0 ? (
+                    <div className="coverage-object-blocks" data-testid="coverage-object-blocks">
+                      <h4>{classFilter} blocks · K={objectView.block_k}</h4>
+                      <div className="coverage-block-list">
+                        {objectView.blocks.map((block) => (
+                          <button
+                            type="button"
+                            key={block.block_id}
+                            data-testid="coverage-object-block"
+                            data-block-id={block.block_id}
+                            onClick={() => selectBlock(block.block_id)}
+                          >
+                            <strong>Block {block.block_id + 1}</strong>
+                            <span>{block.count} objects</span>
+                            <small>Mean sparsity {block.mean_sparsity.toFixed(3)}</small>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : classFilter ? (
+                    <p data-testid="coverage-no-blocks">This class has too few objects for block analysis.</p>
+                  ) : (
+                    <p>Select a class to inspect its object blocks.</p>
+                  )}
+                </div>
+              </section>
+            )}
             <div className="coverage-metrics" aria-label="Coverage summary">
-              <article><strong data-testid="coverage-image-count">{run.records.length}</strong><span>Images</span></article>
-              <article><strong data-testid="coverage-sparse-count">{run.sparse_count}</strong><span>Top {100 - run.sparse_percentile}% sparsity candidates</span></article>
+              <article><strong data-testid="coverage-image-count">{visiblePoints.length}</strong><span>{run.unit === "object" ? "Objects" : "Images"}</span></article>
+              <article><strong data-testid="coverage-sparse-count">{run.unit === "object" ? objectView?.sparse_count || 0 : run.sparse_count}</strong><span>Top {run.unit === "object" ? 20 : 100 - run.sparse_percentile}% sparsity candidates</span></article>
               <article><strong>{run.model_id}</strong><span>Feature model</span></article>
-              <article><strong data-testid="coverage-k-summary">{run.k}</strong><span>Nearest neighbors (k)</span></article>
+              <article><strong data-testid="coverage-k-summary">{run.unit === "object" ? objectView?.k || 1 : run.k}</strong><span>Nearest neighbors (k)</span></article>
             </div>
             <p className="coverage-caveat">Sparse means relatively few nearby examples in this dataset. It is a review clue, not a measured real-world coverage guarantee.</p>
             <div className="coverage-plot-toolbar">
@@ -380,28 +609,28 @@ export default function CoverageWorkspace({
             <div className="coverage-plot" data-testid="coverage-plot">
               {dimension === 2 ? (
                 <ScatterPlot2D
-                  points={run.points}
+                  points={visiblePoints}
                   selectedIndices={selectedIndices}
                   onToggleSelection={toggleSelection}
                   onAddSelection={addSelection}
-                  viewKey={`${run.run_id}:${run.method}:2:${effectiveColorMode}`}
+                  viewKey={`${run.run_id}:${run.unit}:${objectView?.method || run.method}:2:${effectiveColorMode}:${classFilter}`}
                   testIdPrefix="coverage"
                   colorValues={colorValues}
                   labelPalette={coverageLabelColors}
                   pointSizes={pointSizes}
-                  scoreValues={run.sparsity}
+                  scoreValues={visibleScores}
                   scoreLabel="Sparsity"
                 />
               ) : (
                 <ScatterPlot3D
-                  points={run.points}
+                  points={visiblePoints}
                   selectedIndices={selectedIndices}
                   onToggleSelection={toggleSelection}
-                  viewKey={`${run.run_id}:${run.method}:3:${effectiveColorMode}`}
+                  viewKey={`${run.run_id}:${run.unit}:${objectView?.method || run.method}:3:${effectiveColorMode}:${classFilter}`}
                   colorValues={colorValues}
                   labelPalette={coverageLabelColors}
                   pointSizes={pointSizes}
-                  scoreValues={run.sparsity}
+                  scoreValues={visibleScores}
                   scoreLabel="Sparsity"
                   testIdPrefix="coverage"
                 />
@@ -414,9 +643,9 @@ export default function CoverageWorkspace({
                 </span>
               )) : <span><i className="coverage-legend-gradient" />Sparse neighborhoods appear brighter; hover a point to read its score.</span>}
             </div>
-            <section className="coverage-selection" aria-label="Selected images">
+            <section className="coverage-selection" aria-label={run.unit === "object" ? "Selected objects" : "Selected images"}>
               <div className="coverage-selection-heading">
-                <div><h3>Selected images</h3><span data-testid="coverage-selected-count">{selectedRecords.length} selected</span></div>
+              <div><h3>{run.unit === "object" ? "Selected objects" : "Selected images"}</h3><span data-testid="coverage-selected-count">{selectedRecords.length} selected</span></div>
               </div>
               {selectedRecords.length ? (
                 <div className="coverage-gallery">
@@ -426,10 +655,11 @@ export default function CoverageWorkspace({
                       <strong>{record.filename}</strong>
                       <span className="coverage-image-label" style={{ background: classColors.get(record.label) || coverageLabelColors[0] }}>{record.label || "(unlabeled)"}</span>
                       <small>{record.split}</small>
+                      {record.obj_index != null && <small>Object {record.obj_index + 1} · short side {record.short_px ?? "?"} px</small>}
                     </article>
                   ))}
                 </div>
-              ) : <p className="coverage-empty-selection">No images selected yet. Click a point or drag a box on the map.</p>}
+              ) : <p className="coverage-empty-selection">No {run.unit === "object" ? "objects" : "images"} selected yet. Click a point or drag a box on the map.</p>}
             </section>
           </>
         ) : (
@@ -440,7 +670,7 @@ export default function CoverageWorkspace({
             <div className="empty-facts"><span><b>01</b> Choose images</span><span><b>02</b> Extract features locally</span><span><b>03</b> Inspect sparse regions</span></div>
           </div>
         )}
-        <footer className="canvas-footer"><span>VisualLatent · React Web</span><span>Image-level coverage</span></footer>
+        <footer className="canvas-footer"><span>VisualLatent · React Web</span><span>{run?.unit === "object" ? "Object-level coverage" : "Image-level coverage"}</span></footer>
       </main>
     </div>
   );

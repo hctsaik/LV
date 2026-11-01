@@ -146,6 +146,39 @@ def _detector_fixture(root: Path, *, with_classes: bool = True) -> list[Path]:
     return folders
 
 
+def _object_coverage_fixture(root: Path) -> tuple[list[Path], dict[str, str]]:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "classes.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    train, test = root / "train", root / "test"
+    specs = [
+        (train, "01.png", 0, 0.50, 0.50, 0.95),
+        (train, "02.png", 0, 0.10, 0.10, 0.40),
+        (train, "03.png", 0, 0.40, 0.40, 0.85),
+        (train, "04.png", 0, 0.08, 0.08, 0.75),
+        (train, "05.png", 0, 0.60, 0.60, 0.92),
+        (train, "06.png", 0, 0.45, 0.45, 0.70),
+        (test, "07.png", 0, 0.70, 0.70, 0.88),
+        (test, "08.png", 1, 0.50, 0.50, 0.90),
+    ]
+    hashes: dict[str, str] = {}
+    for index, (folder, filename, class_id, width, height, confidence) in enumerate(specs):
+        image_dir, label_dir = folder / "images", folder / "labels"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        image_path = image_dir / filename
+        Image.new("RGB", (64, 64), (25 + index * 23, 55 + index * 17, 180 - index * 13)).save(image_path)
+        label_path = label_dir / f"{Path(filename).stem}.txt"
+        label_path.write_text(
+            f"{class_id} 0.5 0.5 {width} {height} {confidence}\n",
+            encoding="utf-8",
+        )
+        hashes[str(image_path)] = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        hashes[str(label_path)] = hashlib.sha256(label_path.read_bytes()).hexdigest()
+    classes_path = root / "classes.txt"
+    hashes[str(classes_path)] = hashlib.sha256(classes_path.read_bytes()).hexdigest()
+    return [train, test], hashes
+
+
 def _start_api(application):
     port = _free_port()
     server = uvicorn.Server(uvicorn.Config(
@@ -879,6 +912,108 @@ def test_lv_web_03_img_01_visible_coverage_projection_box_selection_and_clear(
 
     assert source_hashes == {
         path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
+def test_lv_web_03_obj_01_visible_object_coverage_filters_blocks_and_crop_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible object coverage filters aligned YOLO rows, guards tiny classes, and selects cropped samples."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    folders, source_hashes = _object_coverage_fixture(tmp_path / "object-coverage-fixture")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def object_loader(_model_id: str, **_kwargs):
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            vector[4] = crop.height / 100.0
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: lambda _path: np.array([1.0] + [0.0] * 383, dtype=np.float32),
+        object_model_loader=object_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            page.get_by_label("Analysis unit").select_option("object")
+            page.get_by_label("Projection method").select_option("lda")
+            for folder in folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("coverage-point")).to_have_count(8)
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("8")
+            expect(page.get_by_role("heading", name="Object coverage by class")).to_be_visible()
+
+            page.get_by_test_id("coverage-object-class").select_option("alpha")
+            page.get_by_test_id("coverage-min-short-px").fill("10")
+            page.get_by_test_id("coverage-confidence-min").fill("0.8")
+            page.get_by_test_id("coverage-confidence-max").fill("0.95")
+            page.get_by_test_id("coverage-apply-object-filters").click()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("4")
+            point_labels = [
+                page.get_by_test_id("coverage-point").nth(index).get_attribute("aria-label")
+                for index in range(4)
+            ]
+            assert [label.split(",", 1)[0] for label in point_labels] == [
+                "Select 01.png", "Select 03.png", "Select 05.png", "Select 07.png",
+            ]
+            beta_summary = page.locator(
+                '[data-testid="coverage-class-summary-row"][data-label="beta"]'
+            )
+            expect(beta_summary).to_contain_text("1")
+            expect(page.get_by_test_id("coverage-object-blocks")).to_contain_text("K=4")
+            expect(page.get_by_test_id("coverage-object-block")).to_have_count(4)
+
+            page.get_by_test_id("coverage-object-class").select_option("beta")
+            page.get_by_test_id("coverage-apply-object-filters").click()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(1)
+            expect(page.get_by_test_id("coverage-no-blocks")).to_be_visible()
+            expect(page.locator(".coverage-warning").filter(
+                has_text="fewer than two objects",
+            )).to_be_visible()
+
+            page.get_by_test_id("coverage-object-class").select_option("alpha")
+            page.get_by_test_id("coverage-apply-object-filters").click()
+            expect(page.get_by_test_id("coverage-object-block")).to_have_count(4)
+            page.get_by_test_id("coverage-object-block").first.click()
+            expect(page.get_by_test_id("coverage-selected-count")).to_have_text("1 selected")
+            selected = page.get_by_test_id("coverage-selected-image").first
+            assert int(selected.get_attribute("data-index")) in {0, 2, 4, 6}
+            image = selected.locator("img")
+            expect(image).to_have_js_property("complete", True)
+            assert 0 < image.evaluate("node => node.naturalWidth") < 64
+            expect(selected.locator("small").nth(1)).to_contain_text("Object ")
+            thumbnail_src = image.get_attribute("src")
+            assert thumbnail_src and page.request.get(base_url + thumbnail_src).status == 200
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
         for path in source_hashes
     }
 

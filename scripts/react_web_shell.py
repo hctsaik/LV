@@ -26,6 +26,7 @@ from starlette.staticfiles import StaticFiles
 
 from _utils import available_models, load_model, load_text_encoder, supports_text_query
 from interaction import (
+    crop_bbox,
     draw_yolo_boxes,
     find_duplicate_pairs_embedding,
     find_duplicate_pairs_phash,
@@ -80,6 +81,7 @@ class CreateComparisonJob(BaseModel):
 class CreateCoverageJob(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
     model_id: str = Field(min_length=1, max_length=128)
+    unit: Literal["image", "object"] = "image"
     method: Literal["pca", "tsne", "umap", "lda", "sumap"] = "sumap"
     dimension: Literal[2, 3] = 2
     k: int = Field(default=10, ge=1, le=1000)
@@ -92,6 +94,17 @@ class CoverageProjectionRequest(BaseModel):
 
 class CoverageSparsityRequest(BaseModel):
     k: int = Field(ge=1, le=1000)
+
+
+class CoverageObjectViewRequest(BaseModel):
+    class_label: str | None = Field(default=None, max_length=256)
+    min_short_px: int = Field(default=0, ge=0, le=4096)
+    confidence_min: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence_max: float = Field(default=1.0, ge=0.0, le=1.0)
+    method: Literal["pca", "tsne", "umap", "lda", "sumap"] = "pca"
+    dimension: Literal[2, 3] = 2
+    k: int = Field(default=10, ge=1, le=1000)
+    block_k: int = Field(default=8, ge=3, le=20)
 
 
 class ProjectComparisonRequest(BaseModel):
@@ -399,6 +412,7 @@ def create_app(
         return [
             {
                 **record,
+                "index": int(record.get("index", index)),
                 "x": float(coordinates[index, 0]),
                 "y": float(coordinates[index, 1]),
                 "z": float(coordinates[index, 2]) if coordinates.shape[1] > 2 else 0.0,
@@ -430,9 +444,11 @@ def create_app(
                 job.request.folders,
                 model_names=[job.request.model_id],
                 methods=["pca"],
-                mode="classifier",
-                unit="image",
+                mode="detector" if job.request.unit == "object" else "classifier",
+                unit=job.request.unit,
                 model_loader=loader,
+                object_model_loader=object_loader,
+                include_raw_embeddings=True,
                 progress=update_progress,
                 cancelled=job.cancel_event.is_set,
             )
@@ -458,6 +474,8 @@ def create_app(
             run = {
                 "run_id": run_id,
                 "model_id": job.request.model_id,
+                "unit": job.request.unit,
+                "object_policy": result.get("object_policy"),
                 "method": used_method,
                 "requested_method": job.request.method,
                 "dimension": job.request.dimension,
@@ -624,6 +642,127 @@ def create_app(
             "sparse_percentile": 90,
         }
 
+    @app.post("/api/v1/coverage/runs/{run_id}/object-view")
+    def get_coverage_object_view(run_id: str, request: CoverageObjectViewRequest) -> dict:
+        if request.confidence_min > request.confidence_max:
+            raise HTTPException(status_code=422, detail="Minimum confidence must not exceed maximum confidence")
+        with app.state.lock:
+            run = app.state.coverage_runs.get(run_id)
+            vectors = app.state.coverage_embeddings.get(run_id)
+            if run is None or vectors is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            if run.get("unit") != "object":
+                raise HTTPException(status_code=409, detail="Object filters require object-level coverage")
+            records = run["records"]
+            vectors = np.asarray(vectors)
+
+        kept = []
+        for index, record in enumerate(records):
+            short_px = int(record.get("short_px", 0) or 0)
+            score = record.get("score")
+            if short_px < request.min_short_px:
+                continue
+            if score is not None and not request.confidence_min <= float(score) <= request.confidence_max:
+                continue
+            kept.append(index)
+
+        labels_after_object_filters = [str(records[index].get("label", "")) for index in kept]
+        class_summary = []
+        for label in sorted(set(labels_after_object_filters)):
+            class_indices = [index for index in kept if str(records[index].get("label", "")) == label]
+            class_vectors = vectors[class_indices]
+            if len(class_indices) >= 2:
+                class_scores = coverage_sparsity(class_vectors, min(request.k, len(class_indices) - 1))
+                threshold = float(np.percentile(class_scores, 80))
+                sparse_count = int(np.sum(np.asarray(class_scores) >= threshold))
+                max_sparsity = float(np.max(class_scores))
+            else:
+                sparse_count = 0
+                max_sparsity = 0.0
+            class_summary.append({
+                "label": label,
+                "count": len(class_indices),
+                "analyzable": len(class_indices) >= 4,
+                "sparse_count": sparse_count,
+                "max_sparsity": max_sparsity,
+            })
+        class_summary.sort(key=lambda row: (row["count"], -row["max_sparsity"], row["label"]))
+
+        selected_indices = [
+            index for index in kept
+            if request.class_label is None
+            or str(records[index].get("label", "")) == request.class_label
+        ]
+        selected_records = [records[index] for index in selected_indices]
+        selected_vectors = vectors[selected_indices]
+        selected_labels = [str(record.get("label", "")) for record in selected_records]
+        warnings: list[str] = []
+        if selected_records:
+            try:
+                coordinates, used_method, projection_warnings = coverage_projection(
+                    selected_vectors,
+                    selected_labels,
+                    request.method,
+                    request.dimension,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            warnings.extend(projection_warnings)
+        else:
+            coordinates = np.zeros((0, request.dimension), dtype=np.float64)
+            used_method = request.method
+            warnings.append("No objects match the current class and filters.")
+
+        k = min(request.k, max(1, len(selected_vectors) - 1))
+        scores = coverage_sparsity(selected_vectors, k)
+        threshold, sparse_count = sparse_threshold(np.asarray(scores, dtype=np.float64), 80.0)
+        block_summaries: list[dict] = []
+        if request.class_label is not None and len(selected_vectors) >= 2:
+            if len(selected_vectors) < 4:
+                warnings.append(
+                    f"{request.class_label} has only {len(selected_vectors)} objects; block coverage may be unstable."
+                )
+            normalized = selected_vectors / np.clip(
+                np.linalg.norm(selected_vectors, axis=1, keepdims=True), 1e-12, None,
+            )
+            block_count = min(request.block_k, len(selected_vectors))
+            fitted = KMeans(n_clusters=block_count, n_init=4, random_state=42).fit(normalized)
+            points = coverage_points(selected_records, coordinates)
+            labels_by_block = fitted.labels_.astype(int)
+            for point, block_id in zip(points, labels_by_block):
+                point["block_id"] = int(block_id)
+            for block_id in sorted(set(labels_by_block.tolist())):
+                members = np.flatnonzero(labels_by_block == block_id)
+                block_summaries.append({
+                    "block_id": int(block_id),
+                    "count": int(len(members)),
+                    "mean_sparsity": float(np.mean(np.asarray(scores)[members])),
+                })
+        else:
+            points = coverage_points(selected_records, coordinates)
+            if request.class_label is not None and len(selected_vectors) < 2:
+                warnings.append(
+                    f"{request.class_label} has fewer than two objects; block analysis is unavailable."
+                )
+
+        return {
+            "class_label": request.class_label,
+            "method": used_method,
+            "requested_method": request.method,
+            "dimension": request.dimension,
+            "records": selected_records,
+            "points": points,
+            "k": k,
+            "sparsity": np.asarray(scores, dtype=float).tolist(),
+            "sparse_threshold": threshold,
+            "sparse_count": sparse_count,
+            "class_summary": class_summary,
+            "block_k": min(request.block_k, len(selected_vectors)) if len(selected_vectors) >= 2 else 0,
+            "blocks": block_summaries,
+            "has_confidence": any(record.get("score") is not None for record in records),
+            "warnings": warnings,
+        }
+
     @app.get("/api/v1/coverage/runs/{run_id}/images/{index}/thumbnail")
     def get_coverage_thumbnail(run_id: str, index: int) -> Response:
         with app.state.lock:
@@ -637,6 +776,14 @@ def create_app(
         thumbnail = safe_open_image(path)
         if thumbnail is None:
             raise HTTPException(status_code=404, detail="Image is no longer available")
+        if run.get("unit") == "object":
+            record = run["records"][index]
+            bbox = record.get("bbox")
+            if bbox is not None:
+                width, height = thumbnail.size
+                long_side = max(float(bbox[2]) * width, float(bbox[3]) * height)
+                pad_px = int(min(64, max(8, round(0.12 * long_side))))
+                thumbnail = crop_bbox(thumbnail, *bbox, pad_px=pad_px)
         thumbnail.thumbnail((256, 256))
         output = BytesIO()
         thumbnail.save(output, format="JPEG", quality=84, optimize=True)

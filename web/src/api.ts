@@ -34,6 +34,7 @@ export type RunRecord = {
   bbox?: [number, number, number, number] | null;
   obj_index?: number | null;
   score?: number | null;
+  short_px?: number | null;
 };
 
 export type EmbeddingPoint = RunRecord & { x: number; y: number; z: number };
@@ -75,6 +76,8 @@ export type VisualizationRun = {
 export type CoverageRun = {
   run_id: string;
   model_id: string;
+  unit: VisualizeUnit;
+  object_policy: ComparisonObjectPolicy | null;
   method: ProjectionMethod;
   requested_method: ProjectionMethod;
   dimension: 2 | 3;
@@ -86,6 +89,49 @@ export type CoverageRun = {
   sparse_threshold: number;
   sparse_count: number;
   sparse_percentile: number;
+  warnings: string[];
+};
+
+export type CoverageObjectViewInput = {
+  class_label?: string | null;
+  min_short_px?: number;
+  confidence_min?: number;
+  confidence_max?: number;
+  method: ProjectionMethod;
+  dimension: 2 | 3;
+  k: number;
+  block_k: number;
+};
+
+export type CoverageClassSummary = {
+  label: string;
+  count: number;
+  analyzable: boolean;
+  sparse_count: number;
+  max_sparsity: number;
+};
+
+export type CoverageBlockSummary = {
+  block_id: number;
+  count: number;
+  mean_sparsity: number;
+};
+
+export type CoverageObjectView = {
+  class_label: string | null;
+  method: ProjectionMethod;
+  requested_method: ProjectionMethod;
+  dimension: 2 | 3;
+  records: RunRecord[];
+  points: Array<EmbeddingPoint & { block_id?: number }>;
+  k: number;
+  sparsity: number[];
+  sparse_threshold: number;
+  sparse_count: number;
+  class_summary: CoverageClassSummary[];
+  block_k: number;
+  blocks: CoverageBlockSummary[];
+  has_confidence: boolean;
   warnings: string[];
 };
 
@@ -312,12 +358,13 @@ export const api = {
   createCoverageJob: (
     folders: string[],
     modelId: string,
+    unit: VisualizeUnit,
     method: ProjectionMethod,
     dimension: 2 | 3,
     k: number,
   ) => request<{ job_id: string; state: string }>("/api/v1/coverage/jobs", {
     method: "POST",
-    body: JSON.stringify({ folders, model_id: modelId, method, dimension, k }),
+    body: JSON.stringify({ folders, model_id: modelId, unit, method, dimension, k }),
   }),
   coverageJob: (jobId: string) =>
     request<JobStatus>("/api/v1/coverage/jobs/" + encodeURIComponent(jobId)),
@@ -336,6 +383,11 @@ export const api = {
     "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/sparsity",
     { method: "POST", body: JSON.stringify({ k }) },
   ),
+  coverageObjectView: (runId: string, input: CoverageObjectViewInput) =>
+    request<CoverageObjectView>(
+      "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/object-view",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
   coverageThumbnailUrl: (runId: string, index: number) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/coverage/runs/"
       + encodeURIComponent(runId) + "/images/" + index + "/thumbnail",
