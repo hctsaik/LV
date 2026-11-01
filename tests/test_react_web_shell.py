@@ -410,3 +410,89 @@ def test_case_lv_web_01_od_01_missing_classes_are_explicit(monkeypatch, tmp_path
     assert missing["error"]["code"] == "CLASS_NAMES_UNAVAILABLE"
     assert fallback["state"] == "completed", fallback
     assert fallback_run["class_names"] == ["scratch", "stain"]
+
+
+def test_case_lv_web_01_od_02_object_detector_uses_crops_and_content_cache(
+    monkeypatch, tmp_path
+):
+    """Object points preserve YOLO order/boxes and cache crops by content, box, model, and policy."""
+    folders = _detector_fixture(tmp_path / "detector")
+    source_root = tmp_path / "detector"
+    source_before = {
+        path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_root.rglob("*") if path.is_file()
+    }
+    crop_calls: list[tuple[int, int]] = []
+
+    def object_loader(_model_id: str, **_kwargs):
+        def embed(crop: Image.Image) -> np.ndarray:
+            crop_calls.append(crop.size)
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            return vector
+        return embed
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "app-cache"))
+    app = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda _model_id: _fake_embedder(),
+        object_model_loader=object_loader,
+    )
+    client = TestClient(app)
+    policy = {"pad": 0.12, "target_res": 224, "head": "cls"}
+    payload = {
+        "folders": [str(folder) for folder in folders],
+        "mode": "detector",
+        "unit": "object",
+        "class_names": ["wrong-fallback"],
+        "model_ids": ["dinov2_vits14"],
+        "methods": ["pca"],
+        "object_policy": policy,
+    }
+
+    runs = []
+    for _ in range(2):
+        job = _run_custom(client, payload)
+        assert job["state"] == "completed", job
+        runs.append(client.get(f"/api/v1/runs/{job['run_id']}").json())
+
+    run = runs[-1]
+    assert run["unit"] == "object"
+    assert run["object_policy"] == policy
+    assert run["class_names"] == ["scratch", "stain"]
+    assert run["embedding_shape"] == [5, 384]
+    assert run["embedding_finite"] is True
+    assert run["embedding_nonzero"] is True
+    assert [
+        (record["filename"], record["split"], record["label"], record["class_id"], record["obj_index"])
+        for record in run["records"]
+    ] == [
+        ("01.png", "train", "scratch", 0, 0),
+        ("02.png", "train", "scratch", 0, 0),
+        ("02.png", "train", "stain", 1, 1),
+        ("03.png", "test", "stain", 1, 0),
+        ("04.png", "test", "class_8", 8, 0),
+    ]
+    assert run["records"][0]["bbox"] == [0.5, 0.5, 0.4, 0.4]
+    assert len(crop_calls) == 5
+    assert all(width < 32 and height < 32 for width, height in crop_calls)
+    assert runs[0]["records"] == run["records"]
+    assert source_before == {
+        path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_root.rglob("*") if path.is_file()
+    }
+
+    # Moving one existing box changes only that object's cache key.
+    label_path = source_root / "train" / "labels" / "01.txt"
+    label_path.write_text("0 0.6 0.5 0.4 0.4\n", encoding="utf-8")
+    job = _run_custom(client, payload)
+    assert job["state"] == "completed", job
+    changed_run = client.get(f"/api/v1/runs/{job['run_id']}").json()
+    assert changed_run["records"][0]["bbox"] == [0.6, 0.5, 0.4, 0.4]
+    assert len(crop_calls) == 6
+    assert all(
+        hashlib.sha256(path.read_bytes()).hexdigest() == source_before[path.relative_to(source_root).as_posix()]
+        for path in source_root.rglob("*.png")
+    )

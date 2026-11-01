@@ -25,7 +25,7 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -176,15 +176,18 @@ def match_profile(fingerprint: dict, profiles=None):
 
 # ── embedding + metrics ──────────────────────────────────────────────────────
 def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
-                  progress=None, model_loader: Callable | None = None):
+                  progress=None, model_loader: Callable | None = None,
+                  cache_keys: Sequence[str] | None = None):
     """Embed each object from an in-memory full-res crop under ``policy``.
     Returns (emb [N,D], short_px [N]). Caches to npz keyed by object identity.
     ``progress(done, total)`` is called per object (once at total on a cache hit)."""
-    keys = [
+    keys = list(cache_keys) if cache_keys is not None else [
         f"{hashlib.sha256(str(Path(m['image_path']).resolve()).encode('utf-8')).hexdigest()[:16]}"
         f"__{Path(m['image_path']).stem}__{m['obj_index']}"
         for m in meta
     ]
+    if len(keys) != len(meta):
+        raise ValueError("cache_keys must contain one key for each object")
     # Incremental + checkpoint: include the resolved source image in the key so
     # equal basenames in different folders cannot reuse each other's objects.
     # save every 200 → a crash resumes from the last checkpoint, and adding data

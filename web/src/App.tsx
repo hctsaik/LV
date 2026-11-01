@@ -2,9 +2,11 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   api,
   type EmbeddingPoint,
+  type ComparisonObjectPolicy,
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
+  type VisualizeUnit,
   type VisualizationRun,
 } from "./api";
 import CompareDistributions from "./CompareDistributions";
@@ -70,7 +72,7 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
               key={point.index}
               role="button"
               tabIndex={0}
-              aria-label={"Select " + point.filename + ", " + point.label + ", " + point.split}
+              aria-label={"Select " + point.filename + (point.obj_index == null ? "" : ", object " + (point.obj_index + 1)) + ", " + point.label + ", " + point.split}
               data-testid="embedding-point"
               data-index={point.index}
               className={"point " + (active ? "point-active" : "")}
@@ -80,7 +82,7 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
                 if (event.key === "Enter" || event.key === " ") onSelect(point.index);
               }}
             >
-              <title>{point.filename + " · " + point.label + " · " + point.split}</title>
+              <title>{point.filename + (point.obj_index == null ? "" : ` · object ${point.obj_index + 1}`) + " · " + point.label + " · " + point.split}</title>
               {active && <circle r={12} className="point-selection-ring" />}
               {shape}
             </g>
@@ -110,6 +112,8 @@ function ScatterPlot({ points, selectedIndex, onSelect, dimension, viewKey }: {
 
 export default function App() {
   const [analysisMode, setAnalysisMode] = useState<"classifier" | "detector">("classifier");
+  const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
+  const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
   const [activeTool, setActiveTool] = useState<"visualize" | "compare">("visualize");
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -219,6 +223,7 @@ export default function App() {
   function changeAnalysisMode(mode: "classifier" | "detector") {
     if (mode === analysisMode) return;
     setAnalysisMode(mode);
+    setAnalysisUnit("image");
     setFolders([]);
     setFolderDraft("");
     setClassNamesDraft("");
@@ -261,7 +266,9 @@ export default function App() {
       const classNames = classNamesDraft.split(",").map((name) => name.trim()).filter(Boolean);
       const created = await api.createJob(selectedFolders, selectedModelIds, selectedMethods, {
         mode: analysisMode,
+        unit: analysisUnit,
         classNames,
+        ...(analysisUnit === "object" ? { objectPolicy } : {}),
       });
       setJob({
         job_id: created.job_id,
@@ -363,6 +370,64 @@ export default function App() {
             </select>
             {analysisMode === "detector" && (
               <>
+                <label className="field-label field-label-spaced" htmlFor="detector-unit">Detection unit</label>
+                <select
+                  id="detector-unit"
+                  data-testid="detector-unit"
+                  aria-label="Detection unit"
+                  value={analysisUnit}
+                  onChange={(event) => {
+                    const value = event.target.value as VisualizeUnit;
+                    setAnalysisUnit(value);
+                    setRun(null);
+                    setJob(null);
+                    setSelectedIndex(null);
+                    setLabelFilter("all");
+                    setSplitFilter("all");
+                  }}
+                  disabled={busy}
+                >
+                  <option value="image">Whole image</option>
+                  <option value="object">Each annotated object</option>
+                </select>
+                {analysisUnit === "object" && (
+                  <div className="object-policy-fields" aria-label="Object crop policy">
+                    <label className="field-label" htmlFor="object-pad">Crop padding</label>
+                    <input
+                      id="object-pad"
+                      aria-label="Object crop padding"
+                      type="number"
+                      min="0"
+                      max="0.5"
+                      step="0.01"
+                      value={objectPolicy.pad}
+                      onChange={(event) => setObjectPolicy((current) => ({ ...current, pad: Number(event.target.value) }))}
+                      disabled={busy}
+                    />
+                    <label className="field-label" htmlFor="object-resolution">Crop resolution</label>
+                    <select
+                      id="object-resolution"
+                      aria-label="Object crop resolution"
+                      value={objectPolicy.target_res}
+                      onChange={(event) => setObjectPolicy((current) => ({ ...current, target_res: Number(event.target.value) as ComparisonObjectPolicy["target_res"] }))}
+                      disabled={busy}
+                    >
+                      {[168, 196, 224, 280, 336, 392, 448].map((resolution) => <option key={resolution} value={resolution}>{resolution}px</option>)}
+                    </select>
+                    <label className="field-label" htmlFor="object-head">Embedding head</label>
+                    <select
+                      id="object-head"
+                      aria-label="Object embedding head"
+                      value={objectPolicy.head}
+                      onChange={(event) => setObjectPolicy((current) => ({ ...current, head: event.target.value as ComparisonObjectPolicy["head"] }))}
+                      disabled={busy}
+                    >
+                      <option value="cls">CLS token</option>
+                      <option value="meanpool">Mean pool</option>
+                    </select>
+                    <div className="field-note">Each YOLO box is cropped with the selected policy; embeddings are cached by image content and box.</div>
+                  </div>
+                )}
                 <label className="field-label field-label-spaced" htmlFor="detector-class-names">Class names fallback</label>
                 <input
                   id="detector-class-names"
@@ -467,7 +532,7 @@ export default function App() {
             <div>
               <div className="eyebrow">ANALYSIS CANVAS</div>
               <h2>{run ? "Embedding distribution" : "Your workspace is ready"}</h2>
-              <p>{run && currentView ? run.records.length.toLocaleString() + " images · " + activeModelId + " · " + currentView.method.toUpperCase() : "Choose a folder and run an analysis to see your collection."}</p>
+              <p>{run && currentView ? run.records.length.toLocaleString() + (run.unit === "object" ? " objects" : " images") + " · " + activeModelId + " · " + currentView.method.toUpperCase() : "Choose a folder and run an analysis to see your collection."}</p>
             </div>
             {run && <div className="run-badge"><span className="badge-dot" /> Result ready</div>}
           </div>
@@ -476,7 +541,7 @@ export default function App() {
             <div className="progress-card" data-testid="job-status" role="status">
               <div className="progress-row"><span>{job?.message || "Preparing analysis"}</span><strong>{Math.round(job?.percent || 0)}%</strong></div>
               <div className="progress-track"><div className="progress-fill" style={{ width: Math.max(3, job?.percent || 0) + "%" }} /></div>
-              <div className="progress-foot">{job?.done || 0} / {job?.total || "—"} model-image embeddings</div>
+              <div className="progress-foot">{job?.done || 0} / {job?.total || "—"} model-{analysisUnit === "object" ? "object" : "image"} embeddings</div>
             </div>
           )}
           {!busy && job?.state === "completed" && <div className="completion-label" data-testid="job-status"><span className="completion-check">✓</span> Completed</div>}
@@ -486,7 +551,7 @@ export default function App() {
             <div className="result-grid">
               <section className="plot-card">
                 <div className="plot-toolbar">
-                  <div className="plot-title"><span className="chart-glyph" aria-hidden="true">⊙</span><div><strong>Image embeddings</strong><small>Click a point to inspect its source</small></div></div>
+                  <div className="plot-title"><span className="chart-glyph" aria-hidden="true">⊙</span><div><strong>{run.unit === "object" ? "Object embeddings" : "Image embeddings"}</strong><small>Click a point to inspect its source{run.unit === "object" ? " object" : ""}</small></div></div>
                   <div className="filters">
                     <label><span>Model</span><select aria-label="Display model" value={activeModelId} onChange={(event) => selectActiveModel(event.target.value)}>{run.models.map((model) => <option key={model}>{model}</option>)}</select></label>
                     <label><span>Method</span><select aria-label="Display method" value={currentView.method} onChange={(event) => setActiveMethod(event.target.value as ProjectionMethod)}>{activeViews.map((view) => <option key={view.method} value={view.method}>{projectionOptions.find((option) => option.value === view.method)?.label || view.method}</option>)}</select></label>
@@ -518,14 +583,18 @@ export default function App() {
               </section>
 
               <aside className="detail-card">
-                <div className="detail-card-heading"><div><div className="eyebrow">IMAGE DETAIL</div><h3>{selectedRecord ? "Selected image" : "Select a point"}</h3></div><span className="detail-count">{selectedRecord ? "#" + (selectedRecord.index + 1) : "—"}</span></div>
+                <div className="detail-card-heading"><div><div className="eyebrow">{selectedRecord && run.unit === "object" ? "OBJECT DETAIL" : "IMAGE DETAIL"}</div><h3>{selectedRecord ? (run.unit === "object" ? "Selected object" : "Selected image") : "Select a point"}</h3></div><span className="detail-count">{selectedRecord ? "#" + (selectedRecord.index + 1) : "—"}</span></div>
                 {selectedRecord && run ? (
                   <>
-                    <div className="image-preview"><img data-testid="selected-image" src={"/api/v1/runs/" + encodeURIComponent(job?.run_id || "") + "/images/" + selectedRecord.index} alt={selectedRecord.filename} /></div>
+                    <div className="image-preview"><div className="image-stage"><img data-testid="selected-image" src={"/api/v1/runs/" + encodeURIComponent(job?.run_id || "") + "/images/" + selectedRecord.index} alt={selectedRecord.filename} />{run.unit === "object" && selectedRecord.bbox && <svg data-testid="selected-object-bbox" aria-label="Selected object bounding box" viewBox="0 0 1 1" preserveAspectRatio="none"><rect x={selectedRecord.bbox[0] - selectedRecord.bbox[2] / 2} y={selectedRecord.bbox[1] - selectedRecord.bbox[3] / 2} width={selectedRecord.bbox[2]} height={selectedRecord.bbox[3]} /></svg>}</div></div>
                     <div className="image-name" data-testid="selected-image-name" title={selectedRecord.filename}>{selectedRecord.filename}</div>
                     <div className="metadata-list">
                       <div><span>Class</span><strong>{selectedRecord.label}</strong></div>
                       <div><span>Split</span><strong>{selectedRecord.split}</strong></div>
+                      {run.unit === "object" && <>
+                        <div><span>Object</span><strong data-testid="selected-object-index">{(selectedRecord.obj_index ?? 0) + 1}</strong></div>
+                        <div><span>Box (cx, cy, w, h)</span><strong data-testid="selected-object-box">{selectedRecord.bbox?.map((value) => value.toFixed(3)).join(", ")}</strong></div>
+                      </>}
                       <div><span>Model</span><strong>{activeModelId}</strong></div>
                       <div><span>Method</span><strong>{currentView.method.toUpperCase()}</strong></div>
                     </div>

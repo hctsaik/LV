@@ -5,6 +5,12 @@ export type ModelOption = {
 };
 
 export type ProjectionMethod = "pca" | "tsne" | "umap" | "lda" | "sumap";
+export type VisualizeUnit = "image" | "object";
+export type ComparisonObjectPolicy = {
+  pad: number;
+  target_res: 168 | 196 | 224 | 280 | 336 | 392 | 448;
+  head: "cls" | "meanpool";
+};
 
 export type JobStatus = {
   job_id: string;
@@ -24,6 +30,10 @@ export type RunRecord = {
   filename: string;
   split: string;
   label: string;
+  class_id?: number | null;
+  bbox?: [number, number, number, number] | null;
+  obj_index?: number | null;
+  score?: number | null;
 };
 
 export type EmbeddingPoint = RunRecord & { x: number; y: number; z: number };
@@ -39,6 +49,8 @@ export type VisualizationView = {
 
 export type VisualizationRun = {
   mode: "classifier" | "detector";
+  unit: VisualizeUnit;
+  object_policy: ComparisonObjectPolicy | null;
   class_names: string[];
   model_id: string;
   method: ProjectionMethod;
@@ -55,12 +67,6 @@ export type VisualizationRun = {
 };
 
 export type CompareUnit = "whole" | "object";
-export type ComparisonObjectPolicy = {
-  pad: number;
-  target_res: 168 | 196 | 224 | 280 | 336 | 392 | 448;
-  head: "cls" | "meanpool";
-};
-
 export type ComparisonRecord = {
   index: number;
   filename: string;
@@ -151,7 +157,12 @@ export const api = {
     folders: string[],
     modelIds: string[],
     methods: ProjectionMethod[],
-    options: { mode?: "classifier" | "detector"; classNames?: string[] } = {},
+    options: {
+      mode?: "classifier" | "detector";
+      unit?: VisualizeUnit;
+      classNames?: string[];
+      objectPolicy?: ComparisonObjectPolicy;
+    } = {},
   ) =>
     request<{ job_id: string; state: string }>("/api/v1/visualize/jobs", {
       method: "POST",
@@ -160,7 +171,9 @@ export const api = {
         model_ids: modelIds,
         methods,
         mode: options.mode || "classifier",
+        unit: options.unit || "image",
         class_names: options.classNames || [],
+        object_policy: options.objectPolicy,
       }),
     }),
   job: (jobId: string) => request<JobStatus>("/api/v1/jobs/" + encodeURIComponent(jobId)),

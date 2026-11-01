@@ -1,6 +1,8 @@
 """Framework-free LV React visualization pipeline for LV-WEB-01-IC-01."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -167,15 +169,18 @@ def run_image_visualization(
     model_names: Sequence[str] | None = None,
     methods: Sequence[str] = ("pca",),
     mode: str = "classifier",
+    unit: str = "image",
     class_names: Sequence[str] = (),
+    object_policy: dict | None = None,
     model_loader: Callable[[str], Callable[[Path], np.ndarray]] = load_model,
+    object_model_loader: Callable[..., Callable] | None = None,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict:
-    """Run a whole-image Visualize flow without Streamlit state.
+    """Run a Visualize flow without Streamlit state.
 
     Discovery, per-model content-hash embedding caches, projection parameters,
-    and label/split alignment follow the existing Visualize Embeddings path.
+    object crops, and label/split alignment follow the existing Visualize path.
     Every write is routed through LV's app-side manifest/cache helpers, never
     into selected source folders.
     """
@@ -213,6 +218,26 @@ def run_image_visualization(
     if any(method not in {"pca", "tsne", "umap", "lda", "sumap"} for method in selected_methods):
         raise VisualizationInputError("METHOD_UNAVAILABLE", "A selected projection method is unavailable.")
 
+    if unit not in {"image", "object"}:
+        raise VisualizationInputError("INVALID_UNIT", "Choose whole-image or object-level analysis.")
+    if unit == "object" and mode != "detector":
+        raise VisualizationInputError("INVALID_UNIT", "Object-level analysis requires Object Detector mode.")
+
+    resolved_object_policy: dict | None = None
+    if unit == "object":
+        from object_eval import DEFAULT_POLICY
+
+        resolved_object_policy = dict(DEFAULT_POLICY)
+        if object_policy is not None:
+            resolved_object_policy.update(object_policy)
+        if (
+            not isinstance(resolved_object_policy.get("pad"), (int, float))
+            or not 0 <= float(resolved_object_policy["pad"]) <= 0.5
+            or resolved_object_policy.get("target_res") not in {168, 196, 224, 280, 336, 392, 448}
+            or resolved_object_policy.get("head") not in {"cls", "meanpool"}
+        ):
+            raise VisualizationInputError("INVALID_OBJECT_POLICY", "The object crop policy is invalid.")
+
     check_cancelled()
     if mode == "classifier":
         resolved_class_names: list[str] = []
@@ -238,12 +263,36 @@ def run_image_visualization(
     records = [record for record in records if str(Path(record["path"]).resolve()) in readable_keys]
     if not records:
         raise VisualizationInputError("NO_IMAGES", "No readable images were found in the selected folders.")
+    source_records = records
+    object_records: list[dict] | None = None
+    if unit == "object":
+        from interaction import discover_yolo_objects
+
+        object_records = discover_yolo_objects(
+            [Path(record["path"]) for record in source_records],
+            resolved_class_names,
+        )
+        if not object_records:
+            raise VisualizationInputError("NO_OBJECTS", "No supported annotated objects were found in the selected folders.")
+        source_by_path = {str(Path(record["path"]).resolve()): record for record in source_records}
+        records = [
+            {
+                "path": Path(item["image_path"]),
+                "split": str(source_by_path[str(Path(item["image_path"]).resolve())]["split"]),
+                "label": str(item["label"]),
+                "class_id": int(item["class_id"]) if item.get("class_id") is not None else None,
+                "bbox": [float(value) for value in item["bbox"]],
+                "obj_index": int(item["obj_index"]),
+                "score": float(item["score"]) if item.get("score") is not None else None,
+            }
+            for item in object_records
+        ]
     check_cancelled()
 
     manifest_by_folder: dict[Path, dict[str, dict]] = {}
     paths_by_folder: dict[Path, list[Path]] = {}
     for folder in resolved_folders:
-        folder_records = [record for record in records if _is_under(Path(record["path"]), folder)]
+        folder_records = [record for record in source_records if _is_under(Path(record["path"]), folder)]
         if not folder_records:
             continue
         manifest_by_folder[folder] = update_manifest(folder, folder_records)
@@ -261,33 +310,68 @@ def run_image_visualization(
 
     for selected_model in selected_models:
         check_cancelled()
-        embed_fn = model_loader(selected_model)
-        all_embeddings: list[np.ndarray] = []
-        for folder in resolved_folders:
-            paths = paths_by_folder.get(folder, [])
-            if not paths:
-                continue
+        def on_item(done: int, _item_total: int) -> None:
             check_cancelled()
-            entries = manifest_by_folder[folder]
-            keys = [entries[rel_key(folder, path)]["sha256"] for path in paths]
-            cache_path = manifest_path_for(folder).parent / f"embeddings_{selected_model}" / "embeddings.npz"
+            if progress is not None:
+                progress(completed + done, total)
 
-            def on_item(done: int, _folder_total: int) -> None:
-                check_cancelled()
-                if progress is not None:
-                    progress(completed + done, total)
+        if unit == "object" and object_records is not None and resolved_object_policy is not None:
+            from object_eval import embed_objects, policy_tag
 
-            folder_embeddings = extract_embeddings(
-                paths,
-                embed_fn,
-                cache_path=cache_path,
-                progress_cb=on_item,
-                cache_keys=keys,
+            cache_keys = []
+            for record in records:
+                path = Path(record["path"]).resolve()
+                folder = next(folder for folder in resolved_folders if _is_under(path, folder))
+                source_sha = manifest_by_folder[folder][rel_key(folder, path)]["sha256"]
+                key_data = {
+                    "path": str(path),
+                    "sha256": source_sha,
+                    "bbox": record["bbox"],
+                    "obj_index": record["obj_index"],
+                    "model": selected_model,
+                    "policy": resolved_object_policy,
+                }
+                cache_keys.append(hashlib.sha256(
+                    json.dumps(key_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest())
+            cache_path = (
+                manifest_path_for(resolved_folders[0]).parent
+                / f"object_embeddings_{selected_model}_{policy_tag(resolved_object_policy)}"
+                / "embeddings.npz"
             )
-            set_embedding_refs(entries, folder, selected_model, paths)
-            all_embeddings.append(folder_embeddings)
-            completed += len(paths)
-        raw = np.vstack(all_embeddings).astype(np.float32, copy=False)
+            raw, _short_px = embed_objects(
+                object_records,
+                selected_model,
+                resolved_object_policy,
+                cache_path=cache_path,
+                progress=on_item,
+                model_loader=object_model_loader or model_loader,
+                cache_keys=cache_keys,
+            )
+            completed += len(records)
+        else:
+            embed_fn = model_loader(selected_model)
+            all_embeddings: list[np.ndarray] = []
+            for folder in resolved_folders:
+                paths = paths_by_folder.get(folder, [])
+                if not paths:
+                    continue
+                check_cancelled()
+                entries = manifest_by_folder[folder]
+                keys = [entries[rel_key(folder, path)]["sha256"] for path in paths]
+                cache_path = manifest_path_for(folder).parent / f"embeddings_{selected_model}" / "embeddings.npz"
+
+                folder_embeddings = extract_embeddings(
+                    paths,
+                    embed_fn,
+                    cache_path=cache_path,
+                    progress_cb=on_item,
+                    cache_keys=keys,
+                )
+                set_embedding_refs(entries, folder, selected_model, paths)
+                all_embeddings.append(folder_embeddings)
+                completed += len(paths)
+            raw = np.vstack(all_embeddings).astype(np.float32, copy=False)
         if raw.ndim != 2 or raw.shape[0] != len(records) or not np.isfinite(raw).all():
             raise VisualizationInputError("INVALID_EMBEDDINGS", "The selected model returned invalid embeddings.")
         nonzero = bool(np.all(np.linalg.norm(raw, axis=1) > 0))
@@ -309,6 +393,12 @@ def run_image_visualization(
             "filename": Path(record["path"]).name,
             "split": str(record["split"]),
             "label": str(record["label"]),
+            **({
+                "class_id": record["class_id"],
+                "bbox": record["bbox"],
+                "obj_index": record["obj_index"],
+                "score": record["score"],
+            } if unit == "object" else {}),
         }
         for index, record in enumerate(records)
     ]
@@ -340,6 +430,8 @@ def run_image_visualization(
     base_warnings = ([f"Skipped {len(unreadable)} unreadable image(s)."] if unreadable else [])
     return {
         "mode": mode,
+        "unit": unit,
+        "object_policy": resolved_object_policy,
         "class_names": resolved_class_names,
         "model_id": primary["model_id"],
         "method": primary["method"],

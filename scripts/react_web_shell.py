@@ -25,20 +25,22 @@ API_VERSION = "1"
 logger = logging.getLogger("lv.react_web")
 
 
-class CreateVisualizationJob(BaseModel):
-    folders: list[str] = Field(min_length=1, max_length=32)
-    mode: Literal["classifier", "detector"] = "classifier"
-    class_names: list[str] = Field(default_factory=list, max_length=256)
-    model_id: str | None = Field(default=None, min_length=1, max_length=128)
-    method: str = "pca"
-    model_ids: list[str] = Field(default_factory=list, max_length=8)
-    methods: list[str] = Field(default_factory=list, max_length=5)
-
-
 class ComparisonObjectPolicy(BaseModel):
     pad: float = Field(ge=0.0, le=0.5)
     target_res: Literal[168, 196, 224, 280, 336, 392, 448]
     head: Literal["cls", "meanpool"]
+
+
+class CreateVisualizationJob(BaseModel):
+    folders: list[str] = Field(min_length=1, max_length=32)
+    mode: Literal["classifier", "detector"] = "classifier"
+    unit: Literal["image", "object"] = "image"
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+    object_policy: ComparisonObjectPolicy | None = None
+    model_id: str | None = Field(default=None, min_length=1, max_length=128)
+    method: str = "pca"
+    model_ids: list[str] = Field(default_factory=list, max_length=8)
+    methods: list[str] = Field(default_factory=list, max_length=5)
 
 
 class CreateComparisonJob(BaseModel):
@@ -204,8 +206,14 @@ def create_app(
                 model_names=selected_models,
                 methods=selected_methods,
                 mode=job.request.mode,
+                unit=job.request.unit,
                 class_names=job.request.class_names,
+                object_policy=(
+                    job.request.object_policy.model_dump()
+                    if job.request.object_policy is not None else None
+                ),
                 model_loader=loader,
+                object_model_loader=object_loader,
                 progress=update_progress,
                 cancelled=job.cancel_event.is_set,
             )

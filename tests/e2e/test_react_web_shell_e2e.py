@@ -40,6 +40,17 @@ DETECTOR_FIXTURE_SHA256 = {
     "train/labels/01.txt": "27870ce778e19c56104999640fb7fcdc18751cab266b594e4c462c4960284748",
     "train/labels/02.txt": "4ea54c88845a9d9e59da0f008b0d72db82edd68ec37f615a00b016e9727aed22",
 }
+DETECTOR_FIXTURE_SHA256 = {
+    "classes.txt": "6790a8ef4600c53847701c63920499d8ea56375232a8de32fc15b3e26b9d6ba4",
+    "test/images/03.png": "d1db8754763264c772e91c2d290fa34eb4fccde5347547a0b88508a03a78e2a8",
+    "test/images/04.png": "2efc4e09db0248ef37f99e869efbf46b3831f0a8a32aebdc15b91fca3a7bd10d",
+    "test/labels/03.txt": "bbad46a203bf72fa2666bd7b28fb48bdad2e401c2f4d52fef2f8395d13fc6a6d",
+    "test/labels/04.txt": "d2a7909432cfee5af8b863bfff69743ee65dd5971a12510c0d1f2bccc97e7b3c",
+    "train/images/01.png": "2bf522ccb76e9a416106fb84e8ce91398058fc5a0df49ee3a2a05a0db0391323",
+    "train/images/02.png": "8acebfda3ba1cbfccce4ed478aa4920f53ae3b7c7e65b8a338a08c432bf63035",
+    "train/labels/01.txt": "27870ce778e19c56104999640fb7fcdc18751cab266b594e4c462c4960284748",
+    "train/labels/02.txt": "4ea54c88845a9d9e59da0f008b0d72db82edd68ec37f615a00b016e9727aed22",
+}
 
 
 def _free_port() -> int:
@@ -378,6 +389,174 @@ def test_lv_web_01_od_01_missing_class_names_is_visible(
             server.should_exit = True
         if server_thread is not None:
             server_thread.join(timeout=10)
+
+
+def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """React selects object granularity, filters boxes, and previews the selected source bbox."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    folders = _detector_fixture(tmp_path / "detector-object-fixture")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def object_loader(_model_id: str, **_kwargs):
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda _model_id: lambda _path: np.array([1.0] + [0.0] * 383, dtype=np.float32),
+        object_model_loader=object_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+            page.on(
+                "response",
+                lambda response: run_payloads.append(response.json())
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Analysis mode").select_option("detector")
+            page.get_by_label("Detection unit").select_option("object")
+            page.get_by_label("Detector class names fallback").fill("wrong-fallback")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in folders:
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=30_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(5)
+
+            assert run_payloads
+            run = run_payloads[-1]
+            assert run["unit"] == "object"
+            assert run["object_policy"] == {"pad": 0.12, "target_res": 224, "head": "cls"}
+            assert [(record["filename"], record["label"], record["obj_index"]) for record in run["records"]] == [
+                ("01.png", "scratch", 0),
+                ("02.png", "scratch", 0),
+                ("02.png", "stain", 1),
+                ("03.png", "stain", 0),
+                ("04.png", "class_8", 0),
+            ]
+
+            page.get_by_label("Filter by class").select_option(label="stain")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(2)
+            page.get_by_test_id("embedding-point").nth(0).click()
+            expect(page.get_by_role("heading", name="Selected object")).to_be_visible()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("02.png")
+            expect(page.get_by_test_id("selected-object-index")).to_have_text("2")
+            expect(page.get_by_test_id("selected-object-box")).to_have_text("0.500, 0.500, 0.200, 0.200")
+            expect(page.get_by_test_id("selected-object-bbox")).to_be_visible()
+            expect(page.get_by_test_id("selected-image")).to_have_js_property("naturalWidth", 32)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible object-level React flow uses the pinned DINOv2 model on real crops."""
+    models_dir = Path(os.environ.get("LV_MODELS_DIR", ROOT / "models")).resolve()
+    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
+    if not weights.is_file():
+        pytest.skip(f"real DINOv2-small weights are unavailable: {weights}")
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
+        "the local model weights differ from the LV-WEB-01 baseline"
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = tmp_path / "detector-object-real-fixture"
+    folders = _detector_fixture(dataset)
+    source_hashes = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    assert source_hashes == DETECTOR_FIXTURE_SHA256
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: available_models(models_dir),
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+        object_model_loader=lambda model_id, **kwargs: load_model(model_id, models_dir=models_dir, **kwargs),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+            page.on(
+                "response",
+                lambda response: run_payloads.append(response.json())
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Analysis mode").select_option("detector")
+            page.get_by_label("Detection unit").select_option("object")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in folders:
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(5)
+
+            assert run_payloads, "React UI did not load the real-model object result"
+            run = run_payloads[-1]
+            assert run["unit"] == "object"
+            assert run["object_policy"] == {"pad": 0.12, "target_res": 224, "head": "cls"}
+            assert run["models"] == ["dinov2_vits14"]
+            assert run["embedding_shape"] == [5, 384]
+            assert run["embedding_finite"] is True
+            assert run["embedding_nonzero"] is True
+            assert [(row["filename"], row["label"], row["obj_index"]) for row in run["records"]] == [
+                ("01.png", "scratch", 0),
+                ("02.png", "scratch", 0),
+                ("02.png", "stain", 1),
+                ("03.png", "stain", 0),
+                ("04.png", "class_8", 0),
+            ]
+            page.get_by_test_id("embedding-point").nth(2).click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("02.png")
+            expect(page.get_by_test_id("selected-object-index")).to_have_text("2")
+            expect(page.get_by_test_id("selected-object-bbox")).to_be_visible()
+            expect(page.get_by_test_id("selected-image")).to_have_js_property("naturalWidth", 32)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }, "object-level React analysis changed the source dataset"
 
 
 def test_lv_web_01_od_01_real_model_visible_detector_ui(

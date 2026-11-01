@@ -19,7 +19,7 @@
 |---|---|---|
 | `GET /api/v1/health` | worker readiness | API 版本、模型目錄狀態、可用模型數 |
 | `GET /api/v1/models` | 讀取模型清單 | model ID、名稱、可用狀態；不載入所有權重 |
-| `POST /api/v1/visualize/jobs` | 建立 Image Classifier 或 Object Detector 整圖 run | job ID、queued 狀態 |
+| `POST /api/v1/visualize/jobs` | 建立 Image Classifier 整圖或 Object Detector 整圖／物件級 run | job ID、queued 狀態 |
 | `POST /api/v1/compare/jobs` | 建立 A/B 比較 run | folders A/B、模型、粒度、可選 object policy、job ID |
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
@@ -30,25 +30,26 @@
 | `POST /api/v1/comparisons/{run_id}/projections` | 計算選定群組的投影 | PCA、t-SNE、UMAP、LDA、Supervised UMAP、維度與物件篩選 |
 | `GET /api/v1/comparisons/{run_id}/images/{side}/{index}` | 讀取對應來源影像 | 只依本次比較登錄的 group/index 解析，不接受檔案路徑 |
 
-Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`，預設 `classifier`）、可選的逗號類別名稱 fallback、`model_ids`（最多 8 個）和 `methods`（PCA、t-SNE、UMAP、LDA、Supervised UMAP，最多 5 個）。Detector 讀取 YOLO `images/` 與 `labels/`；資料集旁 `classes.txt` 優先於手動 fallback，選取的類別表不一致時明確失敗。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
+Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`，預設 `classifier`）、`unit`（`image` 或 `object`，預設 `image`）、可選的逗號類別名稱 fallback、`model_ids`（最多 8 個）、`methods`（最多 5 個）和可選 `object_policy`（pad、target resolution、head）。Classifier 只接受整圖；Detector 讀取 YOLO `images/` 與 `labels/`，整圖時一張影像一筆，物件級時一個支援的 bbox 一筆。資料集旁 `classes.txt` 優先於手動 fallback，選取的類別表不一致時明確失敗。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、無 bbox、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
 
 ## 3. 計算語義
 
 1. 以 `discover_images_classifier(..., allow_flat=True)` 依原排序取得 `{path, split, label}`；用 `partition_readable` 同步剔除壞檔及標籤。
-2. 以 `update_manifest` 及相同的 SHA-256 cache key 更新 App-side cache；呼叫 `load_model` 與 `extract_embeddings` 產生真實向量。第一切片不預建縮圖，選取時只回讀 run 登錄的原圖。
-3. 每個模型各自抽取 embedding 並使用獨立 cache；投影保留同一模型的 embedding 與記錄順序。PCA、t-SNE、UMAP、LDA 和 Supervised UMAP 沿用 legacy 固定參數及小樣本邊界；無法計算的選項明示警告，只有所選投影全部不可用時才以 PCA 維持可檢視結果。監督投影的分群不得解讀為真實可分性。
-4. 2D 使用 SVG 散點；3D 使用隨使用者切換才載入的本機 Plotly bundle，點選與鍵盤輔助操作都能讀回同一 run record。投影維度不足時缺少的座標軸補零。點座標與記錄同序；run ID 變更時清空舊選取。跨工具暫存由各後續 case 定義。
-5. 使用者點選／框選只傳 record index 和 run ID；後端驗證索引，UI 顯示相同 label、split、檔名和原圖。
-6. Compare Distributions 對 A/B 資料夾各自遞迴找圖、略過 App cache 並跳過不可讀影像；來源路徑只留在 worker 記憶體，公開記錄使用 index、檔名和來源識別碼。
-7. 整圖比較沿用目前 Streamlit 的 centroid cosine drift：用所選模型抽取 embedding，分別正規化兩群的平均向量，再計算 `1 - cosine_similarity`。快取依模型、模式、來源路徑和檔案內容雜湊隔離。
-8. 物件比較讀取支援的 detection boxes，按較小資料群執行 object policy autotune，再以同一 policy 對 A/B crop embedding；只對共同類別計算 centroid drift，並明示只出現在單側的類別。操作者可改 pad、解析度與 head，明確套用後重跑；API 會驗證手動 policy，結果同時保留自動候選的整體及物件大小分桶純度。
-9. React 可切換比較類別／投影、2D／3D、confidence 與物件短邊門檻；點選及框選只改變 run record 選取，雙欄縮圖仍讀回原圖並可顯示 bbox。投影距離只供檢視，不作為 drift 指標。
+2. 以 `update_manifest` 及相同的 SHA-256 cache key 更新 App-side cache；整圖呼叫 `load_model` 與 `extract_embeddings` 產生真實向量。第一切片不預建縮圖，選取時只回讀 run 登錄的原圖。
+3. Detector 物件級沿用 `discover_yolo_objects`、`object_eval.embed_objects`、`crop_bbox` 與 `_adaptive_pad_px`；每個 bbox 產生一筆記錄，保留 class ID、object index、正規化 bbox 及原圖路徑。pad／解析度／head 可由 React 設定；物件 embedding cache key 包含原圖 SHA-256、bbox、object index、model ID 和 policy，寫入 App cache，不寫來源資料夾。
+4. 每個模型各自抽取 embedding 並使用獨立 cache；投影保留同一模型的 embedding 與記錄順序。PCA、t-SNE、UMAP、LDA 和 Supervised UMAP 沿用 legacy 固定參數及小樣本邊界；無法計算的選項明示警告，只有所選投影全部不可用時才以 PCA 維持可檢視結果。監督投影的分群不得解讀為真實可分性。
+5. 2D 使用 SVG 散點；3D 使用隨使用者切換才載入的本機 Plotly bundle，點選與鍵盤輔助操作都能讀回同一 run record。投影維度不足時缺少的座標軸補零。點座標與記錄同序；run ID 變更時清空舊選取。跨工具暫存由各後續 case 定義。
+6. 使用者點選／框選只傳 record index 和 run ID；後端驗證索引，UI 顯示相同 label、split、檔名和原圖；物件級另外顯示所選 bbox overlay 與 object index。
+7. Compare Distributions 對 A/B 資料夾各自遞迴找圖、略過 App cache 並跳過不可讀影像；來源路徑只留在 worker 記憶體，公開記錄使用 index、檔名和來源識別碼。
+8. 整圖比較沿用目前 Streamlit 的 centroid cosine drift：用所選模型抽取 embedding，分別正規化兩群的平均向量，再計算 `1 - cosine_similarity`。快取依模型、模式、來源路徑和檔案內容雜湊隔離。
+9. 物件比較讀取支援的 detection boxes，按較小資料群執行 object policy autotune，再以同一 policy 對 A/B crop embedding；只對共同類別計算 centroid drift，並明示只出現在單側的類別。操作者可改 pad、解析度與 head，明確套用後重跑；API 會驗證手動 policy，結果同時保留自動候選的整體及物件大小分桶純度。
+10. React 可切換比較類別／投影、2D／3D、confidence 與物件短邊門檻；點選及框選只改變 run record 選取，雙欄縮圖仍讀回原圖並可顯示 bbox。投影距離只供檢視，不作為 drift 指標。
 
 ## 4. 實作狀態與整合限制
 
 - API 目前以本機路徑陣列建立 run；React 的資料夾按鈕會呼叫公開 `window.cimHost.chooseFile()`，但 LV 尚未接入 NativeApp 發布包，因此真實 OS picker、grant 驗證與殼管理 worker 的端到端仍待驗。
 - 手動路徑欄只供本機開發及測試。React build 與 API 可由單一本機 FastAPI 預覽；NativeApp 交付仍須使用平台 host bridge 和 worker 管理流程。
-- Compare 的 deterministic API 與整圖／物件模式可見 UI E2E 使用 fixture embedder；Visualize classifier 與 detector 的固定 DINOv2-small 可見 UI 路徑已在 Windows ARM64 通過。來源 Streamlit 數值逐項對照、NativeApp folder grant／lifecycle 及 Compare 真實模型仍未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
+- Visualize classifier、detector 整圖與物件級的固定 DINOv2-small 可見 UI 路徑已在 Windows ARM64 通過；Compare 的 deterministic API 與整圖／物件 UI E2E 使用 fixture embedder。來源 Streamlit 數值逐項對照、完整 object candidate workflow、NativeApp folder grant／lifecycle 及 Compare 真實模型仍未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
 
 ## 5. React 驗收契約
 
@@ -65,4 +66,4 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 
 ## 6. 未涵蓋
 
-Object Detector 整圖已有 React／API fixture 流程與固定 DINOv2-small 的 ARM64 visible UI run；與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。Object Detector 物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選的完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖及物件級已有 React/API 可見流程與固定 DINOv2-small 的 ARM64 UI run；物件級 candidate handoff、policy autotune、與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
