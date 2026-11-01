@@ -11,6 +11,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 
 from _utils import extract_embeddings, load_model
+from interaction import compute_label_disagreement, compute_outlier_scores
 from manifest import (
     manifest_path_for,
     rel_key,
@@ -480,6 +481,23 @@ def run_image_visualization(
         for index, record in enumerate(records)
     ]
 
+    # Preserve the existing Visualize review signals for every mode/unit. The
+    # worker keeps only these scalar arrays; raw vectors remain private and
+    # are not added to the public run response.
+    ranking_scores: dict[str, dict[str, object]] = {}
+    if len(records) >= 3:
+        k = min(5, len(records) - 1)
+        for selected_model, raw in embeddings_by_model.items():
+            ranking_scores[selected_model] = {
+                "k": k,
+                "outlier": compute_outlier_scores(
+                    raw, raw, k=k, candidates_in_reference=True,
+                ).astype(float).tolist(),
+                "disagreement": compute_label_disagreement(
+                    raw, labels, k=k,
+                ).astype(float).tolist(),
+            }
+
     views: list[dict] = []
     for selected_model in selected_models:
         for method, coordinates in projections_by_model[selected_model].items():
@@ -541,4 +559,5 @@ def run_image_visualization(
         # Kept only in the local worker for the legacy classifier 3D block
         # drilldown. The HTTP run response deliberately omits this field.
         "_raw_embeddings": embeddings_by_model if mode == "classifier" and unit == "image" else {},
+        "_ranking_scores": ranking_scores,
     }

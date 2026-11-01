@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 import pytest
@@ -122,6 +123,16 @@ def _start_api(application):
     return server, server_thread, base_url
 
 
+def _is_run_summary_response(response) -> bool:
+    path = urlparse(response.url).path.rstrip("/")
+    prefix = "/api/v1/runs/"
+    return (
+        response.request.method == "GET"
+        and path.startswith(prefix)
+        and "/" not in path[len(prefix):]
+    )
+
+
 class _DeterministicUMAP:
     """Picklable reducer double; this E2E validates the React/API journey, not UMAP math."""
 
@@ -174,7 +185,7 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             run_payloads = []
 
             def capture_run(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if _is_run_summary_response(response) and response.ok:
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)
@@ -238,6 +249,89 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             page.get_by_role("button", name="Add folder").click()
             page.get_by_role("button", name="Run analysis").click()
             expect(page.get_by_role("alert")).to_contain_text("No images were found", timeout=10_000)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_rank_01_visible_ranking_viewer_and_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible React ranks both legacy review signals and navigates in rank order."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "ranking-fixture")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            values = {
+                "image-01.png": [1.0, 0.0, 0.0],
+                "image-02.png": [0.9, 0.1, 0.0],
+                "image-03.png": [0.0, 0.9, 0.1],
+                "image-04.png": [0.0, 0.0, 1.0],
+            }
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = values[path.name]
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=fixture_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(10_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-fixture-model").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_label("Image folder").fill(str(dataset / "train"))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_label("Image folder").fill(str(dataset / "test"))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("ranking-workspace")).to_be_visible()
+            rows = page.get_by_test_id("ranked-result")
+            expect(rows).to_have_count(4)
+            assert "not determine image quality" in page.get_by_test_id("ranking-interpretation").inner_text()
+
+            outlier_names = page.locator("[data-testid='ranked-result'] strong").all_inner_texts()
+            rows.first.get_by_role("button").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(outlier_names[0])
+            expect(page.get_by_test_id("selected-image-navigation")).to_contain_text("1 / 4 ranked")
+            page.get_by_role("button", name="Next ranked image").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(outlier_names[1])
+            expect(page.get_by_test_id("selected-image-navigation")).to_contain_text("2 / 4 ranked")
+
+            page.get_by_label("Ranking criterion").select_option("disagreement")
+            expect(page.get_by_test_id("ranking-status")).to_contain_text("highest first")
+            expect(page.get_by_test_id("ranked-result")).to_have_count(4)
+            disagreement_names = page.locator("[data-testid='ranked-result'] strong").all_inner_texts()
+            page.get_by_test_id("ranked-result").first.get_by_role("button").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(disagreement_names[0])
+            page.get_by_role("button", name="Next ranked image").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(disagreement_names[1])
+
+            with page.expect_download() as download_info:
+                page.get_by_test_id("ranking-export").click()
+            download = download_info.value
+            assert download.suggested_filename == "disagreement_ranking.csv"
+            with Path(download.path()).open(encoding="utf-8", newline="") as handle:
+                rows_csv = list(csv.DictReader(handle))
+            assert [row["filename"] for row in rows_csv] == disagreement_names
             browser.close()
     finally:
         if server is not None:
@@ -775,7 +869,7 @@ def test_lv_web_01_edge_01_single_unicode_path_and_unreadable_file_visible(
             run_payloads = []
 
             def capture_run(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if _is_run_summary_response(response) and response.ok:
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)
@@ -887,7 +981,7 @@ def test_lv_web_01_od_01_detector_runs_through_visible_react_ui(
             page.on(
                 "response",
                 lambda response: run_payloads.append(response.json())
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok
+                if _is_run_summary_response(response) and response.ok
                 else None,
             )
             page.goto(base_url, wait_until="networkidle")
@@ -993,7 +1087,7 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             page.on(
                 "response",
                 lambda response: run_payloads.append(response.json())
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok
+                if _is_run_summary_response(response) and response.ok
                 else None,
             )
             page.goto(base_url, wait_until="networkidle")
@@ -1095,7 +1189,7 @@ def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
             page.on(
                 "response",
                 lambda response: run_payloads.append(response.json())
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok
+                if _is_run_summary_response(response) and response.ok
                 else None,
             )
             page.goto(base_url, wait_until="networkidle")
@@ -1181,7 +1275,7 @@ def test_lv_web_01_od_01_real_model_visible_detector_ui(
             page.on(
                 "response",
                 lambda response: run_payloads.append(response.json())
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok
+                if _is_run_summary_response(response) and response.ok
                 else None,
             )
             page.goto(base_url, wait_until="networkidle")

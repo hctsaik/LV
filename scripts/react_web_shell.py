@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import mimetypes
 import os
@@ -171,6 +172,7 @@ def create_app(
     app.state.jobs = {}
     app.state.runs = {}
     app.state.raw_embeddings = {}
+    app.state.ranking_scores = {}
     app.state.text_encoders = {}
     app.state.text_vectors = {}
     app.state.block_cache = {}
@@ -275,15 +277,18 @@ def create_app(
 
             run_id = uuid.uuid4().hex
             raw_embeddings = result.pop("_raw_embeddings", {})
+            ranking_scores = result.pop("_ranking_scores", {})
             run = {key: value for key, value in result.items() if key != "image_paths"}
             run["image_paths"] = result["image_paths"]
             with app.state.lock:
                 # Retain high-dimensional vectors only for the active visual run;
                 # old run summaries stay readable without pinning model arrays.
                 app.state.raw_embeddings.clear()
+                app.state.ranking_scores.clear()
                 app.state.block_cache.clear()
                 app.state.runs[run_id] = run
                 app.state.raw_embeddings[run_id] = raw_embeddings
+                app.state.ranking_scores[run_id] = ranking_scores
                 job.run_id = run_id
                 model_count = len(result["models"])
                 expected = len(result["records"]) * model_count
@@ -569,6 +574,99 @@ def create_app(
                 key: value for key, value in run.items()
                 if key not in {"image_paths", "_raw_embeddings", "_phashes"}
             }
+
+    def ranked_rows(
+        run_id: str,
+        model_id: str,
+        metric: Literal["outlier", "disagreement"],
+        label_filter: str | None = None,
+        split_filter: str | None = None,
+    ) -> tuple[dict, int, list[dict]]:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            by_model = app.state.ranking_scores.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if model_id not in run.get("models", []):
+            raise HTTPException(status_code=404, detail="Model is not part of this run")
+        scores_by_metric = (by_model or {}).get(model_id)
+        if scores_by_metric is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Ranking signals require at least three records in this run",
+            )
+        scores = np.asarray(scores_by_metric.get(metric), dtype=np.float64)
+        records = run.get("records", [])
+        if scores.ndim != 1 or len(scores) != len(records) or not np.isfinite(scores).all():
+            raise HTTPException(status_code=409, detail="Ranking signals do not match this run")
+        order = sorted(range(len(records)), key=lambda index: (-float(scores[index]), index))
+        if label_filter is not None:
+            order = [index for index in order if records[index].get("label") == label_filter]
+        if split_filter is not None:
+            order = [index for index in order if records[index].get("split") == split_filter]
+        rows = [
+            {"rank": rank, "index": index, "score": float(scores[index])}
+            for rank, index in enumerate(order, start=1)
+        ]
+        return run, int(scores_by_metric["k"]), rows
+
+    @app.get("/api/v1/runs/{run_id}/rankings")
+    def get_rankings(
+        run_id: str,
+        model_id: str,
+        metric: Literal["outlier", "disagreement"] = "outlier",
+        label_filter: str | None = None,
+        split_filter: str | None = None,
+    ) -> dict:
+        _run, k, rows = ranked_rows(run_id, model_id, metric, label_filter, split_filter)
+        descriptions = {
+            "outlier": (
+                f"Mean cosine distance to the {k} nearest records. Higher values are "
+                "novelty clues for review, not a quality score or error verdict."
+            ),
+            "disagreement": (
+                f"Fraction of the {k} nearest records with a different label. Higher "
+                "values flag neighborhoods to review; they do not confirm a mislabel."
+            ),
+        }
+        return {
+            "model_id": model_id,
+            "metric": metric,
+            "k": k,
+            "score_direction": "descending",
+            "interpretation": descriptions[metric],
+            "results": rows,
+        }
+
+    @app.get("/api/v1/runs/{run_id}/rankings.csv")
+    def export_rankings(
+        run_id: str,
+        model_id: str,
+        metric: Literal["outlier", "disagreement"] = "outlier",
+        label_filter: str | None = None,
+        split_filter: str | None = None,
+    ) -> Response:
+        run, _k, rows = ranked_rows(run_id, model_id, metric, label_filter, split_filter)
+        output = StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow([
+            "rank", "score", "index", "filename", "split", "label",
+            "class_id", "obj_index", "bbox",
+        ])
+        for row in rows:
+            record = run["records"][row["index"]]
+            writer.writerow([
+                row["rank"], f"{row['score']:.12g}", row["index"],
+                record.get("filename", ""), record.get("split", ""),
+                record.get("label", ""), record.get("class_id", ""),
+                record.get("obj_index", ""),
+                "" if record.get("bbox") is None else json.dumps(record["bbox"], separators=(",", ":")),
+            ])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{metric}_ranking.csv"'},
+        )
 
     def similar_result(
         run_id: str, request: SimilarSearchRequest,

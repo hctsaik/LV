@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
-from io import BytesIO
+from io import BytesIO, StringIO
 import os
 import sys
 import time
@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from react_web_shell import create_app
+from interaction import compute_label_disagreement, compute_outlier_scores
 from visualize_embeddings import discover_images_classifier
 
 
@@ -143,6 +144,77 @@ def test_case_lv_web_01_ic_01_selected_image_is_run_bound(
     assert invalid.status_code == 404
     assert set(invalid.json()) == {"code", "message", "request_id"}
     assert invalid.json()["code"] == "NOT_FOUND"
+
+
+def test_case_lv_web_01_rank_01_legacy_scores_stable_order_filters_and_csv(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """Ranking values match LV's legacy helpers and exports the displayed order."""
+    with _client(monkeypatch, tmp_path) as client:
+        job = _run(client, classifier_fixture["folders"])
+        run_id = job["run_id"]
+        run_response = client.get(f"/api/v1/runs/{run_id}")
+        run = run_response.json()
+        vectors = client.app.state.raw_embeddings[run_id]["dinov2_vits14"]
+        labels = [record["label"] for record in run["records"]]
+        expected_scores = {
+            "outlier": compute_outlier_scores(
+                vectors, vectors, k=min(5, len(vectors) - 1), candidates_in_reference=True,
+            ),
+            "disagreement": compute_label_disagreement(
+                vectors, labels, k=min(5, len(vectors) - 1),
+            ),
+        }
+
+        for metric, expected in expected_scores.items():
+            response = client.get(
+                f"/api/v1/runs/{run_id}/rankings",
+                params={"model_id": "dinov2_vits14", "metric": metric},
+            )
+            assert response.status_code == 200, response.text
+            payload = response.json()
+            assert payload["metric"] == metric
+            assert payload["score_direction"] == "descending"
+            assert "not a quality score" in payload["interpretation"] or "do not confirm a mislabel" in payload["interpretation"]
+            expected_order = sorted(range(len(expected)), key=lambda index: (-float(expected[index]), index))
+            assert [row["index"] for row in payload["results"]] == expected_order
+            assert [row["rank"] for row in payload["results"]] == list(range(1, len(expected) + 1))
+            np.testing.assert_allclose(
+                [row["score"] for row in payload["results"]],
+                [expected[index] for index in expected_order],
+                rtol=0,
+                atol=1e-12,
+            )
+
+            filtered = client.get(
+                f"/api/v1/runs/{run_id}/rankings",
+                params={
+                    "model_id": "dinov2_vits14", "metric": metric,
+                    "label_filter": "apple", "split_filter": "train",
+                },
+            ).json()
+            expected_filtered = [index for index in expected_order if labels[index] == "apple" and run["records"][index]["split"] == "train"]
+            assert [row["index"] for row in filtered["results"]] == expected_filtered
+            assert [row["rank"] for row in filtered["results"]] == list(range(1, len(expected_filtered) + 1))
+
+            exported = client.get(
+                f"/api/v1/runs/{run_id}/rankings.csv",
+                params={
+                    "model_id": "dinov2_vits14", "metric": metric,
+                    "label_filter": "apple", "split_filter": "train",
+                },
+            )
+            rows = list(csv.DictReader(StringIO(exported.text)))
+            assert [int(row["index"]) for row in rows] == expected_filtered
+            assert [int(row["rank"]) for row in rows] == list(range(1, len(expected_filtered) + 1))
+            assert str(classifier_fixture["root"]) not in exported.text
+
+        assert "_ranking_scores" not in run
+        assert "raw_embeddings" not in run_response.text
+        assert client.get(
+            f"/api/v1/runs/{run_id}/rankings",
+            params={"model_id": "missing-model", "metric": "outlier"},
+        ).status_code == 404
 
 
 def test_case_lv_web_01_search_01_cosine_ranking_model_switch_and_csv(
@@ -882,6 +954,12 @@ def test_case_lv_web_01_od_02_object_detector_uses_crops_and_content_cache(
     assert job["state"] == "completed", job
     changed_run = client.get(f"/api/v1/runs/{job['run_id']}").json()
     assert changed_run["records"][0]["bbox"] == [0.6, 0.5, 0.4, 0.4]
+    object_rankings = client.get(
+        f"/api/v1/runs/{job['run_id']}/rankings",
+        params={"model_id": "dinov2_vits14", "metric": "disagreement"},
+    )
+    assert object_rankings.status_code == 200, object_rankings.text
+    assert len(object_rankings.json()["results"]) == len(changed_run["records"]) == 5
     assert len(crop_calls) == 6
     assert all(
         hashlib.sha256(path.read_bytes()).hexdigest() == source_before[path.relative_to(source_root).as_posix()]

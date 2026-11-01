@@ -125,6 +125,16 @@ export type DuplicateScanResult = {
   results: Array<{ left_index: number; right_index: number; distance: number }>;
 };
 
+export type RankingMetric = "outlier" | "disagreement";
+export type RankingResult = {
+  model_id: string;
+  metric: RankingMetric;
+  k: number;
+  score_direction: "descending";
+  interpretation: string;
+  results: Array<{ rank: number; index: number; score: number }>;
+};
+
 export type CompareUnit = "whole" | "object";
 export type ComparisonRecord = {
   index: number;
@@ -247,6 +257,28 @@ export const api = {
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
   ),
+  rankings: (
+    runId: string,
+    input: { model_id: string; metric: RankingMetric; label_filter?: string; split_filter?: string },
+  ) => {
+    const query = new URLSearchParams({ model_id: input.model_id, metric: input.metric });
+    if (input.label_filter) query.set("label_filter", input.label_filter);
+    if (input.split_filter) query.set("split_filter", input.split_filter);
+    return request<RankingResult>(
+      "/api/v1/runs/" + encodeURIComponent(runId) + "/rankings?" + query.toString(),
+    );
+  },
+  rankingsCsv: (
+    runId: string,
+    input: { model_id: string; metric: RankingMetric; label_filter?: string; split_filter?: string },
+  ) => {
+    const query = new URLSearchParams({ model_id: input.model_id, metric: input.metric });
+    if (input.label_filter) query.set("label_filter", input.label_filter);
+    if (input.split_filter) query.set("split_filter", input.split_filter);
+    return requestGetBlob(
+      "/api/v1/runs/" + encodeURIComponent(runId) + "/rankings.csv?" + query.toString(),
+    );
+  },
   kmeansBlocks: (runId: string, input: KMeansBlocksInput) => request<KMeansBlocks>(
     "/api/v1/runs/" + encodeURIComponent(runId) + "/blocks",
     { method: "POST", body: JSON.stringify(input) },
@@ -319,6 +351,15 @@ async function requestBlob(path: string, body: unknown): Promise<Blob> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.message || payload?.detail || "Could not export the results.");
+  }
+  return response.blob();
+}
+
+async function requestGetBlob(path: string): Promise<Blob> {
+  const response = await fetch((window.NATIVEAPP_LOCAL_API || "") + path);
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
     throw new Error(payload?.message || payload?.detail || "Could not export the results.");

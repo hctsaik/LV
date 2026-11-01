@@ -18,6 +18,8 @@ import {
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
+  type RankingMetric,
+  type RankingResult,
   type SimilarSearchResult,
   type TextSearchResult,
   type VisualizeUnit,
@@ -261,6 +263,12 @@ export default function App() {
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [rankedViewerContext, setRankedViewerContext] = useState<number[] | null>(null);
+  const [rankingMetric, setRankingMetric] = useState<RankingMetric>("outlier");
+  const [rankingResults, setRankingResults] = useState<RankingResult | null>(null);
+  const [rankingLoading, setRankingLoading] = useState(false);
+  const [rankingError, setRankingError] = useState("");
+  const [rankingVisibleCount, setRankingVisibleCount] = useState(24);
   const [showAnnotationOverlay, setShowAnnotationOverlay] = useState(true);
   const [similarChain, setSimilarChain] = useState<number[]>([]);
   const [similarK, setSimilarK] = useState(9);
@@ -284,6 +292,7 @@ export default function App() {
   const [duplicateLoading, setDuplicateLoading] = useState(false);
   const [duplicateError, setDuplicateError] = useState("");
   const duplicateRequest = useRef(0);
+  const rankingRequest = useRef(0);
   const [blockCount, setBlockCount] = useState(12);
   const [selectedBlock, setSelectedBlock] = useState<number | null>(null);
   const [blockData, setBlockData] = useState<KMeansBlocks | null>(null);
@@ -341,7 +350,8 @@ export default function App() {
   const labels = useMemo(() => [...new Set(run?.records.map((record) => record.label) || [])].sort(), [run]);
   const splits = useMemo(() => [...new Set(run?.records.map((record) => record.split) || [])].sort(), [run]);
   const selectedRecord = selectedIndex === null ? null : run?.records[selectedIndex] || null;
-  const selectedViewPosition = selectedIndex === null ? -1 : selectedIndices.indexOf(selectedIndex);
+  const viewerIndices = rankedViewerContext ?? selectedIndices;
+  const selectedViewPosition = selectedIndex === null ? -1 : viewerIndices.indexOf(selectedIndex);
   const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
   const canSearchSimilar = run?.mode === "classifier" && run.unit === "image";
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
@@ -351,6 +361,7 @@ export default function App() {
 
   useEffect(() => {
     textRequest.current += 1;
+    rankingRequest.current += 1;
     duplicateRequest.current += 1;
     setTextResults(null);
     setTextSearchInput(null);
@@ -360,7 +371,44 @@ export default function App() {
     setDuplicateScanUsed(null);
     setDuplicateError("");
     setDuplicateLoading(false);
+    setRankingResults(null);
+    setRankingError("");
+    setRankingLoading(false);
+    setRankingVisibleCount(24);
+    setRankedViewerContext(null);
   }, [job?.run_id]);
+
+  useEffect(() => {
+    const requestId = ++rankingRequest.current;
+    const runId = job?.run_id;
+    setRankedViewerContext(null);
+    if (!runId || !run || run.records.length < 3 || !activeModelId) {
+      setRankingResults(null);
+      setRankingError("");
+      setRankingLoading(false);
+      return () => { rankingRequest.current += 1; };
+    }
+
+    setRankingResults(null);
+    setRankingError("");
+    setRankingLoading(true);
+    api.rankings(runId, {
+      model_id: activeModelId,
+      metric: rankingMetric,
+      label_filter: labelFilter === "all" ? undefined : labelFilter,
+      split_filter: splitFilter === "all" ? undefined : splitFilter,
+    }).then((result) => {
+      if (rankingRequest.current !== requestId) return;
+      setRankingResults(result);
+      setRankingVisibleCount(24);
+    }).catch((reason: unknown) => {
+      if (rankingRequest.current !== requestId) return;
+      setRankingError(reason instanceof Error ? reason.message : "Could not rank this run.");
+    }).finally(() => {
+      if (rankingRequest.current === requestId) setRankingLoading(false);
+    });
+    return () => { rankingRequest.current += 1; };
+  }, [job?.run_id, run?.records.length, activeModelId, rankingMetric, labelFilter, splitFilter]);
 
   useEffect(() => {
     const requestId = ++similarRequest.current;
@@ -434,6 +482,7 @@ export default function App() {
   ]);
 
   function toggleSelection(index: number) {
+    setRankedViewerContext(null);
     if (selectedIndices.includes(index)) {
       const next = selectedIndices.filter((current) => current !== index);
       setSelectedIndices(next);
@@ -447,23 +496,53 @@ export default function App() {
   function addSelection(indices: number[]) {
     const additions = [...new Set(indices)].filter((index) => run?.records[index] !== undefined);
     if (!additions.length) return;
+    setRankedViewerContext(null);
     setSelectedIndices((current) => [...new Set([...current, ...additions])]);
     setSelectedIndex(additions[additions.length - 1]);
   }
 
   function clearSelection() {
+    setRankedViewerContext(null);
     setSelectedIndices([]);
     setSelectedIndex(null);
   }
 
   function moveSelectedImage(direction: -1 | 1) {
-    if (!selectedIndices.length) return;
+    if (!viewerIndices.length) return;
     const current = selectedViewPosition >= 0 ? selectedViewPosition : 0;
-    const next = Math.max(0, Math.min(selectedIndices.length - 1, current + direction));
-    setSelectedIndex(selectedIndices[next]);
+    const next = Math.max(0, Math.min(viewerIndices.length - 1, current + direction));
+    setSelectedIndex(viewerIndices[next]);
+  }
+
+  function openRankedImage(index: number) {
+    const indices = rankingResults?.results.map((item) => item.index) || [];
+    if (!indices.includes(index)) return;
+    setRankedViewerContext(indices);
+    setSelectedIndex(index);
+  }
+
+  async function exportRanking() {
+    if (!job?.run_id || !rankingResults) return;
+    try {
+      const blob = await api.rankingsCsv(job.run_id, {
+        model_id: rankingResults.model_id,
+        metric: rankingMetric,
+        label_filter: labelFilter === "all" ? undefined : labelFilter,
+        split_filter: splitFilter === "all" ? undefined : splitFilter,
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${rankingMetric}_ranking.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (reason) {
+      setRankingError(reason instanceof Error ? reason.message : "Could not export the ranking.");
+    }
   }
 
   function startSimilarSearch(index: number) {
+    setRankedViewerContext(null);
     setSimilarK(Math.min(9, Math.max(1, (run?.records.length || 1) - 1)));
     setSelectedIndex(index);
     setSimilarChain([index]);
@@ -1142,7 +1221,7 @@ export default function App() {
                             data-index={index}
                             aria-label={`Open ${record.filename}`}
                             aria-pressed={selectedIndex === index}
-                            onClick={() => setSelectedIndex(index)}
+                            onClick={() => { setRankedViewerContext(null); setSelectedIndex(index); }}
                           >
                             <img
                               src={`/api/v1/runs/${encodeURIComponent(job?.run_id || "")}/images/${index}/thumbnail`}
@@ -1171,9 +1250,9 @@ export default function App() {
                     <div className="image-name" data-testid="selected-image-name" title={selectedRecord.filename}>{selectedRecord.filename}</div>
                     {selectedViewPosition >= 0 && (
                       <div className="selected-image-navigation" data-testid="selected-image-navigation">
-                        <button type="button" aria-label="Previous selected image" data-testid="selected-image-previous" disabled={selectedViewPosition <= 0} onClick={() => moveSelectedImage(-1)}>◀</button>
-                        <span>{selectedViewPosition + 1} / {selectedIndices.length} selected</span>
-                        <button type="button" aria-label="Next selected image" data-testid="selected-image-next" disabled={selectedViewPosition >= selectedIndices.length - 1} onClick={() => moveSelectedImage(1)}>▶</button>
+                        <button type="button" aria-label={rankedViewerContext ? "Previous ranked image" : "Previous selected image"} data-testid="selected-image-previous" disabled={selectedViewPosition <= 0} onClick={() => moveSelectedImage(-1)}>◀</button>
+                        <span>{selectedViewPosition + 1} / {viewerIndices.length} {rankedViewerContext ? "ranked" : "selected"}</span>
+                        <button type="button" aria-label={rankedViewerContext ? "Next ranked image" : "Next selected image"} data-testid="selected-image-next" disabled={selectedViewPosition >= viewerIndices.length - 1} onClick={() => moveSelectedImage(1)}>▶</button>
                       </div>
                     )}
                     {run.mode === "detector" && run.unit === "image" && run.class_names.length > 0 && (
@@ -1408,7 +1487,7 @@ export default function App() {
                                   {[left_index, right_index].map((index) => {
                                     const record = run.records[index];
                                     return (
-                                      <button type="button" className="duplicate-image" key={index} onClick={() => setSelectedIndex(index)} title={`Open ${record.filename}`}>
+                                      <button type="button" className="duplicate-image" key={index} onClick={() => { setRankedViewerContext(null); setSelectedIndex(index); }} title={`Open ${record.filename}`}>
                                         <img src={`/api/v1/runs/${encodeURIComponent(job?.run_id || "")}/images/${index}/thumbnail`} alt="" loading="lazy" />
                                         <strong>{record.filename}</strong>
                                         <small>{record.label} · {record.split}</small>
@@ -1426,6 +1505,82 @@ export default function App() {
                     )}
                   </section>
                 </div>
+              </section>
+            )}
+            {run.records.length >= 3 && (
+              <section className="ranking-workspace" data-testid="ranking-workspace" aria-label="Review ranking">
+                <div className="search-workspace-heading">
+                  <div><div className="eyebrow">REVIEW CLUES</div><h3>Outlier and label-disagreement ranking</h3></div>
+                  <label className="ranking-criterion">
+                    <span>Rank by</span>
+                    <select
+                      aria-label="Ranking criterion"
+                      data-testid="ranking-criterion"
+                      value={rankingMetric}
+                      onChange={(event) => setRankingMetric(event.target.value as RankingMetric)}
+                    >
+                      <option value="outlier">Outlier distance</option>
+                      <option value="disagreement">Label disagreement</option>
+                    </select>
+                  </label>
+                </div>
+                <p className="ranking-caveat" data-testid="ranking-interpretation">
+                  Higher values are review clues only. They do not determine image quality or confirm a labeling error.
+                </p>
+                {rankingError && <div className="search-error" role="alert">{rankingError}</div>}
+                {rankingLoading && <div className="search-status" role="status" data-testid="ranking-loading">Calculating ranking…</div>}
+                {!rankingLoading && rankingResults && (
+                  <>
+                    <div className="search-status" role="status" data-testid="ranking-status">
+                      {rankingResults.results.length} record(s) · {rankingResults.model_id} · k={rankingResults.k} · highest first
+                    </div>
+                    {rankingResults.results.length ? (
+                      <div className="ranked-results" data-testid="ranked-results">
+                        {rankingResults.results.slice(0, rankingVisibleCount).map(({ rank, index, score }) => {
+                          const record = run.records[index];
+                          if (!record) return null;
+                          return (
+                            <article
+                              className="ranked-result"
+                              data-testid="ranked-result"
+                              data-rank={rank}
+                              data-index={index}
+                              key={index}
+                            >
+                              <button
+                                type="button"
+                                aria-label={`Open rank ${rank}: ${record.filename}`}
+                                aria-current={selectedIndex === index && rankedViewerContext ? "true" : undefined}
+                                onClick={() => openRankedImage(index)}
+                              >
+                                <img
+                                  src={`/api/v1/runs/${encodeURIComponent(job?.run_id || "")}/images/${index}/thumbnail`}
+                                  alt=""
+                                  loading="lazy"
+                                />
+                                <span className="ranked-result-number">#{rank}</span>
+                                <strong title={record.filename}>{record.filename}</strong>
+                                <small>{record.label} · {record.split} · {score.toFixed(4)}</small>
+                              </button>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p className="search-tool-note">No records match the current class and split filters.</p>
+                    )}
+                    <div className="ranking-actions">
+                      {rankingVisibleCount < rankingResults.results.length && (
+                        <button type="button" onClick={() => setRankingVisibleCount((count) => count + 24)}>
+                          Show more ({rankingResults.results.length - rankingVisibleCount} remaining)
+                        </button>
+                      )}
+                      <button type="button" data-testid="ranking-export" onClick={() => void exportRanking()}>
+                        Export ranked CSV
+                      </button>
+                    </div>
+                  </>
+                )}
               </section>
             )}
             </>
