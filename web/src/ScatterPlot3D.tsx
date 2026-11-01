@@ -1,7 +1,7 @@
 import createPlotlyComponent from "react-plotly.js/factory";
 import Plotly from "plotly.js-dist-min";
 import type { Data, Layout, PlotMouseEvent } from "plotly.js";
-import type { EmbeddingPoint, KMeansCenter } from "./api";
+import type { EmbeddingPoint } from "./api";
 
 const Plot = createPlotlyComponent(Plotly);
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
@@ -15,12 +15,11 @@ function objectDescription(point: EmbeddingPoint) {
   return point.obj_index == null ? "" : `, object ${point.obj_index + 1}`;
 }
 
-export default function ScatterPlot3D({ points, selectedIndices, onToggleSelection, viewKey, clusterCenters = [] }: {
+export default function ScatterPlot3D({ points, selectedIndex, onSelect, viewKey }: {
   points: EmbeddingPoint[];
-  selectedIndices: number[];
-  onToggleSelection: (index: number) => void;
+  selectedIndex: number | null;
+  onSelect: (index: number) => void;
   viewKey: string;
-  clusterCenters?: KMeansCenter[];
 }) {
   const colors = colorMap(points);
   const data: Data[] = [{
@@ -32,27 +31,13 @@ export default function ScatterPlot3D({ points, selectedIndices, onToggleSelecti
     text: points.map((point) => point.filename + objectDescription(point)),
     customdata: points.map((point) => [point.index, point.filename, objectDescription(point), point.label, point.split]),
     marker: {
-      size: points.map((point) => selectedIndices.includes(point.index) ? 7 : 5),
+      size: points.map((point) => point.index === selectedIndex ? 7 : 5),
       color: points.map((point) => colors.get(point.label) || labelColors[0]),
       opacity: 0.9,
       line: { color: "#ffffff", width: 0.5 },
     },
     hovertemplate: "%{customdata[1]}%{customdata[2]}<br>Class: %{customdata[3]}<br>Split: %{customdata[4]}<br>X: %{x:.3f}<br>Y: %{y:.3f}<br>Z: %{z:.3f}<extra></extra>",
   }];
-  if (clusterCenters.length) {
-    data.push({
-      type: "scatter3d",
-      mode: "text",
-      x: clusterCenters.map((center) => center.x),
-      y: clusterCenters.map((center) => center.y),
-      z: clusterCenters.map((center) => center.z),
-      text: clusterCenters.map((center) => `#${center.block_id}`),
-      textposition: "top center",
-      textfont: { size: 18, color: "#111827" },
-      hoverinfo: "skip",
-      showlegend: false,
-    });
-  }
   const layout: Partial<Layout> = {
     autosize: true,
     height: 440,
@@ -71,7 +56,7 @@ export default function ScatterPlot3D({ points, selectedIndices, onToggleSelecti
 
   function selectPoint(event: Readonly<PlotMouseEvent>) {
     const custom = event.points?.[0]?.customdata;
-    if (Array.isArray(custom)) onToggleSelection(Number(custom[0]));
+    if (Array.isArray(custom)) onSelect(Number(custom[0]));
   }
 
   return (
@@ -91,8 +76,8 @@ export default function ScatterPlot3D({ points, selectedIndices, onToggleSelecti
             type="button"
             data-testid="embedding-point"
             aria-label={"Select " + point.filename + objectDescription(point) + ", " + point.label + ", " + point.split}
-            aria-pressed={selectedIndices.includes(point.index)}
-            onClick={() => onToggleSelection(point.index)}
+            aria-pressed={selectedIndex === point.index}
+            onClick={() => onSelect(point.index)}
           />
         ))}
       </div>

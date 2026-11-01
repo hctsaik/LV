@@ -446,7 +446,4 @@ def run_image_visualization(
         "embedding_nonzero": primary["embedding_nonzero"],
         "warnings": base_warnings + warnings,
         "image_paths": [Path(record["path"]).resolve() for record in records],
-        # Kept only in the local worker for the legacy classifier 3D block
-        # drilldown. The HTTP run response deliberately omits this field.
-        "_raw_embeddings": embeddings_by_model if mode == "classifier" and unit == "image" else {},
     }
