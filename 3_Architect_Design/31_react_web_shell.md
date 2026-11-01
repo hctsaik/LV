@@ -20,7 +20,7 @@
 | `GET /api/v1/health` | worker readiness | API 版本、模型目錄狀態、可用模型數 |
 | `GET /api/v1/models` | 讀取模型清單 | model ID、名稱、可用狀態；不載入所有權重 |
 | `POST /api/v1/visualize/jobs` | 建立 Image Classifier run | job ID、queued 狀態 |
-| `POST /api/v1/compare/jobs` | 建立 A/B 比較 run | folders A/B、模型、整圖／物件粒度、job ID |
+| `POST /api/v1/compare/jobs` | 建立 A/B 比較 run | folders A/B、模型、粒度、可選 object policy、job ID |
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
 | `GET /api/v1/compare/jobs/{job_id}` / `DELETE ...` | 讀取或取消 A/B 比較 | 與 visualize 共用單一 active-job gate |
@@ -41,7 +41,7 @@ Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`meth
 5. 使用者點選／框選只傳 record index 和 run ID；後端驗證索引，UI 顯示相同 label、split、檔名和原圖。
 6. Compare Distributions 對 A/B 資料夾各自遞迴找圖、略過 App cache 並跳過不可讀影像；來源路徑只留在 worker 記憶體，公開記錄使用 index、檔名和來源識別碼。
 7. 整圖比較沿用目前 Streamlit 的 centroid cosine drift：用所選模型抽取 embedding，分別正規化兩群的平均向量，再計算 `1 - cosine_similarity`。快取依模型、模式、來源路徑和檔案內容雜湊隔離。
-8. 物件比較讀取支援的 detection boxes，按較小資料群執行 object policy autotune，再以同一 policy 對 A/B crop embedding；只對共同類別計算 centroid drift，並明示只出現在單側的類別。
+8. 物件比較讀取支援的 detection boxes，按較小資料群執行 object policy autotune，再以同一 policy 對 A/B crop embedding；只對共同類別計算 centroid drift，並明示只出現在單側的類別。操作者可改 pad、解析度與 head，明確套用後重跑；API 會驗證手動 policy，結果同時保留自動候選的整體及物件大小分桶純度。
 9. React 可切換比較類別／投影、2D／3D、confidence 與物件短邊門檻；點選及框選只改變 run record 選取，雙欄縮圖仍讀回原圖並可顯示 bbox。投影距離只供檢視，不作為 drift 指標。
 
 ## 4. 實作狀態與整合限制

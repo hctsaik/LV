@@ -117,6 +117,7 @@ def test_case_lv_web_02_obj_01_compares_shared_classes_and_keeps_boxes_private(
         "folders_b": [str(roots[1])],
         "model_id": "fixture-model",
         "unit": "object",
+        "object_policy": {"pad": 0.2, "target_res": 280, "head": "meanpool"},
     })
     projection = client.post(f"/api/v1/comparisons/{job['run_id']}/projections", json={
         "label": "widget", "method": "pca", "dimension": 2,
@@ -126,7 +127,8 @@ def test_case_lv_web_02_obj_01_compares_shared_classes_and_keeps_boxes_private(
     assert projection.status_code == 200, projection.text
     assert result["rows"][0]["label"] == "widget"
     assert result["rows"][0]["a_count"] == result["rows"][0]["b_count"] == 1
-    assert result["policy"]["target_res"] in {224, 336}
+    assert result["policy"] == {"pad": 0.2, "target_res": 280, "head": "meanpool"}
+    assert result["policy_source"] == "manual"
     assert len(result["autotune_rows"]) == 6
     assert result["records_a"][0]["bbox"] == [0.5, 0.5, 0.7, 0.6]
     assert "path" not in result["records_a"][0]
@@ -143,6 +145,12 @@ def test_case_lv_web_02_rejects_missing_groups_and_invalid_projection(tmp_path, 
         model_catalog=lambda: ["fixture-model"],
         model_loader=lambda _model_id: _whole_embedder,
     ))
+    invalid_policy = client.post("/api/v1/compare/jobs", json={
+        "folders_a": [str(empty_a)], "folders_b": [str(empty_b)],
+        "model_id": "fixture-model", "unit": "object",
+        "object_policy": {"pad": 0.7, "target_res": 280, "head": "meanpool"},
+    })
+    assert invalid_policy.status_code == 422
     job_response = client.post("/api/v1/compare/jobs", json={
         "folders_a": [str(empty_a)], "folders_b": [str(empty_b)],
         "model_id": "fixture-model", "unit": "whole",

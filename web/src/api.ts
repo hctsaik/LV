@@ -53,6 +53,11 @@ export type VisualizationRun = {
 };
 
 export type CompareUnit = "whole" | "object";
+export type ComparisonObjectPolicy = {
+  pad: number;
+  target_res: 168 | 196 | 224 | 280 | 336 | 392 | 448;
+  head: "cls" | "meanpool";
+};
 
 export type ComparisonRecord = {
   index: number;
@@ -82,8 +87,13 @@ export type ComparisonRun = {
   rows: DriftRow[];
   a_only: Record<string, number>;
   b_only: Record<string, number>;
-  policy: { pad: number; target_res: number; head: string } | null;
-  autotune_rows: Array<{ policy: { pad: number; target_res: number; head: string }; macro_purity: number | null; buckets: Record<string, unknown> }>;
+  policy: ComparisonObjectPolicy | null;
+  policy_source: "automatic" | "manual" | null;
+  autotune_rows: Array<{
+    policy: ComparisonObjectPolicy;
+    macro_purity: number | null;
+    buckets: Record<string, { n: number; purity: number | null }>;
+  }>;
   warnings: string[];
 };
 
@@ -114,6 +124,7 @@ export type ComparisonJobInput = {
   model_id: string;
   unit: CompareUnit;
   class_names?: string[];
+  object_policy?: ComparisonObjectPolicy;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

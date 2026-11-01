@@ -220,6 +220,19 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .gallery-heading h2 { margin: 0; color: #35425a; font: 700 13px Manrope, "Segoe UI", sans-serif; }
 .gallery-heading span { color: #8d99aa; font-size: 9px; }
 .compare-gallery-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.object-policy-editor { margin: 14px 0 8px; padding: 12px; border: 1px solid #dbe3ec; border-radius: 12px; min-width: 0; }
+.object-policy-editor legend { padding: 0 6px; color: #334155; font-size: 12px; font-weight: 750; }
+.object-policy-grid { display: grid; grid-template-columns: minmax(95px, .8fr) minmax(110px, 1.2fr); align-items: center; gap: 8px 10px; }
+.object-policy-grid .field-label { margin: 0; }
+.object-policy-grid input, .object-policy-grid select { min-width: 0; width: 100%; }
+.policy-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+.policy-actions .secondary-action { border: 1px solid #d4deea; border-radius: 9px; padding: 8px 10px; background: #f8fafc; color: #24415e; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; }
+.policy-actions .secondary-action:hover { background: #edf4fb; }
+.policy-actions .text-action { border: 0; background: transparent; color: #38689a; font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }
+.autotune-details { margin: 14px 0; padding: 12px 14px; border: 1px solid #e0e7ef; border-radius: 12px; background: #fbfdff; }
+.autotune-details summary { color: #334155; font-size: 13px; font-weight: 720; cursor: pointer; }
+.autotune-details .drift-table-wrap { margin-top: 10px; }
+.autotune-details .drift-table th, .autotune-details .drift-table td { padding: 8px 9px; font-size: 11px; }
 .compare-gallery { min-width: 0; padding: 11px; border: 2px solid #dce8f1; border-radius: 8px; }
 .compare-gallery.a { border-color: #9ecdeb; }
 .compare-gallery.b { border-color: #ecc0bd; }

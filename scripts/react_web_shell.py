@@ -33,12 +33,19 @@ class CreateVisualizationJob(BaseModel):
     methods: list[str] = Field(default_factory=list, max_length=5)
 
 
+class ComparisonObjectPolicy(BaseModel):
+    pad: float = Field(ge=0.0, le=0.5)
+    target_res: Literal[168, 196, 224, 280, 336, 392, 448]
+    head: Literal["cls", "meanpool"]
+
+
 class CreateComparisonJob(BaseModel):
     folders_a: list[str] = Field(min_length=1, max_length=32)
     folders_b: list[str] = Field(min_length=1, max_length=32)
     model_id: str = Field(min_length=1, max_length=128)
     unit: Literal["whole", "object"] = "object"
     class_names: list[str] = Field(default_factory=list, max_length=256)
+    object_policy: ComparisonObjectPolicy | None = None
 
 
 class ProjectComparisonRequest(BaseModel):
@@ -274,6 +281,10 @@ def create_app(
                 job.request.model_id,
                 unit=job.request.unit,
                 class_names=job.request.class_names,
+                object_policy=(
+                    job.request.object_policy.model_dump()
+                    if job.request.object_policy is not None else None
+                ),
                 model_loader=loader,
                 object_model_loader=object_loader,
                 progress=update_progress,

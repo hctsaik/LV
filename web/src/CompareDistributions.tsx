@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type ComparisonPoint,
+  type ComparisonObjectPolicy,
   type ComparisonProjection,
   type ComparisonRecord,
   type ComparisonRun,
@@ -12,6 +13,9 @@ import {
 } from "./api";
 
 const LazyCompareScatter3D = lazy(() => import("./CompareScatter3D"));
+const policyResolutions = [168, 196, 224, 280, 336, 392, 448] as const;
+const defaultObjectPolicy: ComparisonObjectPolicy = { pad: 0.12, target_res: 224, head: "cls" };
+const objectSizeBuckets = ["<32", "32-96", "96-224", ">224"] as const;
 const methods: Array<{ value: ProjectionMethod; label: string }> = [
   { value: "pca", label: "PCA" },
   { value: "tsne", label: "t-SNE" },
@@ -316,6 +320,8 @@ export default function CompareDistributions({
   const [modelId, setModelId] = useState("");
   const [unit, setUnit] = useState<"object" | "whole">("object");
   const [classNamesText, setClassNamesText] = useState("");
+  const [policyDraft, setPolicyDraft] = useState<ComparisonObjectPolicy>(defaultObjectPolicy);
+  const [appliedObjectPolicy, setAppliedObjectPolicy] = useState<ComparisonObjectPolicy | null>(null);
   const [busy, setBusy] = useState(false);
   const [loadingProjection, setLoadingProjection] = useState(false);
   const [job, setJob] = useState<JobStatus | null>(null);
@@ -343,6 +349,19 @@ export default function CompareDistributions({
     setJob(null);
     setNotice("");
     setError("");
+  }
+
+  function applyManualObjectPolicy() {
+    const policy = { ...policyDraft, pad: Number(policyDraft.pad.toFixed(2)) };
+    setAppliedObjectPolicy(policy);
+    invalidateResult();
+    setNotice("Manual object settings applied. Run the comparison again to use them.");
+  }
+
+  function restoreAutomaticObjectPolicy() {
+    setAppliedObjectPolicy(null);
+    invalidateResult();
+    setNotice("Automatic object tuning restored. Run the comparison again to retune.");
   }
 
   useEffect(() => {
@@ -449,6 +468,7 @@ export default function CompareDistributions({
         model_id: modelId,
         unit,
         class_names: classNamesText.split(/[\n,，]/).map((name) => name.trim()).filter(Boolean),
+        ...(unit === "object" && appliedObjectPolicy ? { object_policy: appliedObjectPolicy } : {}),
       });
       setJob({
         job_id: created.job_id, state: "queued", phase: "queued", done: 0, total: 0,
@@ -473,6 +493,7 @@ export default function CompareDistributions({
       const value = await api.comparison(latest.run_id);
       setRun(value);
       setRunId(latest.run_id);
+      if (value.policy) setPolicyDraft(value.policy);
       setSelectedLabel(value.rows[0]?.label ?? "");
       setMethod("sumap");
       setDimension(2);
@@ -554,6 +575,27 @@ export default function CompareDistributions({
           {unit === "object" ? (
             <>
               <p className="field-note">The local worker measures crop settings on the smaller group and applies the best policy to both sides.</p>
+              <fieldset className="object-policy-editor" data-testid="object-policy-editor" disabled={busy}>
+                <legend>Object embedding settings</legend>
+                <div className="object-policy-grid">
+                  <label className="field-label" htmlFor="compare-policy-pad">Padding</label>
+                  <input id="compare-policy-pad" aria-label="Object padding" type="number" min="0" max="0.5" step="0.02" value={policyDraft.pad} onChange={(event) => setPolicyDraft((current) => ({ ...current, pad: Math.max(0, Math.min(0.5, Number(event.target.value))) }))} />
+                  <label className="field-label" htmlFor="compare-policy-resolution">Resolution</label>
+                  <select id="compare-policy-resolution" aria-label="Object resolution" value={policyDraft.target_res} onChange={(event) => setPolicyDraft((current) => ({ ...current, target_res: Number(event.target.value) as ComparisonObjectPolicy["target_res"] }))}>
+                    {policyResolutions.map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
+                  </select>
+                  <label className="field-label" htmlFor="compare-policy-head">Embedding head</label>
+                  <select id="compare-policy-head" aria-label="Object embedding head" value={policyDraft.head} onChange={(event) => setPolicyDraft((current) => ({ ...current, head: event.target.value as ComparisonObjectPolicy["head"] }))}>
+                    <option value="cls">cls</option>
+                    <option value="meanpool">meanpool</option>
+                  </select>
+                </div>
+                <div className="policy-actions">
+                  <button type="button" className="secondary-action" onClick={applyManualObjectPolicy} disabled={busy}>Apply manual settings</button>
+                  {appliedObjectPolicy && <button type="button" className="text-action" onClick={restoreAutomaticObjectPolicy}>Use automatic tuning</button>}
+                </div>
+                <p className="field-note">{appliedObjectPolicy ? `Manual policy active: pad ${appliedObjectPolicy.pad} · ${appliedObjectPolicy.target_res} · ${appliedObjectPolicy.head}.` : "Automatic tuning runs on the smaller group; apply a manual policy here when needed."}</p>
+              </fieldset>
               <label className="field-label field-label-spaced" htmlFor="compare-classes">Class names override (optional)</label>
               <textarea id="compare-classes" rows={3} value={classNamesText} onChange={(event) => { invalidateResult(); setClassNamesText(event.target.value); }} placeholder="One class name per line" disabled={busy} />
               <p className="field-note">Leave blank to use the classes.txt or data.yaml found beside each dataset.</p>
@@ -586,7 +628,8 @@ export default function CompareDistributions({
                 {" · "}only in {run.name_b}: {Object.entries(run.b_only).map(([label, count]) => `${label} (${count})`).join(", ") || "—"}
               </div>
             ) : null}
-            {run.policy && <div className="policy-summary" data-testid="compare-policy">Object policy: pad {run.policy.pad} · resolution {run.policy.target_res} · {run.policy.head} head</div>}
+            {run.policy && <div className="policy-summary" data-testid="compare-policy">{run.policy_source === "manual" ? "Manual object policy" : "Automatic object policy"}: pad {run.policy.pad} · resolution {run.policy.target_res} · {run.policy.head} head</div>}
+            {run.unit === "object" && run.autotune_rows.length > 0 && <details className="autotune-details" data-testid="autotune-results"><summary>Automatic tuning candidates ({run.autotune_rows.length})</summary><div className="drift-table-wrap"><table className="drift-table"><thead><tr><th>Policy</th><th>Overall</th>{objectSizeBuckets.map((bucket) => <th key={bucket}>{bucket}px</th>)}</tr></thead><tbody>{run.autotune_rows.map((candidate) => <tr key={`${candidate.policy.pad}-${candidate.policy.target_res}-${candidate.policy.head}`}><td>pad{Math.round(candidate.policy.pad * 100)}_r{candidate.policy.target_res}_{candidate.policy.head}</td><td>{candidate.macro_purity === null ? "—" : `${(candidate.macro_purity * 100).toFixed(1)}%`}</td>{objectSizeBuckets.map((bucket) => { const score = candidate.buckets[bucket]?.purity; return <td key={bucket}>{score === null || score === undefined ? "—" : `${(score * 100).toFixed(1)}%`}</td>; })}</tr>)}</tbody></table></div></details>}
             <section className="drift-card">
               <div className="section-heading"><span className="step-number">04</span><h2>{run.unit === "whole" ? "Overall image drift" : "Drift by shared class"}</h2></div>
               <p className="field-note">Centroid cosine distance. Higher means the selected groups differ more; the projection below is for visual inspection only.</p>

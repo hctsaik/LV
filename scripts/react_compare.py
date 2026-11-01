@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,7 @@ from safe_io import partition_readable
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 CACHE_PARTS = ("embeddings_", "object_crops", ".thumbs")
 PROJECTION_METHODS = {"pca", "tsne", "umap", "lda", "sumap"}
+OBJECT_TARGET_RESOLUTIONS = {168, 196, 224, 280, 336, 392, 448}
 WHOLE_IMAGE_LABEL = "(全部影像)"
 
 
@@ -26,6 +28,25 @@ class ComparisonInputError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+def _normalize_object_policy(value: dict | None) -> dict | None:
+    if value is None:
+        return None
+    try:
+        pad = float(value["pad"])
+        target_res = int(value["target_res"])
+        head = str(value["head"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ComparisonInputError("INVALID_OBJECT_POLICY", "The object settings are invalid.") from exc
+    if (
+        not math.isfinite(pad)
+        or not 0.0 <= pad <= 0.5
+        or target_res not in OBJECT_TARGET_RESOLUTIONS
+        or head not in {"cls", "meanpool"}
+    ):
+        raise ComparisonInputError("INVALID_OBJECT_POLICY", "The object settings are invalid.")
+    return {"pad": pad, "target_res": target_res, "head": head}
 
 
 def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
@@ -194,6 +215,7 @@ def run_comparison(
     *,
     unit: str = "object",
     class_names: Sequence[str] | None = None,
+    object_policy: dict | None = None,
     model_loader: Callable[[str], Callable] = load_model,
     object_model_loader: Callable | None = None,
     progress: Callable[[str, int, int, str], None] | None = None,
@@ -202,6 +224,9 @@ def run_comparison(
     """Run current LV Compare semantics without importing the Streamlit UI."""
     if unit not in {"whole", "object"}:
         raise ComparisonInputError("INVALID_UNIT", "Choose whole-image or object-by-class comparison.")
+    manual_policy = _normalize_object_policy(object_policy)
+    if unit == "whole" and manual_policy is not None:
+        raise ComparisonInputError("INVALID_OBJECT_POLICY", "Object settings only apply to object comparison.")
     roots_a, paths_a, name_a, notes_a, _bad_a = _resolve_group(folders_a, "A")
     roots_b, paths_b, name_b, notes_b, _bad_b = _resolve_group(folders_b, "B")
     _check_cancelled(cancelled)
@@ -238,6 +263,7 @@ def run_comparison(
             "drift": _centroid_drift(embedding_a, embedding_b),
         }]
         policy = None
+        policy_source = None
         autotune_rows = []
         a_only: dict[str, int] = {}
         b_only: dict[str, int] = {}
@@ -277,12 +303,14 @@ def run_comparison(
                 progress("autotune", stage_done, total,
                          f"Tuning object settings ({candidate + 1}/{candidate_count}) · {done}/{count}")
 
-        autotune_rows, policy, _fingerprint = run_autotune(
+        autotune_rows, automatic_policy, _fingerprint = run_autotune(
             small_paths, small_names, model=model, cache_dir=tune_dir,
             progress=tune_progress, model_loader=object_loader,
         )
-        if not policy:
-            policy = dict(DEFAULT_POLICY)
+        if not automatic_policy:
+            automatic_policy = dict(DEFAULT_POLICY)
+        policy = manual_policy or automatic_policy
+        policy_source = "manual" if manual_policy is not None else "automatic"
         if autotune_rows:
             best = autotune_rows[0].get("macro_purity")
             if best is None:
@@ -358,6 +386,7 @@ def run_comparison(
         "a_only": a_only,
         "b_only": b_only,
         "policy": policy,
+        "policy_source": policy_source,
         "autotune_rows": [
             {
                 "policy": row["policy"],
