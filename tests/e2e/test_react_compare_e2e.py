@@ -106,9 +106,15 @@ def test_lv_web_02_obj_01_react_object_compare_flow_with_local_worker(tmp_path: 
     for root, color in zip(roots, colors):
         (root / "images").mkdir(parents=True)
         (root / "labels").mkdir()
-        (root / "classes.txt").write_text("widget\n", encoding="utf-8")
+        (root / "classes.txt").write_text("widget\na_only\nb_only\n", encoding="utf-8")
         Image.new("RGB", (64, 56), color).save(root / "images" / "item.png")
-        (root / "labels" / "item.txt").write_text("0 0.5 0.5 0.7 0.6\n", encoding="utf-8")
+        unmatched_label = "1" if root == roots[0] else "2"
+        (root / "labels" / "item.txt").write_text(
+            f"0 0.5 0.5 0.7 0.6\n{unmatched_label} 0.25 0.25 0.2 0.2\n",
+            encoding="utf-8",
+        )
+    source_files = [path for root in roots for path in root.rglob("*") if path.is_file()]
+    hashes_before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
     application = create_app(
         model_catalog=lambda: ["fixture-model"],
@@ -147,6 +153,11 @@ def test_lv_web_02_obj_01_react_object_compare_flow_with_local_worker(tmp_path: 
             page.get_by_role("button", name="Run comparison").click()
             expect(page.get_by_test_id("compare-job-status")).to_contain_text("Completed", timeout=60_000)
             expect(page.get_by_role("heading", name="Drift by shared class")).to_be_visible()
+            warning = page.locator(".alert-warning")
+            expect(warning).to_contain_text("a_only (1)")
+            expect(warning).to_contain_text("b_only (1)")
+            expect(page.get_by_role("button", name="widget", exact=True)).to_be_visible()
+            expect(page.get_by_label("Comparison class", exact=True)).to_have_value("widget")
             expect(page.get_by_test_id("compare-policy")).to_contain_text("Automatic object policy")
             expect(page.get_by_test_id("autotune-results")).to_be_visible()
             expect(page.get_by_test_id("comparison-point")).to_have_count(2, timeout=60_000)
@@ -173,6 +184,7 @@ def test_lv_web_02_obj_01_react_object_compare_flow_with_local_worker(tmp_path: 
             first_point.press("Enter")
             expect(page.get_by_test_id("comparison-focused-record")).to_contain_text("Box")
             browser.close()
+        assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files} == hashes_before
     finally:
         server.should_exit = True
         thread.join(timeout=10)
