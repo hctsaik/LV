@@ -584,7 +584,9 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .diagnostic-explanation-summary > div { display: grid; gap: 4px; }
 .diagnostic-explanation-summary strong { color: #2c3b52; font-size: 13px; }
 .diagnostic-explanation-summary small { color: #78869a; font-size: 10px; }
-.diagnostic-evidence-layout { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(220px, 1.2fr); align-items: start; gap: 14px; }
+.diagnostic-export-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.diagnostic-export-actions > * { display: inline-flex; align-items: center; justify-content: center; min-height: 30px; border: 1px solid #d5dfec; border-radius: 5px; padding: 0 10px; background: #f3f7fc; color: #45658e; font-size: 9px; font-weight: 700; text-decoration: none; cursor: pointer; }
+.diagnostic-evidence-layout { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); align-items: start; gap: 12px; }
 .diagnostic-source-preview, .diagnostic-grid-panel { min-width: 0; margin: 0; border: 1px solid #e4e9f0; border-radius: 7px; padding: 10px; background: #fff; }
 .diagnostic-source-preview img { display: block; width: 100%; max-height: 350px; object-fit: contain; background: #f1f3f6; }
 .diagnostic-source-preview figcaption { margin-top: 6px; color: #7c899b; font-size: 9px; }
@@ -600,4 +602,5 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .diagnostic-warnings { border-top: 1px solid #e8edf3; padding-top: 8px; color: #67768c; font-size: 10px; line-height: 1.5; }
 .diagnostic-warnings summary { cursor: pointer; font-weight: 700; }
 .diagnostic-warnings ul { display: grid; gap: 5px; margin-bottom: 0; padding-left: 20px; }
-@media (max-width: 650px) { .diagnostic-evidence-layout { grid-template-columns: 1fr; } .diagnostic-evidence-grid { width: min(100%, 300px); } }
+@media (max-width: 650px) { .diagnostic-evidence-layout { grid-template-columns: repeat(2, minmax(0, 1fr)); } .diagnostic-evidence-grid { width: min(100%, 300px); } }
+@media (max-width: 430px) { .diagnostic-evidence-layout { grid-template-columns: 1fr; } }

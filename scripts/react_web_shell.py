@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import hashlib
 import json
 import logging
@@ -2377,14 +2378,14 @@ def create_app(
                     explain_request,
                     explainer=explainer,
                 )
-                scores = np.asarray(result.display_patch_scores, dtype=np.float32)
+                display_scores = np.asarray(result.display_patch_scores, dtype=np.float32)
                 payload.update({
                     "method": "attention",
                     "attention_method": result.method,
                     "grid": list(result.grid),
                     "patch_size": int(result.patch_size),
                     "score_mode": "positive",
-                    "display_scores": scores.tolist(),
+                    "display_scores": display_scores.tolist(),
                     "raw_scores": np.asarray(result.raw_patch_scores, dtype=np.float32).tolist(),
                     "warnings": list(result.warnings),
                 })
@@ -2428,6 +2429,25 @@ def create_app(
                     "sample_oof": result.sample_oof,
                     "warnings": list(result.warnings),
                 })
+            from explanation_render import export_png_bytes, render_overlay
+
+            signed_view = request.method == "gradcam" and request.display_mode == "signed"
+            overlay = render_overlay(
+                result.input_image,
+                display_scores,
+                alpha=0.45,
+                cmap="blue_white_red" if request.method == "gradcam" else "viridis",
+                signed=signed_view,
+            )
+            payload.update({
+                "source_sha256": expected_hash,
+                "model_input_png_base64": base64.b64encode(
+                    export_png_bytes(result.input_image)
+                ).decode("ascii"),
+                "overlay_png_base64": base64.b64encode(
+                    export_png_bytes(overlay)
+                ).decode("ascii"),
+            })
             try:
                 source_is_current = (
                     source_path.is_file()

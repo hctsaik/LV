@@ -1017,6 +1017,22 @@ export default function App() {
     }
   }
 
+  function downloadDiagnosticJson() {
+    if (!diagnosticExplanation) return;
+    const metadata = Object.fromEntries(
+      Object.entries(diagnosticExplanation).filter(([key]) =>
+        key !== "model_input_png_base64" && key !== "overlay_png_base64",
+      ),
+    );
+    const blob = new Blob([JSON.stringify(metadata, null, 2)], { type: "application/json" });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = "diagnostic-evidence.json";
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+  }
+
   async function cancelAnalysis() {
     if (!job?.job_id) return;
     try {
@@ -1239,6 +1255,20 @@ export default function App() {
                       <small>{diagnosticExplanation.is_predicted_target ? "Target matches actual top-1" : "Counterfactual target hypothesis"} · margin {diagnosticExplanation.target_score?.toFixed(4)}</small>
                     </div>}
                   </div>
+                  <div className="diagnostic-export-actions">
+                    <a
+                      className="secondary-action"
+                      data-testid="diagnostic-download-png"
+                      href={`data:image/png;base64,${diagnosticExplanation.overlay_png_base64}`}
+                      download="diagnostic-overlay.png"
+                    >Download overlay PNG</a>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      data-testid="diagnostic-download-json"
+                      onClick={downloadDiagnosticJson}
+                    >Download evidence JSON</button>
+                  </div>
                   <div className="diagnostic-evidence-layout">
                     <figure className="diagnostic-source-preview">
                       <img
@@ -1247,14 +1277,30 @@ export default function App() {
                       />
                       <figcaption>Selected source image</figcaption>
                     </figure>
-                    <div className="diagnostic-grid-panel">
-                      <div className="diagnostic-grid-heading">
-                        <strong>{diagnosticExplanation.method === "gradcam" ? "Grad-CAM patch evidence" : "DINO Attention patch map"}</strong>
-                        <span>{diagnosticExplanation.grid[0]}×{diagnosticExplanation.grid[1]} patches · {diagnosticExplanation.score_mode}</span>
-                      </div>
-                      <DiagnosticEvidenceGrid result={diagnosticExplanation} />
-                      <p className="field-note">{diagnosticExplanation.warning}</p>
+                    <figure className="diagnostic-source-preview">
+                      <img
+                        data-testid="diagnostic-model-input-image"
+                        src={`data:image/png;base64,${diagnosticExplanation.model_input_png_base64}`}
+                        alt={`Preprocessed ${diagnosticExplanation.scope} model input`}
+                      />
+                      <figcaption>Exact preprocessed model input</figcaption>
+                    </figure>
+                    <figure className="diagnostic-source-preview">
+                      <img
+                        data-testid="diagnostic-overlay-image"
+                        src={`data:image/png;base64,${diagnosticExplanation.overlay_png_base64}`}
+                        alt={`${diagnosticExplanation.method} evidence overlay`}
+                      />
+                      <figcaption>Patch evidence overlay · not a segmentation mask</figcaption>
+                    </figure>
+                  </div>
+                  <div className="diagnostic-grid-panel">
+                    <div className="diagnostic-grid-heading">
+                      <strong>{diagnosticExplanation.method === "gradcam" ? "Grad-CAM patch evidence" : "DINO Attention patch map"}</strong>
+                      <span>{diagnosticExplanation.grid[0]}×{diagnosticExplanation.grid[1]} patches · {diagnosticExplanation.score_mode}</span>
                     </div>
+                    <DiagnosticEvidenceGrid result={diagnosticExplanation} />
+                    <p className="field-note">{diagnosticExplanation.warning}</p>
                   </div>
                   <ul className="diagnostic-class-probabilities" aria-label="Class probabilities">
                     {diagnosticExplanation.class_probabilities.map((item) => <li key={item.class_name}>

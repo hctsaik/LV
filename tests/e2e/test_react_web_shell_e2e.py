@@ -2352,6 +2352,7 @@ def test_lv_web_04_expl_01_visible_attention_and_gradcam_journey(
             raw_patch_scores=np.array([[0.2, 0.8], [0.1, 0.4]], dtype=np.float32),
             display_patch_scores=np.array([[0.25, 1.0], [0.125, 0.5]], dtype=np.float32),
             grid=(2, 2), patch_size=14, method=request.method,
+            input_image=request.image,
             warnings=("Attention is not a defect mask.",),
         )
 
@@ -2361,6 +2362,7 @@ def test_lv_web_04_expl_01_visible_attention_and_gradcam_journey(
             raw_patch_scores=np.array([[-1.0, 2.0], [0.5, -0.25]], dtype=np.float32),
             display_patch_scores=np.array([[-0.5, 1.0], [0.25, -0.125]], dtype=np.float32),
             grid=(2, 2), patch_size=14,
+            input_image=request.image,
             target_class=target_class or "apple", target_score=0.75,
             reference_class="banana", predicted_class="apple",
             predicted_probability=0.7, runner_up_class="banana",
@@ -2471,6 +2473,20 @@ def test_lv_web_04_expl_01_visible_attention_and_gradcam_journey(
             assert str(dataset) not in gradcam_response.value.text()
             expect(page.get_by_test_id("diagnostic-target-result")).to_contain_text("banana")
             expect(page.get_by_test_id("diagnostic-faithfulness")).to_contain_text("supported")
+            expect(page.get_by_test_id("diagnostic-model-input-image")).to_be_visible()
+            expect(page.get_by_test_id("diagnostic-overlay-image")).to_have_js_property("naturalWidth", 64)
+            with page.expect_download() as png_download:
+                page.get_by_test_id("diagnostic-download-png").click()
+            png_file = png_download.value.path()
+            assert png_file and Image.open(png_file).format == "PNG"
+            with page.expect_download() as json_download:
+                page.get_by_test_id("diagnostic-download-json").click()
+            json_file = json_download.value.path()
+            assert json_file
+            downloaded_metadata = json.loads(Path(json_file).read_text(encoding="utf-8"))
+            assert downloaded_metadata["target_class"] == "banana"
+            assert "overlay_png_base64" not in downloaded_metadata
+            assert str(dataset) not in Path(json_file).read_text(encoding="utf-8")
             assert len(gradcam_calls) == 1 and gradcam_calls[0][1] == "banana"
             browser.close()
     finally:
@@ -2491,6 +2507,8 @@ def test_lv_web_04_expl_01_real_dinov2_attention_and_gradcam(
     """Real pinned DINO weights execute both evidence methods at the exact classifier resolution."""
     from fastapi.testclient import TestClient
     import _utils
+    from dino_explain import ExplainRequest, _resolve_checkpoint, attention_map, get_explainer
+    from gradcam_explain import token_gradcam_map
 
     models_dir = Path(
         os.environ.get("LV_MODELS_DIR", r"C:\code\claude\LV\visuallatent\models")
@@ -2568,6 +2586,34 @@ def test_lv_web_04_expl_01_real_dinov2_attention_and_gradcam(
                 "display_mode": "signed",
             },
         )
+        internal_run = client.app.state.runs[run_id]
+        context = client.app.state.diagnostic_references[reference["context_id"]]
+        head_entry = next(
+            entry for entry in client.app.state.diagnostic_heads.values()
+            if entry["resolution"] == 224 and entry["model_id"] == "dinov2_vits14"
+        )
+        source_path = Path(internal_run["image_paths"][0])
+        source_image = Image.open(source_path).convert("RGB")
+        source_id = f"{context['source_sha256']}:{internal_run['records'][0].get('obj_index', '')}"
+        checkpoint = _resolve_checkpoint("dinov2_vits14", None)
+        explainer, checkpoint = get_explainer("dinov2_vits14", checkpoint, head="cls")
+        direct_request = ExplainRequest(
+            image=source_image,
+            source_id=source_id,
+            model_id="dinov2_vits14",
+            checkpoint_path=checkpoint,
+            keep_aspect=False,
+            target_res=224,
+            pooling="cls",
+            original_size=source_image.size,
+        )
+        direct_attention = attention_map(direct_request, explainer=explainer)
+        direct_gradcam = token_gradcam_map(
+            direct_request,
+            head_entry["head"],
+            target_class="banana",
+            explainer=explainer,
+        )
         cache_after_explanation = hashlib.sha256(
             b"".join(
                 str(path.relative_to(cache_root)).encode("utf-8") + path.read_bytes()
@@ -2588,6 +2634,18 @@ def test_lv_web_04_expl_01_real_dinov2_attention_and_gradcam(
     assert np.isfinite(np.asarray(attention_payload["display_scores"], dtype=float)).all()
     assert np.isfinite(np.asarray(gradcam_payload["display_scores"], dtype=float)).all()
     assert "not a defect mask" in gradcam_payload["warning"]
+    np.testing.assert_allclose(
+        np.asarray(attention_payload["raw_scores"], dtype=np.float32),
+        direct_attention.raw_patch_scores,
+        rtol=0,
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(
+        np.asarray(gradcam_payload["raw_scores"], dtype=np.float32),
+        direct_gradcam.raw_patch_scores,
+        rtol=0,
+        atol=1e-7,
+    )
     assert str(dataset) not in attention.text + gradcam.text
     assert cache_before_explanation == cache_after_explanation
     assert source_hashes == {

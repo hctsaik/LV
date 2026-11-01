@@ -88,6 +88,9 @@ export type DiagnosticExplanationResult = {
   predicted_class: string;
   predicted_probability: number;
   class_probabilities: { class_name: string; probability: number }[];
+  source_sha256: string;
+  model_input_png_base64: string;
+  overlay_png_base64: string;
   target_class?: string;
   target_score?: number;
   reference_class?: string;

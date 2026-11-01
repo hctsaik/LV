@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import hashlib
 from io import BytesIO, StringIO
 import os
@@ -853,6 +854,7 @@ def test_case_lv_web_04_expl_01_explicit_attention_and_signed_gradcam_evidence(
             grid=(2, 2),
             patch_size=14,
             method=request.method,
+            input_image=request.image,
             warnings=("Attention is not a defect mask.",),
         )
 
@@ -863,6 +865,7 @@ def test_case_lv_web_04_expl_01_explicit_attention_and_signed_gradcam_evidence(
             display_patch_scores=np.array([[-0.5, 1.0], [0.25, -0.125]], dtype=np.float32),
             grid=(2, 2),
             patch_size=14,
+            input_image=request.image,
             target_class=target_class or "banana",
             target_score=0.75,
             reference_class="apple",
@@ -976,6 +979,11 @@ def test_case_lv_web_04_expl_01_explicit_attention_and_signed_gradcam_evidence(
     assert gradcam_calls[0][1] == "apple"
     assert str(classifier_fixture["root"]) not in attention.text + gradcam.text
     assert "image_path" not in gradcam_payload and "source_path" not in gradcam_payload
+    assert gradcam_payload["source_sha256"] == hashlib.sha256(source_path.read_bytes()).hexdigest()
+    input_png = Image.open(BytesIO(base64.b64decode(gradcam_payload["model_input_png_base64"])))
+    overlay_png = Image.open(BytesIO(base64.b64decode(gradcam_payload["overlay_png_base64"])))
+    assert input_png.format == overlay_png.format == "PNG"
+    assert input_png.size == overlay_png.size == (32, 32)
     assert source_before == source_after
 
 
