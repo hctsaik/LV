@@ -78,13 +78,34 @@ def test_case_lv_web_02_img_01_whole_image_drift_projection_and_path_boundary(
 
     assert projection.status_code == 200, projection.text
     view = projection.json()
+    from sklearn.decomposition import PCA
+
+    # Independently reproduce the legacy Streamlit means, normalization, and
+    # 2D PCA on the same fixed fixture embeddings.
+    embeddings_a = np.stack([_whole_embedder(path) for path in a])
+    embeddings_b = np.stack([_whole_embedder(path) for path in b])
+    mean_a = embeddings_a.mean(axis=0)
+    mean_a = mean_a / (np.linalg.norm(mean_a) + 1e-9)
+    mean_b = embeddings_b.mean(axis=0)
+    mean_b = mean_b / (np.linalg.norm(mean_b) + 1e-9)
+    expected_drift = round(max(0.0, 1.0 - float(mean_a @ mean_b)), 4)
+    expected_projection = PCA(n_components=2, random_state=42).fit_transform(
+        np.vstack([embeddings_a, embeddings_b])
+    )
+
     assert len(result["records_a"]) == len(result["records_b"]) == 3
     assert result["rows"] == [{
         "label": "(全部影像)", "a_count": 3, "b_count": 3, "drift": result["rows"][0]["drift"],
     }]
-    assert 0 < result["rows"][0]["drift"] <= 1
+    assert result["rows"][0]["drift"] == expected_drift
     assert len(view["points"]) == 6
     assert {point["group"] for point in view["points"]} == {"A", "B"}
+    assert np.allclose(
+        [[point["x"], point["y"]] for point in view["points"]],
+        expected_projection,
+        rtol=1e-5,
+        atol=1e-5,
+    )
     assert all(np.isfinite([point["x"], point["y"]]).all() for point in view["points"])
     assert "_paths_a" not in result and "image_paths" not in result
     image = client.get(f"/api/v1/comparisons/{job['run_id']}/images/a/0")
