@@ -136,6 +136,70 @@ def test_case_lv_web_02_obj_01_compares_shared_classes_and_keeps_boxes_private(
     assert client.get(f"/api/v1/comparisons/{job['run_id']}/images/a/0").status_code == 200
 
 
+def test_case_lv_web_02_state_01_compare_selection_adds_unique_original_images_to_curation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    roots = [tmp_path / "det-a", tmp_path / "det-b"]
+    (roots[0] / "images").mkdir(parents=True)
+    (roots[0] / "labels").mkdir()
+    (roots[1] / "images").mkdir(parents=True)
+    (roots[1] / "labels").mkdir()
+    before = []
+    for index, root in enumerate(roots):
+        image_path = root / "images" / f"group-{index}.png"
+        Image.new("RGB", (64, 56), (70 + index * 90, 60, 150)).save(image_path)
+        (root / "classes.txt").write_text("widget\n", encoding="utf-8")
+        label_rows = (
+            ["0 0.3 0.4 0.4 0.5 0.40", "0 0.7 0.6 0.3 0.4 0.45"]
+            if index == 0 else
+            ["0 0.3 0.4 0.4 0.5 0.40", "0 0.7 0.6 0.3 0.4 0.90"]
+        )
+        (root / "labels" / f"group-{index}.txt").write_text("\n".join(label_rows) + "\n", encoding="utf-8")
+        before.extend([image_path, root / "classes.txt", root / "labels" / f"group-{index}.txt"])
+    hashes_before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in before}
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "app-cache"))
+    client = TestClient(create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: _whole_embedder,
+        object_model_loader=lambda _model_id, **_kwargs: _object_embedder,
+    ))
+
+    job, result = _completed_run(client, {
+        "folders_a": [str(roots[0])],
+        "folders_b": [str(roots[1])],
+        "model_id": "fixture-model",
+        "unit": "object",
+    })
+    assert [record["score"] for record in result["records_a"]] == [0.4, 0.45]
+    assert [record["score"] for record in result["records_b"]] == [0.4, 0.9]
+    response = client.post(
+        f"/api/v1/comparisons/{job['run_id']}/curation/items",
+        json={"selections": [
+            {"group": "A", "index": 0}, {"group": "A", "index": 1},
+            {"group": "B", "index": 0},
+        ]},
+    )
+    assert response.status_code == 201, response.text
+    payload = response.json()
+    assert (payload["added"], payload["skipped"], payload["total"]) == (2, 0, 2)
+    assert [
+        (item["filename"], item["label"], item["source"], item["score"], item["level"])
+        for item in payload["items"]
+    ] == [
+        ("group-0.png", "widget", "compare", 0.4, "image"),
+        ("group-1.png", "widget", "compare", 0.4, "image"),
+    ]
+    assert all(not {"path", "image_path", "bbox", "obj_index"} & item.keys() for item in payload["items"])
+
+    invalid = client.post(
+        f"/api/v1/comparisons/{job['run_id']}/curation/items",
+        json={"selections": [{"group": "A", "index": 0}, {"group": "B", "index": 9}]},
+    )
+    assert invalid.status_code == 422
+    assert client.get("/api/v1/curation/items").json()["total"] == 2
+    assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in before} == hashes_before
+
+
 def test_case_lv_web_02_rejects_missing_groups_and_invalid_projection(tmp_path, monkeypatch):
     empty_a, empty_b = tmp_path / "empty-a", tmp_path / "empty-b"
     empty_a.mkdir()

@@ -168,6 +168,16 @@ class AddCoverageCandidateCurationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)
 
 
+class ComparisonCurationSelection(BaseModel):
+    group: Literal["A", "B"]
+    index: int = Field(ge=0)
+
+
+class AddComparisonCurationRequest(BaseModel):
+    selections: list[ComparisonCurationSelection] = Field(min_length=1, max_length=10000)
+    reason: str = Field(default="", max_length=2000)
+
+
 class ProjectComparisonRequest(BaseModel):
     label: str = Field(min_length=1, max_length=256)
     method: str = "sumap"
@@ -1614,6 +1624,78 @@ def create_app(
             if comparison is None:
                 raise HTTPException(status_code=404, detail="Comparison not found")
             return {key: value for key, value in comparison.items() if not key.startswith("_")}
+
+    @app.post("/api/v1/comparisons/{run_id}/curation/items", status_code=201)
+    def add_comparison_records_to_curation(
+        run_id: str,
+        request: AddComparisonCurationRequest,
+    ) -> dict:
+        with app.state.lock:
+            comparison = app.state.comparison_runs.get(run_id)
+            if comparison is None:
+                raise HTTPException(status_code=404, detail="Comparison not found")
+            selections = list(dict.fromkeys(
+                (selection.group, selection.index) for selection in request.selections
+            ))
+            for group, index in selections:
+                side = group.lower()
+                records = comparison[f"records_{side}"]
+                paths = comparison[f"_record_paths_{side}"]
+                if index >= len(records) or index >= len(paths):
+                    raise HTTPException(status_code=422, detail={
+                        "code": "INVALID_COMPARISON_RECORD_INDEX",
+                        "message": "A selected comparison record is no longer available.",
+                        "request_id": uuid.uuid4().hex,
+                    })
+
+            entries = []
+            seen_paths: set[str] = set()
+            for group, index in selections:
+                side = group.lower()
+                record = comparison[f"records_{side}"][index]
+                try:
+                    path = Path(comparison[f"_record_paths_{side}"][index]).expanduser().resolve(strict=True)
+                    if not path.is_file():
+                        raise OSError("source is not a file")
+                    path_key = os.path.normcase(str(path))
+                    if path_key in seen_paths:
+                        continue
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                except OSError as exc:
+                    raise HTTPException(status_code=404, detail={
+                        "code": "CURATION_IMAGE_UNAVAILABLE",
+                        "message": "A selected comparison image is no longer available.",
+                        "request_id": uuid.uuid4().hex,
+                    }) from exc
+                seen_paths.add(path_key)
+                entries.append({
+                    "index": index,
+                    "filename": str(record.get("filename", path.name)),
+                    "path": str(path),
+                    "label": str(record.get("label", "")),
+                    "split": str(record.get("split", "")),
+                    "sha256": digest.hexdigest(),
+                    "source": "compare",
+                    "score": record.get("score"),
+                    "reason": request.reason.strip(),
+                    # Streamlit Compare adds the selected source image to its image-level cart;
+                    # several selected boxes from one file therefore produce one cart item.
+                    "level": "image",
+                })
+            try:
+                added, skipped = app.state.curation_store.add(entries)
+                items = app.state.curation_store.list_items()
+            except CurationStoreError as exc:
+                raise curation_store_error() from exc
+        return {
+            "added": added,
+            "skipped": skipped,
+            "items": [public_curation_item(item) for item in items],
+            "total": len(items),
+        }
 
     @app.post("/api/v1/comparisons/{run_id}/projections")
     def get_comparison_projection(run_id: str, request: ProjectComparisonRequest) -> dict:

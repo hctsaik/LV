@@ -225,6 +225,8 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .block-drilldown-heading span { color: #98a2b0; }
 .screen-reader-points { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .clear-selection { margin-left: auto; border: 1px solid #e1e6ed; border-radius: 5px; padding: 4px 7px; color: #697892; background: #fff; font-size: 9px; }
+.compare-add-curation { flex: 0 0 auto; min-height: 29px; border: 1px solid #d2e2d8; border-radius: 6px; padding: 0 10px; background: #f5fbf7; color: #34634c; font-size: 9px; font-weight: 700; cursor: pointer; }
+.compare-add-curation:disabled { cursor: default; opacity: .5; }
 @media (max-width: 480px) {
   .choice-list { grid-template-columns: 1fr; }
   .plot-subtoolbar { align-items: flex-start; flex-wrap: wrap; }

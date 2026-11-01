@@ -914,7 +914,7 @@ export default function App() {
       {activeTool === "curation" ? (
         <CurationWorkspace onCountChange={setCurationCount} />
       ) : activeTool === "compare" ? (
-        <CompareDistributions models={models} loadingModels={loadingModels} connected={connected} />
+        <CompareDistributions models={models} loadingModels={loadingModels} connected={connected} onCurationCountChange={setCurationCount} />
       ) : activeTool === "coverage" ? null : <div className="workspace">
         <aside className="control-panel">
           <div className="eyebrow">VISUALIZE EMBEDDINGS</div>

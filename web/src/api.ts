@@ -408,6 +408,8 @@ export type ComparisonJobInput = {
   object_policy?: ComparisonObjectPolicy;
 };
 
+export type ComparisonCurationSelection = { group: "A" | "B"; index: number };
+
 export type CurationItem = {
   id: string;
   index: number;
@@ -632,6 +634,11 @@ export const api = {
   comparison: (runId: string) => request<ComparisonRun>(
     "/api/v1/comparisons/" + encodeURIComponent(runId),
   ),
+  addComparisonCuration: (runId: string, selections: ComparisonCurationSelection[], reason = "") =>
+    request<AddCurationResponse>("/api/v1/comparisons/" + encodeURIComponent(runId) + "/curation/items", {
+      method: "POST",
+      body: JSON.stringify({ selections, reason }),
+    }),
   projectComparison: (
     runId: string,
     label: string,

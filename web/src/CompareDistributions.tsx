@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type ComparisonPoint,
+  type ComparisonCurationSelection,
   type ComparisonObjectPolicy,
   type ComparisonProjection,
   type ComparisonRecord,
@@ -308,10 +309,12 @@ export default function CompareDistributions({
   models,
   loadingModels,
   connected,
+  onCurationCountChange,
 }: {
   models: ModelOption[];
   loadingModels: boolean;
   connected: boolean;
+  onCurationCountChange: (count: number) => void;
 }) {
   const [foldersA, setFoldersA] = useState<string[]>([]);
   const [foldersB, setFoldersB] = useState<string[]>([]);
@@ -323,6 +326,7 @@ export default function CompareDistributions({
   const [policyDraft, setPolicyDraft] = useState<ComparisonObjectPolicy>(defaultObjectPolicy);
   const [appliedObjectPolicy, setAppliedObjectPolicy] = useState<ComparisonObjectPolicy | null>(null);
   const [busy, setBusy] = useState(false);
+  const [addingToCuration, setAddingToCuration] = useState(false);
   const [loadingProjection, setLoadingProjection] = useState(false);
   const [job, setJob] = useState<JobStatus | null>(null);
   const [runId, setRunId] = useState("");
@@ -541,6 +545,22 @@ export default function CompareDistributions({
     });
   }
 
+  async function addSelectedToCuration() {
+    if (!runId || !selectedPoints.length || addingToCuration) return;
+    setAddingToCuration(true);
+    setError("");
+    try {
+      const selections: ComparisonCurationSelection[] = selectedPoints.map(({ group, index }) => ({ group, index }));
+      const result = await api.addComparisonCuration(runId, selections);
+      onCurationCountChange(result.total);
+      setNotice(`Added ${result.added} image(s) to curation; skipped ${result.skipped} duplicate(s).`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not add the selected comparison images to curation.");
+    } finally {
+      setAddingToCuration(false);
+    }
+  }
+
   const focused = run ? selectedRecord(focus, run) : null;
   const pointRefs = useMemo(() => selectedPoints.map(pointKey), [selectedPoints]);
   const selectedClasses = [...new Set(selectedPoints.map((point) => point.group))].length;
@@ -653,6 +673,7 @@ export default function CompareDistributions({
                 <div className="dimension-switch" role="group" aria-label="Comparison projection dimension"><button type="button" aria-pressed={dimension === 2} onClick={() => { setDimension(2); setSelectedPoints([]); setFocus(null); }}>2D</button><button type="button" aria-pressed={dimension === 3} onClick={() => { setDimension(3); setSelectedPoints([]); setFocus(null); }}>3D</button></div>
                 {availableConfidence && <div className="object-filters"><label>Confidence {minConfidence.toFixed(2)}–{maxConfidence.toFixed(2)}<div><input aria-label="Minimum confidence" type="range" min="0" max="0.95" step="0.05" value={minConfidence} onChange={(event) => { setMinConfidence(Math.min(Number(event.target.value), maxConfidence)); setSelectedPoints([]); setFocus(null); }} /><input aria-label="Maximum confidence" type="range" min="0.05" max="1" step="0.05" value={maxConfidence} onChange={(event) => { setMaxConfidence(Math.max(Number(event.target.value), minConfidence)); setSelectedPoints([]); setFocus(null); }} /></div></label><label>Hide objects with source short edge below {minShortPx}px<input aria-label="Minimum object short edge" type="range" min="0" max="64" step="4" value={minShortPx} onChange={(event) => { setMinShortPx(Number(event.target.value)); setSelectedPoints([]); setFocus(null); }} /></label></div>}
                 {selectedPoints.length > 0 && <button type="button" className="clear-selection" onClick={() => { setSelectedPoints([]); setFocus(null); }}>Clear selection ({selectedPoints.length})</button>}
+                {selectedPoints.length > 0 && <button type="button" className="compare-add-curation" data-testid="add-comparison-selection-to-curation" disabled={addingToCuration || !runId} onClick={() => void addSelectedToCuration()}>{addingToCuration ? "Adding…" : `Add selected images to curation (${selectedPoints.length})`}</button>}
               </div>
               {loadingProjection ? <div className="plot-frame plot-loading" role="status">Computing {method.toUpperCase()} projection…</div>
                 : projection?.points.length ? dimension === 3
