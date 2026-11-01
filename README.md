@@ -1,6 +1,22 @@
-# VisualLatent — Dataset Embedding Analysis Tools
+# VisualLatent — Local Image Analysis
 
-A Streamlit web app for visualising and comparing image dataset distributions using deep feature embeddings.
+VisualLatent analyses image dataset distributions with local feature models. **M24 React Web migration is in progress.** The Streamlit interface is retained only as the behavioral reference until all existing use cases have matching React cases and evidence.
+
+## React Web migration (M24)
+
+The first React slice implements **Visualize Embeddings → Image Classifier → whole image** (`LV-WEB-01-IC-01`). Local API, manifest-backed embedding cache, real DINOv2-small extraction, PCA scatter, filters, image selection, cancellation, and visible error states have local test evidence. NativeApp packaging and its folder-grant lifecycle are still pending; the other nine tools and nested flows are not migrated yet.
+
+```powershell
+cd web
+npm install
+npm run build
+cd ..
+python scripts/react_web_shell.py
+```
+
+The API binds to `127.0.0.1:8765`. Set `LV_MODELS_DIR` to a local LV model directory and `LV_CACHE_DIR` to an app-owned writable cache location when needed. A built `web/dist` is served by the local worker for standalone development; NativeApp is expected to serve the same static build through its public integration host.
+
+Migration source of truth: [user need](1_user_needs/react_web_migration.md), [PRD](2_PO_PRD/react_web_migration_prd.md), [architecture](3_Architect_Design/31_react_web_shell.md), and [AC-to-test map](4_PM_Feedback/react_web_shell.md).
 
 > 📖 **怎麼使用？** 新手先看 **[使用指南](docs/usage_guide.md)**（逐工具教學）＋ **[五工具總覽圖](docs/tools_overview.html)**；完整文件索引見 **[文件中心](docs/index.html)**。
 
@@ -18,6 +34,7 @@ Both tools run **fully offline** — model architectures and weights are loaded 
 ## Requirements
 
 - Python 3.10+
+- Node.js 18+ (React Web build)
 - Conda (recommended) or virtualenv
 
 ### Install dependencies
@@ -92,7 +109,9 @@ If `classes.txt` is not found, class names can be entered manually in the sideba
 
 ---
 
-## Launch
+## Legacy Streamlit behavioral baseline
+
+This launcher remains temporarily available for use-case comparison while migration continues. It is not the target interface for new work; parity is tracked by case ID above.
 
 ```bash
 streamlit run scripts/app.py

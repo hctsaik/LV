@@ -7,8 +7,7 @@
 > **🏁 AL Loop Infrastructure(M15–M18)已完成(2026-07-12)**:主動學習迴圈四段(選樣 → 送標 →
 > 回讀 → 評估)閉合。六模組 `pool_registry` / `round_ledger` / `gt_pred_diff` / `hybrid_sampler` /
 > `probe_eval` / `heatmap_to_boxes` / `readback_store` 全數落地,gate 全 GREEN + 真實 E2E 23/23 併跑綠。
-> **目前無進行中的里程碑**(最新完成:M22 於 2026-07-19 立案並當日完成)。
-> 新能力請由新 `/user` 需求起輪;候選清單見 M20 決策日誌。
+> **目前進行中: M24 — LV React Web 遷移**(2026-11-01 立案)。依新 `/user` 需求起輪；先完成 LV-WEB-01 真模型垂直流程，再逐項遷移現有工具及巢狀工作流。未通過所有原本可用案例前，Streamlit 基準仍是比較來源，M24 不得標完成。
 >
 > ⚠️ **編號注意:本 repo 有兩條平行的里程碑/模組編號線**(2026-07-12 併軌時的既成事實,PO 決定不追溯重編):
 > - **anomaly / 以樣搜樣線**:M8–M14;模組 08 `al_batch`、09 `al_workspace`、10 `al_service`、
@@ -36,6 +35,7 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M24 — VisualLatent React Web + 本機模型 API 遷移** — 🧪 **第一垂直切片已實作；NativeApp 接入驗證待做**(2026-11-01 立案)。需求 [1_user_needs/react_web_migration.md](1_user_needs/react_web_migration.md)；PRD [2_PO_PRD/react_web_migration_prd.md](2_PO_PRD/react_web_migration_prd.md)；React/API 設計 [3_Architect_Design/31_react_web_shell.md](3_Architect_Design/31_react_web_shell.md)。`LV-WEB-01-IC-01` 的 AC1–AC5 已有單元與真 DINOv2 可見 UI 證據；NativeApp host folder grant／worker lifecycle（AC6）尚未驗證，故此 case 仍未完成。完整目標仍涵蓋 PRD 的 10 個工具及其巢狀流程，不能將單一切片宣稱為遷移完成。
 - **M22 — 晶圓空間簽名分析(wafer map 缺陷空間模式,第 12 工具「🧭 晶圓地圖」)** —
   📴 **已下架**(2026-07-19 使用者裁決「不適用」:工具列移除、分頁不可達;
   引擎 29/30 與單元測試保留在庫,E2E 標 skip;復用=掛回 tool_switch+解 skip)—
@@ -350,6 +350,7 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
 
 ## 決策日誌(append-only)
 > 每次反向閘門退回、模組增刪、需求被砍,追加一行:日期 / 從哪層退到哪層(或 決策) / 一句為什麼。
+- (2026-11-01) **立案 M24：LV React Web 遷移**。使用者決定不再支援 Streamlit，要求把 LV 改寫為 React Web，透過 NativeApp 管理的本機 API 呼叫原有 Python／模型；逐項對照原有可用 use cases，未完成不可將 Streamlit 相容性當作 React 遷移完成。
 - (2026-06-22) 框架初始化(規格疊加模式):實作進 scripts/、測試進 tests/、E2E 重用既有 harness;
   不寫會撞壞既有測試的根 conftest。原因:這是成熟 GUI repo,非 greenfield。
 - (2026-06-22) 需求定案:壞=同物件的好/壞(A);patch 級為主、可切物件級(Could);要熱力圖;
