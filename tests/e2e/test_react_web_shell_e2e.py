@@ -76,8 +76,8 @@ def _start_api(application):
     return server, server_thread, base_url
 
 
-def test_lv_web_01_ic_01_real_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """AC2/AC3: real DINOv2 vectors and visible React point-to-image selection."""
+def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """AC2/AC3: real DINOv2 vectors, projection switching, 3D view and image readback."""
     models_dir = Path(os.environ.get("LV_MODELS_DIR", ROOT / "models")).resolve()
     weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
     if not weights.is_file():
@@ -111,7 +111,11 @@ def test_lv_web_01_ic_01_real_model(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
             page.on("response", capture_run)
             page.goto(base_url, wait_until="networkidle")
-            page.get_by_label("Feature model").select_option("dinov2_vits14")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_label("t-SNE").check()
+            page.get_by_label("LDA (supervised)").check()
             page.get_by_label("Image folder").fill(str(dataset / "train"))
             page.get_by_role("button", name="Add folder").click()
             page.get_by_label("Image folder").fill(str(dataset / "test"))
@@ -126,14 +130,34 @@ def test_lv_web_01_ic_01_real_model(tmp_path: Path, monkeypatch: pytest.MonkeyPa
             assert run_payloads[-1]["embedding_shape"] == [4, 384]
             assert run_payloads[-1]["embedding_finite"] is True
             assert run_payloads[-1]["embedding_nonzero"] is True
+            assert {(view["model_id"], view["method"]) for view in run_payloads[-1]["views"]} >= {
+                ("dinov2_vits14", "pca"),
+                ("dinov2_vits14", "tsne"),
+                ("dinov2_vits14", "lda"),
+            }
             page.get_by_label("Filter by class").select_option(label="apple")
             expect(page.get_by_test_id("embedding-point")).to_have_count(2)
             page.get_by_label("Filter by class").select_option(label="All classes")
             page.get_by_label("Filter by split").select_option(label="test")
             expect(page.get_by_test_id("embedding-point")).to_have_count(1)
             page.get_by_label("Filter by split").select_option(label="All splits")
-            points.nth(2).click()
+            page.get_by_test_id("embedding-point").nth(2).click()
             expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+            page.get_by_label("Display method").select_option("tsne")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+            page.get_by_label("Display method").select_option("lda")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+            page.get_by_test_id("dimension-3d").click()
+            expect(page.get_by_test_id("embedding-plot-3d")).to_be_visible(timeout=60_000)
+            expect(page.locator("[data-testid='embedding-plot-3d'] .js-plotly-plot")).to_be_attached(timeout=60_000)
+            points = page.get_by_test_id("embedding-point")
+            expect(points).to_have_count(4, timeout=60_000)
+            points.nth(3).focus()
+            points.nth(3).press("Enter")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-04.png")
+            page.get_by_test_id("dimension-2d").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-04.png")
             image = page.get_by_test_id("selected-image")
             expect(image).to_be_visible()
             expect(image).to_have_js_property("naturalWidth", 64)

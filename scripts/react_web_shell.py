@@ -25,8 +25,10 @@ logger = logging.getLogger("lv.react_web")
 
 class CreateVisualizationJob(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
-    model_id: str = Field(min_length=1, max_length=128)
+    model_id: str | None = Field(default=None, min_length=1, max_length=128)
     method: str = "pca"
+    model_ids: list[str] = Field(default_factory=list, max_length=8)
+    methods: list[str] = Field(default_factory=list, max_length=5)
 
 
 @dataclass
@@ -124,10 +126,13 @@ def create_app(
         try:
             with app.state.lock:
                 job.state, job.phase, job.message = "running", "discovery", "Scanning image folders"
-            if job.request.method != "pca":
-                raise VisualizationInputError("METHOD_UNAVAILABLE", "This web slice currently supports PCA.")
-            if job.request.model_id not in catalog():
-                raise VisualizationInputError("MODEL_UNAVAILABLE", "The selected model is not installed.")
+            selected_models = job.request.model_ids or (
+                [job.request.model_id] if job.request.model_id else []
+            )
+            selected_methods = job.request.methods or [job.request.method]
+            available_models = set(catalog())
+            if not selected_models or any(name not in available_models for name in selected_models):
+                raise VisualizationInputError("MODEL_UNAVAILABLE", "A selected model is not installed.")
 
             def update_progress(done: int, total: int) -> None:
                 with app.state.lock:
@@ -138,7 +143,8 @@ def create_app(
 
             result = run_image_classifier(
                 job.request.folders,
-                job.request.model_id,
+                model_names=selected_models,
+                methods=selected_methods,
                 model_loader=loader,
                 progress=update_progress,
                 cancelled=job.cancel_event.is_set,
@@ -154,7 +160,9 @@ def create_app(
             with app.state.lock:
                 app.state.runs[run_id] = run
                 job.run_id = run_id
-                job.state, job.phase, job.done, job.total = "completed", "completed", len(result["records"]), len(result["records"])
+                model_count = len(result["models"])
+                expected = len(result["records"]) * model_count
+                job.state, job.phase, job.done, job.total = "completed", "completed", expected, expected
                 job.message = "Completed"
         except JobCancelled:
             with app.state.lock:

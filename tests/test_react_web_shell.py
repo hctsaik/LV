@@ -205,3 +205,118 @@ def test_case_lv_web_01_ic_01_cancel_stops_after_current_image(
             time.sleep(0.02)
 
     assert status["state"] == "cancelled"
+
+def _run_custom(client: TestClient, payload: dict) -> dict:
+    response = client.post("/api/v1/visualize/jobs", json=payload)
+    assert response.status_code == 202, response.text
+    job_id = response.json()["job_id"]
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        status = client.get("/api/v1/jobs/" + job_id).json()
+        if status["state"] in {"completed", "failed", "cancelled"}:
+            return status
+        time.sleep(0.02)
+    pytest.fail("configured visualization job did not finish within 120 seconds")
+
+
+def test_case_lv_web_01_ic_02_multi_model_projection_views(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """Selected models and projections keep one stable record order and separate caches."""
+    calls: list[str] = []
+    selected_models = ["dinov2_vits14", "resnet50"]
+    selected_methods = ["pca", "tsne", "umap", "lda", "sumap"]
+
+    with _client(
+        monkeypatch, tmp_path, embedder=_fake_embedder(calls), models=selected_models
+    ) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in classifier_fixture["folders"]],
+            "model_ids": selected_models,
+            "methods": selected_methods,
+        })
+        assert job["state"] == "completed", job
+        run = client.get("/api/v1/runs/" + job["run_id"]).json()
+
+    assert run["models"] == selected_models
+    assert run["embedding_shapes"] == {
+        "dinov2_vits14": [4, 384],
+        "resnet50": [4, 384],
+    }
+    assert len(calls) == 8
+    view_keys = {(view["model_id"], view["method"]) for view in run["views"]}
+    for model_id in selected_models:
+        assert (model_id, "pca") in view_keys
+        assert (model_id, "tsne") in view_keys
+        assert (model_id, "lda") in view_keys
+        for method in ("umap", "sumap"):
+            if (model_id, method) not in view_keys:
+                assert any(method in warning.lower() for warning in run["warnings"])
+    for view in run["views"]:
+        assert len(view["points"]) == len(run["records"]) == 4
+        assert view["embedding_shape"] == [4, 384]
+        assert view["embedding_finite"] is True
+        assert view["embedding_nonzero"] is True
+        assert all(np.isfinite([point["x"], point["y"], point["z"]]).all()
+                   for point in view["points"])
+        assert [point["index"] for point in view["points"]] == list(range(4))
+    assert run["model_id"] == selected_models[0]
+    assert run["method"] == "pca"
+
+
+def test_case_lv_web_01_ic_02_single_class_supervision_falls_back_to_pca(
+    monkeypatch, tmp_path
+):
+    """Supervised-only selection with one class remains usable and labels the fallback."""
+    folder = tmp_path / "flat-one-class"
+    folder.mkdir()
+    for index, color in enumerate(((200, 20, 30), (30, 200, 40), (40, 50, 210), (210, 190, 20))):
+        Image.new("RGB", (24, 24), color).save(folder / ("image-" + str(index) + ".png"))
+
+    with _client(monkeypatch, tmp_path, models=["dinov2_vits14"]) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder)],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["lda", "sumap"],
+        })
+        assert job["state"] == "completed", job
+        run = client.get("/api/v1/runs/" + job["run_id"]).json()
+
+    assert run["methods"] == ["pca"]
+    assert len(run["points"]) == 4
+    assert any("lda skipped because at least two classes are required" in warning
+               for warning in run["warnings"])
+    assert any("sumap skipped because at least two classes are required" in warning
+               for warning in run["warnings"])
+    assert any("PCA was used" in warning for warning in run["warnings"])
+
+
+def test_case_lv_web_01_edge_01_supervised_projection_skips_small_sample(
+    monkeypatch, tmp_path
+):
+    """Legacy supervised projections need at least four images, even with two classes."""
+    folder = tmp_path / "small-two-class"
+    folder.mkdir()
+    for index, (label, color) in enumerate((
+        ("apple", (200, 20, 30)),
+        ("apple", (30, 200, 40)),
+        ("banana", (40, 50, 210)),
+    )):
+        class_folder = folder / label
+        class_folder.mkdir(exist_ok=True)
+        Image.new("RGB", (24, 24), color).save(class_folder / ("image-" + str(index) + ".png"))
+
+    with _client(monkeypatch, tmp_path, models=["dinov2_vits14"]) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder)],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["lda"],
+        })
+        assert job["state"] == "completed", job
+        run = client.get("/api/v1/runs/" + job["run_id"]).json()
+
+    assert run["methods"] == ["pca"]
+    assert len(run["points"]) == 3
+    assert any("lda skipped because at least four images are required" in warning
+               for warning in run["warnings"])
+    assert any("PCA was used" in warning for warning in run["warnings"])

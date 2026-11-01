@@ -144,3 +144,23 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
   .filters { width: 100%; }.filters label { flex: 1; }.filters select { flex: 1; max-width: unset; }
   .empty-facts { flex-direction: column; gap: 7px; align-items: flex-start; }
 }
+
+.choice-list { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.choice-option { min-width: 0; display: flex; align-items: center; gap: 7px; padding: 7px 8px; border: 1px solid #e4e8ef; border-radius: 6px; color: #526078; background: #fbfcfe; font-size: 10px; cursor: pointer; }
+.choice-option:has(input:checked) { border-color: #bac9e0; background: #f2f6fc; color: #344866; }
+.choice-option input { margin: 0; accent-color: #42699d; }
+.projection-list { grid-template-columns: 1fr; }
+.plot-subtoolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
+.plot-subtoolbar > label { display: flex; align-items: center; gap: 6px; color: #8c98a9; font-size: 9px; }
+.plot-subtoolbar select { height: 28px; min-width: 120px; border: 1px solid #e2e6ec; border-radius: 5px; padding: 0 6px; background: #fff; color: #58657c; font-size: 9px; }
+.dimension-switch { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid #e2e6ec; border-radius: 6px; background: #f6f8fb; }
+.dimension-switch button { min-width: 38px; border: 0; border-radius: 4px; padding: 5px 8px; color: #7c899d; background: transparent; font-size: 9px; }
+.dimension-switch button[aria-pressed=true] { color: #2f4b77; background: #fff; box-shadow: 0 1px 3px #2538581c; }
+.plot-frame-3d { min-height: 380px; }
+.plot-loading { display: grid; place-items: center; min-height: 380px; color: #8793a4; font-size: 11px; }
+.screen-reader-points { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.clear-selection { margin-left: auto; border: 1px solid #e1e6ed; border-radius: 5px; padding: 4px 7px; color: #697892; background: #fff; font-size: 9px; }
+@media (max-width: 480px) {
+  .choice-list { grid-template-columns: 1fr; }
+  .plot-subtoolbar { align-items: flex-start; flex-wrap: wrap; }
+}
