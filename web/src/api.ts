@@ -215,6 +215,67 @@ export type CoverageSparsityResult = {
   sparse_percentile: number;
 };
 
+export type CompletenessAxis = "label" | "split" | "brightness" | "contrast" | "sharpness" | "aspect";
+export type CompletenessFrequency = "高" | "中" | "低" | "不適用";
+
+export type CoverageCompletenessInput = {
+  axis_x: CompletenessAxis;
+  axis_y: CompletenessAxis;
+  bins: number;
+  t_abs: number;
+  d_star: number;
+  frequencies: Array<{ x: number; y: number; frequency: CompletenessFrequency }>;
+};
+
+export type CoverageCompletenessCell = {
+  x: number;
+  y: number;
+  x_label: string;
+  y_label: string;
+  n: number;
+  d: number;
+  t: number;
+  state: "空" | "缺" | "偏缺" | "健康" | "假完整" | "過多" | "不適用";
+  sample_indices: number[];
+  shortfall?: number;
+};
+
+export type CoverageCompletenessResult = {
+  run_id: string;
+  axis_x: CompletenessAxis;
+  axis_y: CompletenessAxis;
+  labels_x: string[];
+  labels_y: string[];
+  bins: number;
+  t_abs: number;
+  d_star: number;
+  calibrated: boolean;
+  frequency_classes: Array<{ x: number; y: number; frequency: CompletenessFrequency }>;
+  cells: CoverageCompletenessCell[];
+  health: {
+    coverage_health: number;
+    counts: Record<string, number>;
+    gini: number;
+    fake_ratio: number;
+    top_gaps: CoverageCompletenessCell[];
+  };
+};
+
+export type CoverageCompletenessCandidate = {
+  index: number;
+  filename: string;
+  split: string;
+  label: string;
+  distance: number;
+};
+
+export type CoverageCompletenessCandidateResult = {
+  run_id: string;
+  cell: { x: number; y: number };
+  items: CoverageCompletenessCandidate[];
+  total: number;
+};
+
 export type KMeansCenter = {
   block_id: number;
   x: number;
@@ -471,6 +532,24 @@ export const api = {
   coverageSparsity: (runId: string, k: number) => request<CoverageSparsityResult>(
     "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/sparsity",
     { method: "POST", body: JSON.stringify({ k }) },
+  ),
+  coverageCompleteness: (runId: string, input: CoverageCompletenessInput) =>
+    request<CoverageCompletenessResult>(
+      "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/completeness",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  mineCoverageCompletenessCandidates: (
+    runId: string,
+    input: { folders: string[]; axis_x: CompletenessAxis; axis_y: CompletenessAxis; bins: number; x: number; y: number },
+  ) => request<CoverageCompletenessCandidateResult>(
+    "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/completeness/candidates",
+    { method: "POST", body: JSON.stringify(input) },
+  ),
+  coverageCompletenessCandidateThumbnailUrl: (runId: string, index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/coverage/runs/"
+      + encodeURIComponent(runId) + "/completeness/candidates/" + index + "/thumbnail",
+  coverageCompletenessCandidatesCsv: (runId: string) => requestGetBlob(
+    "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/completeness/candidates.csv",
   ),
   coverageObjectView: (runId: string, input: CoverageObjectViewInput) =>
     request<CoverageObjectView>(

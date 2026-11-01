@@ -24,6 +24,7 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
+from PIL import Image
 
 from _utils import available_models, load_model, load_text_encoder, supports_text_query
 from interaction import (
@@ -40,6 +41,14 @@ from interaction import (
     yolo_label_path_for,
 )
 from curation_store import CurationStore, CurationStoreError
+from completeness import (
+    bucketize,
+    build_completeness,
+    categorical_buckets,
+    cell_centroid,
+    image_stats,
+    mine_candidates,
+)
 from react_compare import ComparisonInputError, project_comparison, run_comparison
 from react_coverage import (
     coverage_projection,
@@ -98,6 +107,30 @@ class CoverageProjectionRequest(BaseModel):
 
 class CoverageSparsityRequest(BaseModel):
     k: int = Field(ge=1, le=1000)
+
+
+class CoverageCompletenessFrequency(BaseModel):
+    x: int = Field(ge=0, le=8192)
+    y: int = Field(ge=0, le=8192)
+    frequency: Literal["高", "中", "低", "不適用"]
+
+
+class CoverageCompletenessRequest(BaseModel):
+    axis_x: Literal["label", "split", "brightness", "contrast", "sharpness", "aspect"] = "label"
+    axis_y: Literal["label", "split", "brightness", "contrast", "sharpness", "aspect"] = "brightness"
+    bins: int = Field(default=3, ge=2, le=8)
+    t_abs: int = Field(default=10, ge=1, le=1_000_000)
+    d_star: float = Field(default=0.6, ge=0.0, le=1.0)
+    frequencies: list[CoverageCompletenessFrequency] = Field(default_factory=list, max_length=4096)
+
+
+class CoverageCompletenessCandidateRequest(BaseModel):
+    folders: list[str] = Field(min_length=1, max_length=32)
+    axis_x: Literal["label", "split", "brightness", "contrast", "sharpness", "aspect"] = "label"
+    axis_y: Literal["label", "split", "brightness", "contrast", "sharpness", "aspect"] = "brightness"
+    bins: int = Field(default=3, ge=2, le=8)
+    x: int = Field(ge=0, le=8192)
+    y: int = Field(ge=0, le=8192)
 
 
 class CoverageObjectViewRequest(BaseModel):
@@ -289,6 +322,8 @@ def create_app(
     app.state.coverage_runs = {}
     app.state.coverage_embeddings = {}
     app.state.coverage_sparsity = {}
+    app.state.coverage_image_stats = {}
+    app.state.coverage_completeness_candidates = {}
     app.state.coverage_candidate_jobs = {}
     app.state.coverage_candidates = {}
     app.state.curation_store = CurationStore()
@@ -471,6 +506,52 @@ def create_app(
             if key != "image_paths"
         }
 
+    def coverage_attribute_axes(
+        run_id: str,
+        axis_x: str,
+        axis_y: str,
+        bins: int,
+    ) -> tuple[dict, np.ndarray, list[int], list[str], list[int], list[str]]:
+        with app.state.lock:
+            run = app.state.coverage_runs.get(run_id)
+            vectors = app.state.coverage_embeddings.get(run_id)
+            if run is None or vectors is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            if run.get("unit") != "image":
+                raise HTTPException(status_code=409, detail="Attribute completeness requires image-level coverage")
+            records = run["records"]
+            paths: list[Path] = run["image_paths"]
+            stats = app.state.coverage_image_stats.get(run_id)
+        if len(records) != len(paths) or len(records) != len(vectors):
+            raise HTTPException(status_code=409, detail="Coverage run records are inconsistent")
+
+        needs_stats = axis_x not in {"label", "split"} or axis_y not in {"label", "split"}
+        if needs_stats and stats is None:
+            computed = []
+            for path in paths:
+                try:
+                    computed.append(image_stats(Path(path)))
+                except (OSError, Image.DecompressionBombError):
+                    computed.append({axis: 0.0 for axis in ("brightness", "contrast", "sharpness", "aspect")})
+            with app.state.lock:
+                if app.state.coverage_runs.get(run_id) is not run:
+                    raise HTTPException(status_code=404, detail="Coverage run expired")
+                stats = app.state.coverage_image_stats.setdefault(run_id, computed)
+
+        def bucket_axis(axis: str) -> tuple[list[int], list[str]]:
+            if axis in {"label", "split"}:
+                return categorical_buckets([str(record.get(axis, "")) for record in records])
+            assert stats is not None
+            return bucketize(
+                [float(row.get(axis, 0.0)) for row in stats],
+                bins,
+                method="quantile",
+            )
+
+        bucket_x, labels_x = bucket_axis(axis_x)
+        bucket_y, labels_y = bucket_axis(axis_y)
+        return run, vectors, bucket_x, labels_x, bucket_y, labels_y
+
     def execute_coverage(job: _CoverageJob) -> None:
         try:
             with app.state.lock:
@@ -540,6 +621,8 @@ def create_app(
                 app.state.coverage_runs.clear()
                 app.state.coverage_embeddings.clear()
                 app.state.coverage_sparsity.clear()
+                app.state.coverage_image_stats.clear()
+                app.state.coverage_completeness_candidates.clear()
                 app.state.coverage_candidates.clear()
                 app.state.coverage_runs[run_id] = run
                 app.state.coverage_embeddings[run_id] = np.asarray(vectors, dtype=np.float32)
@@ -840,6 +923,193 @@ def create_app(
             "sparse_count": sparse_count,
             "sparse_percentile": 90,
         }
+
+    @app.post("/api/v1/coverage/runs/{run_id}/completeness")
+    def get_coverage_completeness(run_id: str, request: CoverageCompletenessRequest) -> dict:
+        run, vectors, bucket_x, labels_x, bucket_y, labels_y = coverage_attribute_axes(
+            run_id, request.axis_x, request.axis_y, request.bins,
+        )
+        records = run["records"]
+
+        freq_classes: dict[tuple[int, int], str] = {}
+        for item in request.frequencies:
+            key = (item.x, item.y)
+            if item.x >= len(labels_x) or item.y >= len(labels_y):
+                raise HTTPException(status_code=422, detail="A frequency prior refers to a cell outside this grid")
+            if key in freq_classes:
+                raise HTTPException(status_code=422, detail="A grid cell can have only one frequency prior")
+            freq_classes[key] = item.frequency
+
+        result = build_completeness(
+            records,
+            vectors,
+            bucket_x,
+            bucket_y,
+            labels_x,
+            labels_y,
+            t_abs=request.t_abs,
+            d_star=request.d_star,
+            freq_classes=freq_classes or None,
+        )
+
+        def public_cell(cell: dict) -> dict:
+            return {
+                "x": int(cell["x"]),
+                "y": int(cell["y"]),
+                "x_label": str(cell["x_label"]),
+                "y_label": str(cell["y_label"]),
+                "n": int(cell["n"]),
+                "d": float(cell["d"]),
+                "t": float(cell["t"]),
+                "state": str(cell["state"]),
+                "sample_indices": [int(index) for index in cell["indices"][:30]],
+            }
+
+        public_cells = [public_cell(cell) for cell in result["cells"]]
+        top_gaps = [
+            {**public_cell(gap), "shortfall": float(gap["shortfall"])}
+            for gap in result["health"]["top_gaps"]
+        ]
+        health = {**result["health"], "top_gaps": top_gaps}
+        with app.state.lock:
+            if app.state.coverage_runs.get(run_id) is not run:
+                raise HTTPException(status_code=404, detail="Coverage run expired")
+        return {
+            "run_id": run_id,
+            "axis_x": request.axis_x,
+            "axis_y": request.axis_y,
+            "labels_x": labels_x,
+            "labels_y": labels_y,
+            "bins": request.bins,
+            "t_abs": request.t_abs,
+            "d_star": request.d_star,
+            "calibrated": result["calibrated"],
+            "frequency_classes": [
+                {"x": x, "y": y, "frequency": frequency}
+                for (x, y), frequency in sorted(freq_classes.items())
+            ],
+            "cells": public_cells,
+            "health": health,
+        }
+
+    @app.post("/api/v1/coverage/runs/{run_id}/completeness/candidates")
+    def mine_coverage_completeness_candidates(
+        run_id: str,
+        request: CoverageCompletenessCandidateRequest,
+    ) -> dict:
+        run, vectors, bucket_x, labels_x, bucket_y, labels_y = coverage_attribute_axes(
+            run_id, request.axis_x, request.axis_y, request.bins,
+        )
+        if request.x >= len(labels_x) or request.y >= len(labels_y):
+            raise HTTPException(status_code=422, detail="The selected cell is outside this grid")
+        completeness = build_completeness(
+            run["records"], vectors, bucket_x, bucket_y, labels_x, labels_y,
+            t_abs=1,
+        )
+        cell = next(
+            cell for cell in completeness["cells"]
+            if (cell["x"], cell["y"]) == (request.x, request.y)
+        )
+        query = cell_centroid(vectors, cell["indices"])
+        if query is None:
+            # For an empty cell, use the full X-axis marginal as its query seed.
+            # With the default label axis this matches the legacy class fallback.
+            if request.axis_x == "label":
+                fallback_indices = [
+                    index for index, record in enumerate(run["records"])
+                    if str(record.get("label", "")) == cell["x_label"]
+                ]
+            else:
+                fallback_indices = [
+                    index for index, bucket in enumerate(bucket_x)
+                    if bucket == request.x
+                ]
+            query = cell_centroid(vectors, fallback_indices)
+        if query is None:
+            raise HTTPException(status_code=422, detail="This cell has no sample or class-marginal query vector")
+        try:
+            candidate_run = run_image_visualization(
+                request.folders,
+                model_name=run["model_id"],
+                methods=["pca"],
+                mode="classifier",
+                unit="image",
+                model_loader=loader,
+                include_raw_embeddings=True,
+            )
+        except VisualizationInputError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        candidate_vectors = candidate_run["_raw_embeddings"][run["model_id"]]
+        candidate_indices, distances = mine_candidates(candidate_vectors, query, k=12)
+        pool_indices = [int(index) for index in candidate_indices]
+        items = [
+            {
+                "index": index,
+                "filename": str(candidate_run["records"][index]["filename"]),
+                "split": str(candidate_run["records"][index]["split"]),
+                "label": str(candidate_run["records"][index]["label"]),
+                "distance": float(distance),
+            }
+            for index, distance in zip(pool_indices, distances)
+        ]
+        with app.state.lock:
+            if app.state.coverage_runs.get(run_id) is not run:
+                raise HTTPException(status_code=404, detail="Coverage run expired")
+            app.state.coverage_completeness_candidates[run_id] = {
+                "cell": (request.x, request.y),
+                "items": items,
+                "records": candidate_run["records"],
+                "image_paths": candidate_run["image_paths"],
+            }
+        return {
+            "run_id": run_id,
+            "cell": {"x": request.x, "y": request.y},
+            "items": items,
+            "total": len(items),
+        }
+
+    @app.get("/api/v1/coverage/runs/{run_id}/completeness/candidates/{index}/thumbnail")
+    def get_coverage_completeness_candidate_thumbnail(run_id: str, index: int) -> Response:
+        with app.state.lock:
+            candidate_set = app.state.coverage_completeness_candidates.get(run_id)
+            if candidate_set is None:
+                raise HTTPException(status_code=404, detail="Cell candidates not found")
+            items = candidate_set["items"]
+            if not any(int(item["index"]) == index for item in items):
+                raise HTTPException(status_code=404, detail="Candidate image not found")
+            path = candidate_set["image_paths"][index]
+        thumbnail = safe_open_image(path)
+        if thumbnail is None:
+            raise HTTPException(status_code=404, detail="Candidate image is no longer available")
+        thumbnail.thumbnail((256, 256))
+        output = BytesIO()
+        thumbnail.save(output, format="JPEG", quality=84, optimize=True)
+        return Response(
+            content=output.getvalue(),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/v1/coverage/runs/{run_id}/completeness/candidates.csv")
+    def export_coverage_completeness_candidates(run_id: str) -> Response:
+        with app.state.lock:
+            candidate_set = app.state.coverage_completeness_candidates.get(run_id)
+            if candidate_set is None:
+                raise HTTPException(status_code=404, detail="Cell candidates not found")
+            paths: list[Path] = candidate_set["image_paths"]
+            rows = [
+                [str(paths[int(item["index"])]), f"{float(item['distance']):.6f}"]
+                for item in candidate_set["items"]
+            ]
+        buffer = StringIO(newline="")
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(["path", "distance"])
+        writer.writerows(rows)
+        return Response(
+            content=buffer.getvalue().encode("utf-8-sig"),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="cell_candidates.csv"'},
+        )
 
     @app.post("/api/v1/coverage/runs/{run_id}/object-view")
     def get_coverage_object_view(run_id: str, request: CoverageObjectViewRequest) -> dict:

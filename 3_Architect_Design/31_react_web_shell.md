@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的本機 React UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions 及 LV-WEB-03 image/object-level coverage 的局部流程；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
+> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions 及 LV-WEB-03 image/object/attribute coverage 的局部流程；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
 
 ## 1. 邊界
 
@@ -25,6 +25,10 @@
 | `GET /api/v1/coverage/runs/{run_id}` | 讀取 coverage 結果 | records、投影點、稀疏分數與 percentile 門檻；物件粒度附 class、confidence、bbox、short edge；不回傳路徑或 raw embedding |
 | `POST /api/v1/coverage/runs/{run_id}/projections` | 切換 coverage 投影 | PCA、t-SNE、UMAP、LDA、Supervised UMAP；2D／3D |
 | `POST /api/v1/coverage/runs/{run_id}/sparsity` | 變更稀疏度近鄰數 k | 原始高維 cosine 稀疏分數及前 10% 門檻 |
+| `POST /api/v1/coverage/runs/{run_id}/completeness` | 依 label/split 或影像統計屬性建立完整度棋盤 | 分位數分桶、每格目標、頻率先驗、Coverage Health、Gini、diversity state；只回 record indices，不回路徑 |
+| `POST /api/v1/coverage/runs/{run_id}/completeness/candidates` | 以選定格或 X 軸邊際向量查詢候選池 | 最多 12 個 cosine 最近鄰、cell identity、距離及 pool record index |
+| `GET /api/v1/coverage/runs/{run_id}/completeness/candidates/{index}/thumbnail` | 讀取完整度格候選縮圖 | 只依目前 run 的候選索引取圖，不接受路徑 |
+| `GET /api/v1/coverage/runs/{run_id}/completeness/candidates.csv` | 明確匯出完整度格候選 | CSV 含已選 pool 來源路徑與 cosine distance |
 | `POST /api/v1/coverage/runs/{run_id}/object-view` | 對 object run 套用 class/confidence/source-pixel filters，重算投影、稀疏度與區塊 | 過濾後 records/points 保留來源全域 index；類別摘要及 tiny-class 警示 |
 | `GET /api/v1/coverage/runs/{run_id}/images/{index}/thumbnail` | 讀取選中資料集縮圖 | 僅依 run record index 解析已登錄檔案；object run 回傳依 bbox 裁切的縮圖 |
 | `POST /api/v1/compare/jobs` | 建立 A/B 比較 run | folders A/B、模型、粒度、可選 object policy、job ID |
@@ -63,6 +67,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 10. React 可切換比較類別／投影、2D／3D、confidence 與物件短邊門檻；點選及框選只改變 run record 選取，雙欄縮圖仍讀回原圖並可顯示 bbox。投影距離只供檢視，不作為 drift 指標。
 11. Image Classifier 整圖 run 可使用已載入的 Chinese-CLIP image embedding 進行文字搜尋；文字塔沿用本機 Chinese-CLIP encoder 的查詢正規化，使用 exact cosine distance 遞增排序，同距離依 record index 排序。dHash 重複掃描重用 run manifest 指紋，embedding 掃描重用 run 向量；兩者依距離排序、最多回傳 200 對，可只保留跨 split 候選。搜尋結果和配對都以 run ID／record index 操作；本機路徑只在使用者明確下載 CSV 時輸出。配對只是人工覆核線索，不自動刪除或判定洩漏。固定 fixture 的 API 和可見 React 流程已驗；真實 Chinese-CLIP 權重、Windows ARM64 模型相容性與數值逐項對照尚未驗；React 尚未實作跨工具 Labeling handoff。
 12. Visualize 手選把 record index 和 run ID 傳給 worker；worker 在 `LV_CACHE_DIR/curation_log.jsonl` 寫唯一的 append-only cart store。Store 以正規化來源路徑去重，物件級再以 `obj_index` 區分框；同一路徑再次加入不覆蓋初次 source／score／reason。React 清單提供來源篩選、批次理由、移除、確認清空與 CSV／JSON／ZIP；一般 API 不回傳路徑，只有明確下載會包含路徑。Visible React fixture case 驗證 rerun 清空暫存 selection、cart 不清空，並停止 worker 後由不同 PID 讀回資料。舊 Streamlit `viz_export_list` 只存在 session state；`output/curation_log.jsonl` 是獨立的選取日誌，不是 cart store，因此自動匯入尚未實作；NativeApp 實際 cache-root handoff 也未驗證。
+13. Image-level attribute completeness 沿用 `completeness.py`：`label`／`split` 為類別軸，brightness／contrast／sharpness／aspect 依 quantile bucketize；預設 label × brightness、3 bins、`t_abs=10`、`d_star=0.6`。每格高／中／低／不適用先驗分別採 2.0／1.0／0.4 倍／排除分母，未校正時明示 uniform assumption。公開結果只包含 record indices；格內圖片由已登錄 run index 讀取。候選格使用 embedding centroid，空格以 X 軸 marginal 作 seed，最近 12 張可預覽並明確匯出 CSV。Fixture API 與可見 Chromium 測試涵蓋分桶、校正、缺格、原圖讀回、候選排序及 CSV；真實模型數值 parity 和 NativeApp folder-grant/package 尚未驗證。
 
 ## 4. 實作狀態與整合限制
 
@@ -71,6 +76,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 - Visualize classifier、detector 整圖與物件級的固定 DINOv2-small 可見 UI 路徑已在 Windows ARM64 通過；Compare 的 deterministic API 與整圖／物件 UI E2E 使用 fixture embedder。來源 Streamlit 數值逐項對照、完整 object candidate workflow、NativeApp folder grant／lifecycle 及 Compare 真實模型仍未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
 - Curation cart 的 fixture API 與可見 Chromium E2E（含不同 worker PID 重開）已通過；這只完成 Visualize 到 cart 的 case slice，不代表跨工具統一收集器、legacy state import、subset folder export 或 NativeApp cache-root 接線完成。
 - Image-level coverage 以獨立 job 保留舊工具「自己選資料夾／模型並開始分析」流程；object-level coverage 使用相同 job 和 YOLO crop path。高維 cosine 稀疏度與顯示投影分開計算；object view 可按 class、confidence、source short edge 篩選並保持來源索引對齊，顯示類別計數／稀疏度、tiny-class 警示與 class blocks，選取後讀回 bbox crop。`LV-WEB-03-REF-01` 也已用獨立候選資料夾實作 joint projection、pool gap-filler ranking、reference recall／class gap、候選 bbox thumbnail 與 curation provenance。Image／object／candidate-reference 三個 slice 均有 fixture API 和可見 Chromium E2E；真實模型數值對照、NativeApp picker／grant／package 仍未完成。
+- Attribute completeness `LV-WEB-03-ATTR-01` 已接入既有 image-level run，提供 label/split／影像統計軸、quantile bins、樣本目標、d* 門檻、頻率先驗編輯、格狀健康摘要、缺格工作列、格內原圖、候選池最近鄰與 CSV。Fixture API 與可見 Chromium journey 通過；真實模型數值對照與 NativeApp picker／grant／package 仍待驗。
 
 ## 5. React 驗收契約
 

@@ -12,6 +12,7 @@ import type {
   ProjectionMethod,
   VisualizeUnit,
 } from "./api";
+import AttributeCompleteness from "./AttributeCompleteness";
 import { api } from "./api";
 import ScatterPlot2D from "./ScatterPlot2D";
 import ScatterPlot3D from "./ScatterPlot3D";
@@ -70,6 +71,7 @@ export default function CoverageWorkspace({
   const [confidenceMax, setConfidenceMax] = useState(1);
   const [colorMode, setColorMode] = useState<"class" | "sparsity">("class");
   const [run, setRun] = useState<CoverageRun | null>(null);
+  const [viewMode, setViewMode] = useState<"embedding" | "attribute">("embedding");
   const [objectView, setObjectView] = useState<CoverageObjectView | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
   const [candidateJob, setCandidateJob] = useState<JobStatus | null>(null);
@@ -310,6 +312,7 @@ export default function CoverageWorkspace({
         });
       }
       setRun(coverageRun);
+      setViewMode("embedding");
       setObjectView(initialObjectView);
       setUnit(coverageRun.unit);
       setMethod(coverageRun.requested_method);
@@ -629,7 +632,18 @@ export default function CoverageWorkspace({
           </section>
         </form>
 
-        <section className="control-section coverage-candidate-controls" aria-label="Candidate and reference folders">
+        <section className="control-section" aria-label="Coverage view">
+          <div className="section-heading"><span className="step-number">04</span><h2>Coverage view</h2></div>
+          <div className="coverage-view-switch" role="group" aria-label="Coverage view">
+            <button type="button" data-testid="coverage-view-embedding" aria-pressed={viewMode === "embedding"}
+              onClick={() => setViewMode("embedding")} disabled={!run}>Embedding map</button>
+            <button type="button" data-testid="coverage-view-attributes" aria-pressed={viewMode === "attribute"}
+              onClick={() => setViewMode("attribute")} disabled={!run || run.unit !== "image"}>Attribute grid</button>
+          </div>
+          {run?.unit === "object" && <div className="field-note">Attribute completeness uses whole images. Start an image-level run to enable this view.</div>}
+        </section>
+
+        {viewMode === "embedding" && <section className="control-section coverage-candidate-controls" aria-label="Candidate and reference folders">
           <div className="section-heading"><span className="step-number">03</span><h2>Candidate / reference</h2></div>
           <button className="host-picker" type="button" onClick={() => void chooseCandidateFolder()} disabled={candidateBusy}>
             <span className="folder-icon" aria-hidden="true">▱</span>
@@ -699,15 +713,17 @@ export default function CoverageWorkspace({
               disabled={candidateViewBusy || confidenceMin > confidenceMax}
             >Refresh comparison</button>
           )}
-        </section>
+        </section>}
       </aside>
 
       <main className="results-area coverage-results">
         <div className="coverage-heading">
           <div>
             <div className="eyebrow">{run?.unit === "object" ? "OBJECT-LEVEL WORKSPACE" : "IMAGE-LEVEL WORKSPACE"}</div>
-            <h2>Embedding coverage map</h2>
-            <p>{run?.unit === "object"
+            <h2>{viewMode === "attribute" ? "Attribute completeness" : "Embedding coverage map"}</h2>
+            <p>{viewMode === "attribute"
+              ? "Review sample count and embedding diversity in each interpretable attribute cell."
+              : run?.unit === "object"
               ? "Object sparsity uses cosine distance in the original feature space; projection only positions points on this map."
               : "Sparsity uses cosine distance in the original feature space; projection only positions points on this map."}</p>
           </div>
@@ -722,7 +738,9 @@ export default function CoverageWorkspace({
           <span>{candidateJob.message}</span>
           {candidateJob.total > 0 && <span>{candidateJob.done}/{candidateJob.total} · {Math.round(candidateJob.percent)}%</span>}
         </div>}
-        {run ? (
+        {run && viewMode === "attribute" && run.unit === "image" ? (
+          <AttributeCompleteness run={run} />
+        ) : run ? (
           <>
             {run.warnings.map((warning, index) => <div className="coverage-warning" role="status" key={`${warning}-${index}`}>{warning}</div>)}
             {objectView?.warnings.map((warning, index) => <div className="coverage-warning" role="status" key={`object-${warning}-${index}`}>{warning}</div>)}
@@ -1065,7 +1083,7 @@ export default function CoverageWorkspace({
             <div className="empty-facts"><span><b>01</b> Choose images</span><span><b>02</b> Extract features locally</span><span><b>03</b> Inspect sparse regions</span></div>
           </div>
         )}
-        <footer className="canvas-footer"><span>VisualLatent · React Web</span><span>{run?.unit === "object" ? "Object-level coverage" : "Image-level coverage"}</span></footer>
+        <footer className="canvas-footer"><span>VisualLatent · React Web</span><span>{viewMode === "attribute" ? "Attribute completeness" : run?.unit === "object" ? "Object-level coverage" : "Image-level coverage"}</span></footer>
       </main>
     </div>
   );

@@ -957,6 +957,120 @@ def test_lv_web_03_img_01_visible_coverage_projection_box_selection_and_clear(
     }
 
 
+def test_lv_web_03_attr_01_visible_attribute_grid_calibration_and_candidate_mining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The React attribute grid exposes priors, missing cells, samples, and candidate export."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "attribute-fixture")
+    folders = [dataset / "train", dataset / "test"]
+    pool = tmp_path / "cell-candidate-pool"
+    pool.mkdir()
+    for index, color in enumerate(((200, 30, 40), (20, 190, 55), (35, 60, 220), (190, 160, 25))):
+        Image.new("RGB", (48, 32), color).save(pool / f"candidate-{index}.png")
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for folder in [*folders, pool]
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            values = {
+                "image-01.png": [1.0, 0.0, 0.0],
+                "image-02.png": [0.9, 0.1, 0.0],
+                "image-03.png": [0.0, 1.0, 0.0],
+                "image-04.png": [0.0, 0.0, 1.0],
+            }
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = values.get(
+                path.name,
+                np.asarray(Image.open(path).convert("RGB"), dtype=np.float32).mean(axis=(0, 1)) / 255.0 + 0.01,
+            )
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=fixture_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            for folder in folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+            page.get_by_label("Projection method").select_option("pca")
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text("Completed", timeout=60_000)
+            page.get_by_test_id("coverage-view-attributes").click()
+            expect(page.get_by_role("heading", name="Attribute completeness grid")).to_be_visible()
+            expect(page.get_by_test_id("completeness-health")).to_be_visible()
+            expect(page.get_by_test_id("completeness-uncalibrated")).to_be_visible()
+            expect(page.get_by_test_id("coverage-completeness-cell")).to_have_count(6)
+            expect(page.get_by_test_id("coverage-completeness-gap")).not_to_have_count(0)
+
+            populated = page.locator('[data-testid="coverage-completeness-cell"]:not([data-count="0"])').first
+            populated.click()
+            expect(page.get_by_test_id("coverage-completeness-sample")).not_to_have_count(0)
+            sample_image = page.get_by_test_id("coverage-completeness-sample").first.locator("img")
+            expect(sample_image).to_have_js_property("complete", True)
+            assert sample_image.evaluate("node => node.naturalWidth") > 0
+
+            page.get_by_test_id("completeness-frequency-0-0").select_option("低")
+            with page.expect_response(lambda response: response.url.endswith("/completeness")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_test_id("completeness-apply-calibration").click()
+            expect(page.get_by_test_id("completeness-uncalibrated")).to_have_count(0)
+            cell_00 = page.locator('[data-testid="coverage-completeness-cell"][data-index="0:0"]')
+            expect(cell_00).to_contain_text("t=4.0")
+            page.locator('[data-testid="coverage-completeness-cell"][data-count="0"]').first.click()
+            expect(page.get_by_text("This cell has no images.", exact=True)).to_be_visible()
+
+            page.get_by_test_id("completeness-candidate-folder-path").fill(str(pool))
+            page.get_by_test_id("completeness-add-candidate-folder").click()
+            with page.expect_response(lambda response: response.url.endswith("/completeness/candidates")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_test_id("completeness-mine-candidates").click()
+            expect(page.get_by_test_id("completeness-candidate-count")).to_contain_text("candidates")
+            expect(page.get_by_test_id("completeness-candidate")).to_have_count(4)
+            candidate_image = page.get_by_test_id("completeness-candidate").first.locator("img")
+            expect(candidate_image).to_have_js_property("complete", True)
+            assert candidate_image.evaluate("node => node.naturalWidth") > 0
+            with page.expect_download() as download_info:
+                page.get_by_test_id("completeness-export-candidates").click()
+            assert download_info.value.suggested_filename == "cell_candidates.csv"
+            candidate_src = candidate_image.get_attribute("src")
+            assert candidate_src and "/coverage/runs/" in candidate_src
+            run_id = candidate_src.split("/coverage/runs/", 1)[1].split("/", 1)[0]
+            csv_response = page.request.get(base_url + f"/api/v1/coverage/runs/{run_id}/completeness/candidates.csv")
+            assert csv_response.status == 200
+            assert csv_response.text().lstrip("\ufeff").splitlines()[0] == "path,distance"
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
 def test_lv_web_03_obj_01_visible_object_coverage_filters_blocks_and_crop_readback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

@@ -207,6 +207,99 @@ def test_case_lv_web_03_img_01_coverage_sparsity_projection_selection_inputs(
     }
 
 
+def test_case_lv_web_03_attr_01_attribute_grid_calibration_and_cell_candidate_readback(
+    classifier_fixture, monkeypatch, tmp_path,
+):
+    """Attribute cells preserve legacy binning, priors, index-only assets, and mining export."""
+    source_paths = [
+        path for folder in classifier_fixture["folders"] for path in folder.rglob("*")
+        if path.is_file()
+    ]
+    pool = tmp_path / "cell-pool"
+    pool.mkdir()
+    for index, color in enumerate(((220, 50, 30), (20, 180, 70), (30, 40, 220))):
+        Image.new("RGB", (36, 28), color).save(pool / f"pool-{index}.png")
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in [*source_paths, *pool.iterdir()]
+    }
+
+    with _client(monkeypatch, tmp_path / "attribute-grid") as client:
+        job = _run_coverage(client, classifier_fixture["folders"], k=2)
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        base = f"/api/v1/coverage/runs/{run_id}/completeness"
+        response = client.post(base, json={
+            "axis_x": "label", "axis_y": "brightness", "bins": 3,
+            "t_abs": 10, "d_star": 0.6,
+        })
+        assert response.status_code == 200, response.text
+        default = response.json()
+        assert default["labels_x"] == ["apple", "banana"]
+        assert len(default["labels_y"]) == 3
+        assert len(default["cells"]) == 6
+        assert sum(cell["n"] for cell in default["cells"]) == 4
+        assert all(cell["t"] == 10 for cell in default["cells"])
+        assert default["calibrated"] is False
+        assert all(len(cell["sample_indices"]) <= 30 for cell in default["cells"])
+        assert "image_paths" not in default
+        assert all("path" not in cell for cell in default["cells"])
+
+        applied = client.post(base, json={
+            "axis_x": "label", "axis_y": "brightness", "bins": 3,
+            "t_abs": 10, "d_star": 0.6,
+            "frequencies": [
+                {"x": 0, "y": 0, "frequency": "低"},
+                {"x": 1, "y": 0, "frequency": "不適用"},
+                {"x": 0, "y": 1, "frequency": "高"},
+            ],
+        })
+        assert applied.status_code == 200, applied.text
+        calibrated = applied.json()
+        assert calibrated["calibrated"] is True
+        assert next(cell for cell in calibrated["cells"] if (cell["x"], cell["y"]) == (0, 0))["t"] == 4
+        assert next(cell for cell in calibrated["cells"] if (cell["x"], cell["y"]) == (0, 1))["t"] == 20
+        assert next(cell for cell in calibrated["cells"] if (cell["x"], cell["y"]) == (1, 0))["state"] == "不適用"
+        assert calibrated["health"]["counts"]["不適用"] == 1
+        invalid_cell = client.post(base, json={
+            "axis_x": "label", "axis_y": "brightness", "bins": 3,
+            "t_abs": 10, "d_star": 0.6,
+            "frequencies": [{"x": 999, "y": 0, "frequency": "低"}],
+        })
+        assert invalid_cell.status_code == 422
+
+        selected = next(cell for cell in default["cells"] if cell["n"] > 0)
+        mined = client.post(f"{base}/candidates", json={
+            "folders": [str(pool)], "axis_x": "label", "axis_y": "brightness",
+            "bins": 3, "x": selected["x"], "y": selected["y"],
+        })
+        assert mined.status_code == 200, mined.text
+        candidates = mined.json()
+        assert candidates["total"] == 3
+        assert [item["distance"] for item in candidates["items"]] == sorted(
+            item["distance"] for item in candidates["items"]
+        )
+        candidate_index = candidates["items"][0]["index"]
+        assert client.get(f"{base}/candidates/{candidate_index}/thumbnail").status_code == 200
+        csv_response = client.get(f"{base}/candidates.csv")
+        assert csv_response.status_code == 200
+        assert csv_response.text.lstrip("\ufeff").splitlines()[0] == "path,distance"
+        assert str(pool) in csv_response.text
+
+        empty = next(cell for cell in default["cells"] if cell["n"] == 0)
+        empty_query = client.post(f"{base}/candidates", json={
+            "folders": [str(pool)], "axis_x": "label", "axis_y": "brightness",
+            "bins": 3, "x": empty["x"], "y": empty["y"],
+        })
+        assert empty_query.status_code == 200, empty_query.text
+        assert empty_query.json()["total"] == 3
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
 def _object_coverage_fixture(root: Path) -> tuple[list[Path], dict[str, str]]:
     root.mkdir(parents=True, exist_ok=True)
     (root / "classes.txt").write_text("alpha\nbeta\n", encoding="utf-8")
@@ -307,6 +400,9 @@ def test_case_lv_web_03_obj_01_object_coverage_filters_keep_global_alignment(
         assert run["object_policy"] == {"pad": 0.12, "target_res": 224, "head": "cls"}
         assert len(run["records"]) == len(run["points"]) == 8
         assert [record["index"] for record in run["records"]] == list(range(8))
+        assert client.post(
+            f"/api/v1/coverage/runs/{job['run_id']}/completeness", json={},
+        ).status_code == 409
         assert [record["score"] for record in run["records"]] == pytest.approx(
             [0.95, 0.40, 0.85, 0.75, 0.92, 0.70, 0.88, 0.90]
         )
