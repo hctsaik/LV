@@ -154,6 +154,19 @@ def test_case_lv_web_02_obj_01_compares_shared_classes_and_keeps_boxes_private(
     assert result["records_a"][0]["bbox"] == [0.5, 0.5, 0.7, 0.6]
     assert "path" not in result["records_a"][0]
     assert len(projection.json()["points"]) == 2
+    assert np.allclose(
+        [[point["x"], point["y"]] for point in projection.json()["points"]],
+        np.zeros((2, 2)),
+    )
+    projection_3d = client.post(f"/api/v1/comparisons/{job['run_id']}/projections", json={
+        "label": "widget", "method": "pca", "dimension": 3,
+        "min_confidence": 0.0, "max_confidence": 1.0, "min_short_px": 0,
+    })
+    assert projection_3d.status_code == 200, projection_3d.text
+    assert np.allclose(
+        [[point["x"], point["y"], point["z"]] for point in projection_3d.json()["points"]],
+        np.zeros((2, 3)),
+    )
     assert client.get(f"/api/v1/comparisons/{job['run_id']}/images/a/0").status_code == 200
 
 

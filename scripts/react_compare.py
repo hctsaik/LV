@@ -440,12 +440,19 @@ def project_comparison(
     emb_b = comparison["_embeddings_b"][keep_b]
     combined = np.vstack([emb_a, emb_b])
     groups = ["A"] * len(emb_a) + ["B"] * len(emb_b)
-    projections, warnings, _umap_reference_status = _project_embeddings(combined, groups, [method])
-    actual_method = method if method in projections else next(iter(projections))
-    coordinates = projections[actual_method]
-    if coordinates.shape[1] < dimension:
-        coordinates = np.pad(coordinates, ((0, 0), (0, dimension - coordinates.shape[1])))
-    coordinates = coordinates[:, :dimension]
+    if len(combined) <= dimension + 1:
+        # Match the legacy Streamlit comparison: too few objects for the
+        # requested dimensionality are placed at the origin without fitting.
+        actual_method = method
+        warnings = []
+        coordinates = np.zeros((len(combined), dimension), dtype=float)
+    else:
+        projections, warnings, _umap_reference_status = _project_embeddings(combined, groups, [method])
+        actual_method = method if method in projections else next(iter(projections))
+        coordinates = projections[actual_method]
+        if coordinates.shape[1] < dimension:
+            coordinates = np.pad(coordinates, ((0, 0), (0, dimension - coordinates.shape[1])))
+        coordinates = coordinates[:, :dimension]
     points = []
     cursor = 0
     for side, indices, rows in (("A", keep_a, comparison["records_a"]),

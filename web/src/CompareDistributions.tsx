@@ -199,7 +199,7 @@ function CompareScatter2D({
         })}
         {box && <rect x={box.x} y={box.y} width={box.w} height={box.h} className="selection-box" />}
       </svg>
-      <div className="chart-hint">Drag to select a region · Ctrl/⌘-click to add points</div>
+      <div className="chart-hint">Drag to select a region · Ctrl/⌘-click to add points · focus a point and press Enter when points overlap</div>
     </div>
   );
 }
