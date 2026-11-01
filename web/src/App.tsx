@@ -13,6 +13,7 @@ import {
   type EmbeddingPoint,
   type KMeansBlocks,
   type ComparisonObjectPolicy,
+  type DiagnosticHeadStatus,
   type DiagnosticReference,
   type DuplicateScanInput,
   type DuplicateScanResult,
@@ -266,6 +267,10 @@ export default function App() {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [diagnosticReference, setDiagnosticReference] = useState<DiagnosticReference | null>(null);
+  const [diagnosticResolution, setDiagnosticResolution] = useState<224 | 336 | 448>(224);
+  const [diagnosticHeadStatus, setDiagnosticHeadStatus] = useState<DiagnosticHeadStatus | null>(null);
+  const [diagnosticHeadLoading, setDiagnosticHeadLoading] = useState(false);
+  const [diagnosticHeadError, setDiagnosticHeadError] = useState("");
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const [rankedViewerContext, setRankedViewerContext] = useState<number[] | null>(null);
@@ -383,6 +388,28 @@ export default function App() {
       } : current));
     return () => { active = false; };
   }, [activeTool, diagnosticReference?.context_id, currentRunId]);
+
+  useEffect(() => {
+    if (activeTool !== "diagnostics" || !diagnosticReference) return;
+    let active = true;
+    api.diagnosticHeadStatus(
+      diagnosticReference.context_id,
+      diagnosticResolution,
+      currentRunId,
+    ).then((status) => active && setDiagnosticHeadStatus(status))
+      .catch(() => active && setDiagnosticHeadStatus({
+        status: "stale",
+        resolution: diagnosticResolution,
+        reason: "The run or source could not be verified; head preparation is blocked.",
+      }));
+    return () => { active = false; };
+  }, [
+    activeTool,
+    diagnosticReference?.context_id,
+    diagnosticReference?.status,
+    currentRunId,
+    diagnosticResolution,
+  ]);
   const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
   const canSearchSimilar = run?.mode === "classifier" && run.unit === "image";
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
@@ -880,6 +907,9 @@ export default function App() {
     try {
       const reference = await api.createDiagnosticReference(job.run_id, recordIndex, activeModelId);
       setDiagnosticReference(reference);
+      setDiagnosticResolution(224);
+      setDiagnosticHeadStatus(null);
+      setDiagnosticHeadError("");
       setActiveTool("diagnostics");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not create the diagnostics reference.");
@@ -888,6 +918,7 @@ export default function App() {
 
   async function recheckDiagnosticsReference() {
     if (!diagnosticReference) return;
+    setDiagnosticHeadStatus(null);
     try {
       const latest = await api.diagnosticReference(diagnosticReference.context_id, currentRunId);
       setDiagnosticReference(latest);
@@ -897,6 +928,30 @@ export default function App() {
         status: "stale",
         reason: "The source could not be verified; diagnostics remain blocked.",
       } : current);
+    }
+  }
+
+  async function buildDiagnosticHead() {
+    if (!diagnosticReference || !currentRunId || currentRunId !== diagnosticReference.run_id) return;
+    setDiagnosticHeadLoading(true);
+    setDiagnosticHeadError("");
+    setDiagnosticHeadStatus(null);
+    try {
+      const status = await api.buildDiagnosticHead(
+        diagnosticReference.context_id,
+        diagnosticResolution,
+        currentRunId,
+      );
+      setDiagnosticHeadStatus(status);
+    } catch (reason) {
+      setDiagnosticHeadError(reason instanceof Error ? reason.message : "The classifier head could not be prepared.");
+      setDiagnosticHeadStatus({
+        status: "not_ready",
+        resolution: diagnosticResolution,
+        reason: "No matching head was saved; you can retry this action.",
+      });
+    } finally {
+      setDiagnosticHeadLoading(false);
     }
   }
 
@@ -977,6 +1032,51 @@ export default function App() {
                 {diagnosticReference.object_index !== null && <div><dt>Object</dt><dd>{diagnosticReference.object_index + 1}</dd></div>}
               </dl>
               <p className="diagnostics-no-auto-inference" data-testid="diagnostics-no-auto-inference">Opening this page only checks the selected source reference. It does not start model inference.</p>
+              <section className="diagnostic-head-panel" aria-labelledby="diagnostic-head-title">
+                <h2 id="diagnostic-head-title">Classifier head</h2>
+                <label htmlFor="diagnostic-resolution">Analysis resolution</label>
+                <select
+                  id="diagnostic-resolution"
+                  data-testid="diagnostic-resolution"
+                  value={diagnosticResolution}
+                  onChange={(event) => {
+                    setDiagnosticResolution(Number(event.target.value) as 224 | 336 | 448);
+                    setDiagnosticHeadStatus(null);
+                    setDiagnosticHeadError("");
+                  }}
+                >
+                  <option value={224}>224×224 · 16×16 patches</option>
+                  <option value={336}>336×336 · 24×24 patches</option>
+                  <option value={448}>448×448 · 32×32 patches</option>
+                </select>
+                {diagnosticHeadStatus && <div
+                  className={`diagnostic-head-status diagnostic-status-${diagnosticHeadStatus.status === "ready" ? "current" : diagnosticHeadStatus.status === "not_ready" ? "stale" : diagnosticHeadStatus.status}`}
+                  data-testid="diagnostic-head-status"
+                  role={diagnosticHeadStatus.status === "ready" || diagnosticHeadStatus.status === "not_ready" ? "status" : "alert"}
+                  aria-live="polite"
+                >
+                  {diagnosticHeadStatus.status === "ready"
+                    ? `Head ready: ${diagnosticHeadStatus.resolution}×${diagnosticHeadStatus.resolution} · ${diagnosticHeadStatus.training_samples} records · ${diagnosticHeadStatus.classes?.join(", ") || "no classes"}${diagnosticHeadStatus.reused ? " · reused" : ""}`
+                    : diagnosticHeadStatus.status === "not_ready"
+                      ? `Head not prepared: ${diagnosticHeadStatus.reason}`
+                      : `Head ${diagnosticHeadStatus.status}: ${diagnosticHeadStatus.reason}`}
+                </div>}
+                {diagnosticHeadError && <div className="alert alert-error" role="alert">{diagnosticHeadError}</div>}
+                <button
+                  type="button"
+                  className="secondary-action diagnostic-head-build"
+                  data-testid="diagnostic-head-build"
+                  disabled={diagnosticHeadLoading || diagnosticHeadStatus?.status !== "not_ready" || diagnosticReference.status !== "current" || currentRunId !== diagnosticReference.run_id}
+                  onClick={buildDiagnosticHead}
+                >
+                  {diagnosticHeadLoading
+                    ? `Preparing ${diagnosticResolution}×${diagnosticResolution} head…`
+                    : diagnosticHeadStatus?.status === "ready"
+                      ? `Head ready for ${diagnosticResolution}×${diagnosticResolution}`
+                      : `Build ${diagnosticResolution}×${diagnosticResolution} classifier head`}
+                </button>
+                <p className="field-note">A head is created only after this button is pressed. Heads are tied to this Visualize run, model, unit, pooling, and exact resolution; no other resolution is substituted.</p>
+              </section>
               <div className="diagnostics-actions">
                 <button type="button" className="secondary-action" data-testid="diagnostic-recheck" onClick={recheckDiagnosticsReference}>Check source again</button>
                 <button type="button" className="secondary-action" onClick={() => setActiveTool("visualize")}>Return to Visualize</button>

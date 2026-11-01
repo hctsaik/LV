@@ -2195,6 +2195,7 @@ def test_lv_web_04_ctx_01_diagnostics_reference_stale_and_run_incompatible_visib
     dataset = _fixture(tmp_path / "diagnostic-fixture")
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
     inference_calls: list[str] = []
+    diagnostic_attempts: list[int] = []
 
     def fixture_loader(_model_id: str):
         def embed(path: Path) -> np.ndarray:
@@ -2204,9 +2205,22 @@ def test_lv_web_04_ctx_01_diagnostics_reference_stale_and_run_incompatible_visib
             return vector
         return embed
 
+    def diagnostic_loader(_model_id: str, resolution: int, _keep_aspect: bool, _pooling: str):
+        diagnostic_attempts.append(resolution)
+        if resolution == 448 and diagnostic_attempts.count(448) == 1:
+            raise RuntimeError("fixture first 448 attempt failed")
+
+        def embed(path: Path) -> np.ndarray:
+            vector = np.zeros(384, dtype=np.float32)
+            vector[0] = float(Image.open(path).convert("RGB").getpixel((0, 0))[0]) / 255.0
+            vector[1] = resolution / 448.0
+            return vector
+        return embed
+
     application = create_app(
         model_catalog=lambda: ["fixture-model"],
         model_loader=fixture_loader,
+        diagnostic_model_loader=diagnostic_loader,
     )
     server = server_thread = None
     source_path: Path | None = None
@@ -2243,11 +2257,14 @@ def test_lv_web_04_ctx_01_diagnostics_reference_stale_and_run_incompatible_visib
             assert str(dataset) not in created.text()
             expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context current")
             expect(page.get_by_test_id("diagnostics-no-auto-inference")).to_be_visible()
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head not prepared")
+            expect(page.get_by_test_id("diagnostic-head-build")).to_be_enabled()
 
             inference_calls_at_handoff = len(inference_calls)
             page.get_by_test_id("diagnostic-recheck").click()
             expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context current")
             assert len(inference_calls) == inference_calls_at_handoff
+            assert diagnostic_attempts == []
 
             source_path = next(dataset.rglob(reference["filename"]))
             original_source = source_path.read_bytes()
@@ -2256,6 +2273,33 @@ def test_lv_web_04_ctx_01_diagnostics_reference_stale_and_run_incompatible_visib
             expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context stale")
             assert len(inference_calls) == inference_calls_at_handoff
             source_path.write_bytes(original_source)
+            page.get_by_test_id("diagnostic-recheck").click()
+            expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context current")
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head not prepared")
+
+            # Preparing 224 reuses the matching Visualize vectors. Higher
+            # resolutions build their own features only after an explicit click.
+            page.get_by_test_id("diagnostic-head-build").click()
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head ready: 224×224")
+            assert diagnostic_attempts == []
+            assert len(inference_calls) == inference_calls_at_handoff
+
+            page.get_by_label("Analysis resolution").select_option("336")
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head not prepared")
+            assert diagnostic_attempts == []
+            page.get_by_test_id("diagnostic-head-build").click()
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head ready: 336×336")
+            assert diagnostic_attempts == [336]
+
+            page.get_by_label("Analysis resolution").select_option("448")
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head not prepared")
+            page.get_by_test_id("diagnostic-head-build").click()
+            expect(page.get_by_role("alert")).to_contain_text("could not be prepared")
+            expect(page.get_by_test_id("diagnostic-head-build")).to_be_enabled()
+            page.get_by_test_id("diagnostic-head-build").click()
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head ready: 448×448")
+            assert diagnostic_attempts == [336, 448, 448]
+            assert len(inference_calls) == inference_calls_at_handoff
 
             page.get_by_role("button", name="Visualize", exact=True).click()
             page.get_by_role("button", name="Run analysis").click()

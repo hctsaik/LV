@@ -87,6 +87,7 @@ def _client(
     embedder=None,
     models=None,
     object_model_loader=None,
+    diagnostic_model_loader=None,
 ):
     cache_root = tmp_path.parent / f"{tmp_path.name}-lv-cache"
     monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
@@ -94,6 +95,7 @@ def _client(
         model_catalog=lambda: models if models is not None else ["dinov2_vits14"],
         model_loader=lambda _model: embedder or _fake_embedder(),
         object_model_loader=object_model_loader,
+        diagnostic_model_loader=diagnostic_model_loader,
     ))
 
 
@@ -737,6 +739,95 @@ def test_case_lv_web_04_ctx_01_diagnostic_reference_tracks_source_and_run(
     assert invalid_index.json()["code"] == "INVALID_RECORD_INDEX"
     assert "_source_sha256" not in public_run
     assert len(calls) == inference_calls_after_run
+
+
+def test_case_lv_web_04_head_01_exact_resolution_head_build_and_reuse(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    diagnostic_calls: list[tuple[int, str, bool, str]] = []
+
+    def diagnostic_loader(model_id: str, resolution: int, keep_aspect: bool, pooling: str):
+        diagnostic_calls.append((resolution, model_id, keep_aspect, pooling))
+
+        def embed(path: Path) -> np.ndarray:
+            pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0
+            vector[3] = resolution / 448.0
+            return vector
+
+        return embed
+
+    with _client(
+        monkeypatch,
+        tmp_path,
+        diagnostic_model_loader=diagnostic_loader,
+    ) as client:
+        job = _run(client, classifier_fixture["folders"])
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        reference = client.post("/api/v1/diagnostic-references", json={
+            "run_id": run_id,
+            "record_index": 0,
+            "model_id": "dinov2_vits14",
+        }).json()
+        context_id = reference["context_id"]
+
+        before = client.get(
+            f"/api/v1/diagnostic-references/{context_id}/heads/224",
+            params={"current_run_id": run_id},
+        ).json()
+        head_224 = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/heads",
+            json={"current_run_id": run_id, "resolution": 224},
+        )
+        reused_224 = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/heads",
+            json={"current_run_id": run_id, "resolution": 224},
+        ).json()
+        head_336 = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/heads",
+            json={"current_run_id": run_id, "resolution": 336},
+        ).json()
+        head_448 = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/heads",
+            json={"current_run_id": run_id, "resolution": 448},
+        ).json()
+        ready_336 = client.get(
+            f"/api/v1/diagnostic-references/{context_id}/heads/336",
+            params={"current_run_id": run_id},
+        ).json()
+        incompatible = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/heads",
+            json={"current_run_id": "different-run", "resolution": 224},
+        )
+        public_run = client.get(f"/api/v1/runs/{run_id}").json()
+        replacement_run = _run(client, classifier_fixture["folders"])
+        old_run_status = client.get(
+            f"/api/v1/diagnostic-references/{context_id}/heads/224",
+            params={"current_run_id": run_id},
+        ).json()
+
+    assert replacement_run["state"] == "completed", replacement_run
+    assert old_run_status["status"] == "incompatible"
+    assert before.get("status") == "not_ready", before
+    assert head_224.status_code == 200, head_224.text
+    assert head_224.json()["status"] == "ready"
+    assert head_224.json()["resolution"] == 224
+    assert head_224.json()["training_samples"] == len(run["records"])
+    assert set(head_224.json()["classes"]) == {"apple", "banana"}
+    assert reused_224["reused"] is True
+    assert head_336["resolution"] == 336
+    assert head_448["resolution"] == 448
+    assert ready_336["status"] == "ready"
+    assert ready_336["reused"] is True
+    assert diagnostic_calls.count((336, "dinov2_vits14", False, "cls")) == 1
+    assert diagnostic_calls.count((448, "dinov2_vits14", False, "cls")) == 1
+    assert all(call[0] in {336, 448} for call in diagnostic_calls)
+    assert incompatible.status_code == 409
+    assert incompatible.json()["code"] == "INCOMPATIBLE_DIAGNOSTIC_RUN"
+    assert "_source_sha256" not in public_run
 
 
 def test_case_lv_web_01_rank_01_legacy_scores_stable_order_filters_and_csv(

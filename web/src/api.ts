@@ -53,6 +53,21 @@ export type UmapReferenceStatus = {
   new_points: number;
 };
 
+export type DiagnosticHeadStatus = {
+  status: "ready" | "not_ready" | "stale" | "incompatible";
+  resolution: 224 | 336 | 448;
+  reason?: string;
+  model_id?: string;
+  unit?: VisualizeUnit;
+  pooling?: string;
+  classes?: string[];
+  training_samples?: number;
+  embedding_dim?: number;
+  oof_available?: boolean;
+  oof_balanced_accuracy?: number | null;
+  reused?: boolean;
+};
+
 export type DiagnosticReference = {
   context_id: string;
   run_id: string;
@@ -510,6 +525,21 @@ export const api = {
         "?current_run_id=" + encodeURIComponent(current),
     );
   },
+  diagnosticHeadStatus: (contextId: string, resolution: 224 | 336 | 448, currentRunId: string | null) => {
+    const current = currentRunId === null ? "" : currentRunId;
+    return request<DiagnosticHeadStatus>(
+      "/api/v1/diagnostic-references/" + encodeURIComponent(contextId) +
+        "/heads/" + resolution + "?current_run_id=" + encodeURIComponent(current),
+    );
+  },
+  buildDiagnosticHead: (contextId: string, resolution: 224 | 336 | 448, currentRunId: string) =>
+    request<DiagnosticHeadStatus>(
+      "/api/v1/diagnostic-references/" + encodeURIComponent(contextId) + "/heads",
+      {
+        method: "POST",
+        body: JSON.stringify({ current_run_id: currentRunId, resolution }),
+      },
+    ),
   createCoverageJob: (
     folders: string[],
     modelId: string,

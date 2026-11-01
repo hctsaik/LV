@@ -96,6 +96,11 @@ class CreateDiagnosticReferenceRequest(BaseModel):
     model_id: str = Field(min_length=1, max_length=128)
 
 
+class CreateDiagnosticHeadRequest(BaseModel):
+    current_run_id: str = Field(min_length=1, max_length=128)
+    resolution: Literal[224, 336, 448]
+
+
 class CreateComparisonJob(BaseModel):
     folders_a: list[str] = Field(min_length=1, max_length=32)
     folders_b: list[str] = Field(min_length=1, max_length=32)
@@ -319,8 +324,10 @@ def create_app(
     model_loader: Callable[[str], Callable] | None = None,
     text_model_loader: Callable[[str], Callable[[str], np.ndarray]] | None = None,
     object_model_loader: Callable | None = None,
+    diagnostic_model_loader: Callable[[str, int, bool, str], Callable] | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
+    has_custom_model_loader = model_loader is not None
     loader = model_loader or load_model
     text_loader = text_model_loader or load_text_encoder
     if object_model_loader is not None:
@@ -334,7 +341,9 @@ def create_app(
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
     app.state.runs = {}
+    app.state.current_run_id = None
     app.state.diagnostic_references = {}
+    app.state.diagnostic_heads = {}
     app.state.raw_embeddings = {}
     app.state.ranking_scores = {}
     app.state.text_encoders = {}
@@ -465,6 +474,7 @@ def create_app(
                 app.state.ranking_scores.clear()
                 app.state.block_cache.clear()
                 app.state.runs[run_id] = run
+                app.state.current_run_id = run_id
                 app.state.raw_embeddings[run_id] = raw_embeddings
                 app.state.ranking_scores[run_id] = ranking_scores
                 job.run_id = run_id
@@ -510,6 +520,8 @@ def create_app(
                     "request_id": job_id,
                 })
             app.state.jobs[job_id] = job
+            app.state.current_run_id = None
+            app.state.diagnostic_heads.clear()
         threading.Thread(target=execute, args=(job,), daemon=True, name=f"lv-web-{job_id[:8]}").start()
         return {"job_id": job_id, "state": job.state}
 
@@ -1879,6 +1891,12 @@ def create_app(
             run = app.state.runs.get(request.run_id)
             if run is None:
                 raise HTTPException(status_code=404, detail="Run not found")
+            if request.run_id != app.state.current_run_id:
+                raise HTTPException(status_code=409, detail={
+                    "code": "INCOMPATIBLE_DIAGNOSTIC_RUN",
+                    "message": "The selected Visualize run is no longer current.",
+                    "request_id": uuid.uuid4().hex,
+                })
             records = run.get("records", [])
             paths = run.get("image_paths", [])
             source_hashes = run.get("_source_sha256", [])
@@ -1926,13 +1944,265 @@ def create_app(
     ) -> dict:
         with app.state.lock:
             context = app.state.diagnostic_references.get(context_id)
+            actual_run_id = app.state.current_run_id
             if context is None:
                 raise HTTPException(status_code=404, detail="Diagnostic reference not found")
+        if current_run_id is None:
+            checked_run_id = actual_run_id
+        elif current_run_id == actual_run_id:
+            checked_run_id = actual_run_id
+        else:
+            checked_run_id = ""
         return public_diagnostic_reference(
             context,
-            current_run_id=current_run_id,
-            check_run=current_run_id is not None,
+            current_run_id=checked_run_id,
+            check_run=True,
         )
+
+    def diagnostic_run_sources_current(run: dict) -> bool:
+        paths = run.get("image_paths", [])
+        expected_hashes = run.get("_source_sha256", [])
+        if not paths or len(paths) != len(expected_hashes):
+            return False
+        try:
+            return all(
+                Path(path).is_file() and _sha256_file(Path(path)) == expected
+                for path, expected in zip(paths, expected_hashes)
+            )
+        except OSError:
+            return False
+
+    def diagnostic_head_key(run_id: str, run: dict, model_id: str, resolution: int) -> str:
+        policy = dict(run.get("object_policy") or {})
+        payload = {
+            "run_id": run_id,
+            "source_sha256": run.get("_source_sha256", []),
+            "model_id": model_id,
+            "unit": run.get("unit", "image"),
+            "resolution": resolution,
+            "pooling": str(policy.get("head") or "cls"),
+            "object_policy": policy if run.get("unit") == "object" else None,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def diagnostic_head_summary(head_entry: dict, *, reused: bool) -> dict:
+        diagnostics = dict(head_entry["head"].get("explain_diagnostics") or {})
+        return {
+            "status": "ready",
+            "resolution": head_entry["resolution"],
+            "model_id": head_entry["model_id"],
+            "unit": head_entry["unit"],
+            "pooling": head_entry["pooling"],
+            "classes": [str(value) for value in (head_entry["head"].get("classes") or [])],
+            "training_samples": int(head_entry["embeddings"].shape[0]),
+            "embedding_dim": int(head_entry["embeddings"].shape[1]),
+            "oof_available": bool(diagnostics.get("available")),
+            "oof_balanced_accuracy": diagnostics.get("balanced_accuracy"),
+            "reused": reused,
+        }
+
+    def diagnostic_head_state(
+        context_id: str,
+        current_run_id: str | None,
+        resolution: int,
+    ) -> dict:
+        with app.state.lock:
+            context = app.state.diagnostic_references.get(context_id)
+            if context is None:
+                raise HTTPException(status_code=404, detail="Diagnostic reference not found")
+            run = app.state.runs.get(context["run_id"])
+            if run is None:
+                return {"status": "stale", "resolution": resolution, "reason": "The Visualize run is no longer available."}
+            actual_run_id = app.state.current_run_id
+            requested_run_id = actual_run_id if current_run_id is None else current_run_id
+            if requested_run_id != actual_run_id or context["run_id"] != actual_run_id:
+                return {"status": "incompatible", "resolution": resolution, "reason": "Visualize produced a different run."}
+            ref_status = public_diagnostic_reference(context)
+            if ref_status["status"] != "current":
+                return {"status": "stale", "resolution": resolution, "reason": "The selected source image changed or is unavailable."}
+            key = diagnostic_head_key(context["run_id"], run, context["model_id"], resolution)
+            head_entry = app.state.diagnostic_heads.get(key)
+        if head_entry is None:
+            return {"status": "not_ready", "resolution": resolution, "reason": "No matching exact-resolution head has been prepared."}
+        return diagnostic_head_summary(head_entry, reused=True)
+
+    @app.get("/api/v1/diagnostic-references/{context_id}/heads/{resolution}")
+    def get_diagnostic_head_status(
+        context_id: str,
+        resolution: str,
+        current_run_id: str | None = None,
+    ) -> dict:
+        try:
+            parsed_resolution = int(resolution)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Unsupported classifier head resolution") from exc
+        if parsed_resolution not in {224, 336, 448}:
+            raise HTTPException(status_code=422, detail="Unsupported classifier head resolution")
+        return diagnostic_head_state(context_id, current_run_id, parsed_resolution)
+
+    @app.post("/api/v1/diagnostic-references/{context_id}/heads")
+    def build_diagnostic_head(
+        context_id: str,
+        request: CreateDiagnosticHeadRequest,
+    ) -> dict:
+        with app.state.lock:
+            context = app.state.diagnostic_references.get(context_id)
+            if context is None:
+                raise HTTPException(status_code=404, detail="Diagnostic reference not found")
+            if request.current_run_id != context["run_id"] or app.state.current_run_id != context["run_id"]:
+                raise HTTPException(status_code=409, detail={
+                    "code": "INCOMPATIBLE_DIAGNOSTIC_RUN",
+                    "message": "The diagnostics reference belongs to a different Visualize run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            run = app.state.runs.get(context["run_id"])
+            raw_by_model = app.state.raw_embeddings.get(context["run_id"], {})
+            raw_embeddings = raw_by_model.get(context["model_id"])
+            if run is None:
+                raise HTTPException(status_code=409, detail={
+                    "code": "STALE_DIAGNOSTIC_RUN",
+                    "message": "The Visualize run is no longer available.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            run_snapshot = dict(run)
+            records = [dict(record) for record in run.get("records", [])]
+            paths = [Path(item) for item in run.get("image_paths", [])]
+            run_id = context["run_id"]
+            model_id = context["model_id"]
+            resolution = request.resolution
+            unit = str(run.get("unit", "image"))
+            pooling = str((run.get("object_policy") or {}).get("head") or "cls")
+            key = diagnostic_head_key(run_id, run, model_id, resolution)
+            existing = app.state.diagnostic_heads.get(key)
+        if not diagnostic_run_sources_current(run_snapshot):
+            raise HTTPException(status_code=409, detail={
+                "code": "STALE_DIAGNOSTIC_SOURCE",
+                "message": "A source image changed or is unavailable; create a new Visualize run before preparing a head.",
+                "request_id": uuid.uuid4().hex,
+            })
+        if existing is not None:
+            return diagnostic_head_summary(existing, reused=True)
+        if len(records) < 2 or len(paths) != len(records) or len({str(item.get("label") or "") for item in records}) < 2:
+            raise HTTPException(status_code=422, detail={
+                "code": "DIAGNOSTIC_HEAD_DATA_INSUFFICIENT",
+                "message": "At least two readable records from two classes are required to prepare a classifier head.",
+                "request_id": uuid.uuid4().hex,
+            })
+
+        try:
+            from dino_head import evaluate_head_oof, train_head
+
+            policy = dict(run_snapshot.get("object_policy") or {})
+            keep_aspect = unit == "object"
+
+            def exact_model_loader(selected_model: str, **_kwargs):
+                if diagnostic_model_loader is not None:
+                    return diagnostic_model_loader(selected_model, resolution, keep_aspect, pooling)
+                if unit == "object" and object_model_loader is not None:
+                    return object_model_loader(
+                        selected_model,
+                        keep_aspect=keep_aspect,
+                        target_res=resolution,
+                        head=pooling,
+                    )
+                if has_custom_model_loader:
+                    if resolution != 224:
+                        raise ValueError(
+                            "The host has no resolution-aware diagnostics model loader."
+                        )
+                    return loader(selected_model)
+                return load_model(
+                    selected_model,
+                    keep_aspect=keep_aspect,
+                    target_res=resolution,
+                    head=pooling,
+                )
+
+            if unit == "object":
+                from object_eval import embed_objects
+
+                object_records = [
+                    {
+                        "image_path": paths[index],
+                        "bbox": record.get("bbox"),
+                        "obj_index": record.get("obj_index", index),
+                    }
+                    for index, record in enumerate(records)
+                ]
+                exact_policy = {
+                    **policy,
+                    "target_res": resolution,
+                    "head": pooling,
+                }
+                embeddings, _short_px = embed_objects(
+                    object_records,
+                    model_id,
+                    exact_policy,
+                    cache_path=None,
+                    model_loader=exact_model_loader,
+                )
+            elif resolution == 224 and raw_embeddings is not None:
+                embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+            else:
+                embed_fn = exact_model_loader(
+                    model_id,
+                    keep_aspect=False,
+                    target_res=resolution,
+                    head=pooling,
+                )
+                embeddings = np.stack([
+                    np.asarray(embed_fn(path), dtype=np.float32) for path in paths
+                ])
+            embeddings = np.asarray(embeddings, dtype=np.float32)
+            labels = np.asarray([str(record.get("label") or "") for record in records])
+            if embeddings.ndim != 2 or embeddings.shape[0] != len(labels) or not np.isfinite(embeddings).all():
+                raise ValueError("The selected model returned invalid embeddings.")
+            head = train_head(embeddings, labels)
+            head["explain_diagnostics"] = evaluate_head_oof(
+                embeddings,
+                labels,
+                source_ids=[
+                    f"{run.get('_source_sha256', [])[index]}:{record.get('obj_index', '')}"
+                    for index, record in enumerate(records)
+                ],
+            )
+            head["provenance"] = {
+                "run_id": run_id,
+                "model_id": model_id,
+                "unit": unit,
+                "pooling": pooling,
+                "target_res": resolution,
+                "source_fingerprint": key,
+                "exact_resolution": True,
+                "resolution_mode": "exact_head",
+            }
+            entry = {
+                "head": head,
+                "embeddings": embeddings,
+                "resolution": resolution,
+                "model_id": model_id,
+                "unit": unit,
+                "pooling": pooling,
+            }
+            if not diagnostic_run_sources_current(run_snapshot):
+                raise RuntimeError("A source image changed while the classifier head was being prepared.")
+        except Exception as exc:
+            logger.exception("LV diagnostics classifier head preparation failed")
+            raise HTTPException(status_code=422, detail={
+                "code": "DIAGNOSTIC_HEAD_BUILD_FAILED",
+                "message": "The exact-resolution classifier head could not be prepared. Check the local model and dataset, then retry.",
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+        with app.state.lock:
+            if app.state.current_run_id != run_id:
+                raise HTTPException(status_code=409, detail={
+                    "code": "INCOMPATIBLE_DIAGNOSTIC_RUN",
+                    "message": "Visualize changed while the classifier head was being prepared.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            stored = app.state.diagnostic_heads.setdefault(key, entry)
+        return diagnostic_head_summary(stored, reused=stored is not entry)
 
     def curation_store_error() -> HTTPException:
         logger.exception("LV curation store operation failed")
