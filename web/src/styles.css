@@ -707,8 +707,30 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .fp-search-result-body span, .fp-search-result-body small { color: #8793a4; font-size: 8px; line-height: 1.45; overflow-wrap: anywhere; }
 .fp-search-result-body .fp-search-conflict { color: #a55a46; }
 .fp-search-result-body .fp-secondary-button { justify-self: start; }
+.fp-report-card { margin-top: 14px; }
+.fp-report-status-row { display: grid; grid-template-columns: minmax(180px, .65fr) minmax(180px, .9fr) minmax(0, 1.45fr); align-items: end; gap: 12px; margin-top: 12px; }
+.fp-report-status-row > label, .fp-claim-form > label { display: grid; gap: 6px; color: #68758c; font-size: 9px; font-weight: 600; }
+.fp-report-status-row select, .fp-claim-form select:not([multiple]), .fp-claim-form textarea, .fp-claim-form select[multiple] { width: 100%; min-width: 0; min-height: 34px; border: 1px solid #dfe5ed; border-radius: 6px; padding: 7px 8px; color: #53627a; background: #fff; font: 9px/1.5 "Segoe UI", sans-serif; }
+.fp-report-state-summary { display: grid; gap: 5px; color: #8692a4; font-size: 8px; }
+.fp-report-downloads { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 7px; }
+.fp-claim-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin-top: 12px; }
+.fp-report-empty { grid-column: 1 / -1; margin: 0; padding: 12px; border: 1px dashed #dfe5ed; border-radius: 6px; color: #929dad; font-size: 9px; }
+.fp-claim-item { display: grid; align-content: start; gap: 7px; min-width: 0; padding: 10px; border: 1px solid #e7ebf1; border-radius: 7px; background: #fafbfd; }
+.fp-claim-item > div { display: flex; justify-content: space-between; align-items: flex-start; gap: 7px; }
+.fp-claim-item strong { color: #53637b; font-size: 9px; }
+.fp-claim-item p { margin: 0; color: #61718a; font-size: 9px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.fp-claim-item small { color: #8995a7; font-size: 8px; overflow-wrap: anywhere; }
+.fp-claim-review-warning { color: #a76145; font-size: 8px; }
+.fp-claim-item .fp-secondary-button { justify-self: start; }
+.fp-claim-form { display: grid; gap: 10px; margin-top: 13px; padding: 12px; border: 1px solid #e7ebf1; border-radius: 7px; background: #fafbfd; }
+.fp-claim-form h4 { margin: 0; color: #556780; font-size: 10px; }
+.fp-claim-form textarea { resize: vertical; }
+.fp-claim-form select[multiple] { min-height: 75px; }
+.fp-claim-form .fp-claim-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.fp-claim-form .run-button { margin: 0; }
 @media (max-width: 980px) { .fp-search-columns { grid-template-columns: 1fr; }.fp-search-result-card { grid-template-columns: minmax(90px, 150px) minmax(0, 1fr); align-items: center; }.fp-search-result-card > img { height: 100px; } }
 @media (max-width: 700px) { .fp-search-form { grid-template-columns: 1fr; }.fp-search-summary, .fp-search-source-summary { grid-template-columns: 1fr; }.fp-search-result-card { grid-template-columns: 90px minmax(0, 1fr); } }
+@media (max-width: 700px) { .fp-report-status-row { grid-template-columns: 1fr; }.fp-report-downloads { justify-content: flex-start; } }
 @media (max-width: 980px) { .fp-content-grid { grid-template-columns: minmax(0, 1fr); }.fp-case-workspace { grid-template-columns: 230px minmax(0, 1fr); } }
 @media (max-width: 700px) { .fp-case-workspace { display: flex; flex-direction: column; }.fp-case-sidebar { border-right: 0; border-bottom: 1px solid #e4e8ef; padding: 18px; }.fp-case-list { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 190px; }.fp-privacy-note { margin-top: 12px; padding-top: 0; }.fp-case-main { padding: 18px 12px 28px; }.fp-form { grid-template-columns: 1fr; }.fp-form-wide { grid-column: auto; }.fp-detail-header { flex-direction: column; }.fp-content-grid { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 430px) { .fp-roi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.fp-add-region-form { grid-template-columns: 1fr; }.fp-add-region-form h4, .fp-roi-grid, .fp-add-region-form > button { grid-column: auto; } }

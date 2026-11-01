@@ -7,6 +7,7 @@ import {
   type FalsePositiveRegion,
   type FalsePositiveSource,
 } from "./api";
+import FalsePositiveCaseReport from "./FalsePositiveCaseReport";
 
 const verdicts: Array<{ value: FalsePositiveRegion["review"]["verdict"]; label: string }> = [
   { value: "pending", label: "待覆核" },
@@ -775,6 +776,13 @@ export default function FalsePositiveCaseWorkspace() {
                 </div>
               </>}
             </section>
+            <FalsePositiveCaseReport
+              caseData={selectedCase}
+              onCaseUpdated={(next) => {
+                setSelectedCase(next);
+                void refreshCases();
+              }}
+            />
           </>
         )}
       </section>

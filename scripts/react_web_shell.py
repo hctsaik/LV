@@ -48,6 +48,10 @@ from fp_case_store import FalsePositiveCaseStore, public_case
 from fp_case_search import add_candidate as add_fp_search_candidate
 from fp_case_search import model_recipe as fp_case_model_recipe
 from fp_case_search import search_case as run_fp_case_search
+from fp_case_report import report_json as fp_case_report_json
+from fp_case_report import report_markdown as fp_case_report_markdown
+from fp_case_report import set_reply_status as set_fp_case_reply_status
+from fp_case_report import upsert_claim as upsert_fp_case_claim
 from completeness import (
     bucketize,
     build_completeness,
@@ -172,6 +176,19 @@ class CreateFalsePositiveSearchRequest(BaseModel):
 class AddFalsePositiveSearchCandidateRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     category: Literal["normal", "defect", "history"]
+
+
+class UpsertFalsePositiveClaimRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    claim_id: str = Field(default="", max_length=64)
+    kind: Literal["fact", "hypothesis", "action"]
+    text: str = Field(min_length=1, max_length=10_000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=100)
+
+
+class SetFalsePositiveReplyStatusRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    status: Literal["draft", "replied"]
 
 
 class CreateComparisonJob(BaseModel):
@@ -731,6 +748,57 @@ def create_app(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             saved = save_fp_case(case) if added else public_case(case)
             return {"case": saved, "added": added}
+
+    @app.put("/api/v1/fp-cases/{case_id}/claims")
+    def save_fp_case_claim_route(case_id: str, request: UpsertFalsePositiveClaimRequest) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                claim = upsert_fp_case_claim(
+                    case,
+                    request.kind,
+                    request.text,
+                    request.evidence_ids,
+                    request.claim_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"case": save_fp_case(case), "claim_id": claim["id"]}
+
+    @app.patch("/api/v1/fp-cases/{case_id}/reply-status")
+    def update_fp_case_reply_status(case_id: str, request: SetFalsePositiveReplyStatusRequest) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                changed = set_fp_case_reply_status(case, request.status)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            saved = save_fp_case(case) if changed else public_case(case)
+            return {"case": saved, "changed": changed}
+
+    @app.get("/api/v1/fp-cases/{case_id}/report.md")
+    def download_fp_case_markdown(case_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            content = fp_case_report_markdown(case).encode("utf-8")
+        return Response(content, media_type="text/markdown; charset=utf-8", headers={
+            "Content-Disposition": f'attachment; filename="{case_id}.md"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.get("/api/v1/fp-cases/{case_id}/report.json")
+    def download_fp_case_json(case_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            content = fp_case_report_json(case).encode("utf-8")
+        return Response(content, media_type="application/json", headers={
+            "Content-Disposition": f'attachment; filename="{case_id}.json"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
 
     @app.get("/api/v1/models")
     def models() -> dict:

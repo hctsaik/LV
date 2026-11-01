@@ -592,6 +592,19 @@ export type FalsePositiveCandidate = {
   review: FalsePositiveRegion["review"];
 };
 
+export type FalsePositiveClaim = {
+  id: string;
+  kind: "fact" | "hypothesis" | "action";
+  text: string;
+  refs: string[];
+  at: string;
+  updated_at?: string;
+  authorship: "engineer";
+  evidence_id?: string;
+  needs_review?: boolean;
+  review_reason?: string;
+};
+
 export type FalsePositiveCase = {
   schema_version: number;
   id: string;
@@ -604,6 +617,11 @@ export type FalsePositiveCase = {
   items: FalsePositiveRegion[];
   candidates: FalsePositiveCandidate[];
   searches: FalsePositiveSearch[];
+  claims: FalsePositiveClaim[];
+  reply_status: "draft" | "replied";
+  cause_status: "unknown" | "hypothesis";
+  improvement_status: string;
+  effort_minutes: number;
   external: {
     model_id: string;
     threshold: string;
@@ -978,6 +996,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ expected_revision: expectedRevision, category }),
     },
+  ),
+  upsertFalsePositiveClaim: (caseId: string, expectedRevision: number, input: {
+    claim_id?: string;
+    kind: FalsePositiveClaim["kind"];
+    text: string;
+    evidence_ids: string[];
+  }) => request<{ case: FalsePositiveCase; claim_id: string }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/claims", {
+      method: "PUT",
+      body: JSON.stringify({ expected_revision: expectedRevision, ...input }),
+    },
+  ),
+  setFalsePositiveReplyStatus: (caseId: string, expectedRevision: number, status: "draft" | "replied") =>
+    request<{ case: FalsePositiveCase; changed: boolean }>(
+      "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/reply-status", {
+        method: "PATCH",
+        body: JSON.stringify({ expected_revision: expectedRevision, status }),
+      },
+    ),
+  falsePositiveCaseReport: (caseId: string, format: "md" | "json") => requestGetBlob(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/report." + format,
   ),
   falsePositiveSourceImageUrl: (caseId: string, sourceId: string) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fp-cases/" + encodeURIComponent(caseId)

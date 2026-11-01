@@ -2869,3 +2869,77 @@ def test_lv_web_05_retrieve_01_visible_explicit_search_and_candidate_review(
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in [*normal_folder.iterdir(), query_path]
     }, "case search modified its source files"
+
+
+def test_lv_web_05_report_01_visible_cited_claims_reply_and_downloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible report flow cites evidence and keeps user-reply separate from cause."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "fp-cases"))
+    query_path = tmp_path / "reported.png"
+    Image.new("RGB", (96, 72), (130, 140, 145)).save(query_path)
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1480, "height": 1024}, accept_downloads=True)
+            page.set_default_timeout(15000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fp-cases").click()
+            page.get_by_label("案件名稱（可留空）").fill("Cited visible report")
+            page.get_by_label("建立案件圖片").set_input_files(str(query_path))
+            page.get_by_role("button", name="建立案件", exact=True).click()
+            expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Cited visible report")
+            report = page.get_by_test_id("fp-case-report")
+            expect(report.get_by_test_id("fp-claims-empty")).to_be_visible()
+            reference_select = report.get_by_label("引用案件證據")
+            evidence_id = reference_select.locator("option").first.get_attribute("value")
+            assert evidence_id
+
+            report.get_by_label("說明類型").select_option("hypothesis")
+            report.get_by_label("說明內容").fill("可能是反光造成誤逮；目前仍是待驗證假設。")
+            report.get_by_test_id("fp-save-claim").click()
+            claim = page.locator("[data-testid^='fp-claim-c_']").first
+            expect(claim).to_contain_text("可能是反光造成誤逮")
+            expect(report.get_by_text("根因狀態：假設待驗證", exact=True)).to_be_visible()
+            claim_test_id = claim.get_attribute("data-testid")
+            assert claim_test_id
+            claim_id = claim_test_id.removeprefix("fp-claim-")
+
+            claim.get_by_role("button", name="編輯此說明").click()
+            report.get_by_label("說明內容").fill("資料已引用，但反光因果尚未確認。")
+            report.get_by_test_id("fp-save-claim").click()
+            expect(page.get_by_test_id(f"fp-claim-{claim_id}")).to_contain_text("反光因果尚未確認")
+
+            report.get_by_label("使用者回覆狀態").select_option("replied")
+            expect(report.get_by_label("使用者回覆狀態")).to_have_value("replied")
+            expect(report.get_by_text("根因狀態：假設待驗證", exact=True)).to_be_visible()
+
+            with page.expect_download() as markdown_download:
+                report.get_by_test_id("fp-download-report-md").click()
+            markdown_path = Path(markdown_download.value.path())
+            markdown = markdown_path.read_text(encoding="utf-8")
+            assert "反光因果尚未確認" in markdown
+            assert evidence_id in markdown and claim_id in markdown
+            assert "外部模型尚未重播" in markdown
+
+            with page.expect_download() as json_download:
+                report.get_by_test_id("fp-download-report-json").click()
+            json_path = Path(json_download.value.path())
+            snapshot = json.loads(json_path.read_text(encoding="utf-8"))
+            assert snapshot["reply_status"] == "replied"
+            assert snapshot["cause_status"] == "hypothesis"
+            assert snapshot["claims"][0]["refs"] == [evidence_id]
+            assert snapshot["claims"][0]["id"] == claim_id
+            assert str(tmp_path) not in json.dumps(snapshot, ensure_ascii=False)
+            assert any(row.get("claim_id") == claim_id for row in snapshot["evidence"])
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)

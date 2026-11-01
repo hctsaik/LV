@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import base64
 import hashlib
+import json
 from io import BytesIO, StringIO
 import os
 import sys
@@ -569,6 +570,86 @@ def test_case_lv_web_05_retrieve_01_same_roi_and_truncated_source_are_explicit(
         assert result["sources"]["normal"]["n_files"] == 1
         assert result["groups"]["normal"][0]["roi"] == region["roi"]
         assert result["groups"]["defect"] == []
+
+
+def test_case_lv_web_05_report_01_cited_claims_separate_reply_and_cause_with_exports(
+    monkeypatch, tmp_path
+):
+    with _client(monkeypatch, tmp_path / "fp-report") as client:
+        created = client.post("/api/v1/fp-cases", json={
+            "source_name": "report.png",
+            "source_kind": "screenshot",
+            "source_base64": base64.b64encode(_png_bytes((150, 70, 30))).decode("ascii"),
+            "title": "Cited report case",
+            "description": "Reported output requires manual review.",
+            "external_model_id": "detector-v4",
+        }).json()
+        evidence_id = created["evidence"][0]["id"]
+
+        invalid_reference = client.put(f"/api/v1/fp-cases/{created['id']}/claims", json={
+            "expected_revision": 1,
+            "kind": "fact",
+            "text": "Uncited claim must fail.",
+            "evidence_ids": ["e_missing"],
+        })
+        assert invalid_reference.status_code == 422
+        assert client.get(f"/api/v1/fp-cases/{created['id']}").json()["revision"] == 1
+
+        hypothesis_response = client.put(f"/api/v1/fp-cases/{created['id']}/claims", json={
+            "expected_revision": 1,
+            "kind": "hypothesis",
+            "text": "Reflection may be confused with a scratch; this remains unverified.",
+            "evidence_ids": [evidence_id],
+        })
+        assert hypothesis_response.status_code == 200, hypothesis_response.text
+        hypothesis_case = hypothesis_response.json()["case"]
+        claim_id = hypothesis_response.json()["claim_id"]
+        assert hypothesis_case["revision"] == 2
+        assert hypothesis_case["cause_status"] == "hypothesis"
+        assert hypothesis_case["claims"][0]["authorship"] == "engineer"
+        first_claim_evidence = hypothesis_case["claims"][0]["evidence_id"]
+
+        edited = client.put(f"/api/v1/fp-cases/{created['id']}/claims", json={
+            "expected_revision": 2,
+            "claim_id": claim_id,
+            "kind": "fact",
+            "text": "The model version and reported input are recorded; root cause is still unknown.",
+            "evidence_ids": [evidence_id],
+        })
+        assert edited.status_code == 200, edited.text
+        edited_case = edited.json()["case"]
+        assert edited_case["cause_status"] == "unknown"
+        assert len(edited_case["evidence"]) == 3
+        assert next(row for row in edited_case["evidence"] if row["id"] == first_claim_evidence)["claim_text"].startswith("Reflection may")
+
+        stale = client.patch(f"/api/v1/fp-cases/{created['id']}/reply-status", json={
+            "expected_revision": 2,
+            "status": "replied",
+        })
+        assert stale.status_code == 409
+        reply = client.patch(f"/api/v1/fp-cases/{created['id']}/reply-status", json={
+            "expected_revision": 3,
+            "status": "replied",
+        })
+        assert reply.status_code == 200, reply.text
+        assert reply.json()["case"]["reply_status"] == "replied"
+        assert reply.json()["case"]["cause_status"] == "unknown"
+
+        markdown = client.get(f"/api/v1/fp-cases/{created['id']}/report.md")
+        assert markdown.status_code == 200
+        assert "確認事實" in markdown.text
+        assert "待驗證假設" in markdown.text
+        assert claim_id in markdown.text and evidence_id in markdown.text
+        assert "已回覆使用者" not in markdown.text  # status uses the persisted value, not a derived label
+        snapshot = client.get(f"/api/v1/fp-cases/{created['id']}/report.json")
+        assert snapshot.status_code == 200
+        payload = json.loads(snapshot.content)
+        assert payload["report_version"] == 1
+        assert payload["reply_status"] == "replied"
+        assert payload["cause_status"] == "unknown"
+        assert payload["claims"][0]["refs"] == [evidence_id]
+        assert payload["claims"][0]["text"].startswith("The model version")
+        assert str(tmp_path) not in markdown.text + snapshot.text
 
 
 def _run(client: TestClient, folders: list[Path], *, model: str = "dinov2_vits14") -> dict:
