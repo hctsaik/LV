@@ -39,7 +39,7 @@ LV 是成熟的本機影像分析 App。現有 Streamlit 畫面把資料選擇�
 
 首個垂直流程涵蓋 Image Classifier 整圖模式：選取資料夾、模型與投影，執行 embedding、切換 2D／3D 與類別／split 篩選，並選點讀回對應影像。其 4 張影像 fixture 避免原 Streamlit 小樣本規則把 PCA 投影降成一維。
 
-後續實作加入 Object Detector 整圖模式：選取含 `images/` 的資料夾、多模型與投影，按 YOLO `labels/` 的 class ID 標記每張影像；資料集旁的 `classes.txt` 優先於手動類別名稱。缺少類別檔時，只有提供手動類別名稱才可繼續。這個 fixture 流程先驗證 React、API、worker 和標籤語義；尚未完成真實模型數值 parity 與 NativeApp host bridge 驗收。Object Detector 物件級、固定 UMAP 參考座標、其他 Visualize 巢狀操作及其餘 LV-WEB case 仍各自保持未完成。
+後續實作加入 Object Detector 整圖模式：選取含 `images/` 的資料夾、多模型與投影，按 YOLO `labels/` 的 class ID 標記每張影像；資料集旁的 `classes.txt` 優先於手動類別名稱。缺少類別檔時，只有提供手動類別名稱才可繼續。新增固定 DINOv2-small 的可見 React 真模型流程，在 Windows ARM64 產生並檢查 4×384 embedding、類別標籤、篩選與影像讀回；尚未完成與 Streamlit 基準的數值逐項比較及 NativeApp host bridge 驗收。Object Detector 物件級、固定 UMAP 參考座標、其他 Visualize 巢狀操作及其餘 LV-WEB case 仍各自保持未完成。
 
 ## 完成門檻
 

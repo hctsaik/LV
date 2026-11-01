@@ -48,7 +48,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 
 - API 目前以本機路徑陣列建立 run；React 的資料夾按鈕會呼叫公開 `window.cimHost.chooseFile()`，但 LV 尚未接入 NativeApp 發布包，因此真實 OS picker、grant 驗證與殼管理 worker 的端到端仍待驗。
 - 手動路徑欄只供本機開發及測試。React build 與 API 可由單一本機 FastAPI 預覽；NativeApp 交付仍須使用平台 host bridge 和 worker 管理流程。
-- Compare 的 deterministic API 與整圖／物件模式可見 UI E2E 使用 fixture embedder；DINOv2 真實權重、來源 Streamlit 數值逐項對照、Windows ARM64 及 NativeApp lifecycle 尚未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
+- Compare 的 deterministic API 與整圖／物件模式可見 UI E2E 使用 fixture embedder；Visualize classifier 與 detector 的固定 DINOv2-small 可見 UI 路徑已在 Windows ARM64 通過。來源 Streamlit 數值逐項對照、NativeApp folder grant／lifecycle 及 Compare 真實模型仍未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
 
 ## 5. React 驗收契約
 
@@ -65,4 +65,4 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 
 ## 6. 未涵蓋
 
-Object Detector 整圖已有 React／API fixture 流程；真實模型數值 parity 與 NativeApp host bridge 尚待驗。Object Detector 物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選的完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖已有 React／API fixture 流程與固定 DINOv2-small 的 ARM64 visible UI run；與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。Object Detector 物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選的完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。

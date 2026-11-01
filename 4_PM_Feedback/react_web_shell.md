@@ -5,7 +5,7 @@
 | AC | 要證明的行為 | 測試／證據 | 狀態 |
 |---|---|---|---|
 | AC1 | classifier 資料探索、類別、split 與排序符合 Streamlit 基準 | `tests/test_react_web_shell.py::test_case_lv_web_01_ic_01_discovery` | 通過；API／排序與標籤測試 |
-| AC2 | 同一模型與 fixture 產生 4×384 真實 embedding，結果有限且非零 | 真實 DINOv2 E2E：`tests/e2e/test_react_web_shell_e2e.py::test_lv_web_01_ic_01_ic_02_real_model` | 通過；權重 SHA-256 `b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9`；本機 Python 3.14 AMD64，Windows ARM64 尚待驗 |
+| AC2 | 同一模型與 fixture 產生 4×384 真實 embedding，結果有限且非零 | 真實 DINOv2 E2E：`tests/e2e/test_react_web_shell_e2e.py::test_lv_web_01_ic_01_ic_02_real_model` | 通過；權重 SHA-256 `b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9`；Python 3.14 Windows ARM64 visible React run passed on 2026-11-01; NativeApp package not covered |
 | AC3 | React 顯示 4 個投影點；點擊後顯示對應影像、metadata、類別及 split 篩選 | `tests/e2e/test_react_web_shell_e2e.py::test_lv_web_01_ic_01_ic_02_real_model` | 通過；真模型、可見 UI、類別／split 篩選、投影／維度切換時保留選取並讀回原圖 |
 | AC4 | 缺模型、空資料與取消可見；不默默成功或替代 backend | API cases + `test_lv_web_01_ic_01_missing_model_is_visible` + `test_lv_web_01_ic_01_cancel_is_visible_in_react` | 通過；缺模型、空資料、取消均有可見狀態 |
 | AC5 | manifest SHA-256 embedding 快取可重用，來源圖片 bytes 不變，輸出僅在隔離 cache root | `test_case_lv_web_01_ic_01_manifest_cache_and_source_immutability` + `test_case_lv_web_01_ic_01_changed_content_invalidates_embedding` | 通過；重跑重用四張，改圖只重算一張，來源 hash 不受分析流程更動 |
@@ -13,7 +13,7 @@
 
 ## 完成判準
 
-AC2、AC3、AC6 須以真實權重和可見 UI 通過；AC1、AC4、AC5 可先由 deterministic 單元／API 測試覆蓋。AC1–AC5 已在本機完成；AC6 與 Windows ARM64 驗證仍未完成，因此 `LV-WEB-01-IC-01` 及 M24 不能標為完成。任何 `skip`、fake backend、截圖-only、HTTP-only 或模型健康檢查均不得將此 case 標為完成。
+AC2、AC3、AC6 須以真實權重和可見 UI 通過；AC1、AC4、AC5 可先由 deterministic 單元／API 測試覆蓋。AC1–AC5 已有本機證據；固定 DINOv2-small 的直接 worker 路徑亦已在 Windows ARM64 通過。AC6 的 NativeApp picker、folder grant 與 worker lifecycle 尚未驗，因此 `LV-WEB-01-IC-01` 及 M24 不能標為完成。任何 `skip`、fake backend、截圖-only、HTTP-only 或模型健康檢查均不得將此 case 標為完成。
 
 ## 既有操作旅程與 React case inventory
 
@@ -23,11 +23,11 @@ Legacy 測試只作為 Streamlit 行為錨點，不算 React 通過證據。Reac
 
 | Case ID | 原有操作旅程與 parity contract | Streamlit 行為錨點 | React 狀態 |
 |---|---|---|---|
-| LV-WEB-01-IC-01 | Image Classifier 整圖：選來源、DINOv2-small、PCA、執行、選點讀回原圖與類別／split | scripts/app.py::_visualize_embeddings_ui；scripts/visualize_embeddings.py | 本機 AC1–AC5 通過；NativeApp AC6 與 ARM64 待驗 |
+| LV-WEB-01-IC-01 | Image Classifier 整圖：選來源、DINOv2-small、PCA、執行、選點讀回原圖與類別／split | scripts/app.py::_visualize_embeddings_ui；scripts/visualize_embeddings.py | 本機 AC1–AC5 通過；固定模型的 Windows ARM64 visible React 流程通過；NativeApp AC6 待驗 |
 | LV-WEB-01-IC-02 | 分類器多資料夾／多模型；切換 PCA、t-SNE、UMAP、LDA 與 Supervised UMAP，保留 split、類別篩選及點選後的記錄身分 | scripts/app.py::_visualize_embeddings_ui；tests/e2e/test_gui_flows.py::test_f_selection_persists_across_views | deterministic multi-model/projection API cases 通過；真模型可見 UI 已驗 PCA、t-SNE、LDA、維度切換及點選讀回，但只用 DINOv2-small；本機 UMAP 套件未安裝，UMAP 與第二個真實模型 UI 仍待驗 |
 | LV-WEB-01-IC-03 | 固定 UMAP reference：新增資料或重跑時沿用既有參考座標，保持舊點位置穩定並可新增／移除樣本 | scripts/app.py::_visualize_embeddings_ui；tests/e2e/test_gui_flows.py::test_t_umap_reference_frame；umap_ref.py::stable_umap | 未開始；需先凍結 legacy fixture、reference 更新規則與座標容差 |
 | LV-WEB-01-IC-04 | Image Classifier 3D 導覽：切換維度時保留 2D 多點選取，以 KMeans 分區、標記區塊，進入區塊後以 2D 框選／套索加入選取 | scripts/app.py::_viz_kmeans_blocks；tests/e2e/test_gui_flows.py::test_j_3d_mode_preserves_selection | React 目前只支援 3D 散點和單點讀回；尚缺區塊分群、2D drilldown、多點選取及維度切換後的選取保留 |
-| LV-WEB-01-OD-01 | Object Detector 整圖：YOLO images／labels、classes.txt 優先序、多模型，缺少類別檔時明確錯誤 | `tests/test_react_web_shell.py::test_case_lv_web_01_od_01_whole_image_detector_taxonomy_and_models`, `test_case_lv_web_01_od_01_missing_classes_are_explicit`; visible UI: `tests/e2e/test_react_web_shell_e2e.py::test_lv_web_01_od_01_detector_runs_through_visible_react_ui`, `test_lv_web_01_od_01_missing_class_names_is_visible` | API (11 regression tests) and visible React fixture cases pass with deterministic injected embeddings. Real-model parity and NativeApp folder-grant E2E remain unverified |
+| LV-WEB-01-OD-01 | Object Detector 整圖：YOLO images／labels、classes.txt 優先序、多模型，缺少類別檔時明確錯誤 | `tests/test_react_web_shell.py::test_case_lv_web_01_od_01_whole_image_detector_taxonomy_and_models`, `test_case_lv_web_01_od_01_missing_classes_are_explicit`; visible UI: `tests/e2e/test_react_web_shell_e2e.py::test_lv_web_01_od_01_detector_runs_through_visible_react_ui`, `test_lv_web_01_od_01_missing_class_names_is_visible`, `test_lv_web_01_od_01_real_model_visible_detector_ui` | Fixture API/UI and pinned DINOv2-small visible React flow pass on Windows ARM64; verifies 4×384 vectors, YOLO labels, class-file priority, filters, and image readback. Exact Streamlit numerical comparison and NativeApp folder-grant E2E remain unverified |
 | LV-WEB-01-OD-02 | Object Detector 物件級 embedding：bbox 裁切、object policy、class filter、2D／3D 與候選標記順序一致 | tests/e2e/test_scenarios_cov.py；tests/e2e/test_scenarios_objcov.py | 未開始 |
 | LV-WEB-01-VIEW-01 | 框選／套索後縮圖牆與原圖檢視同序；YOLO overlay 在逐張瀏覽時正確更新；模式切換不沿用舊結果 | tests/e2e/test_scenarios_r1.py::test_s02_selection_viewer_yolo_chain、test_s08_mode_switch_isolation_documented | 未開始 |
 | LV-WEB-01-SEARCH-01 | 以圖搜圖按距離排序、選候選續查、跨模型重算並匯出結果 | tests/e2e/test_scenarios_r1.py::test_s03_find_similar_cross_model；tests/e2e/test_similar_gui_e2e.py | 未開始 |

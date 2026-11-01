@@ -4,7 +4,7 @@ VisualLatent analyses image dataset distributions with local feature models. **M
 
 ## React Web migration (M24)
 
-React currently implements **Visualize Embeddings → Image Classifier → whole image** (`LV-WEB-01-IC-01`) and the **Object Detector → whole image** slice (`LV-WEB-01-OD-01`). The classifier has local real DINOv2-small evidence; detector mode reuses the local embedding worker, reads YOLO labels and gives `classes.txt` priority over the manual fallback. Detector parity still needs real-model comparison and NativeApp folder-grant evidence. NativeApp packaging and the remaining nested flows are not complete.
+React currently implements **Visualize Embeddings → Image Classifier → whole image** (`LV-WEB-01-IC-01`) and the **Object Detector → whole image** slice (`LV-WEB-01-OD-01`). Visible React runs with the pinned real DINOv2-small model pass on Windows ARM64 for both classifier and detector fixtures; detector mode reads YOLO labels and gives `classes.txt` priority over manual fallback. Exact Streamlit numerical comparison, NativeApp folder-grant evidence, NativeApp packaging, and the remaining nested flows are not complete.
 
 ```powershell
 cd web
