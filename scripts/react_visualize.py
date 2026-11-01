@@ -65,6 +65,14 @@ def _project_embeddings(
 
     class_names = np.unique(np.asarray(labels))
     label_ids = np.searchsorted(class_names, np.asarray(labels))
+
+    def pca_coordinates() -> np.ndarray:
+        # A one-image dataset has no variance to estimate. Place its single
+        # point at the origin instead of dividing by (n_samples - 1).
+        if n_samples == 1:
+            return np.zeros((1, n_components), dtype=np.float64)
+        return PCA(n_components=n_components, random_state=42).fit_transform(embeddings)
+
     for method in methods:
         if method not in allowed:
             raise VisualizationInputError("METHOD_UNAVAILABLE", "A selected projection method is unavailable.")
@@ -76,7 +84,7 @@ def _project_embeddings(
             continue
         try:
             if method == "pca":
-                coordinates = PCA(n_components=n_components, random_state=42).fit_transform(embeddings)
+                coordinates = pca_coordinates()
             elif method == "tsne":
                 perplexity = min(30, max(1, n_samples - 1))
                 coordinates = TSNE(
@@ -160,9 +168,7 @@ def _project_embeddings(
             warnings.append(f"{method} could not be computed: {str(exc).splitlines()[0][:180]}")
 
     if not projections:
-        projections["pca"] = pad_to_2d(
-            PCA(n_components=n_components, random_state=42).fit_transform(embeddings)
-        )
+        projections["pca"] = pad_to_2d(pca_coordinates())
         warnings.append("PCA was used because none of the selected projections were available.")
     return projections, warnings, umap_reference_status
 

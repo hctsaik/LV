@@ -466,6 +466,73 @@ def test_lv_web_01_ic_01_missing_model_is_visible(tmp_path: Path, monkeypatch: p
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_edge_01_single_unicode_path_and_unreadable_file_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A single image in a Unicode path remains selectable when a sibling file is corrupt."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    image_folder = tmp_path / "資料 集" / "train" / "類別A"
+    image_folder.mkdir(parents=True)
+    image_path = image_folder / "影像 [1].jpg"
+    Image.new("RGB", (48, 36), (127, 64, 192)).save(image_path)
+    unreadable_path = image_folder / "壞檔.jpg"
+    unreadable_path.write_bytes(b"not an image")
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (image_path, unreadable_path)
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: lambda _path: np.array([1.0] + [0.0] * 383, dtype=np.float32),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+
+            def capture_run(response):
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                    run_payloads.append(response.json())
+
+            page.on("response", capture_run)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Image folder").fill(str(image_folder.parent))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=30_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(1)
+            assert run_payloads and run_payloads[-1]["embedding_finite"] is True
+            assert run_payloads[-1]["method"] == "pca"
+            record = run_payloads[-1]["records"][0]
+            assert (record["filename"], record["split"], record["label"]) == (
+                image_path.name, "train", "類別A",
+            )
+            assert all(np.isfinite([point["x"], point["y"]]).all() for point in run_payloads[-1]["points"])
+            expect(page.locator(".alert-info")).to_contain_text("Skipped 1 unreadable image(s).")
+            page.get_by_test_id("embedding-point").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(image_path.name)
+            image = page.get_by_test_id("selected-image")
+            expect(image).to_be_visible()
+            expect(image).to_have_js_property("naturalWidth", 48)
+            assert {
+                path: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (image_path, unreadable_path)
+            } == source_hashes
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
 def test_lv_web_01_ic_01_cancel_is_visible_in_react(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """AC4: the visible UI can cancel a running job and shows its terminal state."""
     dataset = _fixture(tmp_path / "classifier-fixture")
