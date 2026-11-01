@@ -1978,6 +1978,31 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             expect(page.locator('[data-testid="embedding-point"][data-index="3"]')).to_have_class("point point-active")
             expect(page.get_by_test_id("selected-image-name")).to_have_text("03.png")
             expect(page.get_by_test_id("selected-object-index")).to_have_text("1")
+
+            expect(page.get_by_test_id("selection-count")).to_have_text("2 selected")
+            page.get_by_test_id("add-selection-to-curation").click()
+            expect(page.locator(".alert-info")).to_contain_text(
+                "Added 2 item(s) to curation; skipped 0 duplicate(s)."
+            )
+            curation = page.request.get(base_url + "/api/v1/curation/items").json()
+            assert curation["total"] == 2
+            assert [
+                (item["filename"], item["label"], item["level"], item["obj_index"], item["bbox"])
+                for item in curation["items"]
+            ] == [
+                ("02.png", "stain", "object", 1, run["records"][2]["bbox"]),
+                ("03.png", "stain", "object", 0, run["records"][3]["bbox"]),
+            ]
+            assert all("path" not in item and "image_path" not in item for item in curation["items"])
+
+            page.get_by_test_id("open-curation").click()
+            expect(page.get_by_test_id("curation-item")).to_have_count(2)
+            item_headings = page.locator(".curation-item-heading strong")
+            expect(item_headings.nth(0)).to_have_text("02.png")
+            expect(item_headings.nth(1)).to_have_text("03.png")
+            item_metadata = page.locator(".curation-item-meta")
+            expect(item_metadata.nth(0)).to_contain_text("stain · train · manual · object 2")
+            expect(item_metadata.nth(1)).to_contain_text("stain · test · manual · object 1")
             browser.close()
     finally:
         if server is not None:
