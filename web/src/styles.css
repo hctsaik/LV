@@ -401,3 +401,58 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .ranking-actions button:hover { border-color: #b8c9e0; background: #eaf1fa; }
 @media (max-width: 1050px) { .search-tool-grid { grid-template-columns: 1fr; } }
 @media (max-width: 580px) { .search-workspace, .ranking-workspace { padding: 11px; }.search-workspace-heading { align-items: flex-start; flex-direction: column; gap: 4px; }.search-form { grid-template-columns: minmax(0, 1fr) 68px; }.search-form > button { grid-column: 1 / -1; }.duplicate-controls { grid-template-columns: 1fr 1fr; }.duplicate-cross-split { grid-column: 1 / -1; }.duplicate-controls > button { grid-column: 1 / -1; }.duplicate-pair { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }.duplicate-distance { grid-column: 1 / -1; justify-self: end; }.ranking-criterion { width: 100%; }.ranking-criterion select { width: 100%; } }
+
+.coverage-layer[hidden] { display: none !important; }
+.coverage-workspace { background: #f3f5f9; }
+.coverage-inline-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(76px, .72fr); align-items: end; gap: 12px; margin-top: 17px; }
+.coverage-inline-controls > div { min-width: 0; }
+.coverage-inline-controls input[type=number] { width: 100%; height: 32px; border: 1px solid #dfe4ec; border-radius: 6px; padding: 0 8px; color: #34425b; font-size: 10px; }
+.dimension-toggle { display: flex; gap: 4px; }
+.dimension-toggle button { flex: 1; min-height: 32px; border: 1px solid #dfe4ec; border-radius: 5px; background: #fff; color: #6f7d92; font-size: 9px; font-weight: 700; }
+.dimension-toggle button[aria-pressed=true] { border-color: #a9bad1; background: #eef3fa; color: #365781; }
+.coverage-color-mode { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0 0; border: 0; padding: 0; }
+.coverage-color-mode legend { margin-bottom: 8px; padding: 0; }
+.coverage-color-mode label { display: inline-flex; align-items: center; gap: 5px; color: #758299; font-size: 10px; }
+.coverage-color-mode input { accent-color: #5379ad; }
+.coverage-workspace .run-button { margin-top: 22px; }
+.coverage-workspace .cancel-button { width: 100%; margin-top: 8px; }
+.coverage-loading { min-height: calc(100vh - 72px); display: grid; place-items: center; color: #7f8b9e; font-size: 12px; }
+.coverage-results { background: #f7f8fa; }
+.coverage-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+.coverage-heading h2 { margin: 8px 0 5px; color: #24334e; font: 800 21px Manrope, "Segoe UI", sans-serif; letter-spacing: -.5px; }
+.coverage-heading p { margin: 0; max-width: 760px; color: #8490a2; font-size: 10px; line-height: 1.6; }
+.coverage-metrics { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 9px; margin-top: 21px; }
+.coverage-metrics article { display: grid; gap: 5px; min-width: 0; padding: 12px 13px; border: 1px solid #e5e9ef; border-radius: 7px; background: #fff; }
+.coverage-metrics strong { overflow: hidden; color: #355181; font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+.coverage-metrics span { color: #8995a6; font-size: 9px; }
+.coverage-caveat { margin: 10px 0 2px; color: #946b35; font-size: 9px; line-height: 1.5; }
+.coverage-warning { margin-top: 10px; border: 1px solid #eee0bd; border-radius: 6px; padding: 8px 10px; background: #fffaf0; color: #826b3b; font-size: 10px; }
+.coverage-plot-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 17px; }
+.coverage-plot-toolbar p { margin: 0; color: #8490a2; font-size: 9px; line-height: 1.5; }
+.coverage-plot-toolbar .clear-selection { flex: 0 0 auto; min-height: 29px; border: 1px solid #dbe4f0; border-radius: 6px; padding: 0 10px; background: #fff; color: #49658e; font-size: 9px; font-weight: 700; }
+.coverage-plot-toolbar .clear-selection:disabled { cursor: default; opacity: .48; }
+.coverage-plot { min-width: 0; margin-top: 4px; border: 1px solid #e5e9ef; border-radius: 8px; padding: 8px 10px 4px; background: #fff; box-shadow: 0 4px 14px #25385808; }
+.coverage-plot .plot-frame { min-height: 450px; margin-top: 0; }
+.coverage-plot .plot-frame-2d, .coverage-plot .plot-frame-3d { flex: unset; }
+.coverage-legend { display: flex; flex-wrap: wrap; gap: 10px 15px; margin-top: 10px; color: #7b8799; font-size: 9px; }
+.coverage-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.coverage-legend-swatch { width: 9px; height: 9px; border-radius: 50%; }
+.coverage-legend-gradient { width: 55px; height: 8px; border-radius: 5px; background: linear-gradient(90deg, #30123b, #466be3, #28bbec, #32d398, #b7dd3b, #f9a21b, #d9271c); }
+.coverage-selection { margin-top: 19px; padding: 14px; border: 1px solid #e5e9ef; border-radius: 8px; background: #fff; }
+.coverage-selection-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.coverage-selection-heading > div { display: flex; align-items: baseline; gap: 8px; }
+.coverage-selection-heading h3 { margin: 0; color: #35425a; font-size: 12px; }
+.coverage-selection-heading span { color: #8e99a8; font-size: 9px; }
+.coverage-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(125px, 1fr)); gap: 8px; max-height: 420px; margin-top: 12px; overflow: auto; }
+.coverage-image-card { display: grid; align-content: start; gap: 5px; min-width: 0; padding: 7px; border: 1px solid #e8ecf2; border-radius: 6px; background: #fff; }
+.coverage-image-card img { width: 100%; aspect-ratio: 1.25; border-radius: 4px; object-fit: contain; background: #f1f3f6; }
+.coverage-image-card strong { overflow: hidden; color: #576780; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.coverage-image-label { width: fit-content; max-width: 100%; overflow: hidden; border-radius: 4px; padding: 2px 5px; color: #fff; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.coverage-image-card small { color: #96a0af; font-size: 8px; }
+.coverage-empty-selection { margin: 15px 0 4px; color: #929dad; font-size: 10px; }
+.coverage-empty-canvas { min-height: 56vh; margin-top: 15px; }
+.coverage-empty-canvas h3 { margin: 14px 0 6px; color: #34435d; font: 700 15px Manrope, "Segoe UI", sans-serif; }
+.coverage-empty-canvas p { max-width: 410px; margin: 0 auto; color: #8793a4; font-size: 10px; line-height: 1.6; }
+.coverage-results .canvas-footer { margin-top: auto; }
+@media (max-width: 900px) { .coverage-metrics { grid-template-columns: repeat(2, minmax(105px, 1fr)); }.coverage-plot-toolbar { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 800px) { .coverage-workspace { display: flex; flex-direction: column; }.coverage-workspace .control-panel { border-right: 0; border-bottom: 1px solid #e7ebf1; }.coverage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }.coverage-results { padding: 24px 18px 16px; } }

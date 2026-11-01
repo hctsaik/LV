@@ -72,6 +72,39 @@ export type VisualizationRun = {
   warnings: string[];
 };
 
+export type CoverageRun = {
+  run_id: string;
+  model_id: string;
+  method: ProjectionMethod;
+  requested_method: ProjectionMethod;
+  dimension: 2 | 3;
+  records: RunRecord[];
+  points: EmbeddingPoint[];
+  embedding_shape: [number, number];
+  k: number;
+  sparsity: number[];
+  sparse_threshold: number;
+  sparse_count: number;
+  sparse_percentile: number;
+  warnings: string[];
+};
+
+export type CoverageProjectionResult = {
+  method: ProjectionMethod;
+  requested_method: ProjectionMethod;
+  dimension: 2 | 3;
+  points: EmbeddingPoint[];
+  warnings: string[];
+};
+
+export type CoverageSparsityResult = {
+  k: number;
+  scores: number[];
+  threshold: number;
+  sparse_count: number;
+  sparse_percentile: number;
+};
+
 export type KMeansCenter = {
   block_id: number;
   x: number;
@@ -276,6 +309,36 @@ export const api = {
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
   ),
+  createCoverageJob: (
+    folders: string[],
+    modelId: string,
+    method: ProjectionMethod,
+    dimension: 2 | 3,
+    k: number,
+  ) => request<{ job_id: string; state: string }>("/api/v1/coverage/jobs", {
+    method: "POST",
+    body: JSON.stringify({ folders, model_id: modelId, method, dimension, k }),
+  }),
+  coverageJob: (jobId: string) =>
+    request<JobStatus>("/api/v1/coverage/jobs/" + encodeURIComponent(jobId)),
+  cancelCoverage: (jobId: string) => request<{ job_id: string; state: string }>(
+    "/api/v1/coverage/jobs/" + encodeURIComponent(jobId), { method: "DELETE" },
+  ),
+  coverageRun: (runId: string) => request<CoverageRun>(
+    "/api/v1/coverage/runs/" + encodeURIComponent(runId),
+  ),
+  projectCoverage: (runId: string, method: ProjectionMethod, dimension: 2 | 3) =>
+    request<CoverageProjectionResult>(
+      "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/projections",
+      { method: "POST", body: JSON.stringify({ method, dimension }) },
+    ),
+  coverageSparsity: (runId: string, k: number) => request<CoverageSparsityResult>(
+    "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/sparsity",
+    { method: "POST", body: JSON.stringify({ k }) },
+  ),
+  coverageThumbnailUrl: (runId: string, index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/coverage/runs/"
+      + encodeURIComponent(runId) + "/images/" + index + "/thumbnail",
   rankings: (
     runId: string,
     input: { model_id: string; metric: RankingMetric; label_filter?: string; split_filter?: string },

@@ -36,6 +36,11 @@ from interaction import (
 )
 from curation_store import CurationStore, CurationStoreError
 from react_compare import ComparisonInputError, project_comparison, run_comparison
+from react_coverage import (
+    coverage_projection,
+    coverage_sparsity,
+    sparse_threshold,
+)
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 from safe_io import safe_open_image
 
@@ -70,6 +75,23 @@ class CreateComparisonJob(BaseModel):
     unit: Literal["whole", "object"] = "object"
     class_names: list[str] = Field(default_factory=list, max_length=256)
     object_policy: ComparisonObjectPolicy | None = None
+
+
+class CreateCoverageJob(BaseModel):
+    folders: list[str] = Field(min_length=1, max_length=32)
+    model_id: str = Field(min_length=1, max_length=128)
+    method: Literal["pca", "tsne", "umap", "lda", "sumap"] = "sumap"
+    dimension: Literal[2, 3] = 2
+    k: int = Field(default=10, ge=1, le=1000)
+
+
+class CoverageProjectionRequest(BaseModel):
+    method: Literal["pca", "tsne", "umap", "lda", "sumap"]
+    dimension: Literal[2, 3] = 2
+
+
+class CoverageSparsityRequest(BaseModel):
+    k: int = Field(ge=1, le=1000)
 
 
 class ProjectComparisonRequest(BaseModel):
@@ -150,7 +172,21 @@ class _ComparisonJob:
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
-def _job_view(job: _Job) -> dict:
+@dataclass
+class _CoverageJob:
+    job_id: str
+    request: CreateCoverageJob
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    run_id: str | None = None
+    error: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+def _job_view(job: _Job | _ComparisonJob | _CoverageJob) -> dict:
     return {
         "job_id": job.job_id,
         "state": job.state,
@@ -194,11 +230,19 @@ def create_app(
     app.state.comparison_jobs = {}
     app.state.comparison_runs = {}
     app.state.comparison_projections = {}
+    app.state.coverage_jobs = {}
+    app.state.coverage_runs = {}
+    app.state.coverage_embeddings = {}
+    app.state.coverage_sparsity = {}
     app.state.curation_store = CurationStore()
     app.state.lock = threading.RLock()
 
     def has_active_job() -> bool:
-        jobs = list(app.state.jobs.values()) + list(app.state.comparison_jobs.values())
+        jobs = (
+            list(app.state.jobs.values())
+            + list(app.state.comparison_jobs.values())
+            + list(app.state.coverage_jobs.values())
+        )
         return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
     @app.exception_handler(HTTPException)
@@ -350,6 +394,257 @@ def create_app(
             app.state.jobs[job_id] = job
         threading.Thread(target=execute, args=(job,), daemon=True, name=f"lv-web-{job_id[:8]}").start()
         return {"job_id": job_id, "state": job.state}
+
+    def coverage_points(records: list[dict], coordinates: np.ndarray) -> list[dict]:
+        return [
+            {
+                **record,
+                "x": float(coordinates[index, 0]),
+                "y": float(coordinates[index, 1]),
+                "z": float(coordinates[index, 2]) if coordinates.shape[1] > 2 else 0.0,
+            }
+            for index, record in enumerate(records)
+        ]
+
+    def public_coverage_run(run: dict) -> dict:
+        return {
+            key: value for key, value in run.items()
+            if key != "image_paths"
+        }
+
+    def execute_coverage(job: _CoverageJob) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase, job.message = "running", "discovery", "Scanning image folders"
+            if job.request.model_id not in set(catalog()):
+                raise VisualizationInputError("MODEL_UNAVAILABLE", "The selected model is not installed.")
+
+            def update_progress(done: int, total: int) -> None:
+                with app.state.lock:
+                    job.phase = "embedding"
+                    job.done = done
+                    job.total = total
+                    job.message = f"Extracting embeddings ({done}/{total})"
+
+            result = run_image_visualization(
+                job.request.folders,
+                model_names=[job.request.model_id],
+                methods=["pca"],
+                mode="classifier",
+                unit="image",
+                model_loader=loader,
+                progress=update_progress,
+                cancelled=job.cancel_event.is_set,
+            )
+            if job.cancel_event.is_set():
+                raise JobCancelled()
+
+            vectors = result.pop("_raw_embeddings", {}).get(job.request.model_id)
+            if vectors is None or len(vectors) != len(result["records"]):
+                raise VisualizationInputError("INVALID_EMBEDDINGS", "The coverage embeddings are unavailable.")
+            records = result["records"]
+            labels = [str(record.get("label", "")) for record in records]
+            coordinates, used_method, projection_warnings = coverage_projection(
+                vectors,
+                labels,
+                job.request.method,
+                job.request.dimension,
+            )
+            k = min(job.request.k, max(1, len(vectors) - 1))
+            scores = coverage_sparsity(vectors, k)
+            threshold, sparse_count = sparse_threshold(scores)
+            run_id = uuid.uuid4().hex
+            warnings = list(result.get("warnings", [])) + projection_warnings
+            run = {
+                "run_id": run_id,
+                "model_id": job.request.model_id,
+                "method": used_method,
+                "requested_method": job.request.method,
+                "dimension": job.request.dimension,
+                "records": records,
+                "image_paths": result["image_paths"],
+                "points": coverage_points(records, coordinates),
+                "embedding_shape": result["embedding_shape"],
+                "k": k,
+                "sparsity": np.asarray(scores, dtype=float).tolist(),
+                "sparse_threshold": threshold,
+                "sparse_count": sparse_count,
+                "sparse_percentile": 90,
+                "warnings": warnings,
+            }
+            with app.state.lock:
+                app.state.coverage_runs.clear()
+                app.state.coverage_embeddings.clear()
+                app.state.coverage_sparsity.clear()
+                app.state.coverage_runs[run_id] = run
+                app.state.coverage_embeddings[run_id] = np.asarray(vectors, dtype=np.float32)
+                app.state.coverage_sparsity[run_id] = {k: run["sparsity"]}
+                job.run_id = run_id
+                job.state, job.phase = "completed", "completed"
+                job.done = job.total = len(records)
+                job.message = "Completed"
+        except JobCancelled:
+            with app.state.lock:
+                job.state, job.phase, job.message = "cancelled", "cancelled", "Cancelled"
+        except VisualizationInputError as exc:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", exc.code
+                job.error = {"code": exc.code, "message": str(exc), "request_id": job.job_id}
+        except FileNotFoundError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "MODEL_UNAVAILABLE"
+                job.error = {
+                    "code": "MODEL_UNAVAILABLE",
+                    "message": "The selected model weights are unavailable.",
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV web coverage analysis failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "RUN_FAILED"
+                job.error = {
+                    "code": "RUN_FAILED",
+                    "message": "The coverage analysis failed. Check the local worker log and retry.",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/coverage/jobs", status_code=202)
+    def create_coverage_job(request: CreateCoverageJob) -> dict:
+        job_id = uuid.uuid4().hex
+        job = _CoverageJob(job_id=job_id, request=request)
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "Wait for the active analysis to finish before starting another.",
+                    "request_id": job_id,
+                })
+            app.state.coverage_jobs[job_id] = job
+        threading.Thread(
+            target=execute_coverage,
+            args=(job,),
+            daemon=True,
+            name=f"lv-coverage-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/coverage/jobs/{job_id}")
+    def get_coverage_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.coverage_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Coverage job not found")
+            return _job_view(job)
+
+    @app.delete("/api/v1/coverage/jobs/{job_id}", status_code=202)
+    def cancel_coverage_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.coverage_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Coverage job not found")
+            if job.state in {"queued", "running"}:
+                job.state, job.phase, job.message = "cancelling", "cancelling", "Cancellation requested"
+                job.cancel_event.set()
+            return {"job_id": job.job_id, "state": job.state}
+
+    @app.get("/api/v1/coverage/runs/{run_id}")
+    def get_coverage_run(run_id: str) -> dict:
+        with app.state.lock:
+            run = app.state.coverage_runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            return public_coverage_run(run)
+
+    @app.post("/api/v1/coverage/runs/{run_id}/projections")
+    def update_coverage_projection(run_id: str, request: CoverageProjectionRequest) -> dict:
+        with app.state.lock:
+            run = app.state.coverage_runs.get(run_id)
+            vectors = app.state.coverage_embeddings.get(run_id)
+            if run is None or vectors is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            labels = [str(record.get("label", "")) for record in run["records"]]
+            records = run["records"]
+        try:
+            coordinates, used_method, warnings = coverage_projection(
+                vectors, labels, request.method, request.dimension,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        with app.state.lock:
+            current = app.state.coverage_runs.get(run_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            current["method"] = used_method
+            current["requested_method"] = request.method
+            current["dimension"] = request.dimension
+            current["points"] = coverage_points(records, coordinates)
+            current["warnings"] = warnings
+            return {
+                "method": used_method,
+                "requested_method": request.method,
+                "dimension": request.dimension,
+                "points": current["points"],
+                "warnings": warnings,
+            }
+
+    @app.post("/api/v1/coverage/runs/{run_id}/sparsity")
+    def update_coverage_sparsity(run_id: str, request: CoverageSparsityRequest) -> dict:
+        with app.state.lock:
+            run = app.state.coverage_runs.get(run_id)
+            vectors = app.state.coverage_embeddings.get(run_id)
+            if run is None or vectors is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            cache = app.state.coverage_sparsity.setdefault(run_id, {})
+            k = min(request.k, max(1, len(vectors) - 1))
+            scores = cache.get(k)
+        if scores is None:
+            try:
+                scores = coverage_sparsity(vectors, k)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            scores = np.asarray(scores, dtype=float).tolist()
+            with app.state.lock:
+                app.state.coverage_sparsity.setdefault(run_id, {})[k] = scores
+        threshold, sparse_count = sparse_threshold(np.asarray(scores, dtype=float))
+        with app.state.lock:
+            current = app.state.coverage_runs.get(run_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            current.update({
+                "k": k,
+                "sparsity": scores,
+                "sparse_threshold": threshold,
+                "sparse_count": sparse_count,
+            })
+        return {
+            "k": k,
+            "scores": scores,
+            "threshold": threshold,
+            "sparse_count": sparse_count,
+            "sparse_percentile": 90,
+        }
+
+    @app.get("/api/v1/coverage/runs/{run_id}/images/{index}/thumbnail")
+    def get_coverage_thumbnail(run_id: str, index: int) -> Response:
+        with app.state.lock:
+            run = app.state.coverage_runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            paths: list[Path] = run["image_paths"]
+            if index < 0 or index >= len(paths):
+                raise HTTPException(status_code=404, detail="Image not found")
+            path = paths[index]
+        thumbnail = safe_open_image(path)
+        if thumbnail is None:
+            raise HTTPException(status_code=404, detail="Image is no longer available")
+        thumbnail.thumbnail((256, 256))
+        output = BytesIO()
+        thumbnail.save(output, format="JPEG", quality=84, optimize=True)
+        return Response(
+            content=output.getvalue(),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
 
     def execute_comparison(job: _ComparisonJob) -> None:
         try:

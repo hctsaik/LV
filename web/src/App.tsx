@@ -29,6 +29,7 @@ import CompareDistributions from "./CompareDistributions";
 import CurationWorkspace from "./CurationWorkspace";
 const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
+const LazyCoverageWorkspace = lazy(() => import("./CoverageWorkspace"));
 
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
 const projectionOptions: { value: ProjectionMethod; label: string }[] = [
@@ -246,7 +247,8 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "compare" | "curation">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "compare" | "curation" | "coverage">("visualize");
+  const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
   const [selectedMethods, setSelectedMethods] = useState<ProjectionMethod[]>(["sumap"]);
@@ -887,6 +889,7 @@ export default function App() {
         <nav className="tool-nav" aria-label="LV tools">
           <button type="button" className={activeTool === "visualize" ? "active" : ""} aria-current={activeTool === "visualize" ? "page" : undefined} onClick={() => setActiveTool("visualize")}>Visualize</button>
           <button type="button" className={activeTool === "compare" ? "active" : ""} aria-current={activeTool === "compare" ? "page" : undefined} onClick={() => setActiveTool("compare")}>Compare</button>
+          <button type="button" className={activeTool === "coverage" ? "active" : ""} aria-current={activeTool === "coverage" ? "page" : undefined} onClick={() => { setCoverageMounted(true); setActiveTool("coverage"); }}>Coverage</button>
           <button type="button" data-testid="open-curation" className={activeTool === "curation" ? "active" : ""} aria-current={activeTool === "curation" ? "page" : undefined} onClick={() => setActiveTool("curation")}>Curation{curationCount === null ? "" : ` (${curationCount})`}</button>
         </nav>
         <div className={"connection " + (connected ? "connection-ready" : "connection-waiting")}>
@@ -895,11 +898,19 @@ export default function App() {
         </div>
       </header>
 
+      {coverageMounted && (
+        <div className="coverage-layer" hidden={activeTool !== "coverage"}>
+          <Suspense fallback={<div className="coverage-loading" role="status">Loading coverage workspace…</div>}>
+            <LazyCoverageWorkspace models={models} connected={connected} loadingModels={loadingModels} />
+          </Suspense>
+        </div>
+      )}
+
       {activeTool === "curation" ? (
         <CurationWorkspace onCountChange={setCurationCount} />
       ) : activeTool === "compare" ? (
         <CompareDistributions models={models} loadingModels={loadingModels} connected={connected} />
-      ) : <div className="workspace">
+      ) : activeTool === "coverage" ? null : <div className="workspace">
         <aside className="control-panel">
           <div className="eyebrow">VISUALIZE EMBEDDINGS</div>
           <h1>Explore your image space</h1>

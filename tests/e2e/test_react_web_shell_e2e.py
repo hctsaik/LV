@@ -754,6 +754,135 @@ def test_lv_web_01_view_01_selected_gallery_navigation_and_yolo_overlay(
             server_thread.join(timeout=10)
 
 
+def test_lv_web_03_img_01_visible_coverage_projection_box_selection_and_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Coverage runs independently, colors classes, switches projection and reads selected images back."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "coverage-fixture")
+    folders = [dataset / "train", dataset / "test"]
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for folder in folders
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            vectors = {
+                "image-01.png": [1.0, 0.0, 0.0],
+                "image-02.png": [0.9, 0.1, 0.0],
+                "image-03.png": [0.0, 1.0, 0.0],
+                "image-04.png": [0.0, 0.0, 1.0],
+            }
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = vectors[path.name]
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=fixture_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(10_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            for folder in folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+            expect(page.get_by_label("Feature model")).to_have_value("fixture-model")
+            page.get_by_label("Projection method").select_option("pca")
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("4")
+            expect(page.get_by_test_id("coverage-class-legend-item")).to_have_count(2)
+            legend = page.get_by_test_id("coverage-class-legend-item")
+            assert legend.nth(0).get_attribute("data-label") == "apple"
+            assert legend.nth(0).locator("i").evaluate("node => getComputedStyle(node).backgroundColor") == "rgb(231, 76, 60)"
+            assert legend.nth(1).get_attribute("data-label") == "banana"
+            assert legend.nth(1).locator("i").evaluate("node => getComputedStyle(node).backgroundColor") == "rgb(243, 156, 18)"
+            page.locator("input[name='coverage-color-mode'][value='sparsity']").check()
+            expect(page.locator(".coverage-legend-gradient")).to_be_visible()
+            expect(page.get_by_test_id("coverage-class-legend-item")).to_have_count(0)
+            page.locator("input[name='coverage-color-mode'][value='class']").check()
+
+            page.get_by_test_id("coverage-selection-mode-box").click()
+            plot = page.locator("[data-testid='coverage-plot'] .js-plotly-plot")
+            bounds = plot.bounding_box()
+            assert bounds is not None
+            page.mouse.move(bounds["x"] + 58, bounds["y"] + 20)
+            page.mouse.down()
+            page.mouse.move(bounds["x"] + bounds["width"] - 18,
+                            bounds["y"] + bounds["height"] - 45, steps=8)
+            page.mouse.up()
+            expect(page.get_by_test_id("coverage-selected-count")).to_contain_text("selected")
+            expect(page.get_by_test_id("coverage-selected-image")).not_to_have_count(0)
+            selected = page.get_by_test_id("coverage-selected-image").first
+            thumbnail_src = selected.locator("img").get_attribute("src")
+            assert thumbnail_src
+            assert page.request.get(base_url + thumbnail_src).status == 200
+
+            with page.expect_response(lambda response: "/coverage/runs/" in response.url
+                                      and response.url.endswith("/projections")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_label("Projection method").select_option("tsne")
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            expect(page.get_by_test_id("coverage-selected-count")).to_contain_text("selected")
+
+            with page.expect_response(lambda response: "/coverage/runs/" in response.url
+                                      and response.url.endswith("/projections")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_test_id("coverage-dimension-3d").click()
+            expect(page.locator("[data-testid='coverage-plot'] [data-testid='coverage-plot-3d']")).to_be_visible()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            page.get_by_test_id("coverage-point").nth(0).focus()
+            page.get_by_test_id("coverage-point").nth(0).press("Enter")
+            expect(page.get_by_test_id("coverage-selected-count")).to_have_text("3 selected")
+            with page.expect_response(lambda response: "/coverage/runs/" in response.url
+                                      and response.url.endswith("/projections")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_test_id("coverage-dimension-2d").click()
+            expect(page.get_by_test_id("coverage-selected-count")).to_have_text("3 selected")
+
+            with page.expect_response(lambda response: response.url.endswith("/sparsity")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_test_id("coverage-k").fill("1")
+            expect(page.get_by_test_id("coverage-k-summary")).to_have_text("1")
+
+            page.get_by_test_id("coverage-clear-selection").click()
+            expect(page.get_by_test_id("coverage-selected-count")).to_have_text("0 selected")
+            expect(page.get_by_test_id("coverage-selected-image")).to_have_count(0)
+            assert page.get_by_test_id("coverage-clear-selection").is_disabled()
+
+            page.get_by_role("button", name="Visualize", exact=True).click()
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("4")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
 def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

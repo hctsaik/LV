@@ -7,9 +7,9 @@ import type { EmbeddingPoint } from "./api";
 const Plot = createPlotlyComponent(Plotly);
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
 
-function colorMap(points: EmbeddingPoint[]) {
+function colorMap(points: EmbeddingPoint[], palette: string[]) {
   const labels = [...new Set(points.map((point) => point.label))].sort();
-  return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
+  return new Map(labels.map((label, index) => [label, palette[index % palette.length]]));
 }
 
 export default function ScatterPlot2D({
@@ -19,6 +19,11 @@ export default function ScatterPlot2D({
   onAddSelection,
   viewKey,
   testIdPrefix = "embedding",
+  colorValues,
+  labelPalette = labelColors,
+  pointSizes,
+  scoreValues,
+  scoreLabel,
 }: {
   points: EmbeddingPoint[];
   selectedIndices: number[];
@@ -26,9 +31,16 @@ export default function ScatterPlot2D({
   onAddSelection: (indices: number[]) => void;
   viewKey: string;
   testIdPrefix?: string;
+  colorValues?: number[];
+  labelPalette?: string[];
+  pointSizes?: number[];
+  scoreValues?: number[];
+  scoreLabel?: string;
 }) {
   const [selectionMode, setSelectionMode] = useState<false | "select" | "lasso">(false);
-  const colors = colorMap(points);
+  const colors = colorMap(points, labelPalette);
+  const numericColor = colorValues !== undefined && colorValues.length === points.length;
+  const numericScores = scoreValues !== undefined && scoreValues.length === points.length;
   const pointPositions = new Map(points.map((point, position) => [point.index, position]));
   const selectedPositions = selectedIndices
     .map((index) => pointPositions.get(index))
@@ -38,11 +50,22 @@ export default function ScatterPlot2D({
     mode: "markers",
     x: points.map((point) => point.x),
     y: points.map((point) => point.y),
-    text: points.map((point) => `${point.filename}<br>Class: ${point.label}<br>Split: ${point.split}`),
+    text: points.map((point, position) => `${point.filename}<br>Class: ${point.label}<br>Split: ${point.split}`
+      + (numericScores && scoreLabel ? `<br>${scoreLabel}: ${scoreValues[position].toFixed(3)}` : "")),
     customdata: points.map((point) => point.index),
     marker: {
-      size: points.map((point) => selectedIndices.includes(point.index) ? 11 : 8),
-      color: points.map((point) => colors.get(point.label) || labelColors[0]),
+      size: points.map((point, position) => {
+        const baseSize = pointSizes?.length === points.length ? pointSizes[position] : 8;
+        return selectedIndices.includes(point.index) ? Math.max(11, baseSize) : baseSize;
+      }),
+      color: numericColor
+        ? colorValues
+        : points.map((point) => colors.get(point.label) || labelPalette[0]),
+      ...(numericColor ? {
+        colorscale: "Turbo" as const,
+        showscale: true,
+        colorbar: { title: { text: scoreLabel || "Score" } },
+      } : {}),
       symbol: points.map((point) => point.split.toLowerCase() === "test"
         ? "square" : point.split.toLowerCase() === "valid" ? "diamond" : "circle"),
       line: { color: "#ffffff", width: 1 },

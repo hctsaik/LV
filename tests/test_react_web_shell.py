@@ -106,6 +106,97 @@ def _run(client: TestClient, folders: list[Path], *, model: str = "dinov2_vits14
     pytest.fail("job did not reach a terminal state within 15 seconds")
 
 
+def _run_coverage(
+    client: TestClient,
+    folders: list[Path],
+    *,
+    model: str = "dinov2_vits14",
+    method: str = "pca",
+    dimension: int = 2,
+    k: int = 10,
+) -> dict:
+    response = client.post("/api/v1/coverage/jobs", json={
+        "folders": [str(folder) for folder in folders],
+        "model_id": model,
+        "method": method,
+        "dimension": dimension,
+        "k": k,
+    })
+    assert response.status_code == 202, response.text
+    job_id = response.json()["job_id"]
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/v1/coverage/jobs/{job_id}").json()
+        if status["state"] in {"completed", "failed", "cancelled"}:
+            return status
+        time.sleep(0.02)
+    pytest.fail("coverage job did not reach a terminal state within 15 seconds")
+
+
+def test_case_lv_web_03_img_01_coverage_sparsity_projection_selection_inputs(
+    classifier_fixture, monkeypatch, tmp_path,
+):
+    """Image coverage keeps high-dimensional sparsity separate from projection."""
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for folder in classifier_fixture["folders"]
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+    with _client(monkeypatch, tmp_path) as client:
+        job = _run_coverage(client, classifier_fixture["folders"], k=2)
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        run_response = client.get(f"/api/v1/coverage/runs/{run_id}")
+        assert run_response.status_code == 200
+        run = run_response.json()
+        vectors = client.app.state.coverage_embeddings[run_id]
+        expected = compute_outlier_scores(
+            vectors, vectors, k=2, candidates_in_reference=True,
+        )
+        assert np.allclose(run["sparsity"], expected)
+        assert run["sparse_threshold"] == pytest.approx(np.percentile(expected, 90))
+        assert run["sparse_count"] == int(np.sum(expected >= np.percentile(expected, 90)))
+        assert len(run["points"]) == len(run["records"]) == 4
+        assert "image_paths" not in run
+        assert run["requested_method"] == "pca"
+        assert all(np.isfinite([point["x"], point["y"], point["z"]]).all() for point in run["points"])
+
+        switched = client.post(
+            f"/api/v1/coverage/runs/{run_id}/projections",
+            json={"method": "tsne", "dimension": 2},
+        )
+        assert switched.status_code == 200, switched.text
+        projection = switched.json()
+        assert projection["requested_method"] == "tsne"
+        assert projection["method"] == "tsne"
+        assert len(projection["points"]) == 4
+        assert all(np.isfinite([point["x"], point["y"]]).all() for point in projection["points"])
+
+        changed_k = client.post(
+            f"/api/v1/coverage/runs/{run_id}/sparsity",
+            json={"k": 1},
+        )
+        assert changed_k.status_code == 200, changed_k.text
+        sparsity = changed_k.json()
+        expected_k1 = compute_outlier_scores(
+            vectors, vectors, k=1, candidates_in_reference=True,
+        )
+        assert sparsity["k"] == 1
+        assert np.allclose(sparsity["scores"], expected_k1)
+
+        thumbnail = client.get(f"/api/v1/coverage/runs/{run_id}/images/0/thumbnail")
+        assert thumbnail.status_code == 200
+        assert thumbnail.headers["content-type"].startswith("image/jpeg")
+        assert client.get(f"/api/v1/coverage/runs/{run_id}/images/999/thumbnail").status_code == 404
+        assert client.get("/api/v1/coverage/runs/missing").status_code == 404
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
 def test_case_lv_web_01_ic_01_discovery(classifier_fixture, monkeypatch, tmp_path):
     """AC1: React API preserves Streamlit classifier order, labels, and splits."""
     baseline = discover_images_classifier(classifier_fixture["folders"], allow_flat=True)
