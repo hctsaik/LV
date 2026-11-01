@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type FormEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
@@ -12,10 +13,13 @@ import {
   type EmbeddingPoint,
   type KMeansBlocks,
   type ComparisonObjectPolicy,
+  type DuplicateScanInput,
+  type DuplicateScanResult,
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
   type SimilarSearchResult,
+  type TextSearchResult,
   type VisualizeUnit,
   type VisualizationRun,
 } from "./api";
@@ -264,6 +268,22 @@ export default function App() {
   const [similarLoading, setSimilarLoading] = useState(false);
   const [similarError, setSimilarError] = useState("");
   const similarRequest = useRef(0);
+  const [textQuery, setTextQuery] = useState("");
+  const [textResultCount, setTextResultCount] = useState(9);
+  const [textResults, setTextResults] = useState<TextSearchResult | null>(null);
+  const [textSearchInput, setTextSearchInput] = useState<{ model_id: string; query: string; k: number } | null>(null);
+  const [textLoading, setTextLoading] = useState(false);
+  const [textError, setTextError] = useState("");
+  const textRequest = useRef(0);
+  const [duplicateMethod, setDuplicateMethod] = useState<"phash" | "embedding">("phash");
+  const [duplicateCrossSplit, setDuplicateCrossSplit] = useState(false);
+  const [duplicateHamming, setDuplicateHamming] = useState(4);
+  const [duplicateDistance, setDuplicateDistance] = useState(0.05);
+  const [duplicateResults, setDuplicateResults] = useState<DuplicateScanResult | null>(null);
+  const [duplicateScanUsed, setDuplicateScanUsed] = useState<DuplicateScanInput | null>(null);
+  const [duplicateLoading, setDuplicateLoading] = useState(false);
+  const [duplicateError, setDuplicateError] = useState("");
+  const duplicateRequest = useRef(0);
   const [blockCount, setBlockCount] = useState(12);
   const [selectedBlock, setSelectedBlock] = useState<number | null>(null);
   const [blockData, setBlockData] = useState<KMeansBlocks | null>(null);
@@ -325,6 +345,22 @@ export default function App() {
   const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
   const canSearchSimilar = run?.mode === "classifier" && run.unit === "image";
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
+  const canSearchText = Boolean(
+    run?.mode === "classifier" && run.unit === "image" && activeModelId.startsWith("chinese-clip"),
+  );
+
+  useEffect(() => {
+    textRequest.current += 1;
+    duplicateRequest.current += 1;
+    setTextResults(null);
+    setTextSearchInput(null);
+    setTextError("");
+    setTextLoading(false);
+    setDuplicateResults(null);
+    setDuplicateScanUsed(null);
+    setDuplicateError("");
+    setDuplicateLoading(false);
+  }, [job?.run_id]);
 
   useEffect(() => {
     const requestId = ++similarRequest.current;
@@ -429,6 +465,7 @@ export default function App() {
 
   function startSimilarSearch(index: number) {
     setSimilarK(Math.min(9, Math.max(1, (run?.records.length || 1) - 1)));
+    setSelectedIndex(index);
     setSimilarChain([index]);
     setSimilarResults(null);
     setSimilarError("");
@@ -468,6 +505,108 @@ export default function App() {
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (reason) {
       setSimilarError(reason instanceof Error ? reason.message : "Could not export the similar-image results.");
+    }
+  }
+
+  function duplicateScanInput(): DuplicateScanInput {
+    return {
+      method: duplicateMethod,
+      ...(duplicateMethod === "embedding" ? { model_id: activeModelId } : {}),
+      max_hamming: duplicateHamming,
+      max_distance: duplicateDistance,
+      cross_split_only: duplicateCrossSplit,
+      max_pairs: 200,
+    };
+  }
+
+  async function searchByText(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const runId = job?.run_id;
+    const query = textQuery.trim();
+    if (!runId || !query || !canSearchText) return;
+    const requestId = ++textRequest.current;
+    setTextResults(null);
+    setTextSearchInput(null);
+    setTextError("");
+    setTextLoading(true);
+    try {
+      const input = {
+        model_id: activeModelId,
+        query,
+        k: textResultCount,
+      };
+      const result = await api.textSearch(runId, input);
+      if (textRequest.current === requestId) {
+        setTextResults(result);
+        setTextSearchInput(input);
+      }
+    } catch (reason) {
+      if (textRequest.current === requestId) {
+        setTextError(reason instanceof Error ? reason.message : "Could not search images by text.");
+      }
+    } finally {
+      if (textRequest.current === requestId) setTextLoading(false);
+    }
+  }
+
+  async function exportTextSearch() {
+    const runId = job?.run_id;
+    const query = textResults?.query;
+    if (!runId || !query || !textResults || !textSearchInput) return;
+    try {
+      const blob = await api.textSearchCsv(runId, textSearchInput);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "text_search.csv";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (reason) {
+      setTextError(reason instanceof Error ? reason.message : "Could not export text-search results.");
+    }
+  }
+
+  async function scanDuplicateCandidates() {
+    const runId = job?.run_id;
+    if (!runId || run?.mode !== "classifier" || run.unit !== "image") return;
+    const requestId = ++duplicateRequest.current;
+    const input = duplicateScanInput();
+    setDuplicateResults(null);
+    setDuplicateScanUsed(null);
+    setDuplicateError("");
+    setDuplicateLoading(true);
+    try {
+      const result = await api.scanDuplicates(runId, input);
+      if (duplicateRequest.current === requestId) {
+        setDuplicateResults(result);
+        setDuplicateScanUsed(input);
+      }
+    } catch (reason) {
+      if (duplicateRequest.current === requestId) {
+        setDuplicateError(reason instanceof Error ? reason.message : "Could not scan duplicate candidates.");
+      }
+    } finally {
+      if (duplicateRequest.current === requestId) setDuplicateLoading(false);
+    }
+  }
+
+  async function exportDuplicateCandidates() {
+    const runId = job?.run_id;
+    if (!runId || !duplicateResults || !duplicateScanUsed) return;
+    try {
+      const blob = await api.duplicatePairsCsv(runId, duplicateScanUsed);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "duplicate_pairs.csv";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (reason) {
+      setDuplicateError(reason instanceof Error ? reason.message : "Could not export duplicate candidates.");
     }
   }
 
@@ -892,6 +1031,7 @@ export default function App() {
           {!busy && job?.state === "cancelled" && <div className="completion-label" data-testid="job-status">Cancelled</div>}
 
           {run && currentView ? (
+            <>
             <div className="result-grid">
               <section className="plot-card">
                 <div className="plot-toolbar">
@@ -1154,6 +1294,141 @@ export default function App() {
                 )}
               </aside>
             </div>
+            {run.mode === "classifier" && run.unit === "image" && (
+              <section className="search-workspace" data-testid="search-review-workspace" aria-label="Text search and duplicate review">
+                <div className="search-workspace-heading">
+                  <div><div className="eyebrow">IMAGE DISCOVERY</div><h3>Text search and duplicate review</h3></div>
+                  <span>Cosine and dHash matches are review candidates, not automatic decisions.</span>
+                </div>
+                <div className="search-tool-grid">
+                  <section className="search-tool-card" aria-label="Text search">
+                    <div className="search-tool-title"><div><div className="eyebrow">CHINESE-CLIP</div><h4>Search by text</h4></div></div>
+                    <p className="search-tool-note">繁體與簡體中文查詢會沿用 Chinese-CLIP 文字塔；英文亦可查詢。</p>
+                    <form className="search-form" onSubmit={(event) => void searchByText(event)}>
+                      <label>
+                        <span>Text query</span>
+                        <input
+                          aria-label="Chinese-CLIP text query"
+                          value={textQuery}
+                          maxLength={512}
+                          placeholder="例如：斑馬、夜間反光、zebra"
+                          onChange={(event) => setTextQuery(event.target.value)}
+                        />
+                      </label>
+                      <label className="search-count-field">
+                        <span>Results</span>
+                        <input
+                          aria-label="Text result count"
+                          type="number"
+                          min={1}
+                          max={Math.max(1, run.records.length)}
+                          value={Math.min(textResultCount, Math.max(1, run.records.length))}
+                          onChange={(event) => {
+                            const value = Number(event.target.value);
+                            if (Number.isInteger(value) && value >= 1) setTextResultCount(value);
+                          }}
+                        />
+                      </label>
+                      <button type="submit" disabled={!canSearchText || !textQuery.trim() || textLoading || busy}>
+                        {textLoading ? "Searching…" : "Search images"}
+                      </button>
+                    </form>
+                    {!canSearchText && <p className="search-tool-note" role="status">Run Chinese-CLIP image embeddings and select that model above to enable text search.</p>}
+                    {textError && <div className="search-error" role="alert">{textError}</div>}
+                    {textLoading && <div className="search-status" role="status">Encoding query with {activeModelId}…</div>}
+                    {!textLoading && textResults && (
+                      <>
+                        <div className="search-status" data-testid="text-search-status" role="status">
+                          “{textResults.query}” · {textResults.results.length} result(s) · {textResults.model_id} · cosine distance ascending
+                        </div>
+                        {textResults.results.length ? (
+                          <div className="text-search-results">
+                            {textResults.results.map(({ index, distance }) => {
+                              const record = run.records[index];
+                              return (
+                                <article className="text-search-result" data-testid="text-search-result" data-index={index} key={index}>
+                                  <img src={`/api/v1/runs/${encodeURIComponent(job?.run_id || "")}/images/${index}/thumbnail`} alt={record.filename} loading="lazy" />
+                                  <strong title={record.filename}>{record.filename}</strong>
+                                  <small>{record.label} · {record.split} · d={distance.toFixed(4)}</small>
+                                  <button type="button" aria-label={`Use ${record.filename} as visual search query`} onClick={() => startSimilarSearch(index)}>Find similar images</button>
+                                </article>
+                              );
+                            })}
+                          </div>
+                        ) : <p className="search-tool-note">No matching images were found.</p>}
+                        <button type="button" className="search-export-button" data-testid="text-search-export" onClick={() => void exportTextSearch()}>Export text-search CSV</button>
+                      </>
+                    )}
+                  </section>
+
+                  <section className="search-tool-card" aria-label="Duplicate review">
+                    <div className="search-tool-title"><div><div className="eyebrow">REVIEW CANDIDATES</div><h4>Duplicates and split leakage</h4></div></div>
+                    <p className="search-tool-note">dHash finds visual near-copies; embedding finds semantic near-duplicates. Review each pair before taking action.</p>
+                    <div className="duplicate-controls">
+                      <label>
+                        <span>Method</span>
+                        <select aria-label="Duplicate method" value={duplicateMethod} onChange={(event) => setDuplicateMethod(event.target.value as "phash" | "embedding")}>
+                          <option value="phash">dHash (visual)</option>
+                          <option value="embedding">Embedding (semantic)</option>
+                        </select>
+                      </label>
+                      {duplicateMethod === "phash" ? (
+                        <label>
+                          <span>Hamming ≤ {duplicateHamming}</span>
+                          <input aria-label="dHash distance threshold" type="range" min={0} max={16} value={duplicateHamming} onChange={(event) => setDuplicateHamming(Number(event.target.value))} />
+                        </label>
+                      ) : (
+                        <label>
+                          <span>Cosine ≤ {duplicateDistance.toFixed(2)}</span>
+                          <input aria-label="Embedding distance threshold" type="range" min={0} max={0.5} step={0.01} value={duplicateDistance} onChange={(event) => setDuplicateDistance(Number(event.target.value))} />
+                        </label>
+                      )}
+                      <label className="duplicate-cross-split">
+                        <input type="checkbox" aria-label="Only cross-split pairs" checked={duplicateCrossSplit} onChange={(event) => setDuplicateCrossSplit(event.target.checked)} />
+                        <span>Only cross-split pairs</span>
+                      </label>
+                      <button type="button" onClick={() => void scanDuplicateCandidates()} disabled={duplicateLoading || busy}>
+                        {duplicateLoading ? "Scanning…" : "Scan candidates"}
+                      </button>
+                    </div>
+                    {duplicateError && <div className="search-error" role="alert">{duplicateError}</div>}
+                    {duplicateLoading && <div className="search-status" role="status">Comparing {duplicateMethod === "phash" ? "perceptual hashes" : `${activeModelId} embeddings`}…</div>}
+                    {!duplicateLoading && duplicateResults && (
+                      <>
+                        <div className="search-status" data-testid="duplicate-status" role="status">
+                          {duplicateResults.results.length} pair(s) · {duplicateResults.method === "phash" ? "dHash" : duplicateResults.model_id + " embedding"}
+                          {duplicateResults.method === "phash" ? ` · Hamming ≤ ${duplicateScanUsed?.max_hamming}` : ` · cosine ≤ ${duplicateScanUsed?.max_distance?.toFixed(2)}`}
+                          {duplicateResults.cross_split_only ? " · cross-split only" : " · all splits"}
+                        </div>
+                        {duplicateResults.results.length ? (
+                          <div className="duplicate-results">
+                            {duplicateResults.results.slice(0, 50).map(({ left_index, right_index, distance }) => {
+                              return (
+                                <article className="duplicate-pair" data-testid="duplicate-result" data-pair={`${left_index}-${right_index}`} key={`${left_index}-${right_index}`}>
+                                  {[left_index, right_index].map((index) => {
+                                    const record = run.records[index];
+                                    return (
+                                      <button type="button" className="duplicate-image" key={index} onClick={() => setSelectedIndex(index)} title={`Open ${record.filename}`}>
+                                        <img src={`/api/v1/runs/${encodeURIComponent(job?.run_id || "")}/images/${index}/thumbnail`} alt="" loading="lazy" />
+                                        <strong>{record.filename}</strong>
+                                        <small>{record.label} · {record.split}</small>
+                                      </button>
+                                    );
+                                  })}
+                                  <span className="duplicate-distance">d={duplicateMethod === "phash" ? distance : distance.toFixed(4)}</span>
+                                </article>
+                              );
+                            })}
+                          </div>
+                        ) : <p className="search-tool-note">No duplicate candidates under the current settings.</p>}
+                        {duplicateResults.results.length > 0 && <button type="button" className="search-export-button" data-testid="duplicate-export" onClick={() => void exportDuplicateCandidates()}>Export candidate pairs CSV</button>}
+                      </>
+                    )}
+                  </section>
+                </div>
+              </section>
+            )}
+            </>
           ) : (
             <div className="empty-canvas">
               <div className="empty-illustration" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><i className="dot dot-one" /><i className="dot dot-two" /><i className="dot dot-three" /><i className="dot dot-four" /><b>LV</b></div>

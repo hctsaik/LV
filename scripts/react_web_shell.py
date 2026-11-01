@@ -1,14 +1,15 @@
 """Loopback FastAPI adapter for LV's React web interface."""
 from __future__ import annotations
 
+import csv
 import logging
 import mimetypes
 import os
 import threading
 import uuid
-from io import BytesIO
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Literal
 
@@ -21,8 +22,14 @@ from sklearn.decomposition import PCA
 from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
-from _utils import available_models, load_model
-from interaction import draw_yolo_boxes, records_to_csv, yolo_label_path_for
+from _utils import available_models, load_model, load_text_encoder, supports_text_query
+from interaction import (
+    draw_yolo_boxes,
+    find_duplicate_pairs_embedding,
+    find_duplicate_pairs_phash,
+    records_to_csv,
+    yolo_label_path_for,
+)
 from react_compare import ComparisonInputError, project_comparison, run_comparison
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 from safe_io import safe_open_image
@@ -84,6 +91,21 @@ class SimilarSearchRequest(BaseModel):
     k: int = Field(default=9, ge=1, le=10000)
 
 
+class TextSearchRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    query: str = Field(min_length=1, max_length=512)
+    k: int = Field(default=9, ge=1, le=10000)
+
+
+class DuplicateScanRequest(BaseModel):
+    method: Literal["phash", "embedding"] = "phash"
+    model_id: str | None = Field(default=None, min_length=1, max_length=128)
+    max_hamming: int = Field(default=4, ge=0, le=16)
+    max_distance: float = Field(default=0.05, ge=0.0, le=0.5)
+    cross_split_only: bool = False
+    max_pairs: int = Field(default=200, ge=1, le=200)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -131,10 +153,12 @@ def create_app(
     *,
     model_catalog: Callable[[], list[str]] | None = None,
     model_loader: Callable[[str], Callable] | None = None,
+    text_model_loader: Callable[[str], Callable[[str], np.ndarray]] | None = None,
     object_model_loader: Callable | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
     loader = model_loader or load_model
+    text_loader = text_model_loader or load_text_encoder
     if object_model_loader is not None:
         object_loader = object_model_loader
     elif model_loader is None:
@@ -147,6 +171,8 @@ def create_app(
     app.state.jobs = {}
     app.state.runs = {}
     app.state.raw_embeddings = {}
+    app.state.text_encoders = {}
+    app.state.text_vectors = {}
     app.state.block_cache = {}
     app.state.comparison_jobs = {}
     app.state.comparison_runs = {}
@@ -541,7 +567,7 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Run not found")
             return {
                 key: value for key, value in run.items()
-                if key not in {"image_paths", "_raw_embeddings"}
+                if key not in {"image_paths", "_raw_embeddings", "_phashes"}
             }
 
     def similar_result(
@@ -607,6 +633,163 @@ def create_app(
             content=csv_text,
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="similar_group.csv"'},
+        )
+
+    def text_search_result(run_id: str, request: TextSearchRequest) -> tuple[dict, list[int], list[float]]:
+        query_text = request.query.strip()
+        if not query_text:
+            raise HTTPException(status_code=422, detail="The text query cannot be blank")
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            raw_by_model = app.state.raw_embeddings.get(run_id)
+            text_encoder = app.state.text_encoders.get(request.model_id)
+            cached_query = app.state.text_vectors.get(request.model_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.get("mode") != "classifier" or run.get("unit") != "image":
+            raise HTTPException(status_code=409, detail="Text search requires classifier image embeddings")
+        if not supports_text_query(request.model_id):
+            raise HTTPException(status_code=409, detail="Text search requires a Chinese-CLIP model")
+        raw = (raw_by_model or {}).get(request.model_id)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Chinese-CLIP image embeddings are unavailable for this run")
+        if cached_query is not None and cached_query[0] == query_text:
+            query = cached_query[1]
+        else:
+            if text_encoder is None:
+                try:
+                    text_encoder = text_loader(request.model_id)
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail="The local Chinese-CLIP text encoder could not be loaded",
+                    ) from exc
+                with app.state.lock:
+                    text_encoder = app.state.text_encoders.setdefault(request.model_id, text_encoder)
+            try:
+                query = np.asarray(text_encoder(query_text), dtype=np.float32).reshape(-1)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The Chinese-CLIP text query could not be encoded",
+                ) from exc
+            with app.state.lock:
+                app.state.text_vectors[request.model_id] = (query_text, query)
+        vectors = np.asarray(raw, dtype=np.float32)
+        if vectors.ndim != 2 or len(vectors) != len(run["records"]):
+            raise HTTPException(status_code=409, detail="The selected model embeddings do not match this run")
+        if (
+            query.shape[0] != vectors.shape[1]
+            or not np.isfinite(query).all()
+            or not np.linalg.norm(query)
+        ):
+            raise HTTPException(status_code=422, detail="The text encoder returned an invalid embedding")
+        norms = np.linalg.norm(vectors, axis=1)
+        query_norm = np.linalg.norm(query)
+        denominators = norms * query_norm
+        similarities = np.zeros(len(vectors), dtype=np.float32)
+        np.divide(vectors @ query, denominators, out=similarities, where=denominators > 0)
+        distances = np.maximum(0.0, 1.0 - np.clip(similarities, -1.0, 1.0))
+        indices = np.arange(len(vectors), dtype=np.int64)
+        order = np.lexsort((indices, distances))[:request.k]
+        ranked_indices = indices[order].astype(int).tolist()
+        ranked_distances = distances[ranked_indices].astype(float).tolist()
+        return run, ranked_indices, ranked_distances
+
+    @app.post("/api/v1/runs/{run_id}/text-search")
+    def search_images_by_text(run_id: str, request: TextSearchRequest) -> dict:
+        _run, indices, distances = text_search_result(run_id, request)
+        return {
+            "query": request.query.strip(),
+            "model_id": request.model_id,
+            "results": [
+                {"index": index, "distance": distance}
+                for index, distance in zip(indices, distances)
+            ],
+        }
+
+    @app.post("/api/v1/runs/{run_id}/text-search.csv")
+    def export_text_search(run_id: str, request: TextSearchRequest) -> Response:
+        run, indices, _distances = text_search_result(run_id, request)
+        paths: list[Path] = run["image_paths"]
+        records = [
+            {**record, "path": paths[index]}
+            for index, record in enumerate(run["records"])
+        ]
+        return Response(
+            content=records_to_csv(records, indices),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="text_search.csv"'},
+        )
+
+    def duplicate_scan_result(run_id: str, request: DuplicateScanRequest) -> tuple[dict, list[tuple[int, int, int | float]]]:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            raw_by_model = app.state.raw_embeddings.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.get("mode") != "classifier" or run.get("unit") != "image":
+            raise HTTPException(status_code=409, detail="Duplicate review requires classifier image embeddings")
+        splits = [str(record["split"]) for record in run["records"]]
+        if request.method == "phash":
+            phashes = run.get("_phashes")
+            if not isinstance(phashes, list) or len(phashes) != len(splits):
+                raise HTTPException(status_code=409, detail="Perceptual hashes are unavailable for this run")
+            pairs = find_duplicate_pairs_phash(
+                phashes,
+                max_hamming=request.max_hamming,
+                splits=splits,
+                cross_split_only=request.cross_split_only,
+                max_pairs=request.max_pairs,
+            )
+        else:
+            if not request.model_id:
+                raise HTTPException(status_code=422, detail="Choose a model for embedding duplicate review")
+            raw = (raw_by_model or {}).get(request.model_id)
+            if raw is None:
+                raise HTTPException(status_code=404, detail="The selected model embeddings are unavailable for this run")
+            pairs = find_duplicate_pairs_embedding(
+                raw,
+                max_distance=request.max_distance,
+                splits=splits,
+                cross_split_only=request.cross_split_only,
+                max_pairs=request.max_pairs,
+            )
+        return run, pairs
+
+    @app.post("/api/v1/runs/{run_id}/duplicates")
+    def scan_duplicate_images(run_id: str, request: DuplicateScanRequest) -> dict:
+        _run, pairs = duplicate_scan_result(run_id, request)
+        return {
+            "method": request.method,
+            "model_id": request.model_id if request.method == "embedding" else None,
+            "cross_split_only": request.cross_split_only,
+            "results": [
+                {"left_index": left, "right_index": right, "distance": distance}
+                for left, right, distance in pairs
+            ],
+        }
+
+    @app.post("/api/v1/runs/{run_id}/duplicates.csv")
+    def export_duplicate_pairs(run_id: str, request: DuplicateScanRequest) -> Response:
+        run, pairs = duplicate_scan_result(run_id, request)
+        paths: list[Path] = run["image_paths"]
+        output = StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow([
+            "left_index", "left_filename", "left_path", "left_split",
+            "right_index", "right_filename", "right_path", "right_split", "distance",
+        ])
+        for left, right, distance in pairs:
+            a, b = run["records"][left], run["records"][right]
+            writer.writerow([
+                left, a["filename"], str(paths[left]), a["split"],
+                right, b["filename"], str(paths[right]), b["split"], distance,
+            ])
+        return Response(
+            content=output.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="duplicate_pairs.csv"'},
         )
 
     @app.post("/api/v1/runs/{run_id}/blocks")

@@ -211,6 +211,96 @@ def test_case_lv_web_01_search_01_cosine_ranking_model_switch_and_csv(
     assert invalid_index.status_code == 422
 
 
+def test_case_lv_web_01_search_02_text_search_and_duplicate_leakage_review(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """Chinese-CLIP text ranking and both duplicate methods preserve run order and split filters."""
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "search-02-cache"))
+    model_vectors = {
+        "01.jpg": [1.0, 0.0],
+        "02.jpg": [0.0, 1.0],
+        "03.png": [-1.0, 0.0],
+        "04.jpeg": [0.998, 0.063],
+    }
+    encoded_queries: list[str] = []
+
+    def model_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            return np.asarray(model_vectors[path.name], dtype=np.float32)
+        return embed
+
+    def text_model_loader(_model_id: str):
+        def encode(query: str) -> np.ndarray:
+            encoded_queries.append(query)
+            return np.asarray([1.0, 0.0], dtype=np.float32)
+        return encode
+
+    with TestClient(create_app(
+        model_catalog=lambda: ["chinese-clip-fixture"],
+        model_loader=model_loader,
+        text_model_loader=text_model_loader,
+    )) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in classifier_fixture["folders"]],
+            "model_ids": ["chinese-clip-fixture"],
+            "methods": ["pca"],
+        })
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        text_result = client.post(f"/api/v1/runs/{run_id}/text-search", json={
+            "model_id": "chinese-clip-fixture", "query": "  紅色樣本  ", "k": 4,
+        })
+        text_csv = client.post(f"/api/v1/runs/{run_id}/text-search.csv", json={
+            "model_id": "chinese-clip-fixture", "query": "紅色樣本", "k": 4,
+        })
+        phash_result = client.post(f"/api/v1/runs/{run_id}/duplicates", json={
+            "method": "phash", "max_hamming": 0, "cross_split_only": True,
+        })
+        embedding_result = client.post(f"/api/v1/runs/{run_id}/duplicates", json={
+            "method": "embedding", "model_id": "chinese-clip-fixture",
+            "max_distance": 0.05, "cross_split_only": True,
+        })
+        duplicate_csv = client.post(f"/api/v1/runs/{run_id}/duplicates.csv", json={
+            "method": "embedding", "model_id": "chinese-clip-fixture",
+            "max_distance": 0.05, "cross_split_only": True,
+        })
+        unsupported_model = client.post(f"/api/v1/runs/{run_id}/text-search", json={
+            "model_id": "dinov2_vits14", "query": "red", "k": 2,
+        })
+        blank_query = client.post(f"/api/v1/runs/{run_id}/text-search", json={
+            "model_id": "chinese-clip-fixture", "query": "   ", "k": 2,
+        })
+
+    assert [item["index"] for item in text_result.json()["results"]] == [0, 3, 1, 2]
+    distances = [item["distance"] for item in text_result.json()["results"]]
+    assert distances == sorted(distances)
+    assert text_result.json()["query"] == "紅色樣本"
+    assert encoded_queries == ["紅色樣本"]
+    assert "_phashes" not in run and "image_paths" not in run and "_raw_embeddings" not in run
+    assert all("path" not in item for item in text_result.json()["results"])
+    text_rows = list(csv.reader(text_csv.text.splitlines()))
+    assert text_csv.status_code == 200
+    assert [row[1] for row in text_rows[1:]] == [run["records"][i]["filename"] for i in [0, 3, 1, 2]]
+
+    phash_pairs = phash_result.json()["results"]
+    assert [(item["left_index"], item["right_index"]) for item in phash_pairs] == [(0, 3), (1, 3), (2, 3)]
+    embedding_pairs = embedding_result.json()["results"]
+    assert all("path" not in item for item in embedding_pairs)
+    assert [(item["left_index"], item["right_index"]) for item in embedding_pairs] == [(0, 3)]
+    assert embedding_pairs[0]["distance"] == pytest.approx(
+        1 - 0.998 / np.sqrt(0.998**2 + 0.063**2), abs=5e-7,
+    )
+    duplicate_rows = list(csv.reader(duplicate_csv.text.splitlines()))
+    assert duplicate_csv.status_code == 200
+    assert duplicate_rows[0][:4] == ["left_index", "left_filename", "left_path", "left_split"]
+    assert len(duplicate_rows) == 2
+    assert unsupported_model.status_code == 409
+    assert blank_query.status_code == 422
+    for path, expected_hash in classifier_fixture["hashes"].items():
+        assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == expected_hash
+
+
 def test_case_lv_web_01_ic_01_manifest_cache_and_source_immutability(
     classifier_fixture, monkeypatch, tmp_path
 ):

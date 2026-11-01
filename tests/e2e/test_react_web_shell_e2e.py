@@ -433,6 +433,105 @@ def test_lv_web_01_search_01_similar_images_chain_model_switch_and_csv(
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_search_02_text_and_duplicate_review_visible_journey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible React flow searches by Chinese-CLIP text and reviews split leakage pairs."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = tmp_path / "search-02"
+    train_apple = dataset / "train" / "apple"
+    train_banana = dataset / "train" / "banana"
+    test_banana = dataset / "test" / "banana"
+    train_apple.mkdir(parents=True)
+    train_banana.mkdir(parents=True)
+    test_banana.mkdir(parents=True)
+    duplicate_pixels = np.random.default_rng(17).integers(0, 255, (48, 48, 3), dtype=np.uint8)
+    Image.fromarray(duplicate_pixels).save(train_apple / "image-01.png")
+    Image.fromarray(np.random.default_rng(23).integers(0, 255, (48, 48, 3), dtype=np.uint8)).save(train_apple / "image-02.png")
+    Image.fromarray(np.random.default_rng(31).integers(0, 255, (48, 48, 3), dtype=np.uint8)).save(train_banana / "image-03.png")
+    (test_banana / "image-04.png").write_bytes((train_apple / "image-01.png").read_bytes())
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    vectors = {
+        "image-01.png": [1.0, 0.0, 0.0],
+        "image-02.png": [0.0, 1.0, 0.0],
+        "image-03.png": [-1.0, 0.0, 0.0],
+        "image-04.png": [0.998, 0.063, 0.0],
+    }
+
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            return np.asarray(vectors[path.name], dtype=np.float32)
+        return embed
+
+    def fixture_text_loader(_model_id: str):
+        def encode(_query: str) -> np.ndarray:
+            return np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+        return encode
+
+    application = create_app(
+        model_catalog=lambda: ["chinese-clip-fixture"],
+        model_loader=fixture_loader,
+        text_model_loader=fixture_text_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(10_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+            page.get_by_label("Chinese-CLIP text query").fill("反光樣本")
+            page.get_by_role("button", name="Search images").click()
+            expect(page.get_by_test_id("text-search-result")).to_have_count(4)
+            text_order = [int(item.get_attribute("data-index")) for item in page.get_by_test_id("text-search-result").all()]
+            assert text_order == [0, 3, 1, 2]
+            with page.expect_download() as text_download:
+                page.get_by_test_id("text-search-export").click()
+            text_rows = list(csv.reader(Path(text_download.value.path()).read_text(encoding="utf-8").splitlines()))
+            assert [int(row[0]) for row in text_rows[1:]] == text_order
+            page.get_by_role("button", name="Use image-04.png as visual search query").click()
+            similar_panel = page.get_by_test_id("similar-panel")
+            expect(similar_panel.get_by_test_id("similar-result")).to_have_count(3)
+
+            page.get_by_label("Only cross-split pairs").check()
+            page.get_by_role("button", name="Scan candidates").click()
+            expect(page.get_by_test_id("duplicate-result")).to_have_count(1)
+            assert page.get_by_test_id("duplicate-result").first.get_attribute("data-pair") == "0-3"
+            thumbnail_url = page.get_by_test_id("duplicate-result").first.locator("img").first.get_attribute("src")
+            assert thumbnail_url and page.request.get(base_url + thumbnail_url).status == 200
+
+            page.get_by_label("Duplicate method").select_option("embedding")
+            page.get_by_role("button", name="Scan candidates").click()
+            expect(page.get_by_test_id("duplicate-result")).to_have_count(1)
+            with page.expect_download() as duplicate_download:
+                page.get_by_test_id("duplicate-export").click()
+            duplicate_rows = list(csv.reader(Path(duplicate_download.value.path()).read_text(encoding="utf-8").splitlines()))
+            assert len(duplicate_rows) == 2
+            assert duplicate_rows[1][0:2] == ["0", "image-01.png"]
+            assert duplicate_rows[1][4:6] == ["3", "image-04.png"]
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
 def test_lv_web_01_view_01_selected_gallery_navigation_and_yolo_overlay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

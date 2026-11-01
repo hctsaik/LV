@@ -26,6 +26,10 @@
 | `GET /api/v1/compare/jobs/{job_id}` / `DELETE ...` | 讀取或取消 A/B 比較 | 與 visualize 共用單一 active-job gate |
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
 | `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案 |
+| `POST /api/v1/runs/{run_id}/text-search` | Chinese-CLIP 文字查詢影像 | query、model ID、依 cosine distance 排序的 run record index；相同距離以 index 穩定排序 |
+| `POST /api/v1/runs/{run_id}/text-search.csv` | 匯出文字搜尋結果 | 使用者明確匯出時才包含影像路徑 |
+| `POST /api/v1/runs/{run_id}/duplicates` | 掃描 dHash 或 embedding 重複候選 | 成對 run record index、距離、跨 split 篩選；不回傳本機路徑 |
+| `POST /api/v1/runs/{run_id}/duplicates.csv` | 匯出重複候選對 | 成對檔名、split、距離及來源路徑 |
 | `GET /api/v1/comparisons/{run_id}` | 讀取比較結果 | 群組記錄、類別漂移、policy 與警告；不回傳本機路徑 |
 | `POST /api/v1/comparisons/{run_id}/projections` | 計算選定群組的投影 | PCA、t-SNE、UMAP、LDA、Supervised UMAP、維度與物件篩選 |
 | `GET /api/v1/comparisons/{run_id}/images/{side}/{index}` | 讀取對應來源影像 | 只依本次比較登錄的 group/index 解析，不接受檔案路徑 |
@@ -44,6 +48,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 8. 整圖比較沿用目前 Streamlit 的 centroid cosine drift：用所選模型抽取 embedding，分別正規化兩群的平均向量，再計算 `1 - cosine_similarity`。快取依模型、模式、來源路徑和檔案內容雜湊隔離。
 9. 物件比較讀取支援的 detection boxes，按較小資料群執行 object policy autotune，再以同一 policy 對 A/B crop embedding；只對共同類別計算 centroid drift，並明示只出現在單側的類別。操作者可改 pad、解析度與 head，明確套用後重跑；API 會驗證手動 policy，結果同時保留自動候選的整體及物件大小分桶純度。
 10. React 可切換比較類別／投影、2D／3D、confidence 與物件短邊門檻；點選及框選只改變 run record 選取，雙欄縮圖仍讀回原圖並可顯示 bbox。投影距離只供檢視，不作為 drift 指標。
+11. Image Classifier 整圖 run 可使用已載入的 Chinese-CLIP image embedding 進行文字搜尋；文字塔沿用本機 Chinese-CLIP encoder 的查詢正規化，使用 exact cosine distance 遞增排序，同距離依 record index 排序。dHash 重複掃描重用 run manifest 指紋，embedding 掃描重用 run 向量；兩者依距離排序、最多回傳 200 對，可只保留跨 split 候選。搜尋結果和配對都以 run ID／record index 操作；本機路徑只在使用者明確下載 CSV 時輸出。配對只是人工覆核線索，不自動刪除或判定洩漏。固定 fixture 的 API 和可見 React 流程已驗；真實 Chinese-CLIP 權重、Windows ARM64 模型相容性與數值逐項對照尚未驗；React 尚未實作跨工具 Labeling handoff。
 
 ## 4. 實作狀態與整合限制
 

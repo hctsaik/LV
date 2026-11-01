@@ -103,6 +103,28 @@ export type SimilarSearchResult = {
   results: Array<{ index: number; distance: number }>;
 };
 
+export type TextSearchResult = {
+  query: string;
+  model_id: string;
+  results: Array<{ index: number; distance: number }>;
+};
+
+export type DuplicateScanInput = {
+  method: "phash" | "embedding";
+  model_id?: string;
+  max_hamming: number;
+  max_distance: number;
+  cross_split_only: boolean;
+  max_pairs?: number;
+};
+
+export type DuplicateScanResult = {
+  method: "phash" | "embedding";
+  model_id: string | null;
+  cross_split_only: boolean;
+  results: Array<{ left_index: number; right_index: number; distance: number }>;
+};
+
 export type CompareUnit = "whole" | "object";
 export type ComparisonRecord = {
   index: number;
@@ -249,6 +271,18 @@ export const api = {
     }
     return response.blob();
   },
+  textSearch: (runId: string, input: { model_id: string; query: string; k: number }) =>
+    request<TextSearchResult>("/api/v1/runs/" + encodeURIComponent(runId) + "/text-search", {
+      method: "POST", body: JSON.stringify(input),
+    }),
+  textSearchCsv: (runId: string, input: { model_id: string; query: string; k: number }) =>
+    requestBlob("/api/v1/runs/" + encodeURIComponent(runId) + "/text-search.csv", input),
+  scanDuplicates: (runId: string, input: DuplicateScanInput) =>
+    request<DuplicateScanResult>("/api/v1/runs/" + encodeURIComponent(runId) + "/duplicates", {
+      method: "POST", body: JSON.stringify(input),
+    }),
+  duplicatePairsCsv: (runId: string, input: DuplicateScanInput) =>
+    requestBlob("/api/v1/runs/" + encodeURIComponent(runId) + "/duplicates.csv", input),
   createComparisonJob: (input: ComparisonJobInput) =>
     request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
       method: "POST",
@@ -278,6 +312,19 @@ export const api = {
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/comparisons/" + encodeURIComponent(runId)
       + "/images/" + side + "/" + index,
 };
+
+async function requestBlob(path: string, body: unknown): Promise<Blob> {
+  const response = await fetch((window.NATIVEAPP_LOCAL_API || "") + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.message || payload?.detail || "Could not export the results.");
+  }
+  return response.blob();
+}
 
 export type HostFolderResult = {
   canceled?: boolean;

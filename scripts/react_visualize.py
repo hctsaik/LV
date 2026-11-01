@@ -505,6 +505,14 @@ def run_image_visualization(
 
     primary = views[0]
     base_warnings = ([f"Skipped {len(unreadable)} unreadable image(s)."] if unreadable else [])
+    record_phashes: list[str | None] = []
+    if mode == "classifier" and unit == "image":
+        for record in records:
+            path = Path(record["path"]).resolve()
+            folder = next(folder for folder in resolved_folders if _is_under(path, folder))
+            record_phashes.append(
+                manifest_by_folder[folder].get(rel_key(folder, path), {}).get("phash")
+            )
     return {
         "mode": mode,
         "unit": unit,
@@ -527,6 +535,9 @@ def run_image_visualization(
             "by_model": umap_reference_by_model,
         },
         "image_paths": [Path(record["path"]).resolve() for record in records],
+        # dHash values are computed and cached by the run's manifest. Keep them
+        # worker-private and aligned to records for duplicate review.
+        "_phashes": record_phashes,
         # Kept only in the local worker for the legacy classifier 3D block
         # drilldown. The HTTP run response deliberately omits this field.
         "_raw_embeddings": embeddings_by_model if mode == "classifier" and unit == "image" else {},
