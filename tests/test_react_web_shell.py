@@ -92,12 +92,206 @@ def _client(
 ):
     cache_root = tmp_path.parent / f"{tmp_path.name}-lv-cache"
     monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path.parent / f"{tmp_path.name}-fp-cases"))
     return TestClient(create_app(
         model_catalog=lambda: models if models is not None else ["dinov2_vits14"],
         model_loader=lambda _model: embedder or _fake_embedder(),
         object_model_loader=object_model_loader,
         diagnostic_model_loader=diagnostic_model_loader,
     ))
+
+
+def _png_bytes(color: tuple[int, int, int]) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (80, 60), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_case_lv_web_05_case_01_case_sources_yolo_regions_and_revision_conflict(
+    monkeypatch, tmp_path
+):
+    """CASE-01 keeps source identity and region decisions separate across revisions."""
+    screenshot_path = tmp_path / "reported screenshot.png"
+    screenshot_bytes = _png_bytes((210, 80, 40))
+    screenshot_path.write_bytes(screenshot_bytes)
+    screenshot_hash_before = hashlib.sha256(screenshot_path.read_bytes()).hexdigest()
+    original_bytes = _png_bytes((40, 110, 190))
+
+    with _client(monkeypatch, tmp_path / "fp-case-journey") as client:
+        created_response = client.post("/api/v1/fp-cases", json={
+            "source_name": "reported screenshot.html",
+            "source_kind": "screenshot",
+            "source_base64": base64.b64encode(screenshot_bytes).decode("ascii"),
+            "title": "Reflective surface report",
+            "description": "The deployed model flagged a normal reflection.",
+            "external_model_id": "detector-2026.10",
+            "threshold": "0.82",
+            "raw_output": "class=crack score=0.94",
+        })
+        assert created_response.status_code == 201, created_response.text
+        created = created_response.json()
+        assert created["revision"] == 1
+        assert created["external"] == {
+            "model_id": "detector-2026.10",
+            "threshold": "0.82",
+            "raw_output": "class=crack score=0.94",
+            "replay_status": "not_replayed",
+        }
+        assert created["sources"][0]["kind"] == "screenshot"
+        assert "asset" not in created["sources"][0]
+        assert "source_path" not in created["sources"][0]
+        assert str(tmp_path) not in created_response.text
+
+        image_response = client.get(
+            f"/api/v1/fp-cases/{created['id']}/sources/{created['sources'][0]['id']}/image"
+        )
+        assert image_response.status_code == 200
+        assert image_response.content == screenshot_bytes
+        assert image_response.headers["content-type"] == "image/png"
+        assert image_response.headers["x-content-type-options"] == "nosniff"
+
+        source_response = client.post(f"/api/v1/fp-cases/{created['id']}/sources", json={
+            "expected_revision": 1,
+            "source_name": "original.png",
+            "source_kind": "original",
+            "source_base64": base64.b64encode(original_bytes).decode("ascii"),
+        })
+        assert source_response.status_code == 201, source_response.text
+        sourced = source_response.json()
+        original = next(source for source in sourced["sources"] if source["kind"] == "original")
+        assert sourced["revision"] == 2
+        assert original["sha256"] == hashlib.sha256(original_bytes).hexdigest()
+        assert len(sourced["sources"]) == 2
+
+        invalid_import = client.post(f"/api/v1/fp-cases/{created['id']}/predictions/yolo", json={
+            "expected_revision": 2,
+            "source_id": original["id"],
+            "filename": "predictions.txt",
+            "content": "0 0.50 0.50 0.40 0.40 0.91\n1 0.2 0.2 0.1\n",
+        })
+        assert invalid_import.status_code == 422
+        assert client.get(f"/api/v1/fp-cases/{created['id']}").json()["revision"] == 2
+        assert client.get(f"/api/v1/fp-cases/{created['id']}").json()["items"] == []
+
+        imported_response = client.post(f"/api/v1/fp-cases/{created['id']}/predictions/yolo", json={
+            "expected_revision": 2,
+            "source_id": original["id"],
+            "filename": "predictions.txt",
+            "content": "0 0.50 0.50 0.40 0.40 0.91\n1 0.30 0.40 0.20 0.30 0.76\n",
+        })
+        assert imported_response.status_code == 201, imported_response.text
+        imported = imported_response.json()["case"]
+        assert imported_response.json()["imported"] == 2
+        assert imported["revision"] == 3
+        assert [row["review"]["verdict"] for row in imported["items"]] == ["pending", "pending"]
+        assert [row["label"] for row in imported["items"]] == ["0", "1"]
+        assert imported["items"][0]["roi"] == [0.3, 0.3, 0.7, 0.7]
+        assert imported["items"][0]["source_id"] == original["id"]
+        assert imported["evidence"][-1]["filename"] == "predictions.txt"
+
+        first, second = imported["items"]
+        reviewed_response = client.patch(
+            f"/api/v1/fp-cases/{created['id']}/regions/{first['id']}/review",
+            json={
+                "expected_revision": 3,
+                "verdict": "normal",
+                "reviewer": "Engineer A",
+                "reason": "This is an allowed reflection under the product specification.",
+            },
+        )
+        assert reviewed_response.status_code == 200, reviewed_response.text
+        reviewed = reviewed_response.json()
+        assert reviewed["revision"] == 4
+        assert reviewed["items"][0]["review"]["verdict"] == "normal"
+        assert reviewed["items"][1]["review"]["verdict"] == "pending"
+
+        stale_response = client.patch(
+            f"/api/v1/fp-cases/{created['id']}/regions/{second['id']}/review",
+            json={
+                "expected_revision": 3,
+                "verdict": "defect",
+                "reviewer": "Engineer B",
+                "reason": "A second window's stale decision must not overwrite this case.",
+            },
+        )
+        assert stale_response.status_code == 409
+        assert stale_response.json()["code"] == "CASE_REVISION_CONFLICT"
+        after_stale = client.get(f"/api/v1/fp-cases/{created['id']}").json()
+        assert after_stale["items"][0]["review"]["verdict"] == "normal"
+        assert after_stale["items"][1]["review"]["verdict"] == "pending"
+
+        second_review = client.patch(
+            f"/api/v1/fp-cases/{created['id']}/regions/{second['id']}/review",
+            json={
+                "expected_revision": 4,
+                "verdict": "defect",
+                "reviewer": "Engineer B",
+                "reason": "Independent review found a material crack in this ROI.",
+            },
+        )
+        assert second_review.status_code == 200, second_review.text
+        final_case = second_review.json()
+        assert [row["review"]["verdict"] for row in final_case["items"]] == ["normal", "defect"]
+        assert "whole_image_label" not in final_case
+        assert "label" not in final_case
+        assert screenshot_path.read_bytes() == screenshot_bytes
+        assert hashlib.sha256(screenshot_path.read_bytes()).hexdigest() == screenshot_hash_before
+
+
+def test_case_lv_web_05_case_01_manual_roi_and_review_validation(monkeypatch, tmp_path):
+    image_bytes = _png_bytes((30, 140, 90))
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    with _client(monkeypatch, tmp_path / "fp-case-manual") as client:
+        created = client.post("/api/v1/fp-cases", json={
+            "source_name": "report.png",
+            "source_kind": "original",
+            "source_base64": encoded,
+        }).json()
+        bad_roi = client.post(f"/api/v1/fp-cases/{created['id']}/regions", json={
+            "expected_revision": 1,
+            "source_id": created["sources"][0]["id"],
+            "roi": [0.7, 0.2, 0.3, 0.8],
+            "label": "scratch",
+        })
+        assert bad_roi.status_code == 422
+
+        added = client.post(f"/api/v1/fp-cases/{created['id']}/regions", json={
+            "expected_revision": 1,
+            "source_id": created["sources"][0]["id"],
+            "roi": [0.1, 0.2, 0.6, 0.8],
+            "label": "scratch",
+        })
+        assert added.status_code == 201, added.text
+        case = added.json()["case"]
+        item = case["items"][0]
+        assert item["roi"] == [0.1, 0.2, 0.6, 0.8]
+        assert item["review"]["verdict"] == "pending"
+
+        missing_reviewer = client.patch(
+            f"/api/v1/fp-cases/{created['id']}/regions/{item['id']}/review",
+            json={"expected_revision": 2, "verdict": "normal", "reviewer": "", "reason": "reason"},
+        )
+        assert missing_reviewer.status_code == 422
+        assert client.get(f"/api/v1/fp-cases/{created['id']}").json()["items"][0]["review"]["verdict"] == "pending"
+
+        disputed = client.patch(
+            f"/api/v1/fp-cases/{created['id']}/regions/{item['id']}/review",
+            json={"expected_revision": 2, "verdict": "disputed", "reviewer": "Reviewer", "reason": "Specification needs clarification."},
+        )
+        assert disputed.status_code == 200, disputed.text
+        insufficient = client.patch(
+            f"/api/v1/fp-cases/{created['id']}/regions/{item['id']}/review",
+            json={"expected_revision": 3, "verdict": "insufficient", "reviewer": "Reviewer", "reason": "The available image does not show enough detail."},
+        )
+        assert insufficient.status_code == 200, insufficient.text
+        reopened = client.get(f"/api/v1/fp-cases/{created['id']}").json()
+        assert reopened["revision"] == 4
+        assert reopened["items"][0]["review"]["verdict"] == "insufficient"
+        with client.app.state.fp_case_store._connect() as connection:
+            history_count = connection.execute(
+                "SELECT COUNT(*) FROM history WHERE id = ?", (created["id"],)
+            ).fetchone()[0]
+        assert history_count == 4
 
 
 def _run(client: TestClient, folders: list[Path], *, model: str = "dinov2_vits14") -> dict:

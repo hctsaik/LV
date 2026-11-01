@@ -511,6 +511,52 @@ export type CurationItem = {
 export type CurationItemsResponse = { items: CurationItem[]; total: number };
 export type AddCurationResponse = CurationItemsResponse & { added: number; skipped: number };
 
+export type FalsePositiveSource = {
+  id: string;
+  sha256: string;
+  name: string;
+  kind: "original" | "screenshot";
+  size: [number, number];
+  added_at: string;
+};
+
+export type FalsePositiveRegion = {
+  id: string;
+  source_id: string;
+  roi: [number, number, number, number];
+  label: string;
+  score: number | null;
+  prediction_id: string;
+  origin: string;
+  review: {
+    verdict: "pending" | "normal" | "defect" | "disputed" | "insufficient";
+    reviewer: string;
+    reason: string;
+    at: string;
+  };
+};
+
+export type FalsePositiveCase = {
+  schema_version: number;
+  id: string;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  title: string;
+  description: string;
+  sources: FalsePositiveSource[];
+  items: FalsePositiveRegion[];
+  external: {
+    model_id: string;
+    threshold: string;
+    raw_output: string;
+    replay_status: "not_replayed";
+  };
+  evidence: Array<Record<string, unknown>>;
+};
+
+export type FalsePositiveCasesResponse = { items: FalsePositiveCase[]; total: number };
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const base = window.NATIVEAPP_LOCAL_API || "";
   const response = await fetch(base + path, {
@@ -792,6 +838,64 @@ export const api = {
     requestGetBlob("/api/v1/curation." + format),
   curationThumbnailUrl: (itemId: string) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/curation/items/" + encodeURIComponent(itemId) + "/thumbnail",
+  falsePositiveCases: () => request<FalsePositiveCasesResponse>("/api/v1/fp-cases"),
+  falsePositiveCase: (caseId: string) =>
+    request<FalsePositiveCase>("/api/v1/fp-cases/" + encodeURIComponent(caseId)),
+  createFalsePositiveCase: (input: {
+    source_name: string;
+    source_kind: "original" | "screenshot";
+    source_base64: string;
+    title: string;
+    description: string;
+    external_model_id: string;
+    threshold: string;
+    raw_output: string;
+  }) => request<FalsePositiveCase>("/api/v1/fp-cases", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  addFalsePositiveSource: (caseId: string, expectedRevision: number, input: {
+    source_name: string;
+    source_kind: "original" | "screenshot";
+    source_base64: string;
+  }) => request<FalsePositiveCase>("/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/sources", {
+    method: "POST",
+    body: JSON.stringify({ expected_revision: expectedRevision, ...input }),
+  }),
+  addFalsePositiveRegion: (caseId: string, expectedRevision: number, input: {
+    source_id: string;
+    roi: number[];
+    label: string;
+    score: number | null;
+  }) => request<{ case: FalsePositiveCase; item_id: string }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/regions", {
+      method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision, ...input }),
+    },
+  ),
+  importFalsePositiveYolo: (caseId: string, expectedRevision: number, input: {
+    source_id: string;
+    filename: string;
+    content: string;
+  }) => request<{ case: FalsePositiveCase; imported: number }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/predictions/yolo", {
+      method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision, ...input }),
+    },
+  ),
+  reviewFalsePositiveRegion: (caseId: string, itemId: string, expectedRevision: number, input: {
+    verdict: FalsePositiveRegion["review"]["verdict"];
+    reviewer: string;
+    reason: string;
+  }) => request<FalsePositiveCase>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/regions/" + encodeURIComponent(itemId) + "/review", {
+      method: "PATCH",
+      body: JSON.stringify({ expected_revision: expectedRevision, ...input }),
+    },
+  ),
+  falsePositiveSourceImageUrl: (caseId: string, sourceId: string) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fp-cases/" + encodeURIComponent(caseId)
+      + "/sources/" + encodeURIComponent(sourceId) + "/image",
 };
 
 async function requestBlob(path: string, body: unknown): Promise<Blob> {

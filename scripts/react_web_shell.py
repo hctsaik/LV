@@ -12,6 +12,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Literal
@@ -42,6 +43,7 @@ from interaction import (
     yolo_label_path_for,
 )
 from curation_store import CurationStore, CurationStoreError
+from fp_case_store import FalsePositiveCaseStore, public_case
 from completeness import (
     bucketize,
     build_completeness,
@@ -110,6 +112,46 @@ class CreateDiagnosticExplanationRequest(BaseModel):
     head_index: int | None = Field(default=None, ge=0, le=63)
     target_class: str | None = Field(default=None, min_length=1, max_length=256)
     display_mode: Literal["signed", "positive"] = "signed"
+
+
+class CreateFalsePositiveCaseRequest(BaseModel):
+    source_name: str = Field(min_length=1, max_length=512)
+    source_kind: Literal["original", "screenshot"]
+    source_base64: str = Field(min_length=1, max_length=70_000_000)
+    title: str = Field(default="", max_length=240)
+    description: str = Field(default="", max_length=10000)
+    external_model_id: str = Field(default="", max_length=240)
+    threshold: str = Field(default="", max_length=120)
+    raw_output: str = Field(default="", max_length=20000)
+
+
+class AddFalsePositiveSourceRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    source_name: str = Field(min_length=1, max_length=512)
+    source_kind: Literal["original", "screenshot"]
+    source_base64: str = Field(min_length=1, max_length=70_000_000)
+
+
+class AddFalsePositiveRegionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    source_id: str = Field(min_length=1, max_length=64)
+    roi: list[float] = Field(min_length=4, max_length=4)
+    label: str = Field(default="", max_length=256)
+    score: float | None = None
+
+
+class ImportFalsePositivePredictionsRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    source_id: str = Field(min_length=1, max_length=64)
+    filename: str = Field(min_length=1, max_length=512)
+    content: str = Field(min_length=1, max_length=2_000_000)
+
+
+class ReviewFalsePositiveRegionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    verdict: Literal["pending", "normal", "defect", "disputed", "insufficient"]
+    reviewer: str = Field(default="", max_length=256)
+    reason: str = Field(default="", max_length=4000)
 
 
 class CreateComparisonJob(BaseModel):
@@ -372,6 +414,8 @@ def create_app(
     app.state.coverage_candidate_jobs = {}
     app.state.coverage_candidates = {}
     app.state.curation_store = CurationStore()
+    app.state.fp_case_store = FalsePositiveCaseStore()
+    app.state.fp_case_lock = threading.RLock()
     app.state.lock = threading.RLock()
 
     def has_active_job() -> bool:
@@ -420,6 +464,157 @@ def create_app(
             "model_catalog_ready": model_catalog_ready,
             "models_available": models_available,
         }
+
+    def get_fp_case(case_id: str) -> dict:
+        try:
+            return app.state.fp_case_store.load(case_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="找不到誤逮案件") from exc
+
+    def check_fp_revision(case: dict, expected_revision: int) -> None:
+        if case["revision"] != expected_revision:
+            raise HTTPException(status_code=409, detail={
+                "code": "CASE_REVISION_CONFLICT",
+                "message": "案件已在另一個視窗更新，請重新載入後再儲存。",
+                "request_id": uuid.uuid4().hex,
+            })
+
+    def save_fp_case(case: dict) -> dict:
+        try:
+            return public_case(app.state.fp_case_store.save(case))
+        except ValueError as exc:
+            if "另一個視窗更新" in str(exc):
+                raise HTTPException(status_code=409, detail={
+                    "code": "CASE_REVISION_CONFLICT",
+                    "message": str(exc),
+                    "request_id": uuid.uuid4().hex,
+                }) from exc
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def decode_fp_image(source_base64: str) -> bytes:
+        try:
+            return base64.b64decode(source_base64, validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail="影像內容不是有效的 Base64") from exc
+
+    @app.get("/api/v1/fp-cases")
+    def list_fp_cases() -> dict:
+        with app.state.fp_case_lock:
+            cases = app.state.fp_case_store.list()
+        rows = [public_case(case) for case in cases]
+        return {"items": rows, "total": len(rows)}
+
+    @app.post("/api/v1/fp-cases", status_code=201)
+    def create_fp_case(request: CreateFalsePositiveCaseRequest) -> dict:
+        try:
+            source = app.state.fp_case_store.ingest(
+                decode_fp_image(request.source_base64), request.source_name, request.source_kind,
+            )
+            with app.state.fp_case_lock:
+                case = app.state.fp_case_store.create(
+                    source,
+                    title=request.title,
+                    description=request.description,
+                    model_id=request.external_model_id,
+                    threshold=request.threshold,
+                    raw_output=request.raw_output,
+                )
+            return public_case(case)
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/fp-cases/{case_id}")
+    def get_fp_case_route(case_id: str) -> dict:
+        with app.state.fp_case_lock:
+            return public_case(get_fp_case(case_id))
+
+    @app.get("/api/v1/fp-cases/{case_id}/sources/{source_id}/image")
+    def get_fp_case_source_image(case_id: str, source_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            source = next((row for row in case["sources"] if row["id"] == source_id), None)
+            if source is None:
+                raise HTTPException(status_code=404, detail="找不到案件影像來源")
+            try:
+                path = app.state.fp_case_store.image_path(source)
+                content = path.read_bytes()
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return Response(content=content, media_type=media_type, headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.post("/api/v1/fp-cases/{case_id}/sources", status_code=201)
+    def add_fp_case_source(case_id: str, request: AddFalsePositiveSourceRequest) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                source = app.state.fp_case_store.ingest(
+                    decode_fp_image(request.source_base64), request.source_name, request.source_kind,
+                )
+                app.state.fp_case_store.add_source(case, source)
+            except HTTPException:
+                raise
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return save_fp_case(case)
+
+    @app.post("/api/v1/fp-cases/{case_id}/regions", status_code=201)
+    def add_fp_case_region(case_id: str, request: AddFalsePositiveRegionRequest) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                item = app.state.fp_case_store.add_region(
+                    case, request.source_id, request.roi, request.label, request.score,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            saved = save_fp_case(case)
+            return {"case": saved, "item_id": item["id"]}
+
+    @app.post("/api/v1/fp-cases/{case_id}/predictions/yolo", status_code=201)
+    def import_fp_case_yolo(case_id: str, request: ImportFalsePositivePredictionsRequest) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                count = app.state.fp_case_store.import_yolo(case, request.source_id, request.content)
+                case["evidence"].append({
+                    "id": "e_" + uuid.uuid4().hex[:12],
+                    "role": "prediction_file",
+                    "text": "匯入外部 YOLO 預測",
+                    "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "source_id": request.source_id,
+                    "filename": Path(request.filename.replace("\\", "/")).name[:240],
+                    "sha256": hashlib.sha256(request.content.encode("utf-8")).hexdigest(),
+                    "region_count": count,
+                })
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"case": save_fp_case(case), "imported": count}
+
+    @app.patch("/api/v1/fp-cases/{case_id}/regions/{item_id}/review")
+    def review_fp_case_region(
+        case_id: str,
+        item_id: str,
+        request: ReviewFalsePositiveRegionRequest,
+    ) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                app.state.fp_case_store.review_region(
+                    case, item_id, request.verdict, request.reviewer, request.reason,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return save_fp_case(case)
 
     @app.get("/api/v1/models")
     def models() -> dict:

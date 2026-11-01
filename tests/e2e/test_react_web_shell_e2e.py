@@ -2652,3 +2652,125 @@ def test_lv_web_04_expl_01_real_dinov2_attention_and_gradcam(
         path: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in dataset.rglob("*") if path.is_file()
     }
+
+
+def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible React intake, source identity, prediction import, review and case reopen."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from PIL import Image
+    from playwright.sync_api import expect, sync_playwright
+
+    cases_root = tmp_path / "fp-cases"
+    monkeypatch.setenv("LV_CASES_DIR", str(cases_root))
+    screenshot_path = tmp_path / "reported-screen.png"
+    original_path = tmp_path / "original-image.png"
+    predictions_path = tmp_path / "predictions.txt"
+    Image.new("RGB", (80, 60), (220, 80, 35)).save(screenshot_path)
+    Image.new("RGB", (120, 90), (35, 110, 190)).save(original_path)
+    predictions_path.write_text(
+        "0 0.50 0.50 0.40 0.40 0.91\n1 0.30 0.40 0.20 0.30 0.76\n",
+        encoding="utf-8",
+    )
+    reference_hashes = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (screenshot_path, original_path, predictions_path)
+    }
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1480, "height": 1024})
+            page.set_default_timeout(15000)
+            created_cases: list[dict] = []
+            added_sources: list[dict] = []
+
+            def capture_created(response):
+                if response.request.method == "POST" and response.url.rstrip("/").endswith("/api/v1/fp-cases") and response.ok:
+                    created_cases.append(response.json())
+
+            def capture_source(response):
+                if response.request.method == "POST" and response.url.rstrip("/").endswith("/sources") and response.ok:
+                    added_sources.append(response.json())
+
+            page.on("response", capture_created)
+            page.on("response", capture_source)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fp-cases").click()
+            expect(page.get_by_role("heading", name="建立誤逮案件")).to_be_visible()
+            page.get_by_label("案件名稱（可留空）").fill("Reflective surface report")
+            page.get_by_label("新案件來源類型").select_option("screenshot")
+            page.get_by_label("建立案件圖片").set_input_files(str(screenshot_path))
+            page.get_by_label("使用者描述／報案理由").fill("外部模型把可接受反光標成裂痕。")
+            page.get_by_label("外部模型版本").fill("detector-2026.10")
+            page.get_by_label("預測門檻").fill("0.82")
+            page.get_by_label("外部模型原始預測／輸出").fill("class=crack score=0.94")
+            page.get_by_role("button", name="建立案件", exact=True).click()
+            expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Reflective surface report")
+            expect(page.get_by_test_id("fp-case-notice")).to_contain_text("尚未重播")
+            expect(page.get_by_test_id("fp-source-image")).to_have_js_property("naturalWidth", 80)
+            assert created_cases and created_cases[0]["sources"][0]["kind"] == "screenshot"
+            case_id = created_cases[0]["id"]
+
+            page.get_by_label("補入來源類型").select_option("original")
+            page.get_by_label("補入原圖或截圖").set_input_files(str(original_path))
+            page.get_by_role("button", name="加入此案件").click()
+            expect(page.get_by_test_id("fp-case-notice")).to_contain_text("原圖已加入")
+            assert added_sources and len(added_sources[0]["sources"]) == 2
+            original_source = next(source for source in added_sources[0]["sources"] if source["kind"] == "original")
+            screenshot_source = next(source for source in added_sources[0]["sources"] if source["kind"] == "screenshot")
+            page.get_by_test_id(f"fp-source-{original_source['id']}").click()
+            expect(page.get_by_test_id("fp-source-image")).to_have_js_property("naturalWidth", 120)
+            page.get_by_test_id(f"fp-source-{screenshot_source['id']}").click()
+            expect(page.get_by_test_id("fp-source-image")).to_have_js_property("naturalWidth", 80)
+
+            page.get_by_test_id("fp-yolo-file").set_input_files(str(predictions_path))
+            page.get_by_role("button", name="匯入 YOLO 預測").click()
+            expect(page.get_by_test_id("fp-case-notice")).to_contain_text("已匯入 2 個預測區域")
+            expect(page.get_by_test_id("fp-region-count")).to_have_text("2 個區域")
+            expect(page.get_by_test_id("fp-selected-region-roi")).to_be_visible()
+            region_tabs = page.locator("[data-testid^='fp-region-tab-']")
+            expect(region_tabs).to_have_count(2)
+            first_region_id = region_tabs.nth(0).get_attribute("data-testid").removeprefix("fp-region-tab-")
+
+            page.get_by_test_id("fp-review-verdict").select_option("normal")
+            page.get_by_test_id("fp-reviewer").fill("Engineer A")
+            page.get_by_test_id("fp-review-reason").fill("依規格，此 ROI 是可接受反光。")
+            page.get_by_test_id("fp-save-review").click()
+            expect(page.get_by_test_id("fp-case-notice")).to_contain_text("整圖標籤不會隨之改變")
+            page.get_by_test_id(f"fp-region-tab-{first_region_id}").click()
+            assert page.get_by_test_id("fp-review-verdict").input_value() == "normal"
+            page.locator("[data-testid^='fp-region-tab-']").nth(1).click()
+            page.get_by_test_id("fp-review-verdict").select_option("defect")
+            page.get_by_test_id("fp-reviewer").fill("Engineer B")
+            page.get_by_test_id("fp-review-reason").fill("此 ROI 有可見裂痕，與第一區域分開覆核。")
+            page.get_by_test_id("fp-save-review").click()
+            expect(page.locator("[data-testid^='fp-region-tab-']").nth(0)).to_contain_text("確認此區域正常")
+            expect(page.locator("[data-testid^='fp-region-tab-']").nth(1)).to_contain_text("確認此區域有瑕疵")
+
+            page.get_by_role("button", name="＋ 建立案件").click()
+            page.get_by_label("案件名稱（可留空）").fill("Second report")
+            page.get_by_label("建立案件圖片").set_input_files(str(original_path))
+            page.get_by_role("button", name="建立案件", exact=True).click()
+            expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Second report")
+            assert len(created_cases) == 2
+
+            page.get_by_test_id(f"fp-open-case-{case_id}").click()
+            expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Reflective surface report")
+            expect(page.locator("[data-testid^='fp-region-tab-']").nth(0)).to_contain_text("確認此區域正常")
+            page.locator("[data-testid^='fp-region-tab-']").nth(1).click()
+            expect(page.get_by_test_id("fp-review-verdict")).to_have_value("defect")
+            assert not page.get_by_test_id("fp-case-error").count()
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+
+    assert reference_hashes == {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (screenshot_path, original_path, predictions_path)
+    }, "case intake or review modified its source files"

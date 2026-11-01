@@ -31,6 +31,7 @@ import {
 } from "./api";
 import CompareDistributions from "./CompareDistributions";
 import CurationWorkspace from "./CurationWorkspace";
+import FalsePositiveCaseWorkspace from "./FalsePositiveCaseWorkspace";
 const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
 const LazyCoverageWorkspace = lazy(() => import("./CoverageWorkspace"));
@@ -275,7 +276,7 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "curation" | "coverage">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "curation" | "coverage" | "false_positive">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -1067,6 +1068,7 @@ export default function App() {
           <button type="button" className={activeTool === "compare" ? "active" : ""} aria-current={activeTool === "compare" ? "page" : undefined} onClick={() => setActiveTool("compare")}>Compare</button>
           <button type="button" className={activeTool === "coverage" ? "active" : ""} aria-current={activeTool === "coverage" ? "page" : undefined} onClick={() => { setCoverageMounted(true); setActiveTool("coverage"); }}>Coverage</button>
           <button type="button" data-testid="open-curation" className={activeTool === "curation" ? "active" : ""} aria-current={activeTool === "curation" ? "page" : undefined} onClick={() => setActiveTool("curation")}>Curation{curationCount === null ? "" : ` (${curationCount})`}</button>
+          <button type="button" data-testid="open-fp-cases" className={activeTool === "false_positive" ? "active" : ""} aria-current={activeTool === "false_positive" ? "page" : undefined} onClick={() => setActiveTool("false_positive")}>誤逮案件</button>
         </nav>
         <div className={"connection " + (connected ? "connection-ready" : "connection-waiting")}>
           <span className="connection-dot" />
@@ -1323,6 +1325,8 @@ export default function App() {
             </> : <p>Select a Visualize record to create a diagnostics reference.</p>}
           </section>
         </main>
+      ) : activeTool === "false_positive" ? (
+        <FalsePositiveCaseWorkspace />
       ) : activeTool === "curation" ? (
         <CurationWorkspace onCountChange={setCurationCount} />
       ) : activeTool === "compare" ? (
