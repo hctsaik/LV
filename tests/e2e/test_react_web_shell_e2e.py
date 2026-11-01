@@ -366,6 +366,121 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_ic_02_multi_model_projections_visible_journey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible React keeps record identity across two model views and all five projections."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "classifier-multimodel")
+    source_before = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    selected_models = ["dinov2_vits14", "resnet50"]
+    embed_calls: list[tuple[str, str]] = []
+
+    def fixture_loader(model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = len(path.name) / 10.0
+            vector[4] = 0.25 if model_id == selected_models[0] else -0.25
+            embed_calls.append((model_id, str(path)))
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: selected_models,
+        model_loader=fixture_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+            run_payloads = []
+            page.on(
+                "response",
+                lambda response: run_payloads.append(response.json())
+                if _is_run_summary_response(response) and response.ok
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_test_id("model-choice-resnet50").check()
+            for projection in ("pca", "tsne", "umap", "lda"):
+                page.get_by_test_id("projection-" + projection).check()
+            assert page.get_by_label("Supervised UMAP").is_checked()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=120_000)
+            points = page.get_by_test_id("embedding-point")
+            expect(points).to_have_count(4)
+            assert run_payloads, "React UI did not load the completed local API run"
+            run = run_payloads[-1]
+            assert run["models"] == selected_models
+            assert run["embedding_shapes"] == {
+                model_id: [4, 384] for model_id in selected_models
+            }
+            assert len(embed_calls) == 8
+            expected_views = {
+                (model_id, method)
+                for model_id in selected_models
+                for method in ("pca", "tsne", "umap", "lda", "sumap")
+            }
+            actual_views = {(view["model_id"], view["method"]) for view in run["views"]}
+            assert actual_views == expected_views
+            for view in run["views"]:
+                assert [point["index"] for point in view["points"]] == list(range(4))
+                assert all(np.isfinite([point["x"], point["y"], point["z"]]).all()
+                           for point in view["points"])
+
+            page.get_by_label("Filter by class").select_option(label="apple")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(2)
+            page.get_by_label("Filter by class").select_option(label="All classes")
+            page.get_by_label("Filter by split").select_option("test")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(1)
+            page.get_by_label("Filter by split").select_option("all")
+
+            page.get_by_test_id("embedding-point").nth(2).click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+            page.get_by_label("Display model").select_option("resnet50")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+            page.get_by_label("Display method").select_option("umap")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            page.get_by_test_id("dimension-3d").click()
+            expect(page.get_by_test_id("embedding-plot-3d")).to_be_visible(timeout=60_000)
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+            page.get_by_test_id("dimension-2d").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("image-03.png")
+
+            source_after = {
+                path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in dataset.rglob("*")
+                if path.is_file()
+            }
+            assert source_after == source_before
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
 def test_lv_web_01_rank_01_visible_ranking_viewer_and_csv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
