@@ -263,3 +263,39 @@ def test_case_lv_web_02_rejects_missing_groups_and_invalid_projection(tmp_path, 
     assert job["state"] == "failed"
     assert job["error"]["code"] == "NO_IMAGES_A"
     assert "C:\\" not in job["error"]["message"]
+
+
+def test_case_lv_web_02_obj_01_no_shared_classes_is_explicit_and_path_safe(tmp_path, monkeypatch):
+    roots = [tmp_path / "det-a", tmp_path / "det-b"]
+    for root, label in zip(roots, ("alpha", "beta")):
+        (root / "images").mkdir(parents=True)
+        (root / "labels").mkdir()
+        (root / "classes.txt").write_text(f"{label}\n", encoding="utf-8")
+        _image(root / "images", "item.png", (60, 100, 180))
+        (root / "labels" / "item.txt").write_text("0 0.5 0.5 0.7 0.6\n", encoding="utf-8")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "app-cache"))
+    client = TestClient(create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: _whole_embedder,
+        object_model_loader=lambda _model_id, **_kwargs: _object_embedder,
+    ))
+
+    response = client.post("/api/v1/compare/jobs", json={
+        "folders_a": [str(roots[0])], "folders_b": [str(roots[1])],
+        "model_id": "fixture-model", "unit": "object",
+    })
+    assert response.status_code == 202, response.text
+    job_id = response.json()["job_id"]
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        job = client.get(f"/api/v1/compare/jobs/{job_id}").json()
+        if job["state"] in {"failed", "completed", "cancelled"}:
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("comparison job did not report the missing shared classes")
+
+    assert job["state"] == "failed"
+    assert job["error"]["code"] == "NO_COMMON_CLASSES"
+    assert "no shared detection classes" in job["error"]["message"].lower()
+    assert str(tmp_path) not in job["error"]["message"]

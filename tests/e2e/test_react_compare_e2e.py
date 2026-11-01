@@ -190,6 +190,65 @@ def test_lv_web_02_obj_01_react_object_compare_flow_with_local_worker(tmp_path: 
         thread.join(timeout=10)
 
 
+def test_lv_web_02_obj_01_no_shared_classes_shows_visible_error(tmp_path: Path, monkeypatch):
+    roots = [tmp_path / "det-a", tmp_path / "det-b"]
+    for root, label in zip(roots, ("alpha", "beta")):
+        (root / "images").mkdir(parents=True)
+        (root / "labels").mkdir()
+        (root / "classes.txt").write_text(f"{label}\n", encoding="utf-8")
+        Image.new("RGB", (64, 56), (70, 100, 150)).save(root / "images" / "item.png")
+        (root / "labels" / "item.txt").write_text("0 0.5 0.5 0.7 0.6\n", encoding="utf-8")
+    source_files = [path for root in roots for path in root.rglob("*") if path.is_file()]
+    hashes_before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: _embed,
+        object_model_loader=lambda _model, **_kwargs: _embed_object,
+    )
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(application, host="127.0.0.1", port=port, log_level="error", lifespan="off"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                import urllib.request
+
+                with urllib.request.urlopen(base_url + "/api/v1/health", timeout=1) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("local worker did not start")
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Compare").click()
+            page.get_by_label("Image folder", exact=True).nth(0).fill(str(roots[0]))
+            page.get_by_role("button", name="Add Folder A").click()
+            page.get_by_label("Image folder", exact=True).nth(1).fill(str(roots[1]))
+            page.get_by_role("button", name="Add Folder B").click()
+            page.get_by_label("Feature model").select_option("fixture-model")
+            page.get_by_role("button", name="Run comparison").click()
+            alert = page.get_by_role("alert")
+            expect(alert).to_contain_text("Groups A and B have no shared detection classes", timeout=60_000)
+            expect(alert).to_contain_text("same classes.txt")
+            expect(alert).not_to_contain_text(str(tmp_path))
+            expect(page.get_by_test_id("comparison-point")).to_have_count(0)
+            expect(page.get_by_test_id("compare-policy")).to_have_count(0)
+            browser.close()
+        assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files} == hashes_before
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
 def test_lv_web_02_state_01_filters_reset_selection_and_compare_images_handoff_visible_journey(
     tmp_path: Path, monkeypatch,
 ):
