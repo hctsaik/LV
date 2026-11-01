@@ -164,3 +164,80 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
   .choice-list { grid-template-columns: 1fr; }
   .plot-subtoolbar { align-items: flex-start; flex-wrap: wrap; }
 }
+
+.tool-nav { display: flex; align-items: center; gap: 5px; margin: 0 auto 0 52px; }
+.tool-nav button { border: 1px solid transparent; border-radius: 7px; padding: 8px 13px; color: #718097; background: transparent; font-size: 11px; font-weight: 700; }
+.tool-nav button:hover { background: #f5f7fb; color: #3a4f74; }
+.tool-nav button.active { border-color: #dfe6f1; background: #f3f6fb; color: #2e4771; }
+.compare-workspace { min-height: calc(100vh - 72px); display: grid; grid-template-columns: 356px minmax(0, 1fr); }
+.compare-controls { min-width: 0; padding: 25px 23px 24px; background: #fff; border-right: 1px solid #e7ebf1; display: flex; flex-direction: column; align-items: stretch; }
+.compare-controls h1 { margin: 9px 0 7px; color: #202b40; font: 800 22px/1.2 Manrope, "Segoe UI", sans-serif; letter-spacing: -.6px; }
+.compare-folder-section, .compare-config { margin-top: 18px; padding-top: 16px; border-top: 1px solid #edf0f4; }
+.compare-folder-section .section-heading, .compare-config .section-heading { margin-bottom: 12px; }
+.compare-controls select, .compare-controls textarea { width: 100%; border: 1px solid #dfe4ec; border-radius: 7px; background: #fff; color: #34425b; font-size: 11px; outline: none; }
+.compare-controls select { height: 36px; padding: 0 10px; }
+.compare-controls textarea { min-height: 56px; padding: 8px 10px; resize: vertical; }
+.compare-controls select:focus, .compare-controls textarea:focus { border-color: #8298bd; box-shadow: 0 0 0 3px #eef2f8; }
+.compare-controls .host-picker { margin-top: 1px; }
+.compare-results { min-width: 0; padding: 29px 32px 32px; }
+.compare-results .alert { font-size: 11px; }
+.compare-results .alert-warning { border: 1px solid #f1dfbd; background: #fffaf0; color: #88692e; }
+.compare-results .progress-card { margin-bottom: 16px; }
+.policy-summary { margin: 17px 0 0; padding: 9px 12px; border: 1px solid #e3eaf3; border-radius: 7px; background: #f9fbfe; color: #687895; font-size: 10px; }
+.drift-card, .comparison-plot-card, .compare-galleries { min-width: 0; margin-top: 18px; padding: 17px 19px 15px; border: 1px solid #e5e9ef; border-radius: 9px; background: #fff; box-shadow: 0 4px 14px #25385808; }
+.drift-card .section-heading { margin-bottom: 4px; }
+.drift-card > .field-note { margin-bottom: 11px; }
+.drift-table-wrap { overflow: auto; }
+.drift-table { width: 100%; border-collapse: collapse; color: #52617a; font-size: 10px; }
+.drift-table th { padding: 9px 10px; border-bottom: 1px solid #e7ebf1; color: #8a96a8; text-align: left; font-size: 9px; font-weight: 600; }
+.drift-table td { min-width: 100px; padding: 9px 10px; border-bottom: 1px solid #f0f2f5; }
+.drift-table tr:last-child td { border-bottom: 0; }
+.drift-table tr.selected-row { background: #f5f8fc; }
+.class-select { border: 0; padding: 0; background: transparent; color: #334b73; font-size: 10px; font-weight: 700; text-align: left; }
+.class-select:hover { text-decoration: underline; }
+.drift-track { display: inline-block; width: min(140px, 45%); height: 5px; margin-left: 8px; vertical-align: middle; overflow: hidden; border-radius: 5px; background: #edf1f6; }
+.drift-track i { display: block; height: 100%; border-radius: inherit; background: #6788b8; }
+.comparison-plot-card { display: flex; flex-direction: column; }
+.comparison-plot-card .plot-toolbar { flex-wrap: wrap; }
+.comparison-plot-card .filters select { max-width: 150px; }
+.comparison-plot-card .plot-frame { min-height: 340px; }
+.compare-scatter { cursor: crosshair; touch-action: none; user-select: none; }
+.selection-box { fill: #527db522; stroke: #456a9d; stroke-width: 1.2; stroke-dasharray: 5 3; pointer-events: none; }
+.chart-hint { padding: 0 0 6px 38px; color: #9aa4b3; font-size: 9px; }
+.compare-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 15px; padding: 7px 0 0 37px; color: #6f7c91; font-size: 9px; }
+.compare-legend span { display: flex; align-items: center; gap: 6px; }
+.compare-legend i { width: 8px; height: 8px; border-radius: 50%; }
+.compare-legend .legend-a { background: #3498db; }
+.compare-legend .legend-b { background: #e74c3c; border-radius: 2px; }
+.compare-legend small { margin-left: auto; color: #9aa4b3; font-size: 8px; }
+.plot-subtoolbar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; min-height: 36px; margin-top: 10px; }
+.object-filters { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+.object-filters label { color: #7c899c; font-size: 9px; }
+.object-filters label > div { display: flex; gap: 5px; }
+.object-filters input { accent-color: #5376aa; }
+.compare-galleries { padding-bottom: 18px; }
+.gallery-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 15px; }
+.gallery-heading h2 { margin: 0; color: #35425a; font: 700 13px Manrope, "Segoe UI", sans-serif; }
+.gallery-heading span { color: #8d99aa; font-size: 9px; }
+.compare-gallery-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 14px; }
+.compare-gallery { min-width: 0; padding: 11px; border: 2px solid #dce8f1; border-radius: 8px; }
+.compare-gallery.a { border-color: #9ecdeb; }
+.compare-gallery.b { border-color: #ecc0bd; }
+.compare-gallery h3 { display: flex; justify-content: space-between; margin: 0 0 9px; color: #3c5675; font-size: 10px; }
+.compare-gallery.b h3 { color: #875352; }
+.compare-gallery h3 small { color: #95a1b0; font-size: 8px; font-weight: 500; }
+.compare-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(105px, 1fr)); gap: 8px; }
+.compare-image-card { min-width: 0; border: 1px solid #e7ebf1; border-radius: 6px; padding: 5px; background: #fff; color: #59667a; text-align: left; }
+.compare-image-card:hover { border-color: #a8b8d1; background: #f9fbfe; }
+.compare-image-canvas { position: relative; display: block; width: 100%; aspect-ratio: 1; overflow: hidden; border-radius: 4px; background: #f3f5f8; }
+.compare-image-canvas img { width: 100%; height: 100%; object-fit: contain; }
+.compare-image-canvas i { position: absolute; border: 2px solid #f4b439; pointer-events: none; }
+.compare-image-card strong, .compare-image-card small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compare-image-card strong { margin-top: 5px; font-size: 8px; }
+.compare-image-card small { margin-top: 3px; color: #8c98a8; font-size: 8px; }
+.compare-focus { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 12px; color: #8793a4; font-size: 9px; }
+.compare-focus strong { color: #53637c; }
+.compare-empty { min-height: 55vh; margin-top: 12px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (max-width: 1050px) { .compare-workspace { grid-template-columns: 310px minmax(0, 1fr); }.compare-controls { padding-left: 18px; padding-right: 18px; }.compare-results { padding-left: 21px; padding-right: 21px; }.tool-nav { margin-left: 24px; } }
+@media (max-width: 800px) { .tool-nav { margin: 0 0 0 auto; }.tool-nav button { padding: 7px 9px; }.topbar { gap: 12px; }.compare-workspace { display: flex; flex-direction: column; }.compare-controls { border-right: 0; border-bottom: 1px solid #e7ebf1; }.compare-gallery-columns { grid-template-columns: 1fr; }.compare-results { padding: 22px 16px; }.compare-legend small { flex-basis: 100%; margin-left: 0; } }

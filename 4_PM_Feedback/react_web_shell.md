@@ -19,7 +19,7 @@ AC2、AC3、AC6 須以真實權重和可見 UI 通過；AC1、AC4、AC5 可先�
 
 本表依 2026-11-01 LV 工具列、scripts/app.py 的 UI 分流、使用指南、已存在的 UI／E2E 測試與本機來源 checkout 的誤逮案件規格盤點，共整理 44 個可驗收 journey。每列是一個可完整操作與回讀的 journey；控制項數量不等於 use case 數量。
 
-Legacy 測試只作為 Streamlit 行為錨點，不算 React 通過證據。React case 必須用固定輸入、固定模型、可見 UI 操作重跑；檢查顯示結果、領域數值、檔案輸出、跨工具 handoff、資料夾副作用及重開後狀態。React 目前只有 LV-WEB-01-IC-01 的 AC1–AC5 有本機證據；IC-02 已有 deterministic API/core 覆蓋，仍須真實多模型與可見 UI parity receipt。標成「本機來源」的文件／測試存在於原 LV 使用者工作樹，但尚未併入本隔離分支，不得當成此分支的 CI 證據。
+Legacy 測試只作為 Streamlit 行為錨點，不算 React 通過證據。React case 必須用固定輸入、固定模型、可見 UI 操作重跑；檢查顯示結果、領域數值、檔案輸出、跨工具 handoff、資料夾副作用及重開後狀態。LV-WEB-01-IC-01 有 AC1–AC5 本機證據；IC-02 有 deterministic API/core 覆蓋，仍須真實多模型與完整 UI parity。LV-WEB-02 的整圖與物件比較已有 fixture API／UI 局部證據，真實模型與 Streamlit 數值 parity 未驗。標成「本機來源」的文件／測試存在於原 LV 使用者工作樹，但尚未併入本隔離分支，不得當成此分支的 CI 證據。
 
 | Case ID | 原有操作旅程與 parity contract | Streamlit 行為錨點 | React 狀態 |
 |---|---|---|---|
@@ -35,9 +35,9 @@ Legacy 測試只作為 Streamlit 行為錨點，不算 React 通過證據。Reac
 | LV-WEB-01-RANK-01 | 離群度、標籤分歧排序與排名式檢視；排序只是線索，不得變成品質判定 | tests/e2e/test_scenarios_r1.py::test_s04_outlier_ranking_and_export；tests/e2e/test_gui_flows.py::test_k2_label_disagreement_ranking | 未開始 |
 | LV-WEB-01-CART-01 | Visualize 選取／面板候選寫入持久策展清單，CSV／JSON 身分和理由可讀；重複加入有既有規則 | tests/e2e/test_gui_flows.py::test_i_export_list_round_trip；tests/e2e/test_scenarios_r1.py::test_s10_empty_selection_export_honesty | 未開始；需定義跨 worker 持久性 |
 | LV-WEB-01-EDGE-01 | 單張／空資料、壞檔、Unicode 路徑、缺模型與缺類別的明確狀態；來源資料 bytes 不變 | tests/e2e/test_scenarios_r1.py::test_s06_minimal_dataset_single_image、test_s07_unicode_paths_round_trip、test_s09_detector_missing_classes_error | 未開始；React 本案例已覆蓋空資料與缺模型子集 |
-| LV-WEB-02-IMG-01 | Image-level A/B 比較：FID／KID／LPIPS／SSIM 等指標、投影、Coverage Gap、HTML／JSON 匯出 | tests/e2e/test_scenarios_r1.py::test_s05_compare_distributions_metrics | 未開始 |
-| LV-WEB-02-OBJ-01 | Object-level A/B 類別配對、分群投影、選取框與雙欄縮圖對照；不匹配類別要誠實提示 | tests/e2e/test_compare_by_class.py；tests/e2e/test_cmpc_adversarial.py | 未開始 |
-| LV-WEB-02-STATE-01 | 比較單位、投影、維度或類別改變時清除舊選取；手動門檻套用後失效舊結果；A/B 候選可加入購物車 | tests/e2e/test_cmpc_adversarial.py；tests/e2e/test_scenarios_cmpc.py | 未開始 |
+| LV-WEB-02-IMG-01 | Image-level A/B 比較：目前 Streamlit 基準為 centroid cosine drift、共同投影、點選讀回原圖及來源不變；舊 FID／KID／LPIPS／SSIM E2E 已不代表現行介面 | `scripts/app.py::_compute_compare_whole`；`tests/test_react_compare.py::test_case_lv_web_02_img_01_whole_image_drift_projection_and_path_boundary`；`tests/e2e/test_react_compare_e2e.py::test_lv_web_02_img_01_react_compare_flow_with_local_worker` | deterministic API 與 fixture model 可見 UI 有證據；真實模型、原輸出對照、NativeApp folder grant 與完整 parity 未驗 |
+| LV-WEB-02-OBJ-01 | Object-level A/B 類別配對、object policy/autotune、類別 drift、共同投影、框選及縮圖對照；不匹配類別要誠實提示 | `scripts/app.py::_compute_compare_by_class`；`tests/test_react_compare.py::test_case_lv_web_02_obj_01_compares_shared_classes_and_keeps_boxes_private`；`tests/e2e/test_react_compare_e2e.py::test_lv_web_02_obj_01_react_object_compare_flow_with_local_worker` | deterministic API 與 fixture model 可見 UI 有證據；真實模型、原輸出對照與完整 state/cart parity 未驗 |
+| LV-WEB-02-STATE-01 | 比較單位、投影、維度或類別改變時清除舊選取；手動門檻套用後失效舊結果；A/B 候選可加入購物車 | `tests/e2e/test_react_compare_e2e.py`；legacy：`tests/e2e/test_cmpc_adversarial.py`、`tests/e2e/test_scenarios_cmpc.py` | fixture UI 已驗投影切換與 unit 變更清除舊結果；維度／門檻完整狀態 parity 及購物車尚未開始 |
 | LV-WEB-03-ATTR-01 | 屬性棋盤軸、分桶、目標覆蓋及頻率先驗校正；顯示缺格及格內影像 | scripts/app.py::_completeness_ui；目前未定位到完整可見 E2E | 未開始；先凍結預設與使用者校正語義 |
 | LV-WEB-03-IMG-01 | Image-level embedding coverage：稀疏度、類別顏色、投影切換、框選與清除選取 | tests/e2e/test_scenarios_cov.py::test_s01_default_unit_is_object_and_no_pad_input 至 test_s13_clear_button_aligned_with_visualize_pattern | 未開始 |
 | LV-WEB-03-OBJ-01 | Object-level coverage：class/object 過濾、投影／區塊、tiny class guard、框與標籤索引保持一致 | tests/e2e/test_scenarios_cov.py::test_s14_object_filter_keeps_labels_aligned_for_supervised_proj；tests/e2e/test_scenarios_objcov.py | 未開始 |

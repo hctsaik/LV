@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -17,6 +18,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
 from _utils import available_models, load_model
+from react_compare import ComparisonInputError, project_comparison, run_comparison
 from react_visualize import JobCancelled, VisualizationInputError, run_image_classifier
 
 API_VERSION = "1"
@@ -31,10 +33,41 @@ class CreateVisualizationJob(BaseModel):
     methods: list[str] = Field(default_factory=list, max_length=5)
 
 
+class CreateComparisonJob(BaseModel):
+    folders_a: list[str] = Field(min_length=1, max_length=32)
+    folders_b: list[str] = Field(min_length=1, max_length=32)
+    model_id: str = Field(min_length=1, max_length=128)
+    unit: Literal["whole", "object"] = "object"
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+
+
+class ProjectComparisonRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=256)
+    method: str = "sumap"
+    dimension: int = Field(default=2, ge=2, le=3)
+    min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    max_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    min_short_px: int = Field(default=0, ge=0, le=4096)
+
+
 @dataclass
 class _Job:
     job_id: str
     request: CreateVisualizationJob
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    run_id: str | None = None
+    error: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
+class _ComparisonJob:
+    job_id: str
+    request: CreateComparisonJob
     state: str = "queued"
     phase: str = "queued"
     done: int = 0
@@ -64,13 +97,29 @@ def create_app(
     *,
     model_catalog: Callable[[], list[str]] | None = None,
     model_loader: Callable[[str], Callable] | None = None,
+    object_model_loader: Callable | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
     loader = model_loader or load_model
+    if object_model_loader is not None:
+        object_loader = object_model_loader
+    elif model_loader is None:
+        object_loader = load_model
+    else:
+        # Test and host integrations often inject a simple one-argument loader;
+        # it still exercises the exact crop and aggregation code without weights.
+        object_loader = lambda model_id, **_kwargs: loader(model_id)
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
     app.state.runs = {}
+    app.state.comparison_jobs = {}
+    app.state.comparison_runs = {}
+    app.state.comparison_projections = {}
     app.state.lock = threading.RLock()
+
+    def has_active_job() -> bool:
+        jobs = list(app.state.jobs.values()) + list(app.state.comparison_jobs.values())
+        return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
     @app.exception_handler(HTTPException)
     async def http_error(_request: Request, exc: HTTPException) -> JSONResponse:
@@ -195,7 +244,7 @@ def create_app(
         job_id = uuid.uuid4().hex
         job = _Job(job_id=job_id, request=request)
         with app.state.lock:
-            if any(item.state in {"queued", "running", "cancelling"} for item in app.state.jobs.values()):
+            if has_active_job():
                 raise HTTPException(status_code=409, detail={
                     "code": "JOB_ALREADY_RUNNING",
                     "message": "Wait for the active analysis to finish before starting another.",
@@ -204,6 +253,162 @@ def create_app(
             app.state.jobs[job_id] = job
         threading.Thread(target=execute, args=(job,), daemon=True, name=f"lv-web-{job_id[:8]}").start()
         return {"job_id": job_id, "state": job.state}
+
+    def execute_comparison(job: _ComparisonJob) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase, job.message = "running", "discovery", "Scanning both image groups"
+            if job.request.model_id not in set(catalog()):
+                raise ComparisonInputError("MODEL_UNAVAILABLE", "The selected model is not installed.")
+
+            def update_progress(phase: str, done: int, total: int, message: str) -> None:
+                with app.state.lock:
+                    job.phase = phase
+                    job.done = done
+                    job.total = total
+                    job.message = message
+
+            result = run_comparison(
+                job.request.folders_a,
+                job.request.folders_b,
+                job.request.model_id,
+                unit=job.request.unit,
+                class_names=job.request.class_names,
+                model_loader=loader,
+                object_model_loader=object_loader,
+                progress=update_progress,
+                cancelled=job.cancel_event.is_set,
+            )
+            if job.cancel_event.is_set():
+                raise JobCancelled()
+
+            run_id = uuid.uuid4().hex
+            with app.state.lock:
+                app.state.comparison_runs[run_id] = result
+                job.run_id = run_id
+                job.state, job.phase = "completed", "completed"
+                job.done = job.total = max(job.total, len(result["records_a"]) + len(result["records_b"]))
+                job.message = "Completed"
+        except JobCancelled:
+            with app.state.lock:
+                job.state, job.phase, job.message = "cancelled", "cancelled", "Cancelled"
+        except ComparisonInputError as exc:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", exc.code
+                job.error = {"code": exc.code, "message": str(exc), "request_id": job.job_id}
+        except FileNotFoundError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "MODEL_UNAVAILABLE"
+                job.error = {
+                    "code": "MODEL_UNAVAILABLE",
+                    "message": "The selected model weights are unavailable.",
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV web comparison failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "RUN_FAILED"
+                job.error = {
+                    "code": "RUN_FAILED",
+                    "message": "The comparison failed. Check the local worker log and retry.",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/compare/jobs", status_code=202)
+    def create_comparison_job(request: CreateComparisonJob) -> dict:
+        job_id = uuid.uuid4().hex
+        job = _ComparisonJob(job_id=job_id, request=request)
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "Wait for the active analysis to finish before starting another.",
+                    "request_id": job_id,
+                })
+            app.state.comparison_jobs[job_id] = job
+        threading.Thread(
+            target=execute_comparison, args=(job,), daemon=True,
+            name=f"lv-compare-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/compare/jobs/{job_id}")
+    def get_comparison_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.comparison_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+            return _job_view(job)
+
+    @app.delete("/api/v1/compare/jobs/{job_id}", status_code=202)
+    def cancel_comparison_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.comparison_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+            if job.state not in {"queued", "running", "cancelling"}:
+                raise HTTPException(status_code=409, detail="Job is already finished")
+            job.cancel_event.set()
+            job.state, job.message = "cancelling", "Cancellation requested"
+            return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/comparisons/{run_id}")
+    def get_comparison(run_id: str) -> dict:
+        with app.state.lock:
+            comparison = app.state.comparison_runs.get(run_id)
+            if comparison is None:
+                raise HTTPException(status_code=404, detail="Comparison not found")
+            return {key: value for key, value in comparison.items() if not key.startswith("_")}
+
+    @app.post("/api/v1/comparisons/{run_id}/projections")
+    def get_comparison_projection(run_id: str, request: ProjectComparisonRequest) -> dict:
+        with app.state.lock:
+            comparison = app.state.comparison_runs.get(run_id)
+            if comparison is None:
+                raise HTTPException(status_code=404, detail="Comparison not found")
+        key = (run_id, request.label, request.method, request.dimension,
+               request.min_confidence, request.max_confidence, request.min_short_px)
+        with app.state.lock:
+            if key in app.state.comparison_projections:
+                return app.state.comparison_projections[key]
+        try:
+            projected = project_comparison(
+                comparison,
+                label=request.label,
+                method=request.method,
+                dimension=request.dimension,
+                min_confidence=request.min_confidence,
+                max_confidence=request.max_confidence,
+                min_short_px=request.min_short_px,
+            )
+        except ComparisonInputError as exc:
+            raise HTTPException(status_code=422, detail={
+                "code": exc.code,
+                "message": str(exc),
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+        with app.state.lock:
+            app.state.comparison_projections[key] = projected
+        return projected
+
+    @app.get("/api/v1/comparisons/{run_id}/images/{side}/{index}")
+    def get_comparison_image(run_id: str, side: str, index: int) -> Response:
+        if side not in {"a", "b"}:
+            raise HTTPException(status_code=404, detail="Image not found")
+        with app.state.lock:
+            comparison = app.state.comparison_runs.get(run_id)
+            if comparison is None:
+                raise HTTPException(status_code=404, detail="Comparison not found")
+            paths: list[Path] = comparison[f"_record_paths_{side}"]
+            if index < 0 or index >= len(paths):
+                raise HTTPException(status_code=404, detail="Image not found")
+            path = paths[index]
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="Image is no longer available") from exc
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return Response(content=content, media_type=media_type, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/jobs/{job_id}")
     def get_job(job_id: str) -> dict:

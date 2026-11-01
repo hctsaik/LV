@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -175,12 +176,17 @@ def match_profile(fingerprint: dict, profiles=None):
 
 # ── embedding + metrics ──────────────────────────────────────────────────────
 def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
-                  progress=None):
+                  progress=None, model_loader: Callable | None = None):
     """Embed each object from an in-memory full-res crop under ``policy``.
     Returns (emb [N,D], short_px [N]). Caches to npz keyed by object identity.
     ``progress(done, total)`` is called per object (once at total on a cache hit)."""
-    keys = [f"{Path(m['image_path']).stem}__{m['obj_index']}" for m in meta]
-    # incremental + checkpoint: reuse already-computed objects (key = stem__obj),
+    keys = [
+        f"{hashlib.sha256(str(Path(m['image_path']).resolve()).encode('utf-8')).hexdigest()[:16]}"
+        f"__{Path(m['image_path']).stem}__{m['obj_index']}"
+        for m in meta
+    ]
+    # Incremental + checkpoint: include the resolved source image in the key so
+    # equal basenames in different folders cannot reuse each other's objects.
     # save every 200 → a crash resumes from the last checkpoint, and adding data
     # only computes the new objects (not the whole set).
     cached_emb: dict = {}
@@ -210,6 +216,7 @@ def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
         tmp.replace(cp)  # atomic
 
     embed_fn = None  # loaded lazily → a full cache hit never touches torch
+    load = model_loader or load_model
     pad = policy["pad"]
     cur_ip, cur = None, None
     total = len(meta)
@@ -222,8 +229,8 @@ def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
         if k in cached_emb:
             continue
         if embed_fn is None:
-            embed_fn = load_model(model, keep_aspect=True,
-                                  target_res=policy["target_res"], head=policy["head"])
+            embed_fn = load(model, keep_aspect=True,
+                            target_res=policy["target_res"], head=policy["head"])
         ip = m["image_path"]
         if str(ip) != cur_ip:
             cur = safe_open_image(ip)   # 壞圖/超大圖回 None → 該物件補零保索引對齊
@@ -332,7 +339,7 @@ def neighbor_confusion(emb: np.ndarray, labels, k: int = 10) -> dict:
 
 def run_autotune(image_paths, class_names, *, model="dinov2_vits14",
                  candidates=None, cap=800, cache_dir: Path | None = None,
-                 progress=None):
+                 progress=None, model_loader: Callable | None = None):
     """Embed objects under each candidate policy, rank by macro kNN-purity.
     Returns (rows sorted best-first, best_policy, fingerprint)."""
     candidates = candidates or DEFAULT_CANDIDATES
@@ -351,7 +358,10 @@ def run_autotune(image_paths, class_names, *, model="dinov2_vits14",
                  if cache_dir else None)
         ocb = ((lambda d, t, _ci=ci, _pol=pol: progress(_ci, len(candidates), _pol, d, t))
                if progress else None)
-        emb, short = embed_objects(meta, model, pol, cache_path=cache, progress=ocb)
+        emb, short = embed_objects(
+            meta, model, pol, cache_path=cache, progress=ocb,
+            model_loader=model_loader,
+        )
         rows.append({"policy": pol, **score_embeddings(emb, labels, short)})
     rows.sort(key=lambda r: (r["macro_purity"] is not None, r["macro_purity"] or 0.0),
               reverse=True)

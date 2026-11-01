@@ -14,8 +14,11 @@ import zipfile
 from collections.abc import Callable, Sequence
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import hnswlib
+if TYPE_CHECKING:
+    import hnswlib
+
 import numpy as np
 from PIL import Image, ImageDraw
 from sklearn.neighbors import NearestNeighbors
@@ -63,6 +66,13 @@ def build_nn_index(emb_matrix: np.ndarray) -> hnswlib.Index:
     (outlier-ness, label disagreement, dup radius scan) stay on sklearn
     exact search.
     """
+    try:
+        import hnswlib
+    except ImportError as exc:
+        raise RuntimeError(
+            "HNSW search requires the optional `chroma-hnswlib` dependency."
+        ) from exc
+
     emb = np.ascontiguousarray(np.asarray(emb_matrix), dtype=np.float32)
     n, dim = emb.shape
     index = hnswlib.Index(space="cosine", dim=dim)

@@ -1,11 +1,11 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
-> M24 的第一個 UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 本設計目前涵蓋 LV-WEB-01 Image Classifier 整圖模式中的基本及多模型／投影檢視，不表示其他 LV 工具已遷移。
+> M24 的本機 React UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
+> 目前有 LV-WEB-01 Image Classifier 和 LV-WEB-02 Compare Distributions 的局部流程；Compare 的 fixture 測試不代表真模型、NativeApp 或完整 parity 已驗收。
 
 ## 1. 邊界
 
-- `web/` 是 React/Vite UI；`scripts/react_web_shell.py` 是 App-owned FastAPI adapter，`scripts/react_visualize.py` 執行純領域流程。
+- `web/` 是 React/Vite UI；`scripts/react_web_shell.py` 是 App-owned FastAPI adapter，`scripts/react_visualize.py` 與 `scripts/react_compare.py` 執行純領域流程。
 - NativeApp 啟動單一本機 worker，向 UI 提供同源 API 與版本化啟動資訊。API 僅綁 loopback，worker 不啟動 Streamlit。開發模式在 `web/dist` 存在時，FastAPI 也提供同源靜態頁面作獨立本機預覽。
 - 資料夾由 NativeApp 公開 host bridge 選取。開發模式可輸入本機資料夾路徑；API 只對本次 run 已登錄的影像 ID 提供內容，不接受任意檔案讀取路徑。
 - `LV_CACHE_DIR` 指向 worker 的可寫資料區。manifest、縮圖、embedding 與 projection cache 不落入來源資料集。
@@ -20,10 +20,15 @@
 | `GET /api/v1/health` | worker readiness | API 版本、模型目錄狀態、可用模型數 |
 | `GET /api/v1/models` | 讀取模型清單 | model ID、名稱、可用狀態；不載入所有權重 |
 | `POST /api/v1/visualize/jobs` | 建立 Image Classifier run | job ID、queued 狀態 |
+| `POST /api/v1/compare/jobs` | 建立 A/B 比較 run | folders A/B、模型、整圖／物件粒度、job ID |
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
+| `GET /api/v1/compare/jobs/{job_id}` / `DELETE ...` | 讀取或取消 A/B 比較 | 與 visualize 共用單一 active-job gate |
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
 | `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案 |
+| `GET /api/v1/comparisons/{run_id}` | 讀取比較結果 | 群組記錄、類別漂移、policy 與警告；不回傳本機路徑 |
+| `POST /api/v1/comparisons/{run_id}/projections` | 計算選定群組的投影 | PCA、t-SNE、UMAP、LDA、Supervised UMAP、維度與物件篩選 |
+| `GET /api/v1/comparisons/{run_id}/images/{side}/{index}` | 讀取對應來源影像 | 只依本次比較登錄的 group/index 解析，不接受檔案路徑 |
 
 Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`methods`（PCA、t-SNE、UMAP、LDA、Supervised UMAP，最多 5 個）。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
 
@@ -34,11 +39,16 @@ Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`meth
 3. 每個模型各自抽取 embedding 並使用獨立 cache；投影保留同一模型的 embedding 與記錄順序。PCA、t-SNE、UMAP、LDA 和 Supervised UMAP 沿用 legacy 固定參數及小樣本邊界；無法計算的選項明示警告，只有所選投影全部不可用時才以 PCA 維持可檢視結果。監督投影的分群不得解讀為真實可分性。
 4. 2D 使用 SVG 散點；3D 使用隨使用者切換才載入的本機 Plotly bundle，點選與鍵盤輔助操作都能讀回同一 run record。投影維度不足時缺少的座標軸補零。點座標與記錄同序；run ID 變更時清空舊選取。跨工具暫存由各後續 case 定義。
 5. 使用者點選／框選只傳 record index 和 run ID；後端驗證索引，UI 顯示相同 label、split、檔名和原圖。
+6. Compare Distributions 對 A/B 資料夾各自遞迴找圖、略過 App cache 並跳過不可讀影像；來源路徑只留在 worker 記憶體，公開記錄使用 index、檔名和來源識別碼。
+7. 整圖比較沿用目前 Streamlit 的 centroid cosine drift：用所選模型抽取 embedding，分別正規化兩群的平均向量，再計算 `1 - cosine_similarity`。快取依模型、模式、來源路徑和檔案內容雜湊隔離。
+8. 物件比較讀取支援的 detection boxes，按較小資料群執行 object policy autotune，再以同一 policy 對 A/B crop embedding；只對共同類別計算 centroid drift，並明示只出現在單側的類別。
+9. React 可切換比較類別／投影、2D／3D、confidence 與物件短邊門檻；點選及框選只改變 run record 選取，雙欄縮圖仍讀回原圖並可顯示 bbox。投影距離只供檢視，不作為 drift 指標。
 
 ## 4. 實作狀態與整合限制
 
-- API 目前以本機路徑陣列建立 run；React 的資料夾按鈕會呼叫公開 `window.cimHost.chooseFile()`，但 LV 尚未接入 NativeApp 發布包，因此真實 OS picker、grant 驗證與殼管理 worker 的端到端仍是 AC6 待驗項。
+- API 目前以本機路徑陣列建立 run；React 的資料夾按鈕會呼叫公開 `window.cimHost.chooseFile()`，但 LV 尚未接入 NativeApp 發布包，因此真實 OS picker、grant 驗證與殼管理 worker 的端到端仍待驗。
 - 手動路徑欄只供本機開發及測試。React build 與 API 可由單一本機 FastAPI 預覽；NativeApp 交付仍須使用平台 host bridge 和 worker 管理流程。
+- Compare 的 deterministic API 與整圖／物件模式可見 UI E2E 使用 fixture embedder；DINOv2 真實權重、來源 Streamlit 數值逐項對照、Windows ARM64 及 NativeApp lifecycle 尚未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
 
 ## 5. React 驗收契約
 
@@ -55,4 +65,4 @@ Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`meth
 
 ## 6. 未涵蓋
 
-Object Detector 整圖／物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選完整交互、其它九個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖／物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選的完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。

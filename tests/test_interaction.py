@@ -36,6 +36,15 @@ def test_interaction_no_streamlit_import():
     assert "import streamlit" not in src
 
 
+def test_hnsw_dependency_is_only_needed_when_building_index(monkeypatch):
+    import interaction
+
+    monkeypatch.setitem(sys.modules, "hnswlib", None)
+    assert callable(interaction.discover_yolo_objects)
+    with pytest.raises(RuntimeError, match="chroma-hnswlib"):
+        build_nn_index(np.zeros((2, 4), dtype=np.float32))
+
+
 # ── parse_folder_paths ──────────────────────────────────────────────────
 
 def test_parse_folder_paths_crlf():

@@ -52,6 +52,70 @@ export type VisualizationRun = {
   warnings: string[];
 };
 
+export type CompareUnit = "whole" | "object";
+
+export type ComparisonRecord = {
+  index: number;
+  filename: string;
+  label: string;
+  source_id: string;
+  class_id: number | null;
+  bbox: [number, number, number, number] | null;
+  score: number | null;
+  short_px: number | null;
+};
+
+export type DriftRow = {
+  label: string;
+  a_count: number;
+  b_count: number;
+  drift: number;
+};
+
+export type ComparisonRun = {
+  unit: CompareUnit;
+  model: string;
+  name_a: string;
+  name_b: string;
+  records_a: ComparisonRecord[];
+  records_b: ComparisonRecord[];
+  rows: DriftRow[];
+  a_only: Record<string, number>;
+  b_only: Record<string, number>;
+  policy: { pad: number; target_res: number; head: string } | null;
+  autotune_rows: Array<{ policy: { pad: number; target_res: number; head: string }; macro_purity: number | null; buckets: Record<string, unknown> }>;
+  warnings: string[];
+};
+
+export type ComparisonPoint = {
+  group: "A" | "B";
+  index: number;
+  filename: string;
+  label: string;
+  x: number;
+  y: number;
+  z: number;
+};
+
+export type ComparisonProjection = {
+  label: string;
+  method: ProjectionMethod;
+  requested_method: ProjectionMethod;
+  dimension: 2 | 3;
+  points: ComparisonPoint[];
+  warnings: string[];
+  a_count: number;
+  b_count: number;
+};
+
+export type ComparisonJobInput = {
+  folders_a: string[];
+  folders_b: string[];
+  model_id: string;
+  unit: CompareUnit;
+  class_names?: string[];
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const base = window.NATIVEAPP_LOCAL_API || "";
   const response = await fetch(base + path, {
@@ -83,6 +147,34 @@ export const api = {
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
   ),
+  createComparisonJob: (input: ComparisonJobInput) =>
+    request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  comparisonJob: (jobId: string) => request<JobStatus>("/api/v1/compare/jobs/" + encodeURIComponent(jobId)),
+  cancelComparison: (jobId: string) => request<{ job_id: string; state: string }>(
+    "/api/v1/compare/jobs/" + encodeURIComponent(jobId), { method: "DELETE" },
+  ),
+  comparison: (runId: string) => request<ComparisonRun>(
+    "/api/v1/comparisons/" + encodeURIComponent(runId),
+  ),
+  projectComparison: (
+    runId: string,
+    label: string,
+    method: ProjectionMethod,
+    dimension: 2 | 3,
+    filters?: { min_confidence?: number; max_confidence?: number; min_short_px?: number },
+  ) => request<ComparisonProjection>(
+    "/api/v1/comparisons/" + encodeURIComponent(runId) + "/projections",
+    {
+      method: "POST",
+      body: JSON.stringify({ label, method, dimension, ...filters }),
+    },
+  ),
+  comparisonImageUrl: (runId: string, side: "a" | "b", index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/comparisons/" + encodeURIComponent(runId)
+      + "/images/" + side + "/" + index,
 };
 
 export type HostFolderResult = {
