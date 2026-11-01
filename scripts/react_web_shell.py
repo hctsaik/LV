@@ -52,6 +52,13 @@ from fp_case_report import report_json as fp_case_report_json
 from fp_case_report import report_markdown as fp_case_report_markdown
 from fp_case_report import set_reply_status as set_fp_case_reply_status
 from fp_case_report import upsert_claim as upsert_fp_case_claim
+from fp_case_review import apply_review_return as apply_fp_case_review_return
+from fp_case_review import link_round as link_fp_case_review_round
+from fp_case_review import prepare_batch as prepare_fp_case_review_batch
+from fp_case_review import review_candidate as review_fp_case_candidate
+from fp_case_review import review_counts as fp_case_review_counts
+from fp_case_review import review_manifest as fp_case_review_manifest
+from fp_case_review import review_zip as fp_case_review_zip
 from completeness import (
     bucketize,
     build_completeness,
@@ -189,6 +196,22 @@ class UpsertFalsePositiveClaimRequest(BaseModel):
 class SetFalsePositiveReplyStatusRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     status: Literal["draft", "replied"]
+
+
+class ReviewFalsePositiveCandidateRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    verdict: Literal["pending", "normal", "defect", "disputed", "insufficient"]
+    reviewer: str = Field(default="", max_length=256)
+    reason: str = Field(default="", max_length=4000)
+
+
+class PrepareFalsePositiveReviewBatchRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
+class ReturnFalsePositiveReviewBatchRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    manifest: dict
 
 
 class CreateComparisonJob(BaseModel):
@@ -799,6 +822,103 @@ def create_app(
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
         })
+
+    @app.patch("/api/v1/fp-cases/{case_id}/candidates/{candidate_id}/review")
+    def review_fp_case_candidate_route(
+        case_id: str,
+        candidate_id: str,
+        request: ReviewFalsePositiveCandidateRequest,
+    ) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                review_fp_case_candidate(case, candidate_id, request.verdict, request.reviewer, request.reason)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return save_fp_case(case)
+
+    @app.get("/api/v1/fp-cases/{case_id}/candidates/{candidate_id}/image")
+    def get_fp_case_candidate_image(case_id: str, candidate_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            candidate = next((row for row in case.get("candidates", []) if row.get("id") == candidate_id), None)
+            if candidate is None:
+                raise HTTPException(status_code=404, detail="找不到覆核候選")
+            try:
+                path = app.state.fp_case_store.image_path(candidate["source"])
+                content = path.read_bytes()
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return Response(content, media_type=media_type, headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.post("/api/v1/fp-cases/{case_id}/batches", status_code=201)
+    def prepare_fp_case_review_batch_route(case_id: str, request: PrepareFalsePositiveReviewBatchRequest) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                batch = prepare_fp_case_review_batch(case)
+                round_id = link_fp_case_review_round(case, batch["id"])
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            saved = save_fp_case(case)
+            return {
+                "case": saved,
+                "batch_id": batch["id"],
+                "round_id": round_id,
+                "counts": fp_case_review_counts(saved["candidates"]),
+            }
+
+    @app.get("/api/v1/fp-cases/{case_id}/batches/{batch_id}/manifest")
+    def download_fp_case_review_manifest(case_id: str, batch_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            try:
+                manifest = fp_case_review_manifest(case, batch_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            content = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+        return Response(content, media_type="application/json", headers={
+            "Content-Disposition": f'attachment; filename="{batch_id}.json"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.get("/api/v1/fp-cases/{case_id}/batches/{batch_id}/archive.zip")
+    def download_fp_case_review_zip(case_id: str, batch_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            try:
+                manifest = fp_case_review_manifest(case, batch_id)
+                content = fp_case_review_zip(app.state.fp_case_store, case, manifest)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Response(content, media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="{batch_id}.zip"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.post("/api/v1/fp-cases/{case_id}/batches/{batch_id}/return")
+    def read_fp_case_review_return(
+        case_id: str,
+        batch_id: str,
+        request: ReturnFalsePositiveReviewBatchRequest,
+    ) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            try:
+                staged, applied = apply_fp_case_review_return(case, batch_id, request.manifest)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return {"case": save_fp_case(staged), "applied": applied,
+                    "counts": fp_case_review_counts(staged["candidates"]), "training_ready_images": 0}
 
     @app.get("/api/v1/models")
     def models() -> dict:

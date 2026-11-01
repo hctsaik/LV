@@ -652,6 +652,131 @@ def test_case_lv_web_05_report_01_cited_claims_separate_reply_and_cause_with_exp
         assert str(tmp_path) not in markdown.text + snapshot.text
 
 
+def test_case_lv_web_05_al_01_review_batch_round_zip_partial_return_and_identity_guards(
+    monkeypatch, tmp_path
+):
+    output_root = tmp_path / "round-ledger"
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(output_root))
+    with _client(monkeypatch, tmp_path / "fp-al-review") as client:
+        created = client.post("/api/v1/fp-cases", json={
+            "source_name": "reported.png",
+            "source_kind": "screenshot",
+            "source_base64": base64.b64encode(_png_bytes((160, 60, 20))).decode("ascii"),
+            "title": "Review handoff",
+        }).json()
+        store = client.app.state.fp_case_store
+        reference = store.ingest(_png_bytes((20, 80, 170)), "normal.png", "reference")
+        case = store.load(created["id"])
+        for index, roi in enumerate(([0.1, 0.1, 0.4, 0.4], [0.55, 0.5, 0.9, 0.9])):
+            case["candidates"].append({
+                "id": f"cand_{index}",
+                "source": reference,
+                "roi": roi,
+                "reason": "Retrieved visual neighbor",
+                "reference_category": "normal",
+                "evidence_id": case["evidence"][0]["id"],
+                "similarity": 0.91 - index / 100,
+                "label_status": "folder_label_unreviewed",
+                "review": {"verdict": "pending", "reviewer": "", "reason": "", "at": ""},
+            })
+        case = store.save(case)
+
+        prepared = client.post(f"/api/v1/fp-cases/{case['id']}/batches", json={
+            "expected_revision": case["revision"],
+        })
+        assert prepared.status_code == 201, prepared.text
+        saved = prepared.json()["case"]
+        batch_id = prepared.json()["batch_id"]
+        round_id = prepared.json()["round_id"]
+        batch = saved["batches"][0]
+        assert batch["candidate_ids"] == ["cand_0", "cand_1"]
+        assert batch["unique_images"] == 1
+        assert batch["training_export"] is False
+        assert batch["round_id"] == round_id
+
+        repeated = client.post(f"/api/v1/fp-cases/{case['id']}/batches", json={
+            "expected_revision": saved["revision"],
+        })
+        assert repeated.status_code == 201, repeated.text
+        assert repeated.json()["batch_id"] == batch_id
+        assert repeated.json()["round_id"] == round_id
+        saved = repeated.json()["case"]
+
+        manifest_response = client.get(f"/api/v1/fp-cases/{case['id']}/batches/{batch_id}/manifest")
+        manifest = manifest_response.json()
+        assert manifest["purpose"] == "review_only"
+        assert manifest["training_export"] is False
+        assert manifest["counts"]["total_regions"] == 2
+        assert manifest["counts"]["training_ready_images"] == 0
+        assert "asset" not in manifest["items"][0]["source"]
+        assert str(tmp_path) not in manifest_response.text
+
+        archive_response = client.get(f"/api/v1/fp-cases/{case['id']}/batches/{batch_id}/archive.zip")
+        assert archive_response.status_code == 200
+        with ZipFile(BytesIO(archive_response.content)) as archive:
+            archive_names = archive.namelist()
+            assert len([name for name in archive_names if name.startswith("assets/")]) == 1
+            assert "review_manifest.json" in archive_names and "README.txt" in archive_names
+            portable = json.loads(archive.read("review_manifest.json"))
+            assert portable["purpose"] == "review_only"
+            assert all(row["review_image"].startswith("assets/") for row in portable["items"])
+
+        partial = json.loads(json.dumps(manifest))
+        partial["items"] = [partial["items"][0]]
+        partial["items"][0]["review"] = {
+            "verdict": "normal", "reviewer": "Reviewer A", "reason": "Matches the approved normal reference.",
+        }
+        returned = client.post(f"/api/v1/fp-cases/{case['id']}/batches/{batch_id}/return", json={
+            "expected_revision": saved["revision"], "manifest": partial,
+        })
+        assert returned.status_code == 200, returned.text
+        result = returned.json()
+        assert result["applied"] == 1
+        assert result["training_ready_images"] == 0
+        assert result["counts"]["normal_regions"] == 1
+        assert result["counts"]["pending_regions"] == 1
+        reviews = {row["id"]: row["review"]["verdict"] for row in result["case"]["candidates"]}
+        assert reviews == {"cand_0": "normal", "cand_1": "pending"}
+        assert result["case"]["items"] == []
+        assert result["case"]["improvement_status"] == "not_evaluated"
+
+        stale = client.post(f"/api/v1/fp-cases/{case['id']}/batches/{batch_id}/return", json={
+            "expected_revision": result["case"]["revision"], "manifest": partial,
+        })
+        assert stale.status_code == 422 and "過期" in stale.json()["message"]
+
+        fresh_manifest = client.get(f"/api/v1/fp-cases/{case['id']}/batches/{batch_id}/manifest").json()
+        forged_training = json.loads(json.dumps(fresh_manifest))
+        forged_training["training_export"] = True
+        training_flag_mismatch = client.post(f"/api/v1/fp-cases/{case['id']}/batches/{batch_id}/return", json={
+            "expected_revision": result["case"]["revision"], "manifest": forged_training,
+        })
+        assert training_flag_mismatch.status_code == 422
+
+        forged = json.loads(json.dumps(fresh_manifest))
+        forged["items"][0]["source"]["sha256"] = "0" * 64
+        identity_mismatch = client.post(f"/api/v1/fp-cases/{case['id']}/batches/{batch_id}/return", json={
+            "expected_revision": result["case"]["revision"], "manifest": forged,
+        })
+        assert identity_mismatch.status_code == 422
+        assert client.get(f"/api/v1/fp-cases/{case['id']}").json()["revision"] == result["case"]["revision"]
+
+        other = client.post("/api/v1/fp-cases", json={
+            "source_name": "other.png", "source_kind": "original",
+            "source_base64": base64.b64encode(_png_bytes((5, 140, 90))).decode("ascii"),
+        }).json()
+        wrong_case = client.post(f"/api/v1/fp-cases/{other['id']}/batches/{batch_id}/return", json={
+            "expected_revision": other["revision"], "manifest": forged,
+        })
+        assert wrong_case.status_code == 422
+
+    events = [json.loads(line) for line in (output_root / "rounds.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [event["kind"] for event in events] == ["start", "batch"]
+    assert events[0]["round_id"] == round_id
+    assert events[0]["params"]["training_export"] is False
+    assert events[1]["n_sent"] == 1  # unique image count, not region count
+
+
 def _run(client: TestClient, folders: list[Path], *, model: str = "dinov2_vits14") -> dict:
     response = client.post("/api/v1/visualize/jobs", json={
         "folders": [str(folder) for folder in folders],

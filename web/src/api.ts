@@ -590,6 +590,7 @@ export type FalsePositiveCandidate = {
   similarity: number;
   label_status: string;
   review: FalsePositiveRegion["review"];
+  withdrawn?: boolean;
 };
 
 export type FalsePositiveClaim = {
@@ -605,6 +606,16 @@ export type FalsePositiveClaim = {
   review_reason?: string;
 };
 
+export type FalsePositiveBatch = {
+  id: string;
+  candidate_ids: string[];
+  round_id: string;
+  at: string;
+  case_revision: number;
+  training_export: false;
+  unique_images: number;
+};
+
 export type FalsePositiveCase = {
   schema_version: number;
   id: string;
@@ -618,6 +629,7 @@ export type FalsePositiveCase = {
   candidates: FalsePositiveCandidate[];
   searches: FalsePositiveSearch[];
   claims: FalsePositiveClaim[];
+  batches: FalsePositiveBatch[];
   reply_status: "draft" | "replied";
   cause_status: "unknown" | "hypothesis";
   improvement_status: string;
@@ -1018,6 +1030,43 @@ export const api = {
   falsePositiveCaseReport: (caseId: string, format: "md" | "json") => requestGetBlob(
     "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/report." + format,
   ),
+  reviewFalsePositiveCandidate: (caseId: string, candidateId: string, expectedRevision: number, input: {
+    verdict: FalsePositiveRegion["review"]["verdict"];
+    reviewer: string;
+    reason: string;
+  }) => request<FalsePositiveCase>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/candidates/"
+      + encodeURIComponent(candidateId) + "/review", {
+      method: "PATCH",
+      body: JSON.stringify({ expected_revision: expectedRevision, ...input }),
+    },
+  ),
+  prepareFalsePositiveReviewBatch: (caseId: string, expectedRevision: number) =>
+    request<{ case: FalsePositiveCase; batch_id: string; round_id: string; counts: Record<string, number> }>(
+      "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/batches", {
+        method: "POST",
+        body: JSON.stringify({ expected_revision: expectedRevision }),
+      },
+    ),
+  falsePositiveReviewBatchManifest: (caseId: string, batchId: string) => requestGetBlob(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/batches/"
+      + encodeURIComponent(batchId) + "/manifest",
+  ),
+  falsePositiveReviewBatchZip: (caseId: string, batchId: string) => requestGetBlob(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/batches/"
+      + encodeURIComponent(batchId) + "/archive.zip",
+  ),
+  applyFalsePositiveReviewReturn: (caseId: string, batchId: string, expectedRevision: number, manifest: unknown) =>
+    request<{ case: FalsePositiveCase; applied: number; counts: Record<string, number>; training_ready_images: 0 }>(
+      "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/batches/"
+        + encodeURIComponent(batchId) + "/return", {
+        method: "POST",
+        body: JSON.stringify({ expected_revision: expectedRevision, manifest }),
+      },
+    ),
+  falsePositiveCandidateImageUrl: (caseId: string, candidateId: string) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fp-cases/" + encodeURIComponent(caseId)
+      + "/candidates/" + encodeURIComponent(candidateId) + "/image",
   falsePositiveSourceImageUrl: (caseId: string, sourceId: string) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fp-cases/" + encodeURIComponent(caseId)
       + "/sources/" + encodeURIComponent(sourceId) + "/image",

@@ -8,6 +8,7 @@ import {
   type FalsePositiveSource,
 } from "./api";
 import FalsePositiveCaseReport from "./FalsePositiveCaseReport";
+import FalsePositiveReviewBatches from "./FalsePositiveReviewBatches";
 
 const verdicts: Array<{ value: FalsePositiveRegion["review"]["verdict"]; label: string }> = [
   { value: "pending", label: "待覆核" },
@@ -777,6 +778,14 @@ export default function FalsePositiveCaseWorkspace() {
               </>}
             </section>
             <FalsePositiveCaseReport
+              caseData={selectedCase}
+              onCaseUpdated={(next) => {
+                setSelectedCase(next);
+                void refreshCases();
+              }}
+            />
+            <FalsePositiveReviewBatches
+              key={selectedCase.id}
               caseData={selectedCase}
               onCaseUpdated={(next) => {
                 setSelectedCase(next);

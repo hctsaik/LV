@@ -2688,17 +2688,6 @@ def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_revi
             page.set_default_timeout(15000)
             created_cases: list[dict] = []
             added_sources: list[dict] = []
-
-            def capture_created(response):
-                if response.request.method == "POST" and response.url.rstrip("/").endswith("/api/v1/fp-cases") and response.ok:
-                    created_cases.append(response.json())
-
-            def capture_source(response):
-                if response.request.method == "POST" and response.url.rstrip("/").endswith("/sources") and response.ok:
-                    added_sources.append(response.json())
-
-            page.on("response", capture_created)
-            page.on("response", capture_source)
             page.goto(base_url, wait_until="networkidle")
             page.get_by_test_id("open-fp-cases").click()
             expect(page.get_by_role("heading", name="建立誤逮案件")).to_be_visible()
@@ -2709,7 +2698,11 @@ def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_revi
             page.get_by_label("外部模型版本").fill("detector-2026.10")
             page.get_by_label("預測門檻").fill("0.82")
             page.get_by_label("外部模型原始預測／輸出").fill("class=crack score=0.94")
-            page.get_by_role("button", name="建立案件", exact=True).click()
+            with page.expect_response(lambda response: response.request.method == "POST"
+                                      and response.url.rstrip("/").endswith("/api/v1/fp-cases")
+                                      and response.ok) as created_response:
+                page.get_by_role("button", name="建立案件", exact=True).click()
+            created_cases.append(created_response.value.json())
             expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Reflective surface report")
             expect(page.get_by_test_id("fp-case-notice")).to_contain_text("尚未重播")
             expect(page.get_by_test_id("fp-source-image")).to_have_js_property("naturalWidth", 80)
@@ -2718,7 +2711,11 @@ def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_revi
 
             page.get_by_label("補入來源類型").select_option("original")
             page.get_by_label("補入原圖或截圖").set_input_files(str(original_path))
-            page.get_by_role("button", name="加入此案件").click()
+            with page.expect_response(lambda response: response.request.method == "POST"
+                                      and response.url.rstrip("/").endswith("/sources")
+                                      and response.ok) as source_response:
+                page.get_by_role("button", name="加入此案件").click()
+            added_sources.append(source_response.value.json())
             expect(page.get_by_test_id("fp-case-notice")).to_contain_text("原圖已加入")
             assert added_sources and len(added_sources[0]["sources"]) == 2
             original_source = next(source for source in added_sources[0]["sources"] if source["kind"] == "original")
@@ -2755,7 +2752,11 @@ def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_revi
             page.get_by_role("button", name="＋ 建立案件").click()
             page.get_by_label("案件名稱（可留空）").fill("Second report")
             page.get_by_label("建立案件圖片").set_input_files(str(original_path))
-            page.get_by_role("button", name="建立案件", exact=True).click()
+            with page.expect_response(lambda response: response.request.method == "POST"
+                                      and response.url.rstrip("/").endswith("/api/v1/fp-cases")
+                                      and response.ok) as second_created_response:
+                page.get_by_role("button", name="建立案件", exact=True).click()
+            created_cases.append(second_created_response.value.json())
             expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Second report")
             assert len(created_cases) == 2
 
@@ -2939,6 +2940,99 @@ def test_lv_web_05_report_01_visible_cited_claims_reply_and_downloads(
             assert snapshot["claims"][0]["id"] == claim_id
             assert str(tmp_path) not in json.dumps(snapshot, ensure_ascii=False)
             assert any(row.get("claim_id") == claim_id for row in snapshot["evidence"])
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+
+
+def test_lv_web_05_al_01_visible_review_batch_zip_partial_return_and_manual_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible handoff exports one deduplicated image and reads partial/manual reviews back."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "fp-cases"))
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(tmp_path / "lv-output"))
+    image = BytesIO()
+    Image.new("RGB", (96, 72), (120, 90, 55)).save(image, format="PNG")
+    payload = image.getvalue()
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    store = application.state.fp_case_store
+    reported = store.ingest(payload, "reported.png", "screenshot")
+    case = store.create(reported, title="Visible review batch")
+    reference = store.ingest(payload, "normal-reference.png", "reference")
+    for index, roi in enumerate(([0.1, 0.1, 0.4, 0.4], [0.55, 0.5, 0.9, 0.9])):
+        case["candidates"].append({
+            "id": f"cand_visible_{index}",
+            "source": reference,
+            "roi": roi,
+            "reason": "Retrieved visual neighbor",
+            "reference_category": "normal",
+            "evidence_id": case["evidence"][0]["id"],
+            "similarity": 0.91 - index / 100,
+            "label_status": "folder_label_unreviewed",
+            "review": {"verdict": "pending", "reviewer": "", "reason": "", "at": ""},
+        })
+    store.save(case)
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1480, "height": 1024}, accept_downloads=True)
+            page.set_default_timeout(15000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fp-cases").click()
+            page.get_by_test_id(f"fp-open-case-{case['id']}").click()
+            expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Visible review batch")
+            batches = page.get_by_test_id("fp-review-batches")
+            expect(batches.get_by_text("訓練就緒影像：0", exact=True)).to_be_visible()
+            expect(batches.get_by_test_id("fp-candidate-roi-cand_visible_0")).to_be_visible()
+            batches.get_by_test_id("fp-create-batch").click()
+            expect(batches.get_by_test_id("fp-batch-select")).to_be_visible()
+            expect(batches.get_by_text("唯一影像 1 張", exact=False)).to_be_visible()
+
+            with page.expect_download() as zip_download:
+                batches.get_by_test_id("fp-download-batch-zip").click()
+            zip_path = Path(zip_download.value.path())
+            with zipfile.ZipFile(zip_path) as archive:
+                assert len([name for name in archive.namelist() if name.startswith("assets/")]) == 1
+                returned_manifest = json.loads(archive.read("review_manifest.json"))
+            returned_manifest["items"] = returned_manifest["items"][:1]
+            returned_manifest["items"][0]["review"] = {
+                "verdict": "normal", "reviewer": "Visible reviewer", "reason": "Checked against the approved reference.",
+            }
+            partial_path = tmp_path / "partial-review.json"
+            partial_path.write_text(json.dumps(returned_manifest, ensure_ascii=False), encoding="utf-8")
+            batches.get_by_label("回傳已覆核清單 JSON").set_input_files(str(partial_path))
+            batches.get_by_test_id("fp-apply-review-return").click()
+            expect(batches.get_by_test_id("fp-batch-notice")).to_contain_text("已讀回 1 個區域覆核")
+            expect(batches.get_by_text("候選 2 個區域 · 已覆核 1 · 待覆核 1", exact=True)).to_be_visible()
+            first = batches.get_by_test_id("fp-candidate-review-cand_visible_0")
+            expect(first.get_by_label("覆核結果")).to_have_value("normal")
+            expect(first.get_by_label("覆核者")).to_have_value("Visible reviewer")
+
+            batches.get_by_label("回傳已覆核清單 JSON").set_input_files(str(partial_path))
+            batches.get_by_test_id("fp-apply-review-return").click()
+            expect(batches.get_by_test_id("fp-batch-error")).to_contain_text("版本已過期")
+
+            second = batches.get_by_test_id("fp-candidate-review-cand_visible_1")
+            second.get_by_label("覆核結果").select_option("defect")
+            second.get_by_label("覆核者").fill("Visible reviewer")
+            second.get_by_label("判斷依據").fill("The defect is visible in the candidate region.")
+            second.get_by_role("button", name="儲存此候選覆核").click()
+            expect(batches.get_by_text("候選 2 個區域 · 已覆核 2 · 待覆核 0", exact=True)).to_be_visible()
+            expect(batches.get_by_text("訓練就緒影像：0", exact=True)).to_be_visible()
+
+            persisted = store.load(case["id"])
+            assert {row["id"]: row["review"]["verdict"] for row in persisted["candidates"]} == {
+                "cand_visible_0": "normal", "cand_visible_1": "defect",
+            }
+            assert persisted["items"] == []
+            assert persisted["improvement_status"] == "not_evaluated"
             browser.close()
     finally:
         server.should_exit = True
