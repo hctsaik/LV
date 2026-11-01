@@ -110,6 +110,31 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .metadata-list div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .metadata-list span { color: #99a3b2; font-size: 9px; }
 .metadata-list strong { overflow: hidden; color: #5b6980; font-size: 9px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.similar-start-button, .similar-export-button { width: 100%; min-height: 31px; margin-top: 12px; border: 1px solid #dbe4f0; border-radius: 6px; background: #f7f9fc; color: #49658e; font-size: 10px; font-weight: 700; cursor: pointer; }
+.similar-start-button:hover, .similar-export-button:hover:not(:disabled) { border-color: #b8c9e0; background: #eef3fa; }
+.similar-panel { min-height: 0; max-height: 390px; margin-top: 12px; padding: 10px; overflow: auto; border: 1px solid #e3e9f1; border-radius: 7px; background: #fafbfd; }
+.similar-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.similar-heading h4 { margin: 4px 0 0; color: #3f4f69; font: 700 11px Manrope, "Segoe UI", sans-serif; }
+.similar-heading > button, .similar-chain button { border: 1px solid #e1e6ee; border-radius: 5px; background: #fff; color: #71809a; cursor: pointer; }
+.similar-heading > button { width: 23px; height: 23px; font-size: 16px; line-height: 1; }
+.similar-chain { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+.similar-chain button { min-width: 30px; padding: 4px 6px; font-size: 9px; }
+.similar-chain button[aria-current="step"] { border-color: #a9bdd9; background: #edf3fb; color: #425e86; }
+.similar-caption { margin: 8px 0; color: #8995a7; font-size: 9px; line-height: 1.45; }
+.similar-k-field { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #79869a; font-size: 9px; }
+.similar-k-field input { width: 56px; height: 26px; padding: 0 6px; border: 1px solid #e0e6ee; border-radius: 4px; color: #52627b; font-size: 10px; }
+.similar-status { margin-top: 8px; color: #8290a3; font-size: 9px; }
+.similar-error { margin-top: 8px; color: #a44949; font-size: 9px; line-height: 1.45; }
+.similar-results { display: grid; gap: 6px; margin-top: 8px; }
+.similar-result { display: grid; grid-template-columns: 38px minmax(0, 1fr) 24px; align-items: center; gap: 7px; min-width: 0; padding: 5px; border: 1px solid #e8ecf2; border-radius: 5px; background: #fff; }
+.similar-result > img { display: block; width: 38px; height: 38px; border-radius: 4px; object-fit: cover; background: #f1f3f6; }
+.similar-result-info { display: grid; min-width: 0; gap: 4px; }
+.similar-result-info strong, .similar-result-info span { overflow: hidden; color: #576780; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.similar-result-info strong { font-weight: 700; }
+.similar-result-info span { color: #96a0af; }
+.similar-result > button { width: 23px; height: 23px; border: 1px solid #e1e7ef; border-radius: 4px; background: #f8fafd; color: #57749e; font-size: 13px; cursor: pointer; }
+.similar-export-button { min-height: 28px; margin-top: 8px; font-size: 9px; }
+.similar-export-button:disabled { cursor: wait; opacity: .55; }
 .detail-empty { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 20px 12px; text-align: center; }
 .image-placeholder { display: grid; place-items: center; width: 66px; height: 66px; border: 1px dashed #d5dce6; border-radius: 11px; color: #a5b0bf; background: #f8f9fb; font-size: 27px; }
 .detail-empty p { max-width: 185px; margin: 12px 0 0; color: #99a3b1; font-size: 10px; line-height: 1.6; }

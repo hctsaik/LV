@@ -7,6 +7,7 @@ import {
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
+  type SimilarSearchResult,
   type VisualizeUnit,
   type VisualizationRun,
 } from "./api";
@@ -159,6 +160,12 @@ export default function App() {
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [similarChain, setSimilarChain] = useState<number[]>([]);
+  const [similarK, setSimilarK] = useState(9);
+  const [similarResults, setSimilarResults] = useState<SimilarSearchResult | null>(null);
+  const [similarLoading, setSimilarLoading] = useState(false);
+  const [similarError, setSimilarError] = useState("");
+  const similarRequest = useRef(0);
   const [blockCount, setBlockCount] = useState(12);
   const [selectedBlock, setSelectedBlock] = useState<number | null>(null);
   const [blockData, setBlockData] = useState<KMeansBlocks | null>(null);
@@ -217,6 +224,36 @@ export default function App() {
   const splits = useMemo(() => [...new Set(run?.records.map((record) => record.split) || [])].sort(), [run]);
   const selectedRecord = selectedIndex === null ? null : run?.records[selectedIndex] || null;
   const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
+  const canSearchSimilar = run?.mode === "classifier" && run.unit === "image";
+  const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
+
+  useEffect(() => {
+    const requestId = ++similarRequest.current;
+    const runId = job?.run_id;
+    if (!similarChain.length || !runId || !canSearchSimilar || similarQueryIndex === null) {
+      setSimilarResults(null);
+      setSimilarLoading(false);
+      setSimilarError("");
+      return () => { similarRequest.current += 1; };
+    }
+
+    setSimilarResults(null);
+    setSimilarError("");
+    setSimilarLoading(true);
+    api.similarImages(runId, {
+      model_id: activeModelId,
+      query_index: similarQueryIndex,
+      k: similarK,
+    }).then((result) => {
+      if (similarRequest.current === requestId) setSimilarResults(result);
+    }).catch((reason: unknown) => {
+      if (similarRequest.current !== requestId) return;
+      setSimilarError(reason instanceof Error ? reason.message : "Could not find similar images.");
+    }).finally(() => {
+      if (similarRequest.current === requestId) setSimilarLoading(false);
+    });
+    return () => { similarRequest.current += 1; };
+  }, [job?.run_id, canSearchSimilar, similarChain.length, similarQueryIndex, activeModelId, similarK]);
 
   useEffect(() => {
     const requestId = ++blockRequest.current;
@@ -284,6 +321,50 @@ export default function App() {
     setSelectedIndex(null);
   }
 
+  function startSimilarSearch(index: number) {
+    setSimilarK(Math.min(9, Math.max(1, (run?.records.length || 1) - 1)));
+    setSimilarChain([index]);
+    setSimilarResults(null);
+    setSimilarError("");
+  }
+
+  function continueSimilarSearch(index: number) {
+    setSelectedIndex(index);
+    setSimilarChain((current) => current[current.length - 1] === index ? current : [...current, index]);
+  }
+
+  function truncateSimilarChain(position: number) {
+    setSimilarChain((current) => current.slice(0, position + 1));
+  }
+
+  function closeSimilarSearch() {
+    setSimilarChain([]);
+    setSimilarResults(null);
+    setSimilarError("");
+  }
+
+  async function exportSimilarSearch() {
+    const runId = job?.run_id;
+    if (!runId || similarQueryIndex === null) return;
+    try {
+      const blob = await api.similarImagesCsv(runId, {
+        model_id: activeModelId,
+        query_index: similarQueryIndex,
+        k: similarK,
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "similar_group.csv";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (reason) {
+      setSimilarError(reason instanceof Error ? reason.message : "Could not export the similar-image results.");
+    }
+  }
+
   function addFolder(value = folderDraft) {
     const path = value.trim();
     if (!path) return;
@@ -331,6 +412,7 @@ export default function App() {
     setFolderDraft("");
     setClassNamesDraft("");
     setRun(null);
+    closeSimilarSearch();
     setJob(null);
     setSelectedIndex(null);
     setSelectedIndices([]);
@@ -362,6 +444,7 @@ export default function App() {
     setError("");
     setNotice("");
     setRun(null);
+    closeSimilarSearch();
     setSelectedIndex(null);
     setSelectedIndices([]);
     setSelectedBlock(null);
@@ -814,6 +897,97 @@ export default function App() {
                       <div><span>Model</span><strong>{activeModelId}</strong></div>
                       <div><span>Method</span><strong>{currentView.method.toUpperCase()}</strong></div>
                     </div>
+                    {canSearchSimilar && (
+                      <button
+                        type="button"
+                        className="similar-start-button"
+                        data-testid="similar-start"
+                        onClick={() => startSimilarSearch(selectedRecord.index)}
+                      >
+                        Find similar images
+                      </button>
+                    )}
+                    {canSearchSimilar && similarChain.length > 0 && (
+                      <section className="similar-panel" data-testid="similar-panel" aria-label="Similar images">
+                        <div className="similar-heading">
+                          <div><div className="eyebrow">IMAGE SEARCH</div><h4>Similar images</h4></div>
+                          <button type="button" aria-label="Close similar search" onClick={closeSimilarSearch}>×</button>
+                        </div>
+                        <div className="similar-chain" aria-label="Query history">
+                          {similarChain.map((index, position) => (
+                            <button
+                              type="button"
+                              key={`${position}-${index}`}
+                              data-testid="similar-query-chip"
+                              aria-current={position === similarChain.length - 1 ? "step" : undefined}
+                              onClick={() => truncateSimilarChain(position)}
+                            >
+                              #{index + 1}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="similar-caption">
+                          Query: {run.records[similarQueryIndex ?? selectedRecord.index]?.filename}. Cosine distance is sorted ascending.
+                        </p>
+                        <label className="similar-k-field">
+                          <span>Results (k)</span>
+                          <input
+                            aria-label="Similar result count"
+                            type="number"
+                            min={1}
+                            max={Math.max(1, run.records.length - 1)}
+                            value={Math.min(similarK, Math.max(1, run.records.length - 1))}
+                            onChange={(event) => {
+                              const value = Number(event.target.value);
+                              if (Number.isInteger(value) && value >= 1) setSimilarK(value);
+                            }}
+                          />
+                        </label>
+                        {similarLoading && <div className="similar-status" role="status">Searching {activeModelId} embeddings…</div>}
+                        {similarError && <div className="similar-error" role="alert">{similarError}</div>}
+                        {!similarLoading && similarResults && (
+                          <>
+                            <div className="similar-status" data-testid="similar-status">
+                              {similarResults.results.length} result(s) · {similarResults.model_id}
+                            </div>
+                            <div className="similar-results">
+                              {similarResults.results.map(({ index, distance }) => {
+                                const record = run.records[index];
+                                return (
+                                  <article className="similar-result" data-testid="similar-result" data-index={index} key={index}>
+                                    <img
+                                      src={`/api/v1/runs/${encodeURIComponent(job?.run_id || "")}/images/${index}`}
+                                      alt={record.filename}
+                                      loading="lazy"
+                                    />
+                                    <div className="similar-result-info">
+                                      <strong title={record.filename}>{record.filename}</strong>
+                                      <span>{record.label} · d={distance.toFixed(4)}</span>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      aria-label={`Use ${record.filename} as query`}
+                                      onClick={() => continueSimilarSearch(index)}
+                                    >
+                                      ↻
+                                    </button>
+                                  </article>
+                                );
+                              })}
+                            </div>
+                            <button
+                              type="button"
+                              className="similar-export-button"
+                              data-testid="similar-export"
+                              disabled={similarLoading}
+                              onClick={exportSimilarSearch}
+                            >
+                              Export query and results CSV
+                            </button>
+                          </>
+                        )}
+                      </section>
+                    )}
                   </>
                 ) : (
                   <div className="detail-empty"><div className="image-placeholder" aria-hidden="true">▧</div><p>Select a point in the scatter plot to preview the matching image and its metadata.</p></div>

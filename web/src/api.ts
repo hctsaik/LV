@@ -97,6 +97,12 @@ export type KMeansBlocksInput = {
   block_id?: number | null;
 };
 
+export type SimilarSearchResult = {
+  query_index: number;
+  model_id: string;
+  results: Array<{ index: number; distance: number }>;
+};
+
 export type CompareUnit = "whole" | "object";
 export type ComparisonRecord = {
   index: number;
@@ -223,6 +229,26 @@ export const api = {
     "/api/v1/runs/" + encodeURIComponent(runId) + "/blocks",
     { method: "POST", body: JSON.stringify(input) },
   ),
+  similarImages: (runId: string, input: { model_id: string; query_index: number; k: number }) =>
+    request<SimilarSearchResult>("/api/v1/runs/" + encodeURIComponent(runId) + "/similar", {
+      method: "POST", body: JSON.stringify(input),
+    }),
+  similarImagesCsv: async (
+    runId: string,
+    input: { model_id: string; query_index: number; k: number },
+  ): Promise<Blob> => {
+    const response = await fetch((window.NATIVEAPP_LOCAL_API || "") +
+      "/api/v1/runs/" + encodeURIComponent(runId) + "/similar.csv", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input),
+      });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      throw new Error(body?.message || body?.detail || "Could not export the similar-image results.");
+    }
+    return response.blob();
+  },
   createComparisonJob: (input: ComparisonJobInput) =>
     request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
       method: "POST",

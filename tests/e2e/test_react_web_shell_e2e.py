@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import os
 import hashlib
 import socket
@@ -340,6 +341,89 @@ def test_lv_web_01_ic_04_kmeans_drilldown_and_multiselection(
             selected_before_switch = page.get_by_test_id("selection-count").inner_text()
             page.get_by_test_id("dimension-2d").click()
             expect(page.get_by_test_id("selection-count")).to_have_text(selected_before_switch)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_search_01_similar_images_chain_model_switch_and_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible F3 flow keeps ranked results fresh as the query and model change."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = tmp_path / "similar-search"
+    image_folder = dataset / "train" / "apple"
+    image_folder.mkdir(parents=True)
+    for index, color in enumerate(((210, 40, 50), (30, 190, 70), (35, 65, 215), (210, 180, 25), (170, 70, 180))):
+        Image.new("RGB", (48, 48), color).save(image_folder / f"image-{index:02}.png")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    vectors = {
+        "fixture-model-a": [
+            [1.0, 0.0, 0.0], [0.8, 0.6, 0.0], [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0], [0.6, 0.8, 0.0],
+        ],
+        "fixture-model-b": [
+            [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+            [0.8, 0.6, 0.0], [0.6, 0.8, 0.0],
+        ],
+    }
+
+    def fixture_loader(model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            index = int(path.stem.split("-")[-1])
+            return np.asarray(vectors[model_id][index], dtype=np.float32)
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: list(vectors), model_loader=fixture_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(10_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-fixture-model-b").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_label("Image folder").fill(str(image_folder))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(5)
+
+            page.get_by_test_id("embedding-point").nth(0).click()
+            page.get_by_test_id("similar-start").click()
+            panel = page.get_by_test_id("similar-panel")
+            expect(panel.get_by_test_id("similar-result")).to_have_count(4)
+            initial_order = [int(item.get_attribute("data-index")) for item in panel.get_by_test_id("similar-result").all()]
+            assert initial_order == [1, 4, 2, 3]
+
+            page.get_by_role("button", name="Use image-01.png as query").click()
+            expect(panel.get_by_test_id("similar-query-chip")).to_have_count(2)
+            expect(panel).to_contain_text("Query: image-01.png")
+            page.get_by_label("Display model").select_option("fixture-model-b")
+            expect(panel.get_by_test_id("similar-result")).to_have_count(4)
+            switched_order = [int(item.get_attribute("data-index")) for item in panel.get_by_test_id("similar-result").all()]
+            assert switched_order == [2, 4, 3, 0]
+
+            with page.expect_download() as download_info:
+                page.get_by_test_id("similar-export").click()
+            rows = list(csv.reader(Path(download_info.value.path()).read_text(encoding="utf-8").splitlines()))
+            assert rows[0] == ["index", "filename", "path", "label", "split"]
+            assert len(rows) == 6
+            assert rows[1][0:2] == ["1", "image-01.png"]
+            assert [int(row[0]) for row in rows[2:]] == switched_order
             browser.close()
     finally:
         if server is not None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import os
 import sys
@@ -141,6 +142,72 @@ def test_case_lv_web_01_ic_01_selected_image_is_run_bound(
     assert invalid.status_code == 404
     assert set(invalid.json()) == {"code", "message", "request_id"}
     assert invalid.json()["code"] == "NOT_FOUND"
+
+
+def test_case_lv_web_01_search_01_cosine_ranking_model_switch_and_csv(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """F3 API ranks by the active model, excludes the query, and exports ranked rows."""
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "similar-search-cache"))
+    model_vectors = {
+        "model-a": {
+            "01.jpg": [1.0, 0.0], "02.jpg": [0.8, 0.6],
+            "03.png": [0.0, 1.0], "04.jpeg": [-1.0, 0.0],
+        },
+        "model-b": {
+            "01.jpg": [1.0, 0.0], "02.jpg": [-1.0, 0.0],
+            "03.png": [0.8, 0.6], "04.jpeg": [0.0, 1.0],
+        },
+    }
+
+    def loader(model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            return np.asarray(model_vectors[model_id][path.name], dtype=np.float32)
+        return embed
+
+    with TestClient(create_app(
+        model_catalog=lambda: list(model_vectors), model_loader=loader,
+    )) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in classifier_fixture["folders"]],
+            "model_ids": list(model_vectors),
+            "methods": ["pca"],
+        })
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        first_model = client.post(f"/api/v1/runs/{run_id}/similar", json={
+            "model_id": "model-a", "query_index": 0, "k": 9,
+        })
+        second_model = client.post(f"/api/v1/runs/{run_id}/similar", json={
+            "model_id": "model-b", "query_index": 0, "k": 9,
+        })
+        csv_response = client.post(f"/api/v1/runs/{run_id}/similar.csv", json={
+            "model_id": "model-a", "query_index": 0, "k": 9,
+        })
+        missing_model = client.post(f"/api/v1/runs/{run_id}/similar", json={
+            "model_id": "missing", "query_index": 0, "k": 9,
+        })
+        invalid_index = client.post(f"/api/v1/runs/{run_id}/similar", json={
+            "model_id": "model-a", "query_index": 99, "k": 9,
+        })
+
+    ranked_a = first_model.json()["results"]
+    ranked_b = second_model.json()["results"]
+    assert [item["index"] for item in ranked_a] == [1, 2, 3]
+    assert [item["distance"] for item in ranked_a] == sorted(item["distance"] for item in ranked_a)
+    assert ranked_a[0]["distance"] == pytest.approx(0.2)
+    assert ranked_a[-1]["distance"] == pytest.approx(2.0)
+    assert [item["index"] for item in ranked_b] == [2, 3, 1]
+    assert 0 not in [item["index"] for item in ranked_a]
+    assert run["records"][0]["filename"] == "01.jpg"
+    assert "raw_embeddings" not in run
+    rows = list(csv.reader(csv_response.text.splitlines()))
+    assert csv_response.status_code == 200
+    assert rows[0] == ["index", "filename", "path", "label", "split"]
+    assert [row[1] for row in rows[1:]] == ["01.jpg", "02.jpg", "03.png", "04.jpeg"]
+    assert missing_model.status_code == 404
+    assert invalid_index.status_code == 422
 
 
 def test_case_lv_web_01_ic_01_manifest_cache_and_source_immutability(

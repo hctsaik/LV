@@ -21,6 +21,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
 from _utils import available_models, load_model
+from interaction import records_to_csv
 from react_compare import ComparisonInputError, project_comparison, run_comparison
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 
@@ -73,6 +74,12 @@ class KMeansBlocksRequest(BaseModel):
     label_filter: str | None = Field(default=None, max_length=256)
     split_filter: str | None = Field(default=None, max_length=128)
     block_id: int | None = Field(default=None, ge=0, le=29)
+
+
+class SimilarSearchRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    query_index: int = Field(ge=0)
+    k: int = Field(default=9, ge=1, le=10000)
 
 
 @dataclass
@@ -485,6 +492,71 @@ def create_app(
                 key: value for key, value in run.items()
                 if key not in {"image_paths", "_raw_embeddings"}
             }
+
+    def similar_result(
+        run_id: str, request: SimilarSearchRequest,
+    ) -> tuple[dict, list[int], list[float]]:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            raw_by_model = app.state.raw_embeddings.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.get("mode") != "classifier" or run.get("unit") != "image":
+            raise HTTPException(
+                status_code=409,
+                detail="Similar-image search requires classifier image embeddings",
+            )
+        raw = (raw_by_model or {}).get(request.model_id)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Raw embeddings are unavailable for this model")
+        vectors = np.asarray(raw, dtype=np.float32)
+        if vectors.ndim != 2 or len(vectors) != len(run["records"]):
+            raise HTTPException(
+                status_code=409,
+                detail="The selected model embeddings do not match this run",
+            )
+        if request.query_index >= len(vectors):
+            raise HTTPException(status_code=422, detail="The query image is outside this run")
+
+        query = vectors[request.query_index]
+        norms = np.linalg.norm(vectors, axis=1)
+        query_norm = norms[request.query_index]
+        denominators = norms * query_norm
+        similarities = np.zeros(len(vectors), dtype=np.float32)
+        np.divide(vectors @ query, denominators, out=similarities, where=denominators > 0)
+        distances = np.maximum(0.0, 1.0 - np.clip(similarities, -1.0, 1.0))
+        indices = np.asarray([index for index in range(len(vectors)) if index != request.query_index])
+        order = np.lexsort((indices, distances[indices]))[:request.k]
+        ranked_indices = indices[order].astype(int).tolist()
+        ranked_distances = distances[ranked_indices].astype(float).tolist()
+        return run, ranked_indices, ranked_distances
+
+    @app.post("/api/v1/runs/{run_id}/similar")
+    def find_similar_images(run_id: str, request: SimilarSearchRequest) -> dict:
+        _run, indices, distances = similar_result(run_id, request)
+        return {
+            "query_index": request.query_index,
+            "model_id": request.model_id,
+            "results": [
+                {"index": index, "distance": distance}
+                for index, distance in zip(indices, distances)
+            ],
+        }
+
+    @app.post("/api/v1/runs/{run_id}/similar.csv")
+    def export_similar_images(run_id: str, request: SimilarSearchRequest) -> Response:
+        run, indices, _distances = similar_result(run_id, request)
+        paths: list[Path] = run["image_paths"]
+        records = [
+            {**record, "path": paths[index]}
+            for index, record in enumerate(run["records"])
+        ]
+        csv_text = records_to_csv(records, [request.query_index, *indices])
+        return Response(
+            content=csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="similar_group.csv"'},
+        )
 
     @app.post("/api/v1/runs/{run_id}/blocks")
     def get_kmeans_blocks(run_id: str, request: KMeansBlocksRequest) -> dict:
