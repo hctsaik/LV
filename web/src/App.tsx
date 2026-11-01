@@ -1,7 +1,8 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type EmbeddingPoint,
+  type KMeansBlocks,
   type ComparisonObjectPolicy,
   type JobStatus,
   type ModelOption,
@@ -10,6 +11,7 @@ import {
   type VisualizationRun,
 } from "./api";
 import CompareDistributions from "./CompareDistributions";
+const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
 
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
@@ -30,10 +32,10 @@ function colorMap(points: EmbeddingPoint[]) {
   return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
 }
 
-function ScatterPlot2D({ points, selectedIndex, onSelect }: {
+function MainScatterPlot2D({ points, selectedIndices, onToggleSelection }: {
   points: EmbeddingPoint[];
-  selectedIndex: number | null;
-  onSelect: (index: number) => void;
+  selectedIndices: number[];
+  onToggleSelection: (index: number) => void;
 }) {
   const width = 860;
   const height = 480;
@@ -50,7 +52,7 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
 
   return (
     <div className="plot-frame" data-testid="embedding-plot">
-      <svg className="scatter" viewBox={"0 0 " + width + " " + height} role="img" aria-label="Image embedding scatter plot">
+      <svg className="scatter" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Image embedding scatter plot">
         <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} className="axis" />
         <line x1={padding} y1={padding} x2={padding} y2={height - padding} className="axis" />
         <text x={width / 2} y={height - 8} className="axis-label">Component 1</text>
@@ -59,7 +61,7 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
           const x = padding + ((point.x - xMin) / xSpan) * (width - padding * 2);
           const y = height - padding - ((point.y - yMin) / ySpan) * (height - padding * 2);
           const color = colors.get(point.label) || labelColors[0];
-          const active = selectedIndex === point.index;
+          const active = selectedIndices.includes(point.index);
           const shape = point.split.toLowerCase() === "test" ? (
             <rect x={-7} y={-7} width={14} height={14} rx={2} fill={color} />
           ) : point.split.toLowerCase() === "valid" ? (
@@ -72,17 +74,18 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
               key={point.index}
               role="button"
               tabIndex={0}
-              aria-label={"Select " + point.filename + (point.obj_index == null ? "" : ", object " + (point.obj_index + 1)) + ", " + point.label + ", " + point.split}
+              aria-label={`Select ${point.filename}${point.obj_index == null ? "" : `, object ${point.obj_index + 1}`}, ${point.label}, ${point.split}`}
+              aria-pressed={active}
               data-testid="embedding-point"
               data-index={point.index}
-              className={"point " + (active ? "point-active" : "")}
-              transform={"translate(" + x + " " + y + ")"}
-              onClick={() => onSelect(point.index)}
+              className={`point ${active ? "point-active" : ""}`}
+              transform={`translate(${x} ${y})`}
+              onClick={() => onToggleSelection(point.index)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") onSelect(point.index);
+                if (event.key === "Enter" || event.key === " ") onToggleSelection(point.index);
               }}
             >
-              <title>{point.filename + (point.obj_index == null ? "" : ` · object ${point.obj_index + 1}`) + " · " + point.label + " · " + point.split}</title>
+              <title>{`${point.filename} · ${point.label} · ${point.split}`}</title>
               {active && <circle r={12} className="point-selection-ring" />}
               {shape}
             </g>
@@ -93,21 +96,44 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
   );
 }
 
-function ScatterPlot({ points, selectedIndex, onSelect, dimension, viewKey }: {
+function ScatterPlot({ points, selectedIndices, onToggleSelection, onAddSelection, dimension, viewKey, clusterCenters, testIdPrefix }: {
   points: EmbeddingPoint[];
-  selectedIndex: number | null;
-  onSelect: (index: number) => void;
+  selectedIndices: number[];
+  onToggleSelection: (index: number) => void;
+  onAddSelection: (indices: number[]) => void;
   dimension: 2 | 3;
   viewKey: string;
+  clusterCenters?: KMeansBlocks["centers"];
+  testIdPrefix?: string;
 }) {
   if (dimension === 3) {
     return (
       <Suspense fallback={<div className="plot-frame plot-loading" role="status">Loading 3D plot…</div>}>
-        <LazyScatterPlot3D points={points} selectedIndex={selectedIndex} onSelect={onSelect} viewKey={viewKey} />
+        <LazyScatterPlot3D
+          points={points}
+          selectedIndices={selectedIndices}
+          onToggleSelection={onToggleSelection}
+          viewKey={viewKey}
+          clusterCenters={clusterCenters}
+        />
       </Suspense>
     );
   }
-  return <ScatterPlot2D points={points} selectedIndex={selectedIndex} onSelect={onSelect} />;
+  if (testIdPrefix !== "block") {
+    return <MainScatterPlot2D points={points} selectedIndices={selectedIndices} onToggleSelection={onToggleSelection} />;
+  }
+  return (
+    <Suspense fallback={<div className="plot-frame plot-loading" role="status">Loading 2D plot…</div>}>
+      <LazyScatterPlot2D
+        points={points}
+        selectedIndices={selectedIndices}
+        onToggleSelection={onToggleSelection}
+        onAddSelection={onAddSelection}
+        viewKey={viewKey}
+        testIdPrefix={testIdPrefix}
+      />
+    </Suspense>
+  );
 }
 
 export default function App() {
@@ -130,6 +156,12 @@ export default function App() {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [blockCount, setBlockCount] = useState(12);
+  const [selectedBlock, setSelectedBlock] = useState<number | null>(null);
+  const [blockData, setBlockData] = useState<KMeansBlocks | null>(null);
+  const [blockLoading, setBlockLoading] = useState(false);
+  const blockRequest = useRef(0);
   const [labelFilter, setLabelFilter] = useState("all");
   const [splitFilter, setSplitFilter] = useState("all");
   const [error, setError] = useState("");
@@ -182,6 +214,73 @@ export default function App() {
   const labels = useMemo(() => [...new Set(run?.records.map((record) => record.label) || [])].sort(), [run]);
   const splits = useMemo(() => [...new Set(run?.records.map((record) => record.split) || [])].sort(), [run]);
   const selectedRecord = selectedIndex === null ? null : run?.records[selectedIndex] || null;
+  const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
+
+  useEffect(() => {
+    const requestId = ++blockRequest.current;
+    const runId = job?.run_id;
+    if (
+      dimension !== 3 || !usesClassifierBlocks || !runId || !currentView || !currentRecords.length
+    ) {
+      setBlockData(null);
+      setSelectedBlock(null);
+      setBlockLoading(false);
+      return () => { blockRequest.current += 1; };
+    }
+
+    const actualBlockCount = Math.min(blockCount, currentRecords.length);
+    const blockId = selectedBlock !== null && selectedBlock < actualBlockCount
+      ? selectedBlock : null;
+    setBlockLoading(true);
+    api.kmeansBlocks(runId, {
+      model_id: activeModelId,
+      method: currentView.method,
+      k: blockCount,
+      label_filter: labelFilter === "all" ? null : labelFilter,
+      split_filter: splitFilter === "all" ? null : splitFilter,
+      block_id: blockId,
+    }).then((result) => {
+      if (blockRequest.current !== requestId) return;
+      setBlockData(result);
+      const availableBlocks = result.centers.filter((center) => center.count > 0);
+      if (selectedBlock === null || !availableBlocks.some((center) => center.block_id === selectedBlock)) {
+        setSelectedBlock(availableBlocks[0]?.block_id ?? null);
+      }
+    }).catch((reason: unknown) => {
+      if (blockRequest.current !== requestId) return;
+      setBlockData(null);
+      setError(reason instanceof Error ? reason.message : "Could not prepare KMeans blocks.");
+    }).finally(() => {
+      if (blockRequest.current === requestId) setBlockLoading(false);
+    });
+    return () => { blockRequest.current += 1; };
+  }, [
+    dimension, usesClassifierBlocks, job?.run_id, currentView, currentRecords.length,
+    activeModelId, blockCount, labelFilter, splitFilter, selectedBlock,
+  ]);
+
+  function toggleSelection(index: number) {
+    if (selectedIndices.includes(index)) {
+      const next = selectedIndices.filter((current) => current !== index);
+      setSelectedIndices(next);
+      setSelectedIndex((current) => current === index ? (next[next.length - 1] ?? null) : current);
+    } else {
+      setSelectedIndices([...selectedIndices, index]);
+      setSelectedIndex(index);
+    }
+  }
+
+  function addSelection(indices: number[]) {
+    const additions = [...new Set(indices)].filter((index) => run?.records[index] !== undefined);
+    if (!additions.length) return;
+    setSelectedIndices((current) => [...new Set([...current, ...additions])]);
+    setSelectedIndex(additions[additions.length - 1]);
+  }
+
+  function clearSelection() {
+    setSelectedIndices([]);
+    setSelectedIndex(null);
+  }
 
   function addFolder(value = folderDraft) {
     const path = value.trim();
@@ -230,6 +329,9 @@ export default function App() {
     setRun(null);
     setJob(null);
     setSelectedIndex(null);
+    setSelectedIndices([]);
+    setSelectedBlock(null);
+    setBlockData(null);
     setLabelFilter("all");
     setSplitFilter("all");
     setDimension(2);
@@ -257,6 +359,9 @@ export default function App() {
     setNotice("");
     setRun(null);
     setSelectedIndex(null);
+    setSelectedIndices([]);
+    setSelectedBlock(null);
+    setBlockData(null);
     setLabelFilter("all");
     setSplitFilter("all");
     setDimension(2);
@@ -568,17 +673,78 @@ export default function App() {
                 {currentRecords.length ? (
                   <ScatterPlot
                     points={currentRecords}
-                    selectedIndex={selectedIndex}
-                    onSelect={setSelectedIndex}
+                    selectedIndices={selectedIndices}
+                    onToggleSelection={toggleSelection}
+                    onAddSelection={addSelection}
                     dimension={dimension}
                     viewKey={activeModelId + "-" + currentView.method + "-" + splitFilter + "-" + labelFilter}
+                    clusterCenters={dimension === 3 && usesClassifierBlocks ? blockData?.centers : undefined}
                   />
                 ) : <div className="empty-filter">No images match these filters.</div>}
+                {dimension === 3 && usesClassifierBlocks && currentRecords.length > 0 && (
+                  <section className="block-drilldown" data-testid="kmeans-blocks">
+                    <div className="block-controls">
+                      <label>
+                        <span>區塊數 K: {blockCount}</span>
+                        <input
+                          type="range"
+                          min={4}
+                          max={30}
+                          value={blockCount}
+                          aria-label="KMeans block count"
+                          data-testid="kmeans-count"
+                          onChange={(event) => setBlockCount(Number(event.target.value))}
+                        />
+                      </label>
+                      <label>
+                        <span>進入 3D 區塊</span>
+                        <select
+                          aria-label="Enter KMeans block"
+                          data-testid="cluster-block-select"
+                          value={selectedBlock ?? ""}
+                          disabled={blockLoading || !blockData?.centers.length}
+                          onChange={(event) => setSelectedBlock(Number(event.target.value))}
+                        >
+                          {blockData?.centers.filter((center) => center.count > 0).map((center) => (
+                            <option key={center.block_id} value={center.block_id}>
+                              #{center.block_id}（{center.count}）
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <span className="muted-line" role="status" data-testid="kmeans-status">
+                        {blockLoading ? "正在建立區塊…" : blockData ? `3D 已標記 ${blockData.k} 個區塊` : ""}
+                      </span>
+                    </div>
+                    {selectedBlock !== null && (
+                      <div className="block-drilldown-chart" data-testid="block-drilldown">
+                        <div className="block-drilldown-heading">
+                          <strong>區塊 #{selectedBlock} · 2D 框選／套索加入選取</strong>
+                          <span>{blockData?.block_id === selectedBlock ? blockData.drilldown_points.length : 0} points</span>
+                        </div>
+                        {blockData?.block_id === selectedBlock && blockData.drilldown_points.length ? (
+                          <ScatterPlot
+                            points={blockData.drilldown_points}
+                            selectedIndices={selectedIndices}
+                            onToggleSelection={toggleSelection}
+                            onAddSelection={addSelection}
+                            dimension={2}
+                            viewKey={`${activeModelId}-${currentView.method}-${selectedBlock}-${blockCount}`}
+                            testIdPrefix="block"
+                          />
+                        ) : (
+                          <div className="muted-line" role="status">載入區塊內的 2D 投影…</div>
+                        )}
+                      </div>
+                    )}
+                  </section>
+                )}
                 <div className="plot-legend">
                   {labels.map((label) => <span key={label}><i style={{ background: colorMap(currentView.points).get(label) || labelColors[0] }} />{label}</span>)}
                   <span className="legend-separator" />
                   <small>● train　■ test　◆ valid</small>
-                  {selectedIndex !== null && <button type="button" className="clear-selection" onClick={() => setSelectedIndex(null)}>Clear selection</button>}
+                  <span data-testid="selection-count">{selectedIndices.length} selected</span>
+                  {selectedIndices.length > 0 && <button type="button" className="clear-selection" onClick={clearSelection}>Clear selection</button>}
                 </div>
               </section>
 

@@ -66,6 +66,31 @@ export type VisualizationRun = {
   warnings: string[];
 };
 
+export type KMeansCenter = {
+  block_id: number;
+  x: number;
+  y: number;
+  z: number;
+  count: number;
+};
+
+export type KMeansBlocks = {
+  k: number;
+  centers: KMeansCenter[];
+  points: Array<EmbeddingPoint & { block_id: number }>;
+  block_id: number | null;
+  drilldown_points: EmbeddingPoint[];
+};
+
+export type KMeansBlocksInput = {
+  model_id: string;
+  method: ProjectionMethod;
+  k: number;
+  label_filter?: string | null;
+  split_filter?: string | null;
+  block_id?: number | null;
+};
+
 export type CompareUnit = "whole" | "object";
 export type ComparisonRecord = {
   index: number;
@@ -183,6 +208,10 @@ export const api = {
   ),
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
+  ),
+  kmeansBlocks: (runId: string, input: KMeansBlocksInput) => request<KMeansBlocks>(
+    "/api/v1/runs/" + encodeURIComponent(runId) + "/blocks",
+    { method: "POST", body: JSON.stringify(input) },
   ),
   createComparisonJob: (input: ComparisonJobInput) =>
     request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
