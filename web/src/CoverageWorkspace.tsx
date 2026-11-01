@@ -2,6 +2,10 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type {
   CoverageObjectView,
   CoverageObjectViewInput,
+  CoverageCandidateRole,
+  CoverageCandidateView,
+  CoverageCandidateViewInput,
+  CoverageCandidateWorkRecord,
   CoverageRun,
   JobStatus,
   ModelOption,
@@ -42,13 +46,18 @@ export default function CoverageWorkspace({
   models,
   connected,
   loadingModels,
+  onCurationCountChange,
 }: {
   models: ModelOption[];
   connected: boolean;
   loadingModels: boolean;
+  onCurationCountChange?: (count: number) => void;
 }) {
   const [folders, setFolders] = useState<string[]>([]);
   const [folderDraft, setFolderDraft] = useState("");
+  const [candidateFolders, setCandidateFolders] = useState<string[]>([]);
+  const [candidateFolderDraft, setCandidateFolderDraft] = useState("");
+  const [candidateRole, setCandidateRole] = useState<CoverageCandidateRole>("pool");
   const [modelId, setModelId] = useState("");
   const [unit, setUnit] = useState<VisualizeUnit>("image");
   const [method, setMethod] = useState<ProjectionMethod>("sumap");
@@ -63,8 +72,14 @@ export default function CoverageWorkspace({
   const [run, setRun] = useState<CoverageRun | null>(null);
   const [objectView, setObjectView] = useState<CoverageObjectView | null>(null);
   const [job, setJob] = useState<JobStatus | null>(null);
+  const [candidateJob, setCandidateJob] = useState<JobStatus | null>(null);
+  const [candidateView, setCandidateView] = useState<CoverageCandidateView | null>(null);
+  const [candidateReady, setCandidateReady] = useState(false);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [selectedCandidateIndices, setSelectedCandidateIndices] = useState<number[]>([]);
   const [busy, setBusy] = useState(false);
+  const [candidateBusy, setCandidateBusy] = useState(false);
+  const [candidateViewBusy, setCandidateViewBusy] = useState(false);
   const [projectionBusy, setProjectionBusy] = useState(false);
   const [sparsityBusy, setSparsityBusy] = useState(false);
   const [error, setError] = useState("");
@@ -72,6 +87,7 @@ export default function CoverageWorkspace({
   const projectionRequest = useRef(0);
   const sparsityRequest = useRef(0);
   const objectViewRequest = useRef(0);
+  const candidateViewRequest = useRef(0);
 
   useEffect(() => {
     if (models.some((model) => model.model_id === modelId && model.available)) return;
@@ -82,7 +98,9 @@ export default function CoverageWorkspace({
 
   const visiblePoints = run?.unit === "object" ? (objectView?.points || []) : (run?.points || []);
   const visibleScores = run?.unit === "object" ? (objectView?.sparsity || []) : (run?.sparsity || []);
-  const labels = useMemo(() => [...new Set(visiblePoints.map((point) => point.label))].sort(), [visiblePoints]);
+  const plottedPoints = candidateView?.main_points || visiblePoints;
+  const plottedScores = candidateView?.main_sparsity || visibleScores;
+  const labels = useMemo(() => [...new Set(plottedPoints.map((point) => point.label))].sort(), [plottedPoints]);
   const classColors = useMemo(() => run ? labelColors(run.points) : new Map<string, string>(), [run]);
   const effectiveColorMode = labels.length > 1 ? colorMode : "sparsity";
   const selectedRecords = useMemo(() => {
@@ -91,6 +109,10 @@ export default function CoverageWorkspace({
       .filter((index) => Number.isInteger(index) && run.records[index] !== undefined)
       .map((index) => run.records[index]);
   }, [run, selectedIndices]);
+  const candidatePoints = candidateView?.candidate_points || [];
+  const selectedCandidatePoints = useMemo(() => candidatePoints
+    .filter((point) => selectedCandidateIndices.includes(point.index)),
+  [candidatePoints, selectedCandidateIndices]);
 
   function objectViewInput(overrides: Partial<CoverageObjectViewInput> = {}): CoverageObjectViewInput {
     return {
@@ -104,6 +126,28 @@ export default function CoverageWorkspace({
       block_k: blockK,
       ...overrides,
     };
+  }
+
+  function candidateViewInput(overrides: Partial<CoverageCandidateViewInput> = {}): CoverageCandidateViewInput {
+    return {
+      role: candidateRole,
+      class_label: classFilter || null,
+      min_short_px: minShortPx,
+      confidence_min: confidenceMin,
+      confidence_max: confidenceMax,
+      method,
+      dimension,
+      k,
+      limit: 12,
+      ...overrides,
+    };
+  }
+
+  function invalidateCandidateView(clearSelection = false) {
+    ++candidateViewRequest.current;
+    setCandidateView(null);
+    setCandidateViewBusy(false);
+    if (clearSelection) setSelectedCandidateIndices([]);
   }
 
   async function refreshObjectView(overrides: Partial<CoverageObjectViewInput> = {}) {
@@ -123,6 +167,32 @@ export default function CoverageWorkspace({
       }
     } finally {
       if (objectViewRequest.current === requestId) setProjectionBusy(false);
+    }
+  }
+
+  async function refreshCandidateView(
+    overrides: Partial<CoverageCandidateViewInput> = {},
+    allowNewCandidateSet = false,
+  ) {
+    if (!run || (!candidateReady && !allowNewCandidateSet)) return;
+    const requestId = ++candidateViewRequest.current;
+    const runId = run.run_id;
+    setCandidateViewBusy(true);
+    setError("");
+    setCandidateView(null);
+    try {
+      const result = await api.coverageCandidateView(runId, candidateViewInput(overrides));
+      if (candidateViewRequest.current !== requestId) return;
+      setCandidateView(result);
+      setSelectedCandidateIndices((current) => current.filter((index) =>
+        result.candidate_points.some((point) => point.index === index),
+      ));
+    } catch (reason) {
+      if (candidateViewRequest.current === requestId) {
+        setError(reason instanceof Error ? reason.message : "Could not update the candidate comparison.");
+      }
+    } finally {
+      if (candidateViewRequest.current === requestId) setCandidateViewBusy(false);
     }
   }
 
@@ -151,10 +221,41 @@ export default function CoverageWorkspace({
     }
   }
 
+  function addCandidateFolder(value = candidateFolderDraft) {
+    const path = value.trim();
+    if (!path) return;
+    setCandidateFolders((current) => current.includes(path) ? current : [...current, path]);
+    setCandidateFolderDraft("");
+    invalidateCandidateView(true);
+    setCandidateReady(false);
+    setNotice("");
+  }
+
+  async function chooseCandidateFolder() {
+    setError("");
+    if (!window.cimHost?.chooseFile) {
+      setNotice("Native folder picker is not connected. Paste a local candidate folder path below.");
+      return;
+    }
+    try {
+      const result = await window.cimHost.chooseFile();
+      if (result.canceled) return;
+      const chosen = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
+      if (!chosen.length) throw new Error("The host did not return a folder path.");
+      chosen.forEach((path) => addCandidateFolder(path));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The candidate folder picker failed.");
+    }
+  }
+
   async function startAnalysis(event: FormEvent) {
     event.preventDefault();
     setError("");
     setNotice("");
+    if (candidateBusy) {
+      setError("Wait for candidate analysis to finish before starting another coverage run.");
+      return;
+    }
     if (!connected) {
       setError("Connect to the local worker before starting coverage analysis.");
       return;
@@ -169,8 +270,14 @@ export default function CoverageWorkspace({
     }
 
     setBusy(true);
+    ++candidateViewRequest.current;
     setRun(null);
     setObjectView(null);
+    setCandidateView(null);
+    setCandidateReady(false);
+    setCandidateViewBusy(false);
+    setCandidateJob(null);
+    setSelectedCandidateIndices([]);
     setJob(null);
     setSelectedIndices([]);
     try {
@@ -232,12 +339,58 @@ export default function CoverageWorkspace({
     }
   }
 
+  async function startCandidateAnalysis() {
+    if (!run || !candidateFolders.length || !connected) return;
+    setError("");
+    setNotice("");
+    invalidateCandidateView(true);
+    setCandidateReady(false);
+    setCandidateJob(null);
+    setCandidateBusy(true);
+    try {
+      const created = await api.createCoverageCandidateJob(run.run_id, candidateFolders);
+      let status: JobStatus | null = null;
+      const deadline = Date.now() + 10 * 60_000;
+      while (Date.now() < deadline) {
+        status = await api.coverageCandidateJob(created.job_id);
+        setCandidateJob(status);
+        if (["completed", "failed", "cancelled"].includes(status.state)) break;
+        await pause(250);
+      }
+      if (!status || status.state !== "completed") {
+        if (status?.error?.message) throw new Error(status.error.message);
+        if (status?.state === "cancelled") return;
+        throw new Error("Candidate analysis did not finish. Retry after checking the local worker.");
+      }
+      setCandidateReady(true);
+      setNotice(`Projected ${status.done} candidate ${run.unit === "object" ? "objects" : "images"} with ${run.model_id}.`);
+      await refreshCandidateView({}, true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Candidate analysis failed.");
+    } finally {
+      setCandidateBusy(false);
+    }
+  }
+
+  async function cancelCandidateAnalysis() {
+    if (!candidateJob?.job_id || !["queued", "running", "cancelling"].includes(candidateJob.state)) return;
+    try {
+      await api.cancelCoverageCandidateJob(candidateJob.job_id);
+      setCandidateJob((current) => current ? { ...current, state: "cancelling", message: "Cancellation requested" } : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not cancel candidate analysis.");
+    }
+  }
+
   async function changeProjection(nextMethod: ProjectionMethod, nextDimension = dimension) {
     setMethod(nextMethod);
     setDimension(nextDimension);
     if (!run || projectionBusy) return;
     if (run.unit === "object") {
-      await refreshObjectView({ method: nextMethod, dimension: nextDimension });
+      await Promise.all([
+        refreshObjectView({ method: nextMethod, dimension: nextDimension }),
+        refreshCandidateView({ method: nextMethod, dimension: nextDimension }),
+      ]);
       return;
     }
     const requestId = ++projectionRequest.current;
@@ -254,6 +407,7 @@ export default function CoverageWorkspace({
         points: result.points,
         warnings: result.warnings,
       } : current);
+      await refreshCandidateView({ method: nextMethod, dimension: nextDimension });
     } catch (reason) {
       if (projectionRequest.current === requestId) {
         setError(reason instanceof Error ? reason.message : "Could not switch the coverage projection.");
@@ -267,7 +421,7 @@ export default function CoverageWorkspace({
     setK(nextK);
     if (!run || !Number.isFinite(nextK) || nextK < 1 || sparsityBusy) return;
     if (run.unit === "object") {
-      await refreshObjectView({ k: nextK });
+      await Promise.all([refreshObjectView({ k: nextK }), refreshCandidateView({ k: nextK })]);
       return;
     }
     const requestId = ++sparsityRequest.current;
@@ -285,6 +439,7 @@ export default function CoverageWorkspace({
         sparse_percentile: result.sparse_percentile,
       } : current);
       setK(result.k);
+      await refreshCandidateView({ k: result.k });
     } catch (reason) {
       if (sparsityRequest.current === requestId) {
         setError(reason instanceof Error ? reason.message : "Could not update the sparsity values.");
@@ -310,6 +465,37 @@ export default function CoverageWorkspace({
     setSelectedIndices([]);
   }
 
+  function toggleCandidateSelection(index: number) {
+    setSelectedCandidateIndices((current) => current.includes(index)
+      ? current.filter((item) => item !== index)
+      : [...current, index]);
+  }
+
+  function addCandidateSelection(indices: number[]) {
+    const valid = indices.filter((index) => candidatePoints.some((point) => point.index === index));
+    if (valid.length) setSelectedCandidateIndices([...new Set(valid)].sort((left, right) => left - right));
+  }
+
+  async function addCandidatesToCuration(records: Array<Pick<CoverageCandidateWorkRecord, "index">>) {
+    if (!run || !candidateView || !records.length) return;
+    const indices = [...new Set(records.map((record) => record.index))];
+    const source = candidateRole === "pool"
+      ? "gap_filler"
+      : classFilter ? "reference_class" : "reference";
+    const scores = Object.fromEntries(indices.flatMap((index) => {
+      const score = candidateView.work_scores[index];
+      return score === undefined ? [] : [[index, score]];
+    }));
+    setError("");
+    try {
+      const result = await api.addCoverageCandidatesToCuration(run.run_id, indices, source, scores);
+      onCurationCountChange?.(result.total);
+      setNotice(`Added ${result.added} candidate(s) to curation; skipped ${result.skipped} duplicate(s).`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not add candidates to curation.");
+    }
+  }
+
   function selectBlock(blockId: number) {
     if (!objectView) return;
     const indices = objectView.points
@@ -318,14 +504,14 @@ export default function CoverageWorkspace({
     if (indices.length) setSelectedIndices(indices);
   }
 
-  const colorValues = effectiveColorMode === "sparsity" ? visibleScores : undefined;
-  const pointSizes = effectiveColorMode === "class" && visibleScores.length ? (() => {
-    const min = Math.min(...visibleScores);
-    const max = Math.max(...visibleScores);
+  const colorValues = effectiveColorMode === "sparsity" ? plottedScores : undefined;
+  const pointSizes = effectiveColorMode === "class" && plottedScores.length ? (() => {
+    const min = Math.min(...plottedScores);
+    const max = Math.max(...plottedScores);
     const span = max - min;
     const base = dimension === 2 ? 6 : 4;
     const sizeRange = dimension === 2 ? 8 : 4;
-    return visibleScores.map((score) => base + (span > 1e-12 ? sizeRange * (score - min) / span : 0));
+    return plottedScores.map((score) => base + (span > 1e-12 ? sizeRange * (score - min) / span : 0));
   })() : undefined;
 
   return (
@@ -435,13 +621,85 @@ export default function CoverageWorkspace({
                 <label><input type="radio" name="coverage-color-mode" value="sparsity" checked={colorMode === "sparsity"} onChange={() => setColorMode("sparsity")} /> Sparsity</label>
               </fieldset>
             )}
-            <button className="run-button" type="submit" disabled={busy || !connected || loadingModels || !modelId || !folders.length}>
+            <button className="run-button" type="submit" disabled={busy || candidateBusy || !connected || loadingModels || !modelId || !folders.length}>
               {busy ? "Analyzing…" : "Run coverage analysis"}
             </button>
             {busy && <button className="cancel-button" type="button" onClick={() => void cancelAnalysis()}>Cancel analysis</button>}
             {!connected && <div className="field-note">Connect to the local worker to analyze images.</div>}
           </section>
         </form>
+
+        <section className="control-section coverage-candidate-controls" aria-label="Candidate and reference folders">
+          <div className="section-heading"><span className="step-number">03</span><h2>Candidate / reference</h2></div>
+          <button className="host-picker" type="button" onClick={() => void chooseCandidateFolder()} disabled={candidateBusy}>
+            <span className="folder-icon" aria-hidden="true">▱</span>
+            Choose candidate folder
+            <span className="picker-hint">Native</span>
+          </button>
+          <label className="field-label" htmlFor="coverage-candidate-folder-path">Candidate or reference folder</label>
+          <div className="folder-input-row">
+            <input
+              id="coverage-candidate-folder-path"
+              data-testid="coverage-candidate-folder-path"
+              value={candidateFolderDraft}
+              onChange={(event) => setCandidateFolderDraft(event.target.value)}
+              onKeyDown={(event) => event.key === "Enter" && (event.preventDefault(), addCandidateFolder())}
+              placeholder="Paste a local folder path"
+              autoComplete="off"
+              disabled={candidateBusy}
+            />
+            <button type="button" className="add-folder" onClick={() => addCandidateFolder()} aria-label="Add candidate folder" disabled={candidateBusy}>+</button>
+          </div>
+          {candidateFolders.length > 0 && (
+            <ul className="folder-list" aria-label="Candidate folders">
+              {candidateFolders.map((folder) => (
+                <li key={folder} title={folder}>
+                  <span className="folder-chip-dot" />
+                  <span className="folder-chip-name">{folder.split(/[\\/]/).filter(Boolean).at(-1) || folder}</span>
+                  <button type="button" aria-label={`Remove candidate folder ${folder}`} onClick={() => {
+                    setCandidateFolders((current) => current.filter((item) => item !== folder));
+                    invalidateCandidateView(true);
+                    setCandidateReady(false);
+                  }} disabled={candidateBusy}>×</button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="field-note">Candidate vectors use the same local model and object crop policy as the main run.</div>
+          <label className="field-label field-label-spaced" htmlFor="coverage-candidate-role">Candidate folder role</label>
+          <select
+            id="coverage-candidate-role"
+            data-testid="coverage-candidate-role"
+            value={candidateRole}
+            onChange={(event) => {
+              setCandidateRole(event.target.value as CoverageCandidateRole);
+              invalidateCandidateView(true);
+            }}
+            disabled={candidateBusy}
+          >
+            <option value="pool">Mining pool · find gap fillers</option>
+            <option value="reference">External reference · measure recall</option>
+          </select>
+          <button
+            type="button"
+            data-testid="coverage-project-candidates"
+            className="run-button"
+            onClick={() => void startCandidateAnalysis()}
+            disabled={!run || !candidateFolders.length || !connected || busy || candidateBusy}
+          >
+            {candidateBusy ? "Projecting candidates…" : "Project candidate folders"}
+          </button>
+          {candidateBusy && <button className="cancel-button" type="button" onClick={() => void cancelCandidateAnalysis()}>Cancel candidate analysis</button>}
+          {candidateReady && !candidateBusy && (
+            <button
+              type="button"
+              data-testid="coverage-refresh-candidate-view"
+              className="apply-object-filters"
+              onClick={() => void refreshCandidateView()}
+              disabled={candidateViewBusy || confidenceMin > confidenceMax}
+            >Refresh comparison</button>
+          )}
+        </section>
       </aside>
 
       <main className="results-area coverage-results">
@@ -460,10 +718,15 @@ export default function CoverageWorkspace({
           <span>{job.message}</span>
           {job.total > 0 && <span>{job.done}/{job.total} · {Math.round(job.percent)}%</span>}
         </div>}
+        {candidateJob && <div className="job-status" data-testid="coverage-candidate-job-status" role="status">
+          <span>{candidateJob.message}</span>
+          {candidateJob.total > 0 && <span>{candidateJob.done}/{candidateJob.total} · {Math.round(candidateJob.percent)}%</span>}
+        </div>}
         {run ? (
           <>
             {run.warnings.map((warning, index) => <div className="coverage-warning" role="status" key={`${warning}-${index}`}>{warning}</div>)}
             {objectView?.warnings.map((warning, index) => <div className="coverage-warning" role="status" key={`object-${warning}-${index}`}>{warning}</div>)}
+            {candidateView?.warnings.map((warning, index) => <div className="coverage-warning" role="status" key={`candidate-${warning}-${index}`}>{warning}</div>)}
             {run.unit === "object" && objectView && (
               <section className="coverage-object-panel" aria-label="Object coverage filters and blocks">
                 <div className="coverage-object-panel-heading">
@@ -476,10 +739,17 @@ export default function CoverageWorkspace({
                       id="coverage-object-class"
                       data-testid="coverage-object-class"
                       value={classFilter}
-                      onChange={(event) => setClassFilter(event.target.value)}
+                      onChange={(event) => {
+                        setClassFilter(event.target.value);
+                        invalidateCandidateView(true);
+                      }}
                     >
                       <option value="">All classes</option>
-                      {[...new Set(run.records.map((record) => record.label))].sort().map((label) => (
+                      {[...new Set([
+                        ...run.records.map((record) => record.label),
+                        ...(candidateView?.candidate_points.map((point) => point.label) || []),
+                        ...(candidateView?.class_gaps.map((gap) => gap.label) || []),
+                      ])].sort().map((label) => (
                         <option key={label} value={label}>{label}</option>
                       ))}
                     </select>
@@ -493,7 +763,10 @@ export default function CoverageWorkspace({
                       min={0}
                       max={4096}
                       value={minShortPx}
-                      onChange={(event) => setMinShortPx(Math.max(0, Math.min(4096, event.target.valueAsNumber || 0)))}
+                      onChange={(event) => {
+                        setMinShortPx(Math.max(0, Math.min(4096, event.target.valueAsNumber || 0)));
+                        invalidateCandidateView(true);
+                      }}
                     />
                   </div>
                   {objectView.has_confidence && (
@@ -508,7 +781,10 @@ export default function CoverageWorkspace({
                           max={1}
                           step={0.05}
                           value={confidenceMin}
-                          onChange={(event) => setConfidenceMin(Math.max(0, Math.min(1, event.target.valueAsNumber || 0)))}
+                          onChange={(event) => {
+                            setConfidenceMin(Math.max(0, Math.min(1, event.target.valueAsNumber || 0)));
+                            invalidateCandidateView(true);
+                          }}
                         />
                       </div>
                       <div className="coverage-object-field">
@@ -521,8 +797,11 @@ export default function CoverageWorkspace({
                           max={1}
                           step={0.05}
                           value={confidenceMax}
-                          onChange={(event) => setConfidenceMax(Number.isNaN(event.target.valueAsNumber)
-                            ? 1 : Math.max(0, Math.min(1, event.target.valueAsNumber)))}
+                          onChange={(event) => {
+                            setConfidenceMax(Number.isNaN(event.target.valueAsNumber)
+                              ? 1 : Math.max(0, Math.min(1, event.target.valueAsNumber)));
+                            invalidateCandidateView(true);
+                          }}
                         />
                       </div>
                     </>
@@ -543,7 +822,10 @@ export default function CoverageWorkspace({
                     type="button"
                     data-testid="coverage-apply-object-filters"
                     className="apply-object-filters"
-                    onClick={() => void refreshObjectView()}
+                    onClick={() => {
+                      void refreshObjectView();
+                      void refreshCandidateView();
+                    }}
                     disabled={projectionBusy || confidenceMin > confidenceMax}
                   >Apply object filters</button>
                 </div>
@@ -591,9 +873,115 @@ export default function CoverageWorkspace({
                 </div>
               </section>
             )}
+            {candidateReady && (
+              <section className="coverage-candidate-panel" aria-label="Candidate and reference comparison" data-testid="coverage-candidate-panel">
+                <div className="coverage-object-panel-heading">
+                  <div>
+                    <h3>{candidateRole === "pool" ? "Candidate mining pool" : "External reference coverage"}</h3>
+                    <p>{candidateRole === "pool"
+                      ? "Orange diamonds are candidates ranked by distance from the main dataset; choose records to add to curation."
+                      : "Dark diamonds are external reference records projected with the main set; uncovered records indicate reference gaps."}</p>
+                  </div>
+                  {candidateView && (
+                    <div className="coverage-candidate-counts" data-testid="coverage-candidate-counts">
+                      <span>{candidateView.main_count} main</span><span>{candidateView.candidate_count} candidates</span>
+                    </div>
+                  )}
+                </div>
+                {candidateViewBusy && <p className="field-note" role="status">Updating the joint projection and candidate ranking…</p>}
+                {candidateView && candidateRole === "reference" && (
+                  <div className="coverage-reference-metrics" data-testid="coverage-reference-metrics">
+                    <article><strong data-testid="coverage-reference-recall">{candidateView.recall == null ? "Unavailable" : `${(candidateView.recall * 100).toFixed(1)}%`}</strong><span>Reference recall</span></article>
+                    <article><strong data-testid="coverage-reference-uncovered">{candidateView.uncovered_count}</strong><span>Uncovered reference records</span></article>
+                    <article><strong>{candidateView.radius == null ? "—" : candidateView.radius.toFixed(3)}</strong><span>Main-neighborhood radius</span></article>
+                  </div>
+                )}
+                {candidateView && candidateRole === "reference" && candidateView.class_gaps.length > 0 && (
+                  <div className="coverage-class-gaps">
+                    <h4>Class alignment and reference gaps</h4>
+                    <div className="coverage-object-table-wrap">
+                      <table data-testid="coverage-class-gaps">
+                        <thead><tr><th>Class</th><th>Main</th><th>Reference</th><th>Uncovered</th><th>Status</th></tr></thead>
+                        <tbody>
+                          {candidateView.class_gaps.map((gap) => (
+                            <tr key={gap.label} data-testid="coverage-class-gap-row" data-label={gap.label}>
+                              <td><button type="button" onClick={() => {
+                                setClassFilter(gap.label);
+                                invalidateCandidateView(true);
+                                void refreshObjectView({ class_label: gap.label });
+                                void refreshCandidateView({ class_label: gap.label });
+                              }}>{gap.label}</button></td>
+                              <td>{gap.main_count}</td><td>{gap.candidate_count}</td><td>{gap.uncovered_count}</td><td>{gap.state}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+                {candidateView && (
+                  <div className="coverage-candidate-actions">
+                    <button
+                      type="button"
+                      data-testid="coverage-add-selected-candidates"
+                      onClick={() => void addCandidatesToCuration(selectedCandidatePoints)}
+                      disabled={!selectedCandidatePoints.length || candidateViewBusy}
+                    >Add selected candidates ({selectedCandidatePoints.length}) to curation</button>
+                    <button
+                      type="button"
+                      data-testid="coverage-add-top-candidates"
+                      onClick={() => void addCandidatesToCuration(candidateView.work_records)}
+                      disabled={!candidateView.work_records.length || candidateViewBusy}
+                    >Add top {candidateView.work_records.length} to curation</button>
+                    <button
+                      type="button"
+                      data-testid="coverage-clear-candidate-selection"
+                      onClick={() => setSelectedCandidateIndices([])}
+                      disabled={!selectedCandidateIndices.length}
+                    >Clear candidate selection ({selectedCandidateIndices.length})</button>
+                  </div>
+                )}
+                {candidateView && (
+                  <div className="coverage-candidate-worklists">
+                    <section aria-label="Candidate worklist">
+                      <h4>{candidateRole === "pool" ? "Highest-ranked gap fillers" : "Uncovered reference worklist"}</h4>
+                      {candidateView.work_records.length ? (
+                        <div className="coverage-gallery">
+                          {candidateView.work_records.map((record) => (
+                            <article className="coverage-image-card" key={record.index} data-testid="coverage-candidate-work-item" data-index={record.index}>
+                              <img src={api.coverageCandidateThumbnailUrl(run.run_id, record.index)} alt={record.filename} loading="lazy" />
+                              <strong>{record.filename}</strong>
+                              <span className="coverage-image-label" style={{ background: classColors.get(record.label) || coverageLabelColors[0] }}>{record.label || "(unlabeled)"}</span>
+                              <small>{record.split} · {candidateRole === "pool" ? "Gap score" : "Distance to main"} {record.score.toFixed(3)}</small>
+                              {record.provisional_label && <small>Nearest main class: {record.provisional_label}</small>}
+                            </article>
+                          ))}
+                        </div>
+                      ) : <p className="coverage-empty-selection">No candidate records need review under these filters.</p>}
+                    </section>
+                    <section aria-label="Selected candidate records">
+                      <h4>Selected candidate records <span data-testid="coverage-selected-candidate-count">{selectedCandidatePoints.length} selected</span></h4>
+                      {selectedCandidatePoints.length ? (
+                        <div className="coverage-gallery">
+                          {selectedCandidatePoints.map((record) => (
+                            <article className="coverage-image-card" key={record.index} data-testid="coverage-selected-candidate" data-index={record.index}>
+                              <img src={api.coverageCandidateThumbnailUrl(run.run_id, record.index)} alt={record.filename} loading="lazy" />
+                              <strong>{record.filename}</strong>
+                              <span className="coverage-image-label" style={{ background: classColors.get(record.label) || coverageLabelColors[0] }}>{record.label || "(unlabeled)"}</span>
+                              <small>{record.split}{record.obj_index == null ? "" : ` · Object ${record.obj_index + 1}`}</small>
+                              {record.provisional_label && <small>Nearest main class: {record.provisional_label}</small>}
+                            </article>
+                          ))}
+                        </div>
+                      ) : <p className="coverage-empty-selection">Select a candidate point on the joint map or from the accessible point list.</p>}
+                    </section>
+                  </div>
+                )}
+              </section>
+            )}
             <div className="coverage-metrics" aria-label="Coverage summary">
-              <article><strong data-testid="coverage-image-count">{visiblePoints.length}</strong><span>{run.unit === "object" ? "Objects" : "Images"}</span></article>
-              <article><strong data-testid="coverage-sparse-count">{run.unit === "object" ? objectView?.sparse_count || 0 : run.sparse_count}</strong><span>Top {run.unit === "object" ? 20 : 100 - run.sparse_percentile}% sparsity candidates</span></article>
+              <article><strong data-testid="coverage-image-count">{plottedPoints.length}</strong><span>{run.unit === "object" ? "Objects" : "Images"}</span></article>
+              <article><strong data-testid="coverage-sparse-count">{candidateView?.main_sparse_count ?? (run.unit === "object" ? objectView?.sparse_count || 0 : run.sparse_count)}</strong><span>Top {run.unit === "object" ? 20 : 100 - run.sparse_percentile}% sparsity candidates</span></article>
               <article><strong>{run.model_id}</strong><span>Feature model</span></article>
               <article><strong data-testid="coverage-k-summary">{run.unit === "object" ? objectView?.k || 1 : run.k}</strong><span>Nearest neighbors (k)</span></article>
             </div>
@@ -609,28 +997,35 @@ export default function CoverageWorkspace({
             <div className="coverage-plot" data-testid="coverage-plot">
               {dimension === 2 ? (
                 <ScatterPlot2D
-                  points={visiblePoints}
+                  points={plottedPoints}
                   selectedIndices={selectedIndices}
                   onToggleSelection={toggleSelection}
                   onAddSelection={addSelection}
+                  candidatePoints={candidatePoints}
+                  selectedCandidateIndices={selectedCandidateIndices}
+                  onToggleCandidateSelection={toggleCandidateSelection}
+                  onAddCandidateSelection={addCandidateSelection}
                   viewKey={`${run.run_id}:${run.unit}:${objectView?.method || run.method}:2:${effectiveColorMode}:${classFilter}`}
                   testIdPrefix="coverage"
                   colorValues={colorValues}
                   labelPalette={coverageLabelColors}
                   pointSizes={pointSizes}
-                  scoreValues={visibleScores}
+                  scoreValues={plottedScores}
                   scoreLabel="Sparsity"
                 />
               ) : (
                 <ScatterPlot3D
-                  points={visiblePoints}
+                  points={plottedPoints}
                   selectedIndices={selectedIndices}
                   onToggleSelection={toggleSelection}
+                  candidatePoints={candidatePoints}
+                  selectedCandidateIndices={selectedCandidateIndices}
+                  onToggleCandidateSelection={toggleCandidateSelection}
                   viewKey={`${run.run_id}:${run.unit}:${objectView?.method || run.method}:3:${effectiveColorMode}:${classFilter}`}
                   colorValues={colorValues}
                   labelPalette={coverageLabelColors}
                   pointSizes={pointSizes}
-                  scoreValues={visibleScores}
+                  scoreValues={plottedScores}
                   scoreLabel="Sparsity"
                   testIdPrefix="coverage"
                 />

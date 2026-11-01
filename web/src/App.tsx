@@ -901,7 +901,12 @@ export default function App() {
       {coverageMounted && (
         <div className="coverage-layer" hidden={activeTool !== "coverage"}>
           <Suspense fallback={<div className="coverage-loading" role="status">Loading coverage workspace…</div>}>
-            <LazyCoverageWorkspace models={models} connected={connected} loadingModels={loadingModels} />
+            <LazyCoverageWorkspace
+              models={models}
+              connected={connected}
+              loadingModels={loadingModels}
+              onCurationCountChange={setCurationCount}
+            />
           </Suspense>
         </div>
       )}

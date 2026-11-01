@@ -2,7 +2,7 @@ import { useState } from "react";
 import createPlotlyComponent from "react-plotly.js/factory";
 import Plotly from "plotly.js-dist-min";
 import type { Data, Layout, PlotMouseEvent, PlotSelectionEvent } from "plotly.js";
-import type { EmbeddingPoint } from "./api";
+import type { CoverageCandidatePoint, EmbeddingPoint } from "./api";
 
 const Plot = createPlotlyComponent(Plotly);
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
@@ -17,6 +17,10 @@ export default function ScatterPlot2D({
   selectedIndices,
   onToggleSelection,
   onAddSelection,
+  candidatePoints = [],
+  selectedCandidateIndices = [],
+  onToggleCandidateSelection,
+  onAddCandidateSelection,
   viewKey,
   testIdPrefix = "embedding",
   colorValues,
@@ -29,6 +33,10 @@ export default function ScatterPlot2D({
   selectedIndices: number[];
   onToggleSelection: (index: number) => void;
   onAddSelection: (indices: number[]) => void;
+  candidatePoints?: CoverageCandidatePoint[];
+  selectedCandidateIndices?: number[];
+  onToggleCandidateSelection?: (index: number) => void;
+  onAddCandidateSelection?: (indices: number[]) => void;
   viewKey: string;
   testIdPrefix?: string;
   colorValues?: number[];
@@ -45,6 +53,9 @@ export default function ScatterPlot2D({
   const selectedPositions = selectedIndices
     .map((index) => pointPositions.get(index))
     .filter((position): position is number => position !== undefined);
+  const selectedCandidatePositions = selectedCandidateIndices
+    .map((index) => candidatePoints.findIndex((point) => point.index === index))
+    .filter((position) => position >= 0);
   const data: Data[] = [{
     type: "scatter",
     mode: "markers",
@@ -75,6 +86,28 @@ export default function ScatterPlot2D({
     unselected: { marker: { opacity: 0.55 } },
     hovertemplate: "%{text}<br>X: %{x:.3f}<br>Y: %{y:.3f}<extra></extra>",
   }];
+  if (candidatePoints.length) {
+    data.push({
+      type: "scatter",
+      mode: "markers",
+      x: candidatePoints.map((point) => point.x),
+      y: candidatePoints.map((point) => point.y),
+      text: candidatePoints.map((point) => `${point.filename}<br>Class: ${point.label}<br>Split: ${point.split}`
+        + `<br>${point.role === "pool" ? "Candidate pool" : "External reference"}`
+        + (point.score == null ? "" : `<br>${point.role === "pool" ? "Gap score" : "Distance to main"}: ${point.score.toFixed(3)}`)
+        + (point.provisional_label ? `<br>Provisional class: ${point.provisional_label}` : "")),
+      customdata: candidatePoints.map((point) => point.index),
+      marker: {
+        size: candidatePoints.map((point) => selectedCandidateIndices.includes(point.index) ? 15 : 11),
+        color: candidatePoints.map((point) => point.role === "pool" ? "#f08a24" : "#263238"),
+        symbol: "diamond",
+        opacity: 0.96,
+        line: { color: "#ffffff", width: 1.5 },
+      },
+      ...(selectedCandidatePositions.length ? { selectedpoints: selectedCandidatePositions } : {}),
+      hovertemplate: "%{text}<br>X: %{x:.3f}<br>Y: %{y:.3f}<extra></extra>",
+    });
+  }
   const layout: Partial<Layout> = {
     autosize: true,
     height: 440,
@@ -89,16 +122,26 @@ export default function ScatterPlot2D({
   };
 
   function selectPoint(event: Readonly<PlotMouseEvent>) {
-    const custom = event.points?.[0]?.customdata;
-    if (typeof custom === "number") onToggleSelection(custom);
+    const point = event.points?.[0];
+    const custom = point?.customdata;
+    if (typeof custom !== "number") return;
+    if (point.curveNumber === 1) onToggleCandidateSelection?.(custom);
+    else onToggleSelection(custom);
   }
 
   function selectPoints(event: Readonly<PlotSelectionEvent>) {
-    const indices = event.points
+    const mainIndices = event.points
+      .filter((point) => point.curveNumber !== 1)
       .map((point) => point.customdata)
       .filter((custom): custom is number => typeof custom === "number")
       .filter(Number.isInteger);
-    if (indices.length) onAddSelection(indices);
+    const candidateIndices = event.points
+      .filter((point) => point.curveNumber === 1)
+      .map((point) => point.customdata)
+      .filter((custom): custom is number => typeof custom === "number")
+      .filter(Number.isInteger);
+    if (mainIndices.length) onAddSelection(mainIndices);
+    if (candidateIndices.length) onAddCandidateSelection?.(candidateIndices);
   }
 
   return (
@@ -135,6 +178,16 @@ export default function ScatterPlot2D({
             aria-label={`Select ${point.filename}, ${point.label}, ${point.split}`}
             aria-pressed={selectedIndices.includes(point.index)}
             onClick={() => onToggleSelection(point.index)}
+          />
+        ))}
+        {candidatePoints.map((point) => (
+          <button
+            key={`candidate-${point.index}`}
+            type="button"
+            data-testid={`${testIdPrefix}-candidate-point`}
+            aria-label={`Select candidate ${point.filename}, ${point.label}, ${point.split}`}
+            aria-pressed={selectedCandidateIndices.includes(point.index)}
+            onClick={() => onToggleCandidateSelection?.(point.index)}
           />
         ))}
       </div>

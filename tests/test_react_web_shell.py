@@ -239,6 +239,34 @@ def _object_coverage_fixture(root: Path) -> tuple[list[Path], dict[str, str]]:
     return [train, test], hashes
 
 
+def _candidate_object_coverage_fixture(root: Path) -> tuple[list[Path], dict[str, str]]:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "classes.txt").write_text("beta\nalpha\ngamma\n", encoding="utf-8")
+    train, test = root / "train", root / "test"
+    specs = [
+        (train, "11.png", 1, 0.55, 0.55, 0.92),
+        (train, "12.png", 2, 0.45, 0.40, 0.90),
+        (test, "13.png", 0, 0.50, 0.50, 0.95),
+    ]
+    hashes: dict[str, str] = {}
+    colors = [(235, 35, 45), (25, 225, 65), (30, 55, 240)]
+    for index, (folder, filename, class_id, width, height, confidence) in enumerate(specs):
+        image_dir, label_dir = folder / "images", folder / "labels"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        image_path = image_dir / filename
+        Image.new("RGB", (64, 64), colors[index]).save(image_path)
+        label_path = label_dir / f"{Path(filename).stem}.txt"
+        label_path.write_text(
+            f"{class_id} 0.5 0.5 {width} {height} {confidence}\n",
+            encoding="utf-8",
+        )
+        hashes[str(image_path)] = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        hashes[str(label_path)] = hashlib.sha256(label_path.read_bytes()).hexdigest()
+    hashes[str(root / "classes.txt")] = hashlib.sha256((root / "classes.txt").read_bytes()).hexdigest()
+    return [train, test], hashes
+
+
 def test_case_lv_web_03_obj_01_object_coverage_filters_keep_global_alignment(
     monkeypatch, tmp_path,
 ):
@@ -363,6 +391,155 @@ def test_case_lv_web_03_obj_01_object_coverage_filters_keep_global_alignment(
         path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
         for path in source_hashes
     }
+
+
+def test_case_lv_web_03_ref_01_candidate_pool_reference_and_class_name_alignment(
+    monkeypatch, tmp_path,
+):
+    """Candidate mining and reference roles preserve taxonomy, indices, coverage and cart identity."""
+    main_folders, main_hashes = _object_coverage_fixture(tmp_path / "reference-main")
+    candidate_folders, candidate_hashes = _candidate_object_coverage_fixture(
+        tmp_path / "reference-candidates",
+    )
+
+    def object_loader(_model_id: str, **_kwargs):
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            vector[4] = crop.height / 100.0
+            return vector
+        return embed
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "candidate-cache"))
+    app = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda _model: _fake_embedder(),
+        object_model_loader=object_loader,
+    )
+    with TestClient(app) as client:
+        main_job = _run_coverage(client, main_folders, unit="object", method="pca", k=2)
+        assert main_job["state"] == "completed", main_job
+        run_id = main_job["run_id"]
+        created = client.post(
+            f"/api/v1/coverage/runs/{run_id}/candidates/jobs",
+            json={"folders": [str(folder) for folder in candidate_folders]},
+        )
+        assert created.status_code == 202, created.text
+        job_id = created.json()["job_id"]
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            candidate_job = client.get(f"/api/v1/coverage/candidate-jobs/{job_id}").json()
+            if candidate_job["state"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("coverage candidate job did not finish within 15 seconds")
+        assert candidate_job["state"] == "completed", candidate_job
+        assert candidate_job["run_id"] == run_id
+
+        base_request = {
+            "role": "pool",
+            "class_label": None,
+            "min_short_px": 10,
+            "confidence_min": 0.8,
+            "confidence_max": 1.0,
+            "method": "lda",
+            "dimension": 2,
+            "k": 2,
+            "limit": 12,
+        }
+        pool_response = client.post(
+            f"/api/v1/coverage/runs/{run_id}/candidate-view",
+            json=base_request,
+        )
+        assert pool_response.status_code == 200, pool_response.text
+        pool = pool_response.json()
+        assert pool["role"] == "pool"
+        assert pool["method"] == "lda"
+        assert pool["candidate_count"] == 3
+        assert [point["label"] for point in pool["candidate_points"]] == [
+            "alpha", "gamma", "beta",
+        ]
+        assert [point["index"] for point in pool["candidate_points"]] == [0, 1, 2]
+        assert all(point["provisional_label"] in {"alpha", "beta"}
+                   for point in pool["candidate_points"])
+        assert pool["work_indices"]
+        assert pool["work_scores"]
+        assert all(np.isfinite([point["x"], point["y"], point["score"]]).all()
+                   for point in pool["candidate_points"])
+
+        reference_response = client.post(
+            f"/api/v1/coverage/runs/{run_id}/candidate-view",
+            json={**base_request, "role": "reference"},
+        )
+        assert reference_response.status_code == 200, reference_response.text
+        reference = reference_response.json()
+        assert reference["recall"] is not None
+        assert 0.0 <= reference["recall"] <= 1.0
+        assert reference["uncovered_count"] == len(reference["work_indices"])
+        gamma = next(row for row in reference["class_gaps"] if row["label"] == "gamma")
+        assert gamma == {
+            "label": "gamma",
+            "main_count": 0,
+            "candidate_count": 1,
+            "uncovered_count": gamma["uncovered_count"],
+            "state": "missing",
+        }
+
+        missing_class = client.post(
+            f"/api/v1/coverage/runs/{run_id}/candidate-view",
+            json={**base_request, "role": "reference", "class_label": "ghost"},
+        )
+        assert missing_class.status_code == 200, missing_class.text
+        assert missing_class.json()["candidate_count"] == 0
+        assert any("No candidate objects match ghost" in warning
+                   for warning in missing_class.json()["warnings"])
+
+        candidate_only_class = client.post(
+            f"/api/v1/coverage/runs/{run_id}/candidate-view",
+            json={**base_request, "role": "reference", "class_label": "gamma"},
+        )
+        assert candidate_only_class.status_code == 200, candidate_only_class.text
+        candidate_only = candidate_only_class.json()
+        assert candidate_only["main_count"] == 0
+        assert candidate_only["candidate_count"] == 1
+        assert candidate_only["recall"] is None
+        assert candidate_only["candidate_points"][0]["provisional_label"] == ""
+        assert any("coverage cannot be measured" in warning
+                   for warning in candidate_only["warnings"])
+
+        empty_reference = client.post(
+            f"/api/v1/coverage/runs/{run_id}/candidate-view",
+            json={**base_request, "role": "reference", "min_short_px": 1000},
+        )
+        assert empty_reference.status_code == 200, empty_reference.text
+        assert empty_reference.json()["candidate_count"] == 0
+        assert empty_reference.json()["recall"] is None
+        assert any("no candidates match the current confidence" in warning.lower()
+                   for warning in empty_reference.json()["warnings"])
+
+        thumbnail = client.get(
+            f"/api/v1/coverage/runs/{run_id}/candidates/0/thumbnail",
+        )
+        assert thumbnail.status_code == 200
+        assert Image.open(BytesIO(thumbnail.content)).size[0] < 64
+        added = client.post(
+            f"/api/v1/coverage/runs/{run_id}/candidates/curation",
+            json={"indices": [1], "source": "reference_class", "scores": {"1": 0.37}},
+        )
+        assert added.status_code == 201, added.text
+        assert added.json()["added"] == 1
+        item = added.json()["items"][0]
+        assert item["label"] == "gamma"
+        assert item["source"] == "reference_class"
+        assert item["score"] == pytest.approx(0.37)
+        assert item["level"] == "object"
+        assert item["obj_index"] == 0
+
+    for path, digest in {**main_hashes, **candidate_hashes}.items():
+        assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
 
 
 def test_case_lv_web_01_ic_01_discovery(classifier_fixture, monkeypatch, tmp_path):

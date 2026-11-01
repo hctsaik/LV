@@ -1,7 +1,7 @@
 import createPlotlyComponent from "react-plotly.js/factory";
 import Plotly from "plotly.js-dist-min";
 import type { Data, Layout, PlotMouseEvent } from "plotly.js";
-import type { EmbeddingPoint, KMeansCenter } from "./api";
+import type { CoverageCandidatePoint, EmbeddingPoint, KMeansCenter } from "./api";
 
 const Plot = createPlotlyComponent(Plotly);
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
@@ -19,6 +19,9 @@ export default function ScatterPlot3D({
   points,
   selectedIndices,
   onToggleSelection,
+  candidatePoints = [],
+  selectedCandidateIndices = [],
+  onToggleCandidateSelection,
   viewKey,
   clusterCenters = [],
   colorValues,
@@ -31,6 +34,9 @@ export default function ScatterPlot3D({
   points: EmbeddingPoint[];
   selectedIndices: number[];
   onToggleSelection: (index: number) => void;
+  candidatePoints?: CoverageCandidatePoint[];
+  selectedCandidateIndices?: number[];
+  onToggleCandidateSelection?: (index: number) => void;
   viewKey: string;
   clusterCenters?: KMeansCenter[];
   colorValues?: number[];
@@ -43,6 +49,9 @@ export default function ScatterPlot3D({
   const colors = colorMap(points, labelPalette);
   const numericColor = colorValues !== undefined && colorValues.length === points.length;
   const numericScores = scoreValues !== undefined && scoreValues.length === points.length;
+  const selectedCandidatePositions = selectedCandidateIndices
+    .map((index) => candidatePoints.findIndex((point) => point.index === index))
+    .filter((position) => position >= 0);
   const data: Data[] = [{
     type: "scatter3d",
     mode: "markers",
@@ -70,6 +79,30 @@ export default function ScatterPlot3D({
     },
     hovertemplate: "%{customdata[1]}%{customdata[2]}<br>Class: %{customdata[3]}<br>Split: %{customdata[4]}<br>X: %{x:.3f}<br>Y: %{y:.3f}<br>Z: %{z:.3f}<extra></extra>",
   }];
+  if (candidatePoints.length) {
+    data.push({
+      type: "scatter3d",
+      mode: "markers",
+      x: candidatePoints.map((point) => point.x),
+      y: candidatePoints.map((point) => point.y),
+      z: candidatePoints.map((point) => point.z),
+      text: candidatePoints.map((point) => `${point.filename}${objectDescription(point)}`
+        + `<br>Class: ${point.label}<br>Split: ${point.split}`
+        + `<br>${point.role === "pool" ? "Candidate pool" : "External reference"}`
+        + (point.score == null ? "" : `<br>${point.role === "pool" ? "Gap score" : "Distance to main"}: ${point.score.toFixed(3)}`)
+        + (point.provisional_label ? `<br>Provisional class: ${point.provisional_label}` : "")),
+      customdata: candidatePoints.map((point) => [point.index, point.filename, objectDescription(point), point.label, point.split]),
+      marker: {
+        size: candidatePoints.map((point) => selectedCandidateIndices.includes(point.index) ? 9 : 7),
+        color: candidatePoints.map((point) => point.role === "pool" ? "#f08a24" : "#263238"),
+        symbol: "diamond",
+        opacity: 0.96,
+        line: { color: "#ffffff", width: 1.5 },
+      },
+      ...(selectedCandidatePositions.length ? { selectedpoints: selectedCandidatePositions } : {}),
+      hovertemplate: "%{text}<br>X: %{x:.3f}<br>Y: %{y:.3f}<br>Z: %{z:.3f}<extra></extra>",
+    });
+  }
   if (clusterCenters.length) {
     data.push({
       type: "scatter3d",
@@ -101,8 +134,12 @@ export default function ScatterPlot3D({
   };
 
   function selectPoint(event: Readonly<PlotMouseEvent>) {
-    const custom = event.points?.[0]?.customdata;
-    if (Array.isArray(custom)) onToggleSelection(Number(custom[0]));
+    const point = event.points?.[0];
+    const custom = point?.customdata;
+    if (!Array.isArray(custom)) return;
+    const index = Number(custom[0]);
+    if (point.curveNumber === 1) onToggleCandidateSelection?.(index);
+    else onToggleSelection(index);
   }
 
   return (
@@ -124,6 +161,16 @@ export default function ScatterPlot3D({
             aria-label={"Select " + point.filename + objectDescription(point) + ", " + point.label + ", " + point.split}
             aria-pressed={selectedIndices.includes(point.index)}
             onClick={() => onToggleSelection(point.index)}
+          />
+        ))}
+        {candidatePoints.map((point) => (
+          <button
+            key={`candidate-${point.index}`}
+            type="button"
+            data-testid={`${testIdPrefix}-candidate-point`}
+            aria-label={`Select candidate ${point.filename}${objectDescription(point)}, ${point.label}, ${point.split}`}
+            aria-pressed={selectedCandidateIndices.includes(point.index)}
+            onClick={() => onToggleCandidateSelection?.(point.index)}
           />
         ))}
       </div>

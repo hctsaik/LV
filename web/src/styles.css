@@ -428,6 +428,26 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .coverage-caveat { margin: 10px 0 2px; color: #946b35; font-size: 9px; line-height: 1.5; }
 .coverage-warning { margin-top: 10px; border: 1px solid #eee0bd; border-radius: 6px; padding: 8px 10px; background: #fffaf0; color: #826b3b; font-size: 10px; }
 .coverage-object-panel { margin-top: 18px; padding: 14px; border: 1px solid #e5e9ef; border-radius: 8px; background: #fff; box-shadow: 0 4px 14px #25385808; }
+.coverage-candidate-controls { border-top: 1px solid #edf0f4; padding-top: 17px; }
+.coverage-candidate-controls .apply-object-filters { width: 100%; min-height: 31px; margin-top: 8px; border: 1px solid #cfdbea; border-radius: 5px; padding: 0 11px; background: #eef3fa; color: #365781; font-size: 9px; font-weight: 700; cursor: pointer; }
+.coverage-candidate-controls .apply-object-filters:disabled { cursor: default; opacity: .5; }
+.coverage-candidate-panel { margin-top: 18px; padding: 14px; border: 1px solid #dbe5f1; border-radius: 8px; background: #fff; box-shadow: 0 4px 14px #25385808; }
+.coverage-candidate-counts { display: flex; flex-wrap: wrap; gap: 6px; color: #65738a; font-size: 9px; }
+.coverage-candidate-counts span { border: 1px solid #e5eaf1; border-radius: 12px; padding: 4px 8px; background: #fafbfd; }
+.coverage-reference-metrics { display: grid; grid-template-columns: repeat(3, minmax(110px, 1fr)); gap: 8px; margin-top: 12px; }
+.coverage-reference-metrics article { display: grid; gap: 4px; padding: 9px 10px; border: 1px solid #e7ebf1; border-radius: 6px; background: #fbfcfe; }
+.coverage-reference-metrics strong { color: #355181; font-size: 13px; }
+.coverage-reference-metrics span { color: #8995a6; font-size: 8px; }
+.coverage-class-gaps, .coverage-candidate-worklists { margin-top: 14px; }
+.coverage-class-gaps h4, .coverage-candidate-worklists h4 { margin: 0 0 7px; color: #35425a; font-size: 10px; }
+.coverage-class-gaps td button { border: 0; padding: 0; background: transparent; color: #426b9d; font: inherit; text-decoration: underline; cursor: pointer; }
+.coverage-candidate-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.coverage-candidate-actions button { min-height: 29px; border: 1px solid #d5dfec; border-radius: 5px; padding: 0 10px; background: #f3f7fc; color: #45658e; font-size: 9px; font-weight: 700; cursor: pointer; }
+.coverage-candidate-actions button:disabled { cursor: default; opacity: .5; }
+.coverage-candidate-worklists { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.coverage-candidate-worklists > section { min-width: 0; }
+.coverage-candidate-worklists .coverage-gallery { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); max-height: 300px; }
+.coverage-candidate-worklists h4 span { color: #8e99a8; font-weight: 500; }
 .coverage-object-panel-heading h3, .coverage-object-summary h4, .coverage-object-blocks h4 { margin: 0; color: #35425a; font-size: 12px; }
 .coverage-object-panel-heading p { margin: 5px 0 0; color: #8490a2; font-size: 9px; line-height: 1.5; }
 .coverage-object-filters { display: grid; grid-template-columns: repeat(4, minmax(125px, 1fr)); align-items: end; gap: 9px 11px; margin-top: 12px; }
@@ -476,4 +496,5 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 @media (max-width: 900px) { .coverage-metrics { grid-template-columns: repeat(2, minmax(105px, 1fr)); }.coverage-plot-toolbar { align-items: flex-start; flex-direction: column; } }
 @media (max-width: 900px) { .coverage-object-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 520px) { .coverage-object-panel { padding: 10px; }.coverage-object-filters { grid-template-columns: 1fr; } }
+@media (max-width: 680px) { .coverage-candidate-worklists { grid-template-columns: 1fr; }.coverage-reference-metrics { grid-template-columns: 1fr; } }
 @media (max-width: 800px) { .coverage-workspace { display: flex; flex-direction: column; }.coverage-workspace .control-panel { border-right: 0; border-bottom: 1px solid #e7ebf1; }.coverage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }.coverage-results { padding: 24px 18px 16px; } }

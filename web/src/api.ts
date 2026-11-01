@@ -135,6 +135,70 @@ export type CoverageObjectView = {
   warnings: string[];
 };
 
+export type CoverageCandidateRole = "pool" | "reference";
+
+export type CoverageCandidateViewInput = {
+  role: CoverageCandidateRole;
+  class_label: string | null;
+  min_short_px: number;
+  confidence_min: number;
+  confidence_max: number;
+  method: ProjectionMethod;
+  dimension: 2 | 3;
+  k: number;
+  limit: number;
+};
+
+export type CoverageCandidatePoint = EmbeddingPoint & {
+  score: number | null;
+  provisional_label: string;
+  role: CoverageCandidateRole;
+};
+
+export type CoverageCandidateWorkRecord = RunRecord & {
+  score: number;
+  provisional_label: string;
+};
+
+export type CoverageClassGap = {
+  label: string;
+  main_count: number;
+  candidate_count: number;
+  uncovered_count: number;
+  state: "missing" | "sparse" | "covered";
+};
+
+export type CoverageCandidateView = {
+  role: CoverageCandidateRole;
+  class_label: string | null;
+  method: ProjectionMethod;
+  requested_method: ProjectionMethod;
+  dimension: 2 | 3;
+  main_count: number;
+  candidate_count: number;
+  main_points: EmbeddingPoint[];
+  candidate_points: CoverageCandidatePoint[];
+  main_sparsity: number[];
+  main_sparse_threshold: number;
+  main_sparse_count: number;
+  k: number;
+  radius: number | null;
+  recall: number | null;
+  uncovered_count: number;
+  work_indices: number[];
+  work_scores: Record<number, number>;
+  work_records: CoverageCandidateWorkRecord[];
+  class_gaps: CoverageClassGap[];
+  warnings: string[];
+};
+
+export type AddCoverageCandidateCurationResult = {
+  added: number;
+  skipped: number;
+  items: CurationItem[];
+  total: number;
+};
+
 export type CoverageProjectionResult = {
   method: ProjectionMethod;
   requested_method: ProjectionMethod;
@@ -371,6 +435,31 @@ export const api = {
   cancelCoverage: (jobId: string) => request<{ job_id: string; state: string }>(
     "/api/v1/coverage/jobs/" + encodeURIComponent(jobId), { method: "DELETE" },
   ),
+  createCoverageCandidateJob: (runId: string, folders: string[]) =>
+    request<{ job_id: string; state: string }>(
+      "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/candidates/jobs",
+      { method: "POST", body: JSON.stringify({ folders }) },
+    ),
+  coverageCandidateJob: (jobId: string) =>
+    request<JobStatus>("/api/v1/coverage/candidate-jobs/" + encodeURIComponent(jobId)),
+  cancelCoverageCandidateJob: (jobId: string) =>
+    request<{ job_id: string; state: string }>(
+      "/api/v1/coverage/candidate-jobs/" + encodeURIComponent(jobId), { method: "DELETE" },
+    ),
+  coverageCandidateView: (runId: string, input: CoverageCandidateViewInput) =>
+    request<CoverageCandidateView>(
+      "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/candidate-view",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  addCoverageCandidatesToCuration: (
+    runId: string,
+    indices: number[],
+    source: "reference" | "reference_class" | "gap_filler",
+    scores: Record<number, number>,
+  ) => request<AddCoverageCandidateCurationResult>(
+    "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/candidates/curation",
+    { method: "POST", body: JSON.stringify({ indices, source, scores }) },
+  ),
   coverageRun: (runId: string) => request<CoverageRun>(
     "/api/v1/coverage/runs/" + encodeURIComponent(runId),
   ),
@@ -388,6 +477,9 @@ export const api = {
       "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/object-view",
       { method: "POST", body: JSON.stringify(input) },
     ),
+  coverageCandidateThumbnailUrl: (runId: string, index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/coverage/runs/"
+      + encodeURIComponent(runId) + "/candidates/" + index + "/thumbnail",
   coverageThumbnailUrl: (runId: string, index: number) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/coverage/runs/"
       + encodeURIComponent(runId) + "/images/" + index + "/thumbnail",

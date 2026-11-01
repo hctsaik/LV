@@ -70,7 +70,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 - 手動路徑欄只供本機開發及測試。React build 與 API 可由單一本機 FastAPI 預覽；NativeApp 交付仍須使用平台 host bridge 和 worker 管理流程。
 - Visualize classifier、detector 整圖與物件級的固定 DINOv2-small 可見 UI 路徑已在 Windows ARM64 通過；Compare 的 deterministic API 與整圖／物件 UI E2E 使用 fixture embedder。來源 Streamlit 數值逐項對照、完整 object candidate workflow、NativeApp folder grant／lifecycle 及 Compare 真實模型仍未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
 - Curation cart 的 fixture API 與可見 Chromium E2E（含不同 worker PID 重開）已通過；這只完成 Visualize 到 cart 的 case slice，不代表跨工具統一收集器、legacy state import、subset folder export 或 NativeApp cache-root 接線完成。
-- Image-level coverage 以獨立 job 保留舊工具「自己選資料夾／模型並開始分析」流程；object-level coverage 使用相同 job 和 YOLO crop path。高維 cosine 稀疏度與顯示投影分開計算；object view 可按 class、confidence、source short edge 篩選並保持來源索引對齊，顯示類別計數／稀疏度、tiny-class 警示與 class blocks，選取後讀回 bbox crop。兩個 coverage slice 的 fixture API 與可見 Chromium E2E 已通過；真實模型數值對照、NativeApp picker／grant／package，以及 object reference/candidate workflow 仍未完成。
+- Image-level coverage 以獨立 job 保留舊工具「自己選資料夾／模型並開始分析」流程；object-level coverage 使用相同 job 和 YOLO crop path。高維 cosine 稀疏度與顯示投影分開計算；object view 可按 class、confidence、source short edge 篩選並保持來源索引對齊，顯示類別計數／稀疏度、tiny-class 警示與 class blocks，選取後讀回 bbox crop。`LV-WEB-03-REF-01` 也已用獨立候選資料夾實作 joint projection、pool gap-filler ranking、reference recall／class gap、候選 bbox thumbnail 與 curation provenance。Image／object／candidate-reference 三個 slice 均有 fixture API 和可見 Chromium E2E；真實模型數值對照、NativeApp picker／grant／package 仍未完成。
 
 ## 5. React 驗收契約
 

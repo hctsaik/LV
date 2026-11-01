@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
@@ -30,6 +31,9 @@ from interaction import (
     draw_yolo_boxes,
     find_duplicate_pairs_embedding,
     find_duplicate_pairs_phash,
+    nearest_labels,
+    rank_gap_fillers,
+    reference_coverage,
     records_to_csv,
     snapshots_to_csv,
     zip_selected_images,
@@ -105,6 +109,30 @@ class CoverageObjectViewRequest(BaseModel):
     dimension: Literal[2, 3] = 2
     k: int = Field(default=10, ge=1, le=1000)
     block_k: int = Field(default=8, ge=3, le=20)
+
+
+class CreateCoverageCandidateJob(BaseModel):
+    folders: list[str] = Field(min_length=1, max_length=32)
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+
+
+class CoverageCandidateViewRequest(BaseModel):
+    role: Literal["pool", "reference"] = "pool"
+    class_label: str | None = Field(default=None, max_length=256)
+    min_short_px: int = Field(default=0, ge=0, le=4096)
+    confidence_min: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence_max: float = Field(default=1.0, ge=0.0, le=1.0)
+    method: Literal["pca", "tsne", "umap", "lda", "sumap"] = "pca"
+    dimension: Literal[2, 3] = 2
+    k: int = Field(default=10, ge=1, le=1000)
+    limit: int = Field(default=12, ge=1, le=60)
+
+
+class AddCoverageCandidateCurationRequest(BaseModel):
+    indices: list[int] = Field(min_length=1, max_length=10000)
+    source: Literal["reference", "reference_class", "gap_filler"]
+    scores: dict[int, float] = Field(default_factory=dict)
+    reason: str = Field(default="", max_length=2000)
 
 
 class ProjectComparisonRequest(BaseModel):
@@ -199,7 +227,21 @@ class _CoverageJob:
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
-def _job_view(job: _Job | _ComparisonJob | _CoverageJob) -> dict:
+@dataclass
+class _CoverageCandidateJob:
+    job_id: str
+    run_id: str
+    request: CreateCoverageCandidateJob
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    error: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob) -> dict:
     return {
         "job_id": job.job_id,
         "state": job.state,
@@ -247,6 +289,8 @@ def create_app(
     app.state.coverage_runs = {}
     app.state.coverage_embeddings = {}
     app.state.coverage_sparsity = {}
+    app.state.coverage_candidate_jobs = {}
+    app.state.coverage_candidates = {}
     app.state.curation_store = CurationStore()
     app.state.lock = threading.RLock()
 
@@ -255,6 +299,7 @@ def create_app(
             list(app.state.jobs.values())
             + list(app.state.comparison_jobs.values())
             + list(app.state.coverage_jobs.values())
+            + list(app.state.coverage_candidate_jobs.values())
         )
         return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
@@ -476,6 +521,7 @@ def create_app(
                 "model_id": job.request.model_id,
                 "unit": job.request.unit,
                 "object_policy": result.get("object_policy"),
+                "class_names": result.get("class_names", []),
                 "method": used_method,
                 "requested_method": job.request.method,
                 "dimension": job.request.dimension,
@@ -494,6 +540,7 @@ def create_app(
                 app.state.coverage_runs.clear()
                 app.state.coverage_embeddings.clear()
                 app.state.coverage_sparsity.clear()
+                app.state.coverage_candidates.clear()
                 app.state.coverage_runs[run_id] = run
                 app.state.coverage_embeddings[run_id] = np.asarray(vectors, dtype=np.float32)
                 app.state.coverage_sparsity[run_id] = {k: run["sparsity"]}
@@ -560,6 +607,158 @@ def create_app(
             job = app.state.coverage_jobs.get(job_id)
             if job is None:
                 raise HTTPException(status_code=404, detail="Coverage job not found")
+            if job.state in {"queued", "running"}:
+                job.state, job.phase, job.message = "cancelling", "cancelling", "Cancellation requested"
+                job.cancel_event.set()
+            return {"job_id": job.job_id, "state": job.state}
+
+    def execute_coverage_candidate_job(job: _CoverageCandidateJob) -> None:
+        try:
+            with app.state.lock:
+                run = app.state.coverage_runs.get(job.run_id)
+            if run is None:
+                raise VisualizationInputError("RUN_NOT_FOUND", "The coverage run is no longer available.")
+            if run["model_id"] not in set(catalog()):
+                raise VisualizationInputError("MODEL_UNAVAILABLE", "The coverage model is no longer installed.")
+
+            records: list[dict] = []
+            image_paths: list[Path] = []
+            embedding_batches: list[np.ndarray] = []
+            warnings: list[str] = []
+            mode = "detector" if run["unit"] == "object" else "classifier"
+            fallback_names = job.request.class_names or run.get("class_names", [])
+            for folder_value in job.request.folders:
+                if job.cancel_event.is_set():
+                    raise JobCancelled()
+                base_done = job.done
+
+                def update_candidate_progress(done: int, total: int) -> None:
+                    with app.state.lock:
+                        job.phase = "embedding"
+                        job.done = base_done + done
+                        job.total = base_done + total
+                        job.message = f"Embedding candidate folder ({job.done}/{job.total})"
+
+                try:
+                    result = run_image_visualization(
+                        [folder_value],
+                        model_names=[run["model_id"]],
+                        methods=["pca"],
+                        mode=mode,
+                        unit=run["unit"],
+                        class_names=fallback_names,
+                        object_policy=run.get("object_policy"),
+                        model_loader=loader,
+                        object_model_loader=object_loader,
+                        include_raw_embeddings=True,
+                        progress=update_candidate_progress,
+                        cancelled=job.cancel_event.is_set,
+                    )
+                except VisualizationInputError as exc:
+                    if exc.code in {"NO_IMAGES", "NO_OBJECTS", "INVALID_DETECTOR_DATASET"}:
+                        warnings.append(f"{Path(folder_value).name}: {exc}")
+                        continue
+                    raise
+                vectors = result.pop("_raw_embeddings", {}).get(run["model_id"])
+                if vectors is None or len(vectors) != len(result["records"]):
+                    raise VisualizationInputError(
+                        "INVALID_EMBEDDINGS", "Candidate embeddings could not be aligned to their records.",
+                    )
+                offset = len(records)
+                records.extend({**record, "index": offset + index}
+                               for index, record in enumerate(result["records"])
+                )
+                image_paths.extend(Path(path) for path in result["image_paths"])
+                embedding_batches.append(np.asarray(vectors, dtype=np.float32))
+                warnings.extend(result.get("warnings", []))
+
+            if not records or not embedding_batches:
+                detail = "No readable candidate images were found in the selected folders."
+                if warnings:
+                    detail = "No candidate records were found. " + " ".join(warnings)
+                raise VisualizationInputError("NO_CANDIDATES", detail)
+            vectors = np.vstack(embedding_batches).astype(np.float32, copy=False)
+            if vectors.ndim != 2 or vectors.shape[0] != len(records) or not np.isfinite(vectors).all():
+                raise VisualizationInputError("INVALID_EMBEDDINGS", "Candidate embeddings are invalid.")
+            candidate_set = {
+                "run_id": job.run_id,
+                "unit": run["unit"],
+                "model_id": run["model_id"],
+                "records": records,
+                "image_paths": image_paths,
+                "embeddings": vectors,
+                "embedding_shape": [int(vectors.shape[0]), int(vectors.shape[1])],
+                "warnings": warnings,
+            }
+            with app.state.lock:
+                if app.state.coverage_runs.get(job.run_id) is None:
+                    raise VisualizationInputError("RUN_NOT_FOUND", "The coverage run is no longer available.")
+                app.state.coverage_candidates[job.run_id] = candidate_set
+                job.state, job.phase, job.message = "completed", "completed", "Completed"
+                job.done = job.total = len(records)
+        except JobCancelled:
+            with app.state.lock:
+                job.state, job.phase, job.message = "cancelled", "cancelled", "Cancelled"
+        except VisualizationInputError as exc:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", exc.code
+                job.error = {"code": exc.code, "message": str(exc), "request_id": job.job_id}
+        except FileNotFoundError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "MODEL_UNAVAILABLE"
+                job.error = {
+                    "code": "MODEL_UNAVAILABLE",
+                    "message": "The selected model weights are unavailable.",
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV web coverage candidate analysis failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "RUN_FAILED"
+                job.error = {
+                    "code": "RUN_FAILED",
+                    "message": "Candidate analysis failed. Check the local worker log and retry.",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/coverage/runs/{run_id}/candidates/jobs", status_code=202)
+    def create_coverage_candidate_job(run_id: str, request: CreateCoverageCandidateJob) -> dict:
+        job_id = uuid.uuid4().hex
+        with app.state.lock:
+            if app.state.coverage_runs.get(run_id) is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "Wait for the active analysis to finish before adding candidates.",
+                    "request_id": job_id,
+                })
+            job = _CoverageCandidateJob(job_id=job_id, run_id=run_id, request=request)
+            app.state.coverage_candidate_jobs[job_id] = job
+        threading.Thread(
+            target=execute_coverage_candidate_job,
+            args=(job,),
+            daemon=True,
+            name=f"lv-coverage-candidates-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/coverage/candidate-jobs/{job_id}")
+    def get_coverage_candidate_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.coverage_candidate_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Coverage candidate job not found")
+            result = _job_view(job)
+            result["run_id"] = job.run_id
+            return result
+
+    @app.delete("/api/v1/coverage/candidate-jobs/{job_id}", status_code=202)
+    def cancel_coverage_candidate_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.coverage_candidate_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Coverage candidate job not found")
             if job.state in {"queued", "running"}:
                 job.state, job.phase, job.message = "cancelling", "cancelling", "Cancellation requested"
                 job.cancel_event.set()
@@ -763,6 +962,218 @@ def create_app(
             "warnings": warnings,
         }
 
+    @app.post("/api/v1/coverage/runs/{run_id}/candidate-view")
+    def get_coverage_candidate_view(run_id: str, request: CoverageCandidateViewRequest) -> dict:
+        if request.confidence_min > request.confidence_max:
+            raise HTTPException(status_code=422, detail="Minimum confidence must not exceed maximum confidence")
+        with app.state.lock:
+            run = app.state.coverage_runs.get(run_id)
+            main_vectors = app.state.coverage_embeddings.get(run_id)
+            candidate_set = app.state.coverage_candidates.get(run_id)
+            if run is None or main_vectors is None:
+                raise HTTPException(status_code=404, detail="Coverage run not found")
+            if candidate_set is None:
+                raise HTTPException(status_code=409, detail="Project candidate folders before requesting a candidate view")
+            main_records = run["records"]
+            candidate_records = candidate_set["records"]
+            main_vectors = np.asarray(main_vectors)
+            candidate_vectors = np.asarray(candidate_set["embeddings"])
+
+        def keep_record(record: dict) -> bool:
+            if run["unit"] != "object":
+                return True
+            short_px = int(record.get("short_px", 0) or 0)
+            if short_px < request.min_short_px:
+                return False
+            score = record.get("score")
+            if score is not None and not request.confidence_min <= float(score) <= request.confidence_max:
+                return False
+            return True
+
+        main_indices = [
+            index for index, record in enumerate(main_records)
+            if keep_record(record)
+            and (request.class_label is None or str(record.get("label", "")) == request.class_label)
+        ]
+        candidate_indices = [
+            index for index, record in enumerate(candidate_records)
+            if keep_record(record)
+            and (request.class_label is None or str(record.get("label", "")) == request.class_label)
+        ]
+        selected_main_records = [main_records[index] for index in main_indices]
+        selected_candidate_records = [candidate_records[index] for index in candidate_indices]
+        selected_main_vectors = main_vectors[main_indices]
+        selected_candidate_vectors = candidate_vectors[candidate_indices]
+        main_labels = [str(record.get("label", "")) for record in selected_main_records]
+        candidate_labels = [str(record.get("label", "")) for record in selected_candidate_records]
+        warnings = list(candidate_set.get("warnings", []))
+        if request.class_label is not None and not selected_candidate_records:
+            warnings.append(
+                f"No candidate objects match {request.class_label}. Check candidate class names or choose another class."
+            )
+        elif not selected_candidate_records:
+            warnings.append("No candidates match the current confidence and source-size filters.")
+        if not selected_main_records:
+            warnings.append("No main records match the current class and object filters; coverage cannot be measured.")
+
+        bounded_k = min(request.k, max(1, len(selected_main_vectors) - 1))
+        main_sparsity = coverage_sparsity(selected_main_vectors, bounded_k)
+        radius = 0.0
+        if len(selected_main_vectors) >= 2:
+            nn = NearestNeighbors(metric="cosine", n_neighbors=2).fit(selected_main_vectors)
+            distances, _ = nn.kneighbors(selected_main_vectors)
+            radius = float(np.percentile(distances[:, 1], 75))
+
+        provisional_labels = nearest_labels(
+            selected_candidate_vectors, selected_main_vectors, main_labels,
+        )
+        candidate_scores_by_local: dict[int, float] = {}
+        if not len(selected_main_vectors):
+            ranked_local: list[int] = []
+            work_local: list[int] = []
+            recall = None
+            warnings.append("Candidate ranking needs at least one main record.")
+        elif not len(selected_candidate_vectors):
+            ranked_local = []
+            work_local = []
+            recall = None
+            if request.role == "reference":
+                warnings.append("Reference coverage is unavailable because no candidate rows remain after filtering.")
+        elif request.role == "pool":
+            ranked_local, ranked_scores = rank_gap_fillers(
+                selected_candidate_vectors, selected_main_vectors, k=bounded_k,
+            )
+            candidate_scores_by_local = {
+                index: float(score) for index, score in zip(ranked_local, ranked_scores)
+            }
+            work_local = ranked_local
+            recall = None
+        else:
+            uncovered_local, recall, distances = reference_coverage(
+                selected_main_vectors, selected_candidate_vectors, radius,
+            )
+            candidate_scores_by_local = {
+                index: float(distances[index]) for index in range(len(distances))
+            }
+            work_local = uncovered_local
+            ranked_local = uncovered_local
+
+        combined_vectors = np.vstack([selected_main_vectors, selected_candidate_vectors])
+        combined_labels = main_labels + provisional_labels
+        if len(combined_vectors):
+            try:
+                coordinates, used_method, projection_warnings = coverage_projection(
+                    combined_vectors,
+                    combined_labels,
+                    request.method,
+                    request.dimension,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            warnings.extend(projection_warnings)
+            main_coordinates = coordinates[:len(selected_main_vectors)]
+            candidate_coordinates = coordinates[len(selected_main_vectors):]
+        else:
+            used_method = request.method
+            main_coordinates = np.zeros((0, request.dimension), dtype=np.float64)
+            candidate_coordinates = np.zeros((0, request.dimension), dtype=np.float64)
+        main_points = coverage_points(selected_main_records, main_coordinates)
+        candidate_points = []
+        score_by_global_index: dict[int, float] = {}
+        work_indices = []
+        work_scores: dict[int, float] = {}
+        for local_index in ranked_local:
+            global_index = candidate_indices[local_index]
+            score = candidate_scores_by_local.get(local_index, 0.0)
+            score_by_global_index[global_index] = score
+        for local_index in work_local:
+            global_index = candidate_indices[local_index]
+            work_indices.append(global_index)
+            work_scores[global_index] = candidate_scores_by_local.get(local_index, 0.0)
+        for local_index, record in enumerate(selected_candidate_records):
+            candidate_points.append({
+                **record,
+                "index": int(record.get("index", candidate_indices[local_index])),
+                "x": float(candidate_coordinates[local_index, 0]),
+                "y": float(candidate_coordinates[local_index, 1]),
+                "z": float(candidate_coordinates[local_index, 2])
+                if candidate_coordinates.shape[1] > 2 else 0.0,
+                "score": score_by_global_index.get(candidate_indices[local_index]),
+                "provisional_label": provisional_labels[local_index],
+                "role": request.role,
+            })
+
+        class_gaps = []
+        if run["unit"] == "object" and request.role == "reference" and request.class_label is None:
+            main_counts: dict[str, int] = {}
+            candidate_counts: dict[str, int] = {}
+            uncovered_counts: dict[str, int] = {}
+            uncovered_set = set(work_indices)
+            for record in selected_main_records:
+                label = str(record.get("label", ""))
+                main_counts[label] = main_counts.get(label, 0) + 1
+            for record in selected_candidate_records:
+                label = str(record.get("label", ""))
+                candidate_counts[label] = candidate_counts.get(label, 0) + 1
+                if int(record.get("index", -1)) in uncovered_set:
+                    uncovered_counts[label] = uncovered_counts.get(label, 0) + 1
+            for label in sorted(candidate_counts, key=lambda item: (
+                main_counts.get(item, 0) != 0, -uncovered_counts.get(item, 0), item,
+            )):
+                count = candidate_counts[label]
+                uncovered_count = uncovered_counts.get(label, 0)
+                if main_counts.get(label, 0) == 0:
+                    state = "missing"
+                elif uncovered_count / max(count, 1) > 0.6:
+                    state = "sparse"
+                else:
+                    state = "covered"
+                class_gaps.append({
+                    "label": label,
+                    "main_count": main_counts.get(label, 0),
+                    "candidate_count": count,
+                    "uncovered_count": uncovered_count,
+                    "state": state,
+                })
+
+        selected_work = [
+            {
+                **candidate_records[index],
+                "score": work_scores.get(index, 0.0),
+                "provisional_label": next((
+                    point["provisional_label"] for point in candidate_points
+                    if point["index"] == index
+                ), ""),
+            }
+            for index in work_indices[:request.limit]
+        ]
+        main_threshold, main_sparse_count = sparse_threshold(
+            np.asarray(main_sparsity, dtype=np.float64), 80.0,
+        )
+        return {
+            "role": request.role,
+            "class_label": request.class_label,
+            "method": used_method,
+            "requested_method": request.method,
+            "dimension": request.dimension,
+            "main_count": len(selected_main_records),
+            "candidate_count": len(selected_candidate_records),
+            "main_points": main_points,
+            "candidate_points": candidate_points,
+            "main_sparsity": np.asarray(main_sparsity, dtype=float).tolist(),
+            "main_sparse_threshold": main_threshold,
+            "main_sparse_count": main_sparse_count,
+            "k": bounded_k,
+            "radius": radius if len(selected_main_vectors) >= 2 else None,
+            "recall": recall,
+            "uncovered_count": len(work_indices) if request.role == "reference" else 0,
+            "work_indices": work_indices,
+            "work_scores": work_scores,
+            "work_records": selected_work,
+            "class_gaps": class_gaps,
+            "warnings": warnings,
+        }
+
     @app.get("/api/v1/coverage/runs/{run_id}/images/{index}/thumbnail")
     def get_coverage_thumbnail(run_id: str, index: int) -> Response:
         with app.state.lock:
@@ -778,6 +1189,37 @@ def create_app(
             raise HTTPException(status_code=404, detail="Image is no longer available")
         if run.get("unit") == "object":
             record = run["records"][index]
+            bbox = record.get("bbox")
+            if bbox is not None:
+                width, height = thumbnail.size
+                long_side = max(float(bbox[2]) * width, float(bbox[3]) * height)
+                pad_px = int(min(64, max(8, round(0.12 * long_side))))
+                thumbnail = crop_bbox(thumbnail, *bbox, pad_px=pad_px)
+        thumbnail.thumbnail((256, 256))
+        output = BytesIO()
+        thumbnail.save(output, format="JPEG", quality=84, optimize=True)
+        return Response(
+            content=output.getvalue(),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/v1/coverage/runs/{run_id}/candidates/{index}/thumbnail")
+    def get_coverage_candidate_thumbnail(run_id: str, index: int) -> Response:
+        with app.state.lock:
+            candidate_set = app.state.coverage_candidates.get(run_id)
+            if candidate_set is None:
+                raise HTTPException(status_code=404, detail="Coverage candidates not found")
+            paths: list[Path] = candidate_set["image_paths"]
+            if index < 0 or index >= len(paths):
+                raise HTTPException(status_code=404, detail="Candidate image not found")
+            path = paths[index]
+            record = candidate_set["records"][index]
+            unit = candidate_set["unit"]
+        thumbnail = safe_open_image(path)
+        if thumbnail is None:
+            raise HTTPException(status_code=404, detail="Candidate image is no longer available")
+        if unit == "object":
             bbox = record.get("bbox")
             if bbox is not None:
                 width, height = thumbnail.size
@@ -1054,6 +1496,71 @@ def create_app(
     def get_curation_items() -> dict:
         items = curation_snapshot()
         return {"items": [public_curation_item(item) for item in items], "total": len(items)}
+
+    @app.post("/api/v1/coverage/runs/{run_id}/candidates/curation", status_code=201)
+    def add_coverage_candidates_to_curation(
+        run_id: str,
+        request: AddCoverageCandidateCurationRequest,
+    ) -> dict:
+        with app.state.lock:
+            candidate_set = app.state.coverage_candidates.get(run_id)
+            if candidate_set is None:
+                raise HTTPException(status_code=404, detail="Coverage candidates not found")
+            records = candidate_set["records"]
+            paths: list[Path] = candidate_set["image_paths"]
+            if any(index < 0 or index >= len(records) or index >= len(paths) for index in request.indices):
+                raise HTTPException(status_code=422, detail={
+                    "code": "INVALID_RECORD_INDEX",
+                    "message": "A selected candidate is not part of this coverage run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            entries = []
+            for index in dict.fromkeys(request.indices):
+                record = records[index]
+                try:
+                    path = Path(paths[index]).expanduser().resolve(strict=True)
+                    if not path.is_file():
+                        raise OSError("source is not a file")
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                except OSError as exc:
+                    raise HTTPException(status_code=404, detail={
+                        "code": "CURATION_IMAGE_UNAVAILABLE",
+                        "message": "A selected candidate image is no longer available.",
+                        "request_id": uuid.uuid4().hex,
+                    }) from exc
+                entry = {
+                    "index": index,
+                    "filename": str(record.get("filename", path.name)),
+                    "path": str(path),
+                    "label": str(record.get("label", "")),
+                    "split": str(record.get("split", "")),
+                    "sha256": digest.hexdigest(),
+                    "source": request.source,
+                    "score": request.scores.get(index),
+                    "reason": request.reason.strip(),
+                    "level": candidate_set["unit"],
+                }
+                if candidate_set["unit"] == "object":
+                    entry.update({
+                        "image_path": str(path),
+                        "bbox": record.get("bbox"),
+                        "obj_index": record.get("obj_index"),
+                    })
+                entries.append(entry)
+            try:
+                added, skipped = app.state.curation_store.add(entries)
+                items = app.state.curation_store.list_items()
+            except CurationStoreError as exc:
+                raise curation_store_error() from exc
+        return {
+            "added": added,
+            "skipped": skipped,
+            "items": [public_curation_item(item) for item in items],
+            "total": len(items),
+        }
 
     @app.post("/api/v1/runs/{run_id}/curation/items", status_code=201)
     def add_run_records_to_curation(run_id: str, request: AddCurationRequest) -> dict:

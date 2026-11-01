@@ -48,6 +48,10 @@ DETECTOR_FIXTURE_SHA256 = {
     "train/labels/01.txt": "27870ce778e19c56104999640fb7fcdc18751cab266b594e4c462c4960284748",
     "train/labels/02.txt": "4ea54c88845a9d9e59da0f008b0d72db82edd68ec37f615a00b016e9727aed22",
 }
+COVERAGE_REF_FIXTURE_TREE_SHA256 = {
+    "main": "d372c90e9203550f627f044a29a0f35241a97df216e024f96e45d7d9267ba337",
+    "candidate": "2f6e47474450aae0443d6b0e755657f36f81bcd753f6420e0cd03d0c0376782e",
+}
 DETECTOR_FIXTURE_SHA256 = {
     "classes.txt": "6790a8ef4600c53847701c63920499d8ea56375232a8de32fc15b3e26b9d6ba4",
     "test/images/03.png": "d1db8754763264c772e91c2d290fa34eb4fccde5347547a0b88508a03a78e2a8",
@@ -177,6 +181,43 @@ def _object_coverage_fixture(root: Path) -> tuple[list[Path], dict[str, str]]:
     classes_path = root / "classes.txt"
     hashes[str(classes_path)] = hashlib.sha256(classes_path.read_bytes()).hexdigest()
     return [train, test], hashes
+
+
+def _candidate_object_coverage_fixture(root: Path) -> tuple[list[Path], dict[str, str]]:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "classes.txt").write_text("beta\nalpha\ngamma\n", encoding="utf-8")
+    train, test = root / "train", root / "test"
+    specs = [
+        (train, "11.png", 1, 0.55, 0.55, 0.92),
+        (train, "12.png", 2, 0.45, 0.40, 0.90),
+        (test, "13.png", 0, 0.50, 0.50, 0.95),
+    ]
+    colors = [(235, 35, 45), (25, 225, 65), (30, 55, 240)]
+    hashes: dict[str, str] = {}
+    for index, (folder, filename, class_id, width, height, confidence) in enumerate(specs):
+        image_dir, label_dir = folder / "images", folder / "labels"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        image_path = image_dir / filename
+        Image.new("RGB", (64, 64), colors[index]).save(image_path)
+        label_path = label_dir / f"{Path(filename).stem}.txt"
+        label_path.write_text(
+            f"{class_id} 0.5 0.5 {width} {height} {confidence}\n",
+            encoding="utf-8",
+        )
+        hashes[str(image_path)] = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        hashes[str(label_path)] = hashlib.sha256(label_path.read_bytes()).hexdigest()
+    classes_path = root / "classes.txt"
+    hashes[str(classes_path)] = hashlib.sha256(classes_path.read_bytes()).hexdigest()
+    return [train, test], hashes
+
+
+def _fixture_tree_digest(root: Path, source_hashes: dict[str, str]) -> str:
+    rows = sorted(
+        f"{Path(path).relative_to(root).as_posix()}:{digest}"
+        for path, digest in source_hashes.items()
+    )
+    return hashlib.sha256("\n".join(rows).encode("utf-8")).hexdigest()
 
 
 def _start_api(application):
@@ -1005,6 +1046,165 @@ def test_lv_web_03_obj_01_visible_object_coverage_filters_blocks_and_crop_readba
             expect(selected.locator("small").nth(1)).to_contain_text("Object ")
             thumbnail_src = image.get_attribute("src")
             assert thumbnail_src and page.request.get(base_url + thumbnail_src).status == 200
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
+def test_lv_web_03_ref_01_visible_candidate_pool_reference_and_curation_journey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """React projects a separate candidate pool/reference and keeps class, crop, and curation identity aligned."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    main_root = tmp_path / "reference-main"
+    candidate_root = tmp_path / "reference-candidates"
+    main_folders, main_hashes = _object_coverage_fixture(main_root)
+    candidate_folders, candidate_hashes = _candidate_object_coverage_fixture(candidate_root)
+    assert _fixture_tree_digest(main_root, main_hashes) == COVERAGE_REF_FIXTURE_TREE_SHA256["main"]
+    assert _fixture_tree_digest(candidate_root, candidate_hashes) == COVERAGE_REF_FIXTURE_TREE_SHA256["candidate"]
+    source_hashes = {**main_hashes, **candidate_hashes}
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def object_loader(_model_id: str, **_kwargs):
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            vector[4] = crop.height / 100.0
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: lambda _path: np.array([1.0] + [0.0] * 383, dtype=np.float32),
+        object_model_loader=object_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1540, "height": 1200}, accept_downloads=True)
+            page.set_default_timeout(20_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            page.get_by_label("Analysis unit").select_option("object")
+            page.get_by_label("Projection method").select_option("pca")
+            for folder in main_folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("coverage-point")).to_have_count(8)
+
+            for folder in candidate_folders:
+                page.get_by_test_id("coverage-candidate-folder-path").fill(str(folder))
+                page.get_by_role("button", name="Add candidate folder").click()
+            with page.expect_response(
+                lambda response: response.url.endswith("/candidate-view")
+                and response.request.method == "POST" and response.ok,
+                timeout=60_000,
+            ) as pool_view_response:
+                page.get_by_test_id("coverage-project-candidates").click()
+            expect(page.get_by_test_id("coverage-candidate-job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("coverage-candidate-counts")).to_contain_text("3 candidates")
+            expect(page.get_by_test_id("coverage-candidate-point")).to_have_count(3)
+            expect(page.get_by_test_id("coverage-candidate-work-item")).to_have_count(3)
+            pool_view = pool_view_response.value.json()
+            assert [point["label"] for point in pool_view["candidate_points"]] == ["alpha", "gamma", "beta"]
+            for records in (pool_view["main_points"], pool_view["candidate_points"], pool_view["work_records"]):
+                assert all("path" not in record and "image_path" not in record for record in records)
+
+            pool_point = page.get_by_test_id("coverage-candidate-point")
+            pool_point.nth(0).focus()
+            pool_point.nth(0).press("Enter")
+            expect(page.get_by_test_id("coverage-selected-candidate-count")).to_have_text("1 selected")
+            selected_candidate = page.get_by_test_id("coverage-selected-candidate").first
+            candidate_image = selected_candidate.locator("img")
+            expect(candidate_image).to_have_js_property("complete", True)
+            assert 0 < candidate_image.evaluate("node => node.naturalWidth") < 64
+            page.get_by_test_id("coverage-add-selected-candidates").click()
+            expect(page.locator(".notice-banner")).to_contain_text("Added 1 candidate(s) to curation")
+
+            page.get_by_test_id("coverage-dimension-3d").click()
+            expect(page.locator("[data-testid='coverage-plot'] [data-testid='coverage-plot-3d']")).to_be_visible()
+            expect(page.get_by_test_id("coverage-candidate-point")).to_have_count(3, timeout=60_000)
+            pool_point = page.get_by_test_id("coverage-candidate-point")
+            pool_point.nth(1).focus()
+            pool_point.nth(1).press("Enter")
+            expect(page.get_by_test_id("coverage-selected-candidate-count")).to_have_text("2 selected")
+            page.get_by_test_id("coverage-dimension-2d").click()
+            expect(page.get_by_test_id("coverage-candidate-point")).to_have_count(3, timeout=60_000)
+            expect(page.get_by_test_id("coverage-selected-candidate-count")).to_have_text("2 selected")
+            page.get_by_test_id("coverage-add-selected-candidates").click()
+            page.get_by_test_id("coverage-add-top-candidates").click()
+            expect(page.locator(".notice-banner")).to_contain_text("Added 1 candidate(s) to curation; skipped 2 duplicate(s).")
+            pool_items_response = page.request.get(base_url + "/api/v1/curation/items")
+            pool_items = pool_items_response.json()["items"]
+            assert len(pool_items) == 3
+            assert {item["source"] for item in pool_items} == {"gap_filler"}
+            assert all(item["level"] == "object" and item.get("obj_index") is not None for item in pool_items)
+
+            page.get_by_test_id("open-curation").click()
+            expect(page.get_by_test_id("curation-item")).to_have_count(3)
+            page.get_by_role("button", name="Clear list").click()
+            page.get_by_role("button", name="Confirm clear list").click()
+            expect(page.get_by_test_id("curation-empty")).to_be_visible()
+            page.get_by_role("button", name="Coverage", exact=True).click()
+
+            page.get_by_test_id("coverage-candidate-role").select_option("reference")
+            with page.expect_response(
+                lambda response: response.url.endswith("/candidate-view")
+                and response.request.method == "POST" and response.ok,
+                timeout=60_000,
+            ) as reference_view_response:
+                page.get_by_test_id("coverage-refresh-candidate-view").click()
+            reference_view = reference_view_response.value.json()
+            assert reference_view["recall"] is not None
+            assert 0.0 <= reference_view["recall"] <= 1.0
+            gamma = next(row for row in reference_view["class_gaps"] if row["label"] == "gamma")
+            assert gamma["main_count"] == 0 and gamma["candidate_count"] == 1 and gamma["state"] == "missing"
+            expect(page.get_by_test_id("coverage-reference-recall")).not_to_have_text("Unavailable")
+            expect(page.locator('[data-testid="coverage-class-gap-row"][data-label="gamma"]')).to_contain_text("missing")
+            reference_point = page.get_by_test_id("coverage-candidate-point")
+            reference_point.nth(0).focus()
+            reference_point.nth(0).press("Enter")
+            expect(page.get_by_test_id("coverage-selected-candidate")).to_have_count(1)
+            page.get_by_test_id("coverage-add-selected-candidates").click()
+            reference_items = page.request.get(base_url + "/api/v1/curation/items").json()["items"]
+            assert len(reference_items) == 1
+            assert reference_items[0]["source"] == "reference"
+
+            page.get_by_test_id("coverage-object-class").select_option("gamma")
+            page.get_by_test_id("coverage-apply-object-filters").click()
+            expect(page.get_by_test_id("coverage-candidate-counts")).to_contain_text("0 main")
+            expect(page.get_by_test_id("coverage-candidate-counts")).to_contain_text("1 candidates")
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("0")
+            expect(page.get_by_test_id("coverage-reference-recall")).to_have_text("Unavailable")
+            expect(page.locator(".coverage-warning").filter(has_text="No main records match")).to_be_visible()
+            expect(page.get_by_test_id("coverage-candidate-point")).to_have_count(1)
+            gamma_point = page.get_by_test_id("coverage-candidate-point")
+            gamma_point.focus()
+            gamma_point.press("Enter")
+            page.get_by_test_id("coverage-add-selected-candidates").click()
+            gamma_items = page.request.get(base_url + "/api/v1/curation/items").json()["items"]
+            assert len(gamma_items) == 2
+            gamma_item = next(item for item in gamma_items if item["label"] == "gamma")
+            assert gamma_item["source"] == "reference_class"
+            assert gamma_item["level"] == "object" and gamma_item["obj_index"] == 0
             browser.close()
     finally:
         if server is not None:
