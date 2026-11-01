@@ -440,7 +440,7 @@ def project_comparison(
     emb_b = comparison["_embeddings_b"][keep_b]
     combined = np.vstack([emb_a, emb_b])
     groups = ["A"] * len(emb_a) + ["B"] * len(emb_b)
-    projections, warnings = _project_embeddings(combined, groups, [method])
+    projections, warnings, _umap_reference_status = _project_embeddings(combined, groups, [method])
     actual_method = method if method in projections else next(iter(projections))
     coordinates = projections[actual_method]
     if coordinates.shape[1] < dimension:
