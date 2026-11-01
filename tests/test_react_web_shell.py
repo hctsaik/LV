@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import time
+import types
 from pathlib import Path
 from threading import Event
 
@@ -15,6 +17,28 @@ from PIL import Image
 
 from react_web_shell import create_app
 from visualize_embeddings import discover_images_classifier
+
+
+class _DeterministicUMAP:
+    """Small picklable reducer used to exercise the reference-frame contract."""
+
+    fit_calls = 0
+    transform_calls = 0
+
+    def __init__(self, *, n_components: int, n_neighbors: int, random_state: int):
+        self.n_components = n_components
+        self.n_neighbors = n_neighbors
+        self.random_state = random_state
+        self.offset = 0.0
+
+    def fit_transform(self, values: np.ndarray) -> np.ndarray:
+        type(self).fit_calls += 1
+        self.offset = float(type(self).fit_calls)
+        return np.asarray(values[:, :self.n_components], dtype=np.float64) + self.offset
+
+    def transform(self, values: np.ndarray) -> np.ndarray:
+        type(self).transform_calls += 1
+        return np.asarray(values[:, :self.n_components], dtype=np.float64) + self.offset + 10.0
 
 
 @pytest.fixture
@@ -262,6 +286,136 @@ def test_case_lv_web_01_ic_02_multi_model_projection_views(
         assert [point["index"] for point in view["points"]] == list(range(4))
     assert run["model_id"] == selected_models[0]
     assert run["method"] == "pca"
+
+
+def test_case_lv_web_01_ic_03_fixed_umap_reference_frame(
+    classifier_fixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Known images stay fixed; new images transform into the frame; rebuild refits."""
+    fake_umap = types.ModuleType("umap")
+    fake_umap.UMAP = _DeterministicUMAP
+    monkeypatch.setitem(sys.modules, "umap", fake_umap)
+    if "umap_ref" in sys.modules:
+        monkeypatch.setattr(sys.modules["umap_ref"], "umap", fake_umap)
+    _DeterministicUMAP.fit_calls = 0
+    _DeterministicUMAP.transform_calls = 0
+
+    payload = {
+        "folders": [str(folder) for folder in classifier_fixture["folders"]],
+        "model_ids": ["dinov2_vits14"],
+        "methods": ["umap"],
+        "umap_reference": True,
+    }
+
+    def run(client: TestClient, request: dict = payload) -> dict:
+        job = _run_custom(client, request)
+        assert job["state"] == "completed", job
+        return client.get("/api/v1/runs/" + job["run_id"]).json()
+
+    def umap_points(result: dict) -> dict[str, tuple[float, float, float]]:
+        view = next(view for view in result["views"] if view["method"] == "umap")
+        return {
+            point["filename"]: (point["x"], point["y"], point["z"])
+            for point in view["points"]
+        }
+
+    with _client(monkeypatch, tmp_path, embedder=_fake_embedder()) as client:
+        first = run(client)
+        assert first["umap_reference"] == {
+            "enabled": True,
+            "by_model": {"dinov2_vits14": {"refitted": True, "new_points": 0}},
+        }
+        first_points = umap_points(first)
+
+        repeated = run(client)
+        assert repeated["umap_reference"]["by_model"]["dinov2_vits14"] == {
+            "refitted": False, "new_points": 0,
+        }
+        assert umap_points(repeated) == first_points
+
+        new_image = classifier_fixture["folders"][0] / "apple" / "99.png"
+        Image.new("RGB", (32, 32), (180, 90, 35)).save(new_image)
+        extended = run(client)
+        extension_status = extended["umap_reference"]["by_model"]["dinov2_vits14"]
+        assert extension_status == {"refitted": False, "new_points": 1}
+        extended_points = umap_points(extended)
+        assert all(extended_points[name] == coords for name, coords in first_points.items())
+        assert "99.png" in extended_points
+        assert _DeterministicUMAP.transform_calls == 1
+
+        new_image.unlink()
+        reduced = run(client)
+        assert reduced["umap_reference"]["by_model"]["dinov2_vits14"] == {
+            "refitted": False, "new_points": 0,
+        }
+        assert umap_points(reduced) == first_points
+
+        reference_files = list((tmp_path.parent / f"{tmp_path.name}-lv-cache").rglob("umap_ref.pkl"))
+        assert len(reference_files) == 1
+        assert not reference_files[0].is_relative_to(classifier_fixture["root"])
+
+        rebuilt = run(client, {**payload, "umap_rebuild": True})
+        assert rebuilt["umap_reference"]["by_model"]["dinov2_vits14"] == {
+            "refitted": True, "new_points": 0,
+        }
+        assert _DeterministicUMAP.fit_calls == 2
+
+
+def test_case_lv_web_01_ic_03_real_umap_reference_integration(
+    classifier_fixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The real reducer keeps its first coordinate dimensionality as data grows."""
+    try:
+        import umap  # noqa: F401
+    except ImportError:
+        pytest.skip("install the declared umap-learn dependency for real reducer validation")
+
+    payload = {
+        "folders": [str(folder) for folder in classifier_fixture["folders"]],
+        "model_ids": ["dinov2_vits14"],
+        "methods": ["umap"],
+        "umap_reference": True,
+    }
+
+    def run(client: TestClient, request: dict = payload) -> dict:
+        job = _run_custom(client, request)
+        assert job["state"] == "completed", job
+        return client.get("/api/v1/runs/" + job["run_id"]).json()
+
+    def umap_points(result: dict) -> dict[str, np.ndarray]:
+        view = next(view for view in result["views"] if view["method"] == "umap")
+        return {
+            point["filename"]: np.asarray([point["x"], point["y"], point["z"]])
+            for point in view["points"]
+        }
+
+    with _client(monkeypatch, tmp_path, embedder=_fake_embedder()) as client:
+        first = run(client)
+        assert first["umap_reference"]["by_model"]["dinov2_vits14"]["refitted"] is True
+        first_points = umap_points(first)
+        assert all(np.isfinite(point).all() for point in first_points.values())
+
+        new_image = classifier_fixture["folders"][0] / "apple" / "99.png"
+        Image.new("RGB", (32, 32), (180, 90, 35)).save(new_image)
+        extended = run(client)
+        assert extended["umap_reference"]["by_model"]["dinov2_vits14"] == {
+            "refitted": False, "new_points": 1,
+        }
+        extended_points = umap_points(extended)
+        assert all(np.array_equal(extended_points[name], coords)
+                   for name, coords in first_points.items())
+        assert np.isfinite(extended_points["99.png"]).all()
+
+        new_image.unlink()
+        reduced = run(client)
+        assert reduced["umap_reference"]["by_model"]["dinov2_vits14"] == {
+            "refitted": False, "new_points": 0,
+        }
+        assert all(np.array_equal(umap_points(reduced)[name], coords)
+                   for name, coords in first_points.items())
+
+        rebuilt = run(client, {**payload, "umap_rebuild": True})
+        assert rebuilt["umap_reference"]["by_model"]["dinov2_vits14"]["refitted"] is True
 
 
 def test_case_lv_web_01_ic_04_kmeans_blocks_and_pca_drilldown(

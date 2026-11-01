@@ -44,6 +44,8 @@ class CreateVisualizationJob(BaseModel):
     method: str = "pca"
     model_ids: list[str] = Field(default_factory=list, max_length=8)
     methods: list[str] = Field(default_factory=list, max_length=5)
+    umap_reference: bool = False
+    umap_rebuild: bool = False
 
 
 class CreateComparisonJob(BaseModel):
@@ -226,6 +228,8 @@ def create_app(
                     job.request.object_policy.model_dump()
                     if job.request.object_policy is not None else None
                 ),
+                umap_reference=job.request.umap_reference,
+                umap_rebuild=job.request.umap_rebuild,
                 model_loader=loader,
                 object_model_loader=object_loader,
                 progress=update_progress,

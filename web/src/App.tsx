@@ -145,6 +145,8 @@ export default function App() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
   const [selectedMethods, setSelectedMethods] = useState<ProjectionMethod[]>(["sumap"]);
+  const [umapReferenceEnabled, setUmapReferenceEnabled] = useState(false);
+  const [umapRebuildRequested, setUmapRebuildRequested] = useState(false);
   const [activeModelId, setActiveModelId] = useState("");
   const [activeMethod, setActiveMethod] = useState<ProjectionMethod>("sumap");
   const [dimension, setDimension] = useState<2 | 3>(2);
@@ -323,6 +325,8 @@ export default function App() {
     if (mode === analysisMode) return;
     setAnalysisMode(mode);
     setAnalysisUnit("image");
+    setUmapReferenceEnabled(false);
+    setUmapRebuildRequested(false);
     setFolders([]);
     setFolderDraft("");
     setClassNamesDraft("");
@@ -373,6 +377,8 @@ export default function App() {
         mode: analysisMode,
         unit: analysisUnit,
         classNames,
+        umapReference: umapReferenceEnabled,
+        umapRebuild: umapReferenceEnabled && umapRebuildRequested,
         ...(analysisUnit === "object" ? { objectPolicy } : {}),
       });
       setJob({
@@ -405,6 +411,7 @@ export default function App() {
       if (!latest.run_id) throw new Error("The worker completed without returning a run result.");
       const result = await api.run(latest.run_id);
       setRun(result);
+      if (umapReferenceEnabled && result.umap_reference?.enabled) setUmapRebuildRequested(false);
       setNotice(result.warnings.join(" "));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The analysis failed.");
@@ -484,6 +491,10 @@ export default function App() {
                   onChange={(event) => {
                     const value = event.target.value as VisualizeUnit;
                     setAnalysisUnit(value);
+                    if (value === "object") {
+                      setUmapReferenceEnabled(false);
+                      setUmapRebuildRequested(false);
+                    }
                     setRun(null);
                     setJob(null);
                     setSelectedIndex(null);
@@ -619,6 +630,35 @@ export default function App() {
               ))}
             </div>
             <div className="field-note">LDA and Supervised UMAP use class labels to arrange points. Their layout is a visual aid, not proof of separability.</div>
+            {analysisMode === "classifier" && analysisUnit === "image" && selectedMethods.includes("umap") && (
+              <div className="umap-reference-controls" data-testid="umap-reference-controls">
+                <label className="choice-option">
+                  <input
+                    type="checkbox"
+                    aria-label="Keep UMAP reference frame"
+                    checked={umapReferenceEnabled}
+                    disabled={busy}
+                    onChange={(event) => {
+                      setUmapReferenceEnabled(event.target.checked);
+                      if (!event.target.checked) setUmapRebuildRequested(false);
+                    }}
+                  />
+                  <span>Keep UMAP reference frame</span>
+                </label>
+                <div className="field-note">Freeze the first UMAP layout in the app cache. Later images are transformed into it, so existing points stay fixed. Rebuild after a major dataset change.</div>
+                {umapReferenceEnabled && (
+                  <button
+                    className="secondary-action"
+                    type="button"
+                    disabled={busy}
+                    onClick={() => setUmapRebuildRequested(true)}
+                  >
+                    Rebuild UMAP reference next run
+                  </button>
+                )}
+                {umapRebuildRequested && <p className="umap-rebuild-pending" role="status">The next analysis will refit and replace each selected model's reference frame.</p>}
+              </div>
+            )}
           </section>
 
           {error && <div className="alert alert-error" role="alert">{error}</div>}
@@ -641,6 +681,16 @@ export default function App() {
             </div>
             {run && <div className="run-badge"><span className="badge-dot" /> Result ready</div>}
           </div>
+
+          {run?.umap_reference?.enabled && currentView?.method === "umap" && (
+            <div className="umap-reference-result" data-testid="umap-reference-result" role="status">
+              {run.umap_reference.by_model[activeModelId]?.refitted
+                ? `UMAP reference fitted for ${activeModelId}.`
+                : run.umap_reference.by_model[activeModelId]
+                  ? `UMAP reference reused for ${activeModelId}; ${run.umap_reference.by_model[activeModelId].new_points} new point(s) transformed.`
+                  : `UMAP reference was unavailable for ${activeModelId}. Check the run warning.`}
+            </div>
+          )}
 
           {busy && (
             <div className="progress-card" data-testid="job-status" role="status">

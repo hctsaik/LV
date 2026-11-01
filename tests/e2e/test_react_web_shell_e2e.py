@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import hashlib
 import socket
+import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -116,6 +118,28 @@ def _start_api(application):
     base_url = f"http://127.0.0.1:{port}"
     _wait_http(f"{base_url}/api/v1/health", server_thread)
     return server, server_thread, base_url
+
+
+class _DeterministicUMAP:
+    """Picklable reducer double; this E2E validates the React/API journey, not UMAP math."""
+
+    fit_calls = 0
+    transform_calls = 0
+
+    def __init__(self, *, n_components: int, n_neighbors: int, random_state: int):
+        self.n_components = n_components
+        self.n_neighbors = n_neighbors
+        self.random_state = random_state
+        self.offset = 0.0
+
+    def fit_transform(self, values: np.ndarray) -> np.ndarray:
+        type(self).fit_calls += 1
+        self.offset = float(type(self).fit_calls)
+        return np.asarray(values[:, :self.n_components], dtype=np.float64) + self.offset
+
+    def transform(self, values: np.ndarray) -> np.ndarray:
+        type(self).transform_calls += 1
+        return np.asarray(values[:, :self.n_components], dtype=np.float64) + self.offset + 10.0
 
 
 def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -316,6 +340,101 @@ def test_lv_web_01_ic_04_kmeans_drilldown_and_multiselection(
             selected_before_switch = page.get_by_test_id("selection-count").inner_text()
             page.get_by_test_id("dimension-2d").click()
             expect(page.get_by_test_id("selection-count")).to_have_text(selected_before_switch)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_ic_03_umap_reference_visible_journey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible React controls report fit, reuse, transform, and rebuild transitions."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    fake_umap = types.ModuleType("umap")
+    fake_umap.UMAP = _DeterministicUMAP
+    monkeypatch.setitem(sys.modules, "umap", fake_umap)
+    if "umap_ref" in sys.modules:
+        monkeypatch.setattr(sys.modules["umap_ref"], "umap", fake_umap)
+    _DeterministicUMAP.fit_calls = 0
+    _DeterministicUMAP.transform_calls = 0
+
+    dataset = tmp_path / "classifier-reference"
+    image_folder = dataset / "train" / "apple"
+    image_folder.mkdir(parents=True)
+    for index, color in enumerate(((220, 35, 45), (30, 190, 70), (35, 65, 215), (210, 180, 25))):
+        Image.new("RGB", (64, 64), color).save(image_folder / f"image-{index:02}.png")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = len(path.name) / 10.0
+            return vector
+        return embed
+
+    application = create_app(model_catalog=lambda: ["fixture-model"], model_loader=fixture_loader)
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1450, "height": 1000})
+            page.set_default_timeout(10_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-fixture-model").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_test_id("projection-umap").check()
+            page.get_by_label("Image folder").fill(str(dataset / "train"))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_label("Keep UMAP reference frame").check()
+
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("umap-reference-result")).to_contain_text(
+                "UMAP reference fitted for fixture-model."
+            )
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("umap-reference-result")).to_contain_text(
+                "UMAP reference reused for fixture-model; 0 new point(s) transformed."
+            )
+
+            Image.new("RGB", (64, 64), (180, 90, 35)).save(image_folder / "image-99.png")
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("umap-reference-result")).to_contain_text(
+                "UMAP reference reused for fixture-model; 1 new point(s) transformed."
+            )
+            expect(page.get_by_test_id("embedding-point")).to_have_count(5)
+
+            (image_folder / "image-99.png").unlink()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("umap-reference-result")).to_contain_text(
+                "UMAP reference reused for fixture-model; 0 new point(s) transformed."
+            )
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+            page.get_by_role("button", name="Rebuild UMAP reference next run").click()
+            expect(page.locator(".umap-rebuild-pending")).to_contain_text("next analysis will refit")
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("umap-reference-result")).to_contain_text(
+                "UMAP reference fitted for fixture-model."
+            )
+            assert _DeterministicUMAP.fit_calls == 2
+            assert _DeterministicUMAP.transform_calls == 1
             browser.close()
     finally:
         if server is not None:

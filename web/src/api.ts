@@ -47,6 +47,11 @@ export type VisualizationView = {
   embedding_nonzero: boolean;
 };
 
+export type UmapReferenceStatus = {
+  refitted: boolean;
+  new_points: number;
+};
+
 export type VisualizationRun = {
   mode: "classifier" | "detector";
   unit: VisualizeUnit;
@@ -63,6 +68,7 @@ export type VisualizationRun = {
   embedding_shape: [number, number];
   embedding_finite: boolean;
   embedding_nonzero: boolean;
+  umap_reference: { enabled: boolean; by_model: Record<string, UmapReferenceStatus> };
   warnings: string[];
 };
 
@@ -187,6 +193,8 @@ export const api = {
       unit?: VisualizeUnit;
       classNames?: string[];
       objectPolicy?: ComparisonObjectPolicy;
+      umapReference?: boolean;
+      umapRebuild?: boolean;
     } = {},
   ) =>
     request<{ job_id: string; state: string }>("/api/v1/visualize/jobs", {
@@ -199,6 +207,8 @@ export const api = {
         unit: options.unit || "image",
         class_names: options.classNames || [],
         object_policy: options.objectPolicy,
+        umap_reference: options.umapReference || false,
+        umap_rebuild: options.umapRebuild || false,
       }),
     }),
   job: (jobId: string) => request<JobStatus>("/api/v1/jobs/" + encodeURIComponent(jobId)),

@@ -37,7 +37,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 1. 以 `discover_images_classifier(..., allow_flat=True)` 依原排序取得 `{path, split, label}`；用 `partition_readable` 同步剔除壞檔及標籤。
 2. 以 `update_manifest` 及相同的 SHA-256 cache key 更新 App-side cache；整圖呼叫 `load_model` 與 `extract_embeddings` 產生真實向量。第一切片不預建縮圖，選取時只回讀 run 登錄的原圖。
 3. Detector 物件級沿用 `discover_yolo_objects`、`object_eval.embed_objects`、`crop_bbox` 與 `_adaptive_pad_px`；每個 bbox 產生一筆記錄，保留 class ID、object index、正規化 bbox 及原圖路徑。pad／解析度／head 可由 React 設定；物件 embedding cache key 包含原圖 SHA-256、bbox、object index、model ID 和 policy，寫入 App cache，不寫來源資料夾。
-4. 每個模型各自抽取 embedding 並使用獨立 cache；投影保留同一模型的 embedding 與記錄順序。PCA、t-SNE、UMAP、LDA 和 Supervised UMAP 沿用 legacy 固定參數及小樣本邊界；無法計算的選項明示警告，只有所選投影全部不可用時才以 PCA 維持可檢視結果。監督投影的分群不得解讀為真實可分性。
+4. 每個模型各自抽取 embedding 並使用獨立 cache；投影保留同一模型的 embedding 與記錄順序。PCA、t-SNE、UMAP、LDA 和 Supervised UMAP 沿用 legacy 固定參數及小樣本邊界；無法計算的選項明示警告，只有所選投影全部不可用時才以 PCA 維持可檢視結果。分類器整圖可選擇固定 UMAP reference：以圖片 SHA-256 對應座標，首次參考 reducer 和座標存於 LV app cache，後續新圖片轉入原座標維度，既有圖片保持原位；移除圖片只影響當次顯示，明確要求 rebuild 才重擬合。監督投影的分群不得解讀為真實可分性。此切片的 deterministic API／可見 UI 驗證及 `umap-learn` 真實 reducer integration 已通過；Windows ARM64 runtime 與 Streamlit 座標數值對照仍待驗。
 5. 2D 使用 SVG 散點；3D 使用隨使用者切換才載入的本機 Plotly bundle，點選與鍵盤輔助操作都能讀回同一 run record。投影維度不足時缺少的座標軸補零。點座標與記錄同序；run ID 變更時清空舊選取。跨工具暫存由各後續 case 定義。
 6. 使用者點選／框選只傳 record index 和 run ID；後端驗證索引，UI 顯示相同 label、split、檔名和原圖；物件級另外顯示所選 bbox overlay 與 object index。
 7. Compare Distributions 對 A/B 資料夾各自遞迴找圖、略過 App cache 並跳過不可讀影像；來源路徑只留在 worker 記憶體，公開記錄使用 index、檔名和來源識別碼。
@@ -66,4 +66,4 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 
 ## 6. 未涵蓋
 
-Object Detector 整圖及物件級已有 React/API 可見流程與固定 DINOv2-small 的 ARM64 UI run；物件級 candidate handoff、policy autotune、與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖及物件級已有 React/API 可見流程與固定 DINOv2-small 的 ARM64 UI run；物件級 candidate handoff、policy autotune、與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。固定 UMAP reference 的 React 控制、快取座標沿用、增刪圖片與重建有 deterministic API／UI 覆蓋，實際 `umap-learn` 0.5.12 integration 在隔離 CPython 3.11 AMD64 驗證通過；Windows ARM64 runtime 和 legacy 座標數值 parity 尚未驗。散點框選完整 parity、其它八個工具及巢狀工作流仍留在後續 case；本設計不縮小全產品 PRD 範圍。

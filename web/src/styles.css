@@ -155,6 +155,13 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .choice-option:has(input:checked) { border-color: #bac9e0; background: #f2f6fc; color: #344866; }
 .choice-option input { margin: 0; accent-color: #42699d; }
 .projection-list { grid-template-columns: 1fr; }
+.umap-reference-controls { display: grid; gap: 6px; margin-top: 11px; padding: 10px; border: 1px solid #e1e8f1; border-radius: 7px; background: #fafcff; }
+.umap-reference-controls .choice-option { border: 0; padding: 2px 0; background: transparent; font-size: 10px; }
+.umap-reference-controls .field-note { margin: 0; }
+.secondary-action { border: 1px solid #d4deea; border-radius: 7px; padding: 7px 9px; background: #f8fafc; color: #38516e; font: inherit; font-size: 10px; font-weight: 650; text-align: left; }
+.secondary-action:hover:not(:disabled) { background: #edf4fb; }
+.umap-rebuild-pending { margin: 0; color: #8b6530; font-size: 9px; line-height: 1.5; }
+.umap-reference-result { margin: -7px 0 17px; padding: 9px 12px; border: 1px solid #dbe8f0; border-radius: 7px; background: #f5fafc; color: #48667a; font-size: 10px; line-height: 1.5; }
 .plot-subtoolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
 .plot-subtoolbar > label { display: flex; align-items: center; gap: 6px; color: #8c98a9; font-size: 9px; }
 .plot-subtoolbar select { height: 28px; min-width: 120px; border: 1px solid #e2e6ec; border-radius: 5px; padding: 0 6px; background: #fff; color: #58657c; font-size: 9px; }

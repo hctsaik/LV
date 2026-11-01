@@ -40,7 +40,16 @@ def _is_under(path: Path, folder: Path) -> bool:
         return False
 
 
-def _project_embeddings(embeddings: np.ndarray, labels: Sequence[str], methods: Sequence[str]) -> tuple[dict[str, np.ndarray], list[str]]:
+def _project_embeddings(
+    embeddings: np.ndarray,
+    labels: Sequence[str],
+    methods: Sequence[str],
+    *,
+    umap_keys: Sequence[str] = (),
+    umap_ref_path: Path | None = None,
+    use_umap_reference: bool = False,
+    rebuild_umap_reference: bool = False,
+) -> tuple[dict[str, np.ndarray], list[str], dict[str, dict[str, int | bool]]]:
     """Project image embeddings with the same parameters as the legacy Visualize flow."""
     from sklearn.manifold import TSNE
 
@@ -49,6 +58,7 @@ def _project_embeddings(embeddings: np.ndarray, labels: Sequence[str], methods: 
     n_components = min(3, max(1, n_samples - 2))
     projections: dict[str, np.ndarray] = {}
     warnings: list[str] = []
+    umap_reference_status: dict[str, dict[str, int | bool]] = {}
 
     def pad_to_2d(values: np.ndarray) -> np.ndarray:
         return values if values.shape[1] >= 2 else np.hstack([values, np.zeros((len(values), 1))])
@@ -75,14 +85,46 @@ def _project_embeddings(embeddings: np.ndarray, labels: Sequence[str], methods: 
                     perplexity=perplexity,
                 ).fit_transform(embeddings)
             elif method == "umap":
-                import umap
-
                 neighbors = min(15, max(2, n_samples - 1))
-                coordinates = umap.UMAP(
-                    n_components=n_components,
-                    n_neighbors=neighbors,
-                    random_state=42,
-                ).fit_transform(embeddings)
+                if use_umap_reference:
+                    if umap_ref_path is None or len(umap_keys) != n_samples:
+                        raise VisualizationInputError(
+                            "INVALID_UMAP_REFERENCE",
+                            "A fixed UMAP reference needs one content key per image and an app cache path.",
+                        )
+                    from umap_ref import load_ref, stable_umap
+
+                    # Keep the reference's dimensionality as the collection grows.
+                    # The general projection default may move from 2D to 3D when
+                    # sample count crosses a threshold; that must not invalidate
+                    # a user-pinned frame unless they explicitly request rebuild.
+                    umap_components = n_components
+                    if not rebuild_umap_reference:
+                        reference = load_ref(umap_ref_path)
+                        if (reference is not None
+                                and reference.get("dim") == embeddings.shape[1]):
+                            umap_components = int(reference["coords"].shape[1])
+
+                    coordinates, new_points, refitted = stable_umap(
+                        embeddings,
+                        umap_keys,
+                        umap_ref_path,
+                        umap_components,
+                        neighbors,
+                        rebuild=rebuild_umap_reference,
+                    )
+                    umap_reference_status = {
+                        "refitted": bool(refitted),
+                        "new_points": int(new_points),
+                    }
+                else:
+                    import umap
+
+                    coordinates = umap.UMAP(
+                        n_components=n_components,
+                        n_neighbors=neighbors,
+                        random_state=42,
+                    ).fit_transform(embeddings)
             elif method == "lda":
                 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
@@ -122,7 +164,7 @@ def _project_embeddings(embeddings: np.ndarray, labels: Sequence[str], methods: 
             PCA(n_components=n_components, random_state=42).fit_transform(embeddings)
         )
         warnings.append("PCA was used because none of the selected projections were available.")
-    return projections, warnings
+    return projections, warnings, umap_reference_status
 
 
 def _detector_class_names(folders: Sequence[Path], manual: Sequence[str]) -> list[str]:
@@ -172,6 +214,8 @@ def run_image_visualization(
     unit: str = "image",
     class_names: Sequence[str] = (),
     object_policy: dict | None = None,
+    umap_reference: bool = False,
+    umap_rebuild: bool = False,
     model_loader: Callable[[str], Callable[[Path], np.ndarray]] = load_model,
     object_model_loader: Callable[..., Callable] | None = None,
     progress: Callable[[int, int], None] | None = None,
@@ -222,6 +266,12 @@ def run_image_visualization(
         raise VisualizationInputError("INVALID_UNIT", "Choose whole-image or object-level analysis.")
     if unit == "object" and mode != "detector":
         raise VisualizationInputError("INVALID_UNIT", "Object-level analysis requires Object Detector mode.")
+    if umap_rebuild and not umap_reference:
+        raise VisualizationInputError("INVALID_UMAP_REFERENCE", "Enable the fixed UMAP reference before requesting a rebuild.")
+    if umap_reference and (mode != "classifier" or unit != "image"):
+        raise VisualizationInputError("INVALID_UMAP_REFERENCE", "The fixed UMAP reference is available for whole-image classification only.")
+    if umap_reference and "umap" not in selected_methods:
+        raise VisualizationInputError("INVALID_UMAP_REFERENCE", "Select UMAP to use its fixed reference frame.")
 
     resolved_object_policy: dict | None = None
     if unit == "object":
@@ -302,6 +352,7 @@ def run_image_visualization(
     total = len(records) * len(selected_models)
     embeddings_by_model: dict[str, np.ndarray] = {}
     projections_by_model: dict[str, dict[str, np.ndarray]] = {}
+    umap_reference_by_model: dict[str, dict[str, int | bool]] = {}
     embedding_shapes: dict[str, list[int]] = {}
     warnings: list[str] = []
     labels = [str(record["label"]) for record in records]
@@ -379,8 +430,28 @@ def run_image_visualization(
             raise VisualizationInputError("INVALID_EMBEDDINGS", "The selected model returned an empty embedding.")
         embeddings_by_model[selected_model] = raw
         embedding_shapes[selected_model] = [int(raw.shape[0]), int(raw.shape[1])]
-        projections, projection_warnings = _project_embeddings(raw, labels, selected_methods)
+        umap_keys: list[str] = []
+        umap_ref_path: Path | None = None
+        if umap_reference:
+            for record in records:
+                path = Path(record["path"]).resolve()
+                folder = next(folder for folder in resolved_folders if _is_under(path, folder))
+                umap_keys.append(str(manifest_by_folder[folder][rel_key(folder, path)]["sha256"]))
+            from umap_ref import ref_path_for
+
+            umap_ref_path = ref_path_for(resolved_folders[0], selected_model)
+        projections, projection_warnings, umap_status = _project_embeddings(
+            raw,
+            labels,
+            selected_methods,
+            umap_keys=umap_keys,
+            umap_ref_path=umap_ref_path,
+            use_umap_reference=umap_reference,
+            rebuild_umap_reference=umap_rebuild,
+        )
         projections_by_model[selected_model] = projections
+        if umap_status:
+            umap_reference_by_model[selected_model] = umap_status
         warnings.extend(f"{selected_model}: {warning}" for warning in projection_warnings)
         check_cancelled()
 
@@ -445,6 +516,10 @@ def run_image_visualization(
         "embedding_finite": primary["embedding_finite"],
         "embedding_nonzero": primary["embedding_nonzero"],
         "warnings": base_warnings + warnings,
+        "umap_reference": {
+            "enabled": bool(umap_reference),
+            "by_model": umap_reference_by_model,
+        },
         "image_paths": [Path(record["path"]).resolve() for record in records],
         # Kept only in the local worker for the legacy classifier 3D block
         # drilldown. The HTTP run response deliberately omits this field.
