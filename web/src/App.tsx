@@ -13,6 +13,8 @@ import {
   type EmbeddingPoint,
   type KMeansBlocks,
   type ComparisonObjectPolicy,
+  type DiagnosticExplanationInput,
+  type DiagnosticExplanationResult,
   type DiagnosticHeadStatus,
   type DiagnosticReference,
   type DuplicateScanInput,
@@ -49,6 +51,30 @@ function pause(ms: number) {
 function colorMap(points: EmbeddingPoint[]) {
   const labels = [...new Set(points.map((point) => point.label))].sort();
   return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
+}
+
+function DiagnosticEvidenceGrid({ result }: { result: DiagnosticExplanationResult }) {
+  const [rows, columns] = result.grid;
+  return <div
+    className="diagnostic-evidence-grid"
+    data-testid="diagnostic-evidence-grid"
+    role="img"
+    aria-label={`${result.method === "gradcam" ? "Signed Grad-CAM" : "DINO attention"} patch evidence, ${rows} by ${columns}`}
+    style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+  >
+    {result.display_scores.flatMap((line, row) => line.map((score, column) => {
+      const value = Number.isFinite(score) ? Math.max(-1, Math.min(1, score)) : 0;
+      const opacity = 0.08 + Math.abs(value) * 0.82;
+      const color = result.score_mode === "signed" && value < 0
+        ? `rgba(42, 99, 183, ${opacity})`
+        : `rgba(204, 54, 45, ${opacity})`;
+      return <span
+        key={`${row}-${column}`}
+        title={`Patch ${row + 1}, ${column + 1}: ${value.toFixed(4)}`}
+        style={{ backgroundColor: color }}
+      />;
+    }))}
+  </div>;
 }
 
 function MainScatterPlot2D({ points, selectedIndices, onToggleSelection, onAddSelection }: {
@@ -271,6 +297,14 @@ export default function App() {
   const [diagnosticHeadStatus, setDiagnosticHeadStatus] = useState<DiagnosticHeadStatus | null>(null);
   const [diagnosticHeadLoading, setDiagnosticHeadLoading] = useState(false);
   const [diagnosticHeadError, setDiagnosticHeadError] = useState("");
+  const [diagnosticMethod, setDiagnosticMethod] = useState<"attention" | "gradcam">("attention");
+  const [diagnosticAttentionMethod, setDiagnosticAttentionMethod] = useState<DiagnosticExplanationInput["attention_method"]>("last_layer_head_mean");
+  const [diagnosticHeadIndex, setDiagnosticHeadIndex] = useState(0);
+  const [diagnosticTargetClass, setDiagnosticTargetClass] = useState("");
+  const [diagnosticDisplayMode, setDiagnosticDisplayMode] = useState<"signed" | "positive">("signed");
+  const [diagnosticExplanation, setDiagnosticExplanation] = useState<DiagnosticExplanationResult | null>(null);
+  const [diagnosticExplanationLoading, setDiagnosticExplanationLoading] = useState(false);
+  const [diagnosticExplanationError, setDiagnosticExplanationError] = useState("");
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const [rankedViewerContext, setRankedViewerContext] = useState<number[] | null>(null);
@@ -910,6 +944,8 @@ export default function App() {
       setDiagnosticResolution(224);
       setDiagnosticHeadStatus(null);
       setDiagnosticHeadError("");
+      setDiagnosticExplanation(null);
+      setDiagnosticExplanationError("");
       setActiveTool("diagnostics");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not create the diagnostics reference.");
@@ -943,6 +979,8 @@ export default function App() {
         currentRunId,
       );
       setDiagnosticHeadStatus(status);
+      setDiagnosticExplanation(null);
+      setDiagnosticExplanationError("");
     } catch (reason) {
       setDiagnosticHeadError(reason instanceof Error ? reason.message : "The classifier head could not be prepared.");
       setDiagnosticHeadStatus({
@@ -952,6 +990,30 @@ export default function App() {
       });
     } finally {
       setDiagnosticHeadLoading(false);
+    }
+  }
+
+  async function runDiagnosticExplanation() {
+    if (!diagnosticReference || !currentRunId || currentRunId !== diagnosticReference.run_id) return;
+    if (diagnosticHeadStatus?.status !== "ready") return;
+    setDiagnosticExplanationLoading(true);
+    setDiagnosticExplanationError("");
+    setDiagnosticExplanation(null);
+    try {
+      const input: DiagnosticExplanationInput = {
+        current_run_id: currentRunId,
+        resolution: diagnosticResolution,
+        method: diagnosticMethod,
+        attention_method: diagnosticAttentionMethod,
+        head_index: diagnosticAttentionMethod === "single_head" ? diagnosticHeadIndex : null,
+        target_class: diagnosticMethod === "gradcam" && diagnosticTargetClass ? diagnosticTargetClass : null,
+        display_mode: diagnosticDisplayMode,
+      };
+      setDiagnosticExplanation(await api.createDiagnosticExplanation(diagnosticReference.context_id, input));
+    } catch (reason) {
+      setDiagnosticExplanationError(reason instanceof Error ? reason.message : "The explanation could not be generated.");
+    } finally {
+      setDiagnosticExplanationLoading(false);
     }
   }
 
@@ -1076,6 +1138,137 @@ export default function App() {
                       : `Build ${diagnosticResolution}×${diagnosticResolution} classifier head`}
                 </button>
                 <p className="field-note">A head is created only after this button is pressed. Heads are tied to this Visualize run, model, unit, pooling, and exact resolution; no other resolution is substituted.</p>
+              </section>
+              <section className="diagnostic-explanation-panel" aria-labelledby="diagnostic-explanation-title">
+                <h2 id="diagnostic-explanation-title">Run classification evidence</h2>
+                <p className="field-note">Inference runs only when you press the button. Patch evidence is coarse and does not represent a defect mask or pixel-accurate localization.</p>
+                <div className="diagnostic-explanation-controls">
+                  <label>
+                    Evidence method
+                    <select
+                      data-testid="diagnostic-method"
+                      value={diagnosticMethod}
+                      onChange={(event) => {
+                        setDiagnosticMethod(event.target.value as "attention" | "gradcam");
+                        setDiagnosticExplanation(null);
+                        setDiagnosticExplanationError("");
+                      }}
+                    >
+                      <option value="attention">DINO Attention</option>
+                      <option value="gradcam">Classifier Grad-CAM</option>
+                    </select>
+                  </label>
+                  {diagnosticMethod === "attention" ? <>
+                    <label>
+                      Attention recipe
+                      <select
+                        data-testid="diagnostic-attention-method"
+                        value={diagnosticAttentionMethod}
+                        onChange={(event) => {
+                          setDiagnosticAttentionMethod(event.target.value as DiagnosticExplanationInput["attention_method"]);
+                          setDiagnosticExplanation(null);
+                        }}
+                      >
+                        <option value="last_layer_head_mean">Last layer, mean of heads</option>
+                        <option value="single_head">Single attention head</option>
+                        <option value="rollout">Attention rollout (experimental)</option>
+                      </select>
+                    </label>
+                    {diagnosticAttentionMethod === "single_head" && <label>
+                      Attention head index
+                      <input
+                        data-testid="diagnostic-attention-head-index"
+                        type="number"
+                        min={0}
+                        max={63}
+                        value={diagnosticHeadIndex}
+                        onChange={(event) => setDiagnosticHeadIndex(Math.max(0, Number(event.target.value) || 0))}
+                      />
+                    </label>}
+                  </> : <>
+                    <label>
+                      Target class
+                      <select
+                        data-testid="diagnostic-target-class"
+                        value={diagnosticTargetClass}
+                        onChange={(event) => {
+                          setDiagnosticTargetClass(event.target.value);
+                          setDiagnosticExplanation(null);
+                        }}
+                      >
+                        <option value="">Actual top-1 (automatic)</option>
+                        {(diagnosticHeadStatus?.classes || []).map((name) => <option key={name} value={name}>{name}</option>)}
+                      </select>
+                    </label>
+                    <label>
+                      Evidence view
+                      <select
+                        data-testid="diagnostic-display-mode"
+                        value={diagnosticDisplayMode}
+                        onChange={(event) => {
+                          setDiagnosticDisplayMode(event.target.value as "signed" | "positive");
+                          setDiagnosticExplanation(null);
+                        }}
+                      >
+                        <option value="signed">Signed: supports target / reference</option>
+                        <option value="positive">Positive target evidence only</option>
+                      </select>
+                    </label>
+                  </>}
+                </div>
+                {diagnosticExplanationError && <div className="alert alert-error" data-testid="diagnostic-explanation-error" role="alert">{diagnosticExplanationError}</div>}
+                <button
+                  type="button"
+                  className="secondary-action diagnostic-explain-run"
+                  data-testid="diagnostic-explain-run"
+                  disabled={diagnosticExplanationLoading || diagnosticHeadStatus?.status !== "ready" || diagnosticReference.status !== "current" || currentRunId !== diagnosticReference.run_id}
+                  onClick={runDiagnosticExplanation}
+                >
+                  {diagnosticExplanationLoading ? "Running explanation…" : "Run explanation"}
+                </button>
+                {diagnosticExplanation && <div className="diagnostic-explanation-result" data-testid="diagnostic-explanation-result">
+                  <div className="diagnostic-explanation-summary">
+                    <div>
+                      <span className="eyebrow">CLASSIFICATION</span>
+                      <strong data-testid="diagnostic-predicted-class">{diagnosticExplanation.predicted_class}</strong>
+                      <small>{(diagnosticExplanation.predicted_probability * 100).toFixed(1)}% top-1 confidence · {diagnosticExplanation.resolution}×{diagnosticExplanation.resolution} · {diagnosticExplanation.scope}</small>
+                    </div>
+                    {diagnosticExplanation.method === "gradcam" && <div>
+                      <span className="eyebrow">TARGET / REFERENCE</span>
+                      <strong data-testid="diagnostic-target-result">{diagnosticExplanation.target_class} / {diagnosticExplanation.reference_class}</strong>
+                      <small>{diagnosticExplanation.is_predicted_target ? "Target matches actual top-1" : "Counterfactual target hypothesis"} · margin {diagnosticExplanation.target_score?.toFixed(4)}</small>
+                    </div>}
+                  </div>
+                  <div className="diagnostic-evidence-layout">
+                    <figure className="diagnostic-source-preview">
+                      <img
+                        src={`/api/v1/runs/${encodeURIComponent(diagnosticExplanation.run_id)}/images/${diagnosticExplanation.record_index}`}
+                        alt={diagnosticReference.filename}
+                      />
+                      <figcaption>Selected source image</figcaption>
+                    </figure>
+                    <div className="diagnostic-grid-panel">
+                      <div className="diagnostic-grid-heading">
+                        <strong>{diagnosticExplanation.method === "gradcam" ? "Grad-CAM patch evidence" : "DINO Attention patch map"}</strong>
+                        <span>{diagnosticExplanation.grid[0]}×{diagnosticExplanation.grid[1]} patches · {diagnosticExplanation.score_mode}</span>
+                      </div>
+                      <DiagnosticEvidenceGrid result={diagnosticExplanation} />
+                      <p className="field-note">{diagnosticExplanation.warning}</p>
+                    </div>
+                  </div>
+                  <ul className="diagnostic-class-probabilities" aria-label="Class probabilities">
+                    {diagnosticExplanation.class_probabilities.map((item) => <li key={item.class_name}>
+                      <span>{item.class_name}</span><strong>{(item.probability * 100).toFixed(1)}%</strong>
+                    </li>)}
+                  </ul>
+                  {diagnosticExplanation.faithfulness && <p className="diagnostic-faithfulness" data-testid="diagnostic-faithfulness">
+                    Occlusion faithfulness: {String(diagnosticExplanation.faithfulness.status || "not available")}.
+                  </p>}
+                  <details className="diagnostic-warnings">
+                    <summary>Interpretation notes</summary>
+                    <ul>{diagnosticExplanation.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+                  </details>
+                </div>}
               </section>
               <div className="diagnostics-actions">
                 <button type="button" className="secondary-action" data-testid="diagnostic-recheck" onClick={recheckDiagnosticsReference}>Check source again</button>

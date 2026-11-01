@@ -830,6 +830,155 @@ def test_case_lv_web_04_head_01_exact_resolution_head_build_and_reuse(
     assert "_source_sha256" not in public_run
 
 
+def test_case_lv_web_04_expl_01_explicit_attention_and_signed_gradcam_evidence(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """Explanation is explicit, tied to the exact head, and never exposes paths or masks."""
+    import dino_explain
+    import gradcam_explain
+
+    attention_calls = []
+    gradcam_calls = []
+    checkpoint = classifier_fixture["root"] / "fixture-checkpoint.pth"
+    checkpoint.write_bytes(b"test checkpoint identity")
+
+    class FakeExplainer:
+        pass
+
+    def fake_attention(request, *, explainer=None):
+        attention_calls.append(request)
+        return types.SimpleNamespace(
+            raw_patch_scores=np.array([[0.2, 0.8], [0.1, 0.4]], dtype=np.float32),
+            display_patch_scores=np.array([[0.25, 1.0], [0.125, 0.5]], dtype=np.float32),
+            grid=(2, 2),
+            patch_size=14,
+            method=request.method,
+            warnings=("Attention is not a defect mask.",),
+        )
+
+    def fake_gradcam(request, head, *, target_class, explainer=None):
+        gradcam_calls.append((request, target_class, head, explainer))
+        return types.SimpleNamespace(
+            raw_patch_scores=np.array([[-1.0, 2.0], [0.5, -0.25]], dtype=np.float32),
+            display_patch_scores=np.array([[-0.5, 1.0], [0.25, -0.125]], dtype=np.float32),
+            grid=(2, 2),
+            patch_size=14,
+            target_class=target_class or "banana",
+            target_score=0.75,
+            reference_class="apple",
+            predicted_class="banana",
+            predicted_probability=0.7,
+            runner_up_class="apple",
+            runner_up_probability=0.3,
+            probability_margin=0.4,
+            target_probability=0.7,
+            reference_probability=0.3,
+            is_predicted_target=(target_class in (None, "banana")),
+            positive_mass=2.5,
+            negative_mass=1.25,
+            faithfulness={"available": True, "status": "supported"},
+            head_diagnostics={"available": False},
+            sample_oof=None,
+            warnings=("Signed evidence is not segmentation.",),
+        )
+
+    monkeypatch.setattr(dino_explain, "_resolve_checkpoint", lambda *_args, **_kwargs: checkpoint)
+    monkeypatch.setattr(
+        dino_explain,
+        "get_explainer",
+        lambda *_args, **_kwargs: (FakeExplainer(), checkpoint),
+    )
+    monkeypatch.setattr(dino_explain, "attention_map", fake_attention)
+    monkeypatch.setattr(gradcam_explain, "token_gradcam_map", fake_gradcam)
+
+    def diagnostic_loader(model_id: str, resolution: int, keep_aspect: bool, pooling: str):
+        def embed(path: Path) -> np.ndarray:
+            pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0
+            vector[3] = resolution / 448.0
+            return vector
+        return embed
+
+    with _client(
+        monkeypatch,
+        tmp_path,
+        diagnostic_model_loader=diagnostic_loader,
+    ) as client:
+        job = _run(client, classifier_fixture["folders"])
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        reference = client.post("/api/v1/diagnostic-references", json={
+            "run_id": run_id, "record_index": 0, "model_id": "dinov2_vits14",
+        }).json()
+        context_id = reference["context_id"]
+        unavailable = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/explanations",
+            json={
+                "current_run_id": run_id, "resolution": 224,
+                "method": "attention",
+            },
+        )
+        head = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/heads",
+            json={"current_run_id": run_id, "resolution": 224},
+        )
+        source_path = classifier_fixture["root"] / run["records"][0]["split"] / run["records"][0]["label"] / run["records"][0]["filename"]
+        source_before = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        attention = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/explanations",
+            json={
+                "current_run_id": run_id,
+                "resolution": 224,
+                "method": "attention",
+                "attention_method": "single_head",
+                "head_index": 2,
+            },
+        )
+        gradcam = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/explanations",
+            json={
+                "current_run_id": run_id,
+                "resolution": 224,
+                "method": "gradcam",
+                "target_class": "apple",
+                "display_mode": "positive",
+            },
+        )
+        incompatible = client.post(
+            f"/api/v1/diagnostic-references/{context_id}/explanations",
+            json={
+                "current_run_id": "different-run", "resolution": 224,
+                "method": "attention",
+            },
+        )
+        source_after = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+    assert unavailable.status_code == 409
+    assert unavailable.json()["code"] == "DIAGNOSTIC_HEAD_NOT_READY"
+    assert head.status_code == 200, head.text
+    assert attention.status_code == 200, attention.text
+    assert gradcam.status_code == 200, gradcam.text
+    assert incompatible.status_code == 409
+    assert incompatible.json()["code"] == "INCOMPATIBLE_DIAGNOSTIC_RUN"
+    assert attention.json()["method"] == "attention"
+    assert attention.json()["attention_method"] == "single_head"
+    assert attention.json()["grid"] == [2, 2]
+    assert attention_calls[0].head_index == 2
+    assert attention_calls[0].method == "single_head"
+    assert "mask" in attention.json()["warning"]
+    gradcam_payload = gradcam.json()
+    assert gradcam_payload["target_class"] == "apple"
+    assert gradcam_payload["reference_class"] == "apple"
+    assert gradcam_payload["score_mode"] == "positive"
+    assert gradcam_payload["display_scores"] == [[0.0, 1.0], [0.25, 0.0]]
+    assert gradcam_payload["faithfulness"]["status"] == "supported"
+    assert gradcam_calls[0][1] == "apple"
+    assert str(classifier_fixture["root"]) not in attention.text + gradcam.text
+    assert "image_path" not in gradcam_payload and "source_path" not in gradcam_payload
+    assert source_before == source_after
+
+
 def test_case_lv_web_01_rank_01_legacy_scores_stable_order_filters_and_csv(
     classifier_fixture, monkeypatch, tmp_path
 ):

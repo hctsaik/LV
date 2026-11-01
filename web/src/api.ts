@@ -68,6 +68,54 @@ export type DiagnosticHeadStatus = {
   reused?: boolean;
 };
 
+export type DiagnosticExplanationResult = {
+  status: "ready";
+  run_id: string;
+  context_id: string;
+  record_index: number;
+  resolution: 224 | 336 | 448;
+  model_id: string;
+  unit: VisualizeUnit;
+  scope: string;
+  method: "attention" | "gradcam";
+  attention_method: "last_layer_head_mean" | "single_head" | "rollout" | null;
+  grid: [number, number];
+  patch_size: number;
+  score_mode: "signed" | "positive";
+  display_scores: number[][];
+  raw_scores: number[][];
+  classes: string[];
+  predicted_class: string;
+  predicted_probability: number;
+  class_probabilities: { class_name: string; probability: number }[];
+  target_class?: string;
+  target_score?: number;
+  reference_class?: string;
+  runner_up_class?: string;
+  runner_up_probability?: number;
+  probability_margin?: number;
+  target_probability?: number;
+  reference_probability?: number;
+  is_predicted_target?: boolean;
+  positive_mass?: number;
+  negative_mass?: number;
+  faithfulness?: Record<string, unknown>;
+  head_diagnostics?: Record<string, unknown>;
+  sample_oof?: Record<string, unknown> | null;
+  warning: string;
+  warnings: string[];
+};
+
+export type DiagnosticExplanationInput = {
+  current_run_id: string;
+  resolution: 224 | 336 | 448;
+  method: "attention" | "gradcam";
+  attention_method: "last_layer_head_mean" | "single_head" | "rollout";
+  head_index: number | null;
+  target_class: string | null;
+  display_mode: "signed" | "positive";
+};
+
 export type DiagnosticReference = {
   context_id: string;
   run_id: string;
@@ -540,6 +588,13 @@ export const api = {
         body: JSON.stringify({ current_run_id: currentRunId, resolution }),
       },
     ),
+  createDiagnosticExplanation: (
+    contextId: string,
+    input: DiagnosticExplanationInput,
+  ) => request<DiagnosticExplanationResult>(
+    "/api/v1/diagnostic-references/" + encodeURIComponent(contextId) + "/explanations",
+    { method: "POST", body: JSON.stringify(input) },
+  ),
   createCoverageJob: (
     folders: string[],
     modelId: string,

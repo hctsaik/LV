@@ -2319,3 +2319,278 @@ def test_lv_web_04_ctx_01_diagnostics_reference_stale_and_run_incompatible_visib
             server_thread.join(timeout=10)
 
     assert len(inference_calls) > 0, "the fixture run should have invoked its model before handoff"
+
+
+def test_lv_web_04_expl_01_visible_attention_and_gradcam_journey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible explanation controls are explicit and keep signed evidence distinct from masks."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    import dino_explain
+    import gradcam_explain
+
+    dataset = _fixture(tmp_path / "diagnostic-explanation-fixture")
+    fixture_hashes = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    inference_calls: list[str] = []
+    attention_calls: list[object] = []
+    gradcam_calls: list[tuple[object, str | None]] = []
+    checkpoint = tmp_path / "fixture-checkpoint.pth"
+    checkpoint.write_bytes(b"fixture checkpoint identity")
+
+    class FakeExplainer:
+        pass
+
+    def fake_attention(request, *, explainer=None):
+        attention_calls.append(request)
+        return types.SimpleNamespace(
+            raw_patch_scores=np.array([[0.2, 0.8], [0.1, 0.4]], dtype=np.float32),
+            display_patch_scores=np.array([[0.25, 1.0], [0.125, 0.5]], dtype=np.float32),
+            grid=(2, 2), patch_size=14, method=request.method,
+            warnings=("Attention is not a defect mask.",),
+        )
+
+    def fake_gradcam(request, head, *, target_class, explainer=None):
+        gradcam_calls.append((request, target_class))
+        return types.SimpleNamespace(
+            raw_patch_scores=np.array([[-1.0, 2.0], [0.5, -0.25]], dtype=np.float32),
+            display_patch_scores=np.array([[-0.5, 1.0], [0.25, -0.125]], dtype=np.float32),
+            grid=(2, 2), patch_size=14,
+            target_class=target_class or "apple", target_score=0.75,
+            reference_class="banana", predicted_class="apple",
+            predicted_probability=0.7, runner_up_class="banana",
+            runner_up_probability=0.3, probability_margin=0.4,
+            target_probability=0.7, reference_probability=0.3,
+            is_predicted_target=target_class in (None, "apple"),
+            positive_mass=2.5, negative_mass=1.25,
+            faithfulness={"available": True, "status": "supported"},
+            head_diagnostics={"available": False}, sample_oof=None,
+            warnings=("Signed evidence is not segmentation.",),
+        )
+
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            inference_calls.append(str(path))
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = np.asarray(Image.open(path).convert("RGB")).mean(axis=(0, 1)) / 255.0
+            return vector
+        return embed
+
+    def diagnostic_loader(_model_id: str, resolution: int, _keep_aspect: bool, _pooling: str):
+        def embed(path: Path) -> np.ndarray:
+            vector = np.zeros(384, dtype=np.float32)
+            vector[0] = float(Image.open(path).convert("RGB").getpixel((0, 0))[0]) / 255.0
+            vector[1] = resolution / 448.0
+            return vector
+        return embed
+
+    monkeypatch.setattr(dino_explain, "_resolve_checkpoint", lambda *_args, **_kwargs: checkpoint)
+    monkeypatch.setattr(
+        dino_explain, "get_explainer",
+        lambda *_args, **_kwargs: (FakeExplainer(), checkpoint),
+    )
+    monkeypatch.setattr(dino_explain, "attention_map", fake_attention)
+    monkeypatch.setattr(gradcam_explain, "token_gradcam_map", fake_gradcam)
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=fixture_loader,
+        diagnostic_model_loader=diagnostic_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1450, "height": 1050})
+            page.set_default_timeout(15_000)
+            explanation_responses = []
+            page.on(
+                "response",
+                lambda response: explanation_responses.append(response)
+                if response.url.endswith("/explanations")
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            page.get_by_test_id("embedding-point").nth(0).click()
+            page.get_by_test_id("open-diagnostics-reference").click()
+            expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context current")
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head not prepared")
+            expect(page.get_by_test_id("diagnostics-no-auto-inference")).to_be_visible()
+            expect(page.get_by_test_id("diagnostic-explain-run")).to_be_disabled()
+            assert not attention_calls and not gradcam_calls and not explanation_responses
+
+            page.get_by_test_id("diagnostic-head-build").click()
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text("Head ready: 224×224")
+            expect(page.get_by_test_id("diagnostic-explain-run")).to_be_enabled()
+            assert not attention_calls and not gradcam_calls
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/explanations")
+                and response.request.method == "POST"
+            ) as attention_response:
+                page.get_by_test_id("diagnostic-explain-run").click()
+            attention_payload = attention_response.value.json()
+            assert attention_payload["method"] == "attention"
+            assert attention_payload["attention_method"] == "last_layer_head_mean"
+            assert str(dataset) not in attention_response.value.text()
+            expect(page.get_by_test_id("diagnostic-evidence-grid")).to_be_visible()
+            expect(page.get_by_test_id("diagnostic-evidence-grid").locator("span")).to_have_count(4)
+            expect(page.get_by_test_id("diagnostic-explanation-result")).to_contain_text("not a defect mask")
+            assert len(attention_calls) == 1
+
+            page.get_by_test_id("diagnostic-method").select_option("gradcam")
+            page.get_by_test_id("diagnostic-target-class").select_option("banana")
+            page.get_by_test_id("diagnostic-display-mode").select_option("signed")
+            with page.expect_response(
+                lambda response: response.url.endswith("/explanations")
+                and response.request.method == "POST"
+            ) as gradcam_response:
+                page.get_by_test_id("diagnostic-explain-run").click()
+            gradcam_payload = gradcam_response.value.json()
+            assert gradcam_payload["method"] == "gradcam"
+            assert gradcam_payload["target_class"] == "banana"
+            assert gradcam_payload["score_mode"] == "signed"
+            assert gradcam_payload["display_scores"][0][0] < 0
+            assert gradcam_payload["display_scores"][0][1] > 0
+            assert str(dataset) not in gradcam_response.value.text()
+            expect(page.get_by_test_id("diagnostic-target-result")).to_contain_text("banana")
+            expect(page.get_by_test_id("diagnostic-faithfulness")).to_contain_text("supported")
+            assert len(gradcam_calls) == 1 and gradcam_calls[0][1] == "banana"
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert fixture_hashes == {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }, "diagnostics changed the source dataset"
+
+
+def test_lv_web_04_expl_01_real_dinov2_attention_and_gradcam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Real pinned DINO weights execute both evidence methods at the exact classifier resolution."""
+    from fastapi.testclient import TestClient
+    import _utils
+
+    models_dir = Path(
+        os.environ.get("LV_MODELS_DIR", r"C:\code\claude\LV\visuallatent\models")
+    ).resolve()
+    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
+    if not weights.is_file():
+        pytest.skip(f"pinned real DINOv2-small weights are unavailable: {weights}")
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
+        "the local DINOv2-small weights differ from the pinned diagnostics baseline"
+    monkeypatch.setattr(_utils, "_DEFAULT_MODELS_DIR", models_dir)
+    monkeypatch.setattr(_utils.available_models, "__defaults__", (models_dir,))
+    monkeypatch.setattr(
+        _utils.load_model,
+        "__defaults__",
+        (models_dir, *_utils.load_model.__defaults__[1:]),
+    )
+    cache_root = tmp_path / "real-diagnostics-cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
+
+    dataset = _fixture(tmp_path / "real-diagnostics-fixture")
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    application = create_app()
+    with TestClient(application) as client:
+        response = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(dataset / "train"), str(dataset / "test")],
+            "model_id": "dinov2_vits14",
+            "method": "pca",
+        })
+        assert response.status_code == 202, response.text
+        job_id = response.json()["job_id"]
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            job = client.get(f"/api/v1/jobs/{job_id}").json()
+            if job["state"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.05)
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        reference = client.post("/api/v1/diagnostic-references", json={
+            "run_id": run_id,
+            "record_index": 0,
+            "model_id": "dinov2_vits14",
+        }).json()
+        head = client.post(
+            f"/api/v1/diagnostic-references/{reference['context_id']}/heads",
+            json={"current_run_id": run_id, "resolution": 224},
+        )
+        assert head.status_code == 200, head.text
+        cache_before_explanation = hashlib.sha256(
+            b"".join(
+                str(path.relative_to(cache_root)).encode("utf-8") + path.read_bytes()
+                for path in sorted(cache_root.rglob("*")) if path.is_file()
+            )
+        ).hexdigest()
+        attention = client.post(
+            f"/api/v1/diagnostic-references/{reference['context_id']}/explanations",
+            json={
+                "current_run_id": run_id,
+                "resolution": 224,
+                "method": "attention",
+                "attention_method": "last_layer_head_mean",
+            },
+        )
+        gradcam = client.post(
+            f"/api/v1/diagnostic-references/{reference['context_id']}/explanations",
+            json={
+                "current_run_id": run_id,
+                "resolution": 224,
+                "method": "gradcam",
+                "target_class": "banana",
+                "display_mode": "signed",
+            },
+        )
+        cache_after_explanation = hashlib.sha256(
+            b"".join(
+                str(path.relative_to(cache_root)).encode("utf-8") + path.read_bytes()
+                for path in sorted(cache_root.rglob("*")) if path.is_file()
+            )
+        ).hexdigest()
+
+    assert attention.status_code == 200, attention.text
+    assert gradcam.status_code == 200, gradcam.text
+    attention_payload = attention.json()
+    gradcam_payload = gradcam.json()
+    assert run["embedding_shape"] == [4, 384]
+    assert attention_payload["grid"] == [16, 16]
+    assert gradcam_payload["grid"] == [16, 16]
+    assert attention_payload["predicted_class"] in {"apple", "banana"}
+    assert gradcam_payload["target_class"] == "banana"
+    assert gradcam_payload["reference_class"] in {"apple", "banana"}
+    assert np.isfinite(np.asarray(attention_payload["display_scores"], dtype=float)).all()
+    assert np.isfinite(np.asarray(gradcam_payload["display_scores"], dtype=float)).all()
+    assert "not a defect mask" in gradcam_payload["warning"]
+    assert str(dataset) not in attention.text + gradcam.text
+    assert cache_before_explanation == cache_after_explanation
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }

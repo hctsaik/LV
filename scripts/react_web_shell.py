@@ -101,6 +101,16 @@ class CreateDiagnosticHeadRequest(BaseModel):
     resolution: Literal[224, 336, 448]
 
 
+class CreateDiagnosticExplanationRequest(BaseModel):
+    current_run_id: str = Field(min_length=1, max_length=128)
+    resolution: Literal[224, 336, 448]
+    method: Literal["attention", "gradcam"]
+    attention_method: Literal["last_layer_head_mean", "single_head", "rollout"] = "last_layer_head_mean"
+    head_index: int | None = Field(default=None, ge=0, le=63)
+    target_class: str | None = Field(default=None, min_length=1, max_length=256)
+    display_mode: Literal["signed", "positive"] = "signed"
+
+
 class CreateComparisonJob(BaseModel):
     folders_a: list[str] = Field(min_length=1, max_length=32)
     folders_b: list[str] = Field(min_length=1, max_length=32)
@@ -2177,6 +2187,31 @@ def create_app(
                 "exact_resolution": True,
                 "resolution_mode": "exact_head",
             }
+            checkpoint = None
+            if model_loader is None and object_model_loader is None and diagnostic_model_loader is None:
+                from dino_explain import _resolve_checkpoint
+
+                try:
+                    checkpoint = _resolve_checkpoint(model_id, None)
+                except Exception:
+                    # The head itself can still be retained from already computed
+                    # Visualize features. Explanation preflight will refuse Grad-CAM
+                    # until the model identity can be established.
+                    checkpoint = None
+            # An injected host/test embedder does not currently publish a weight
+            # identity, so it must not be represented as the default DINO checkpoint.
+            from dino_explain import checkpoint_identity
+            head["explain_provenance"] = {
+                "model_id": model_id,
+                "checkpoint_id": checkpoint_identity(checkpoint),
+                "embedding_dim": int(embeddings.shape[1]),
+                "keep_aspect": keep_aspect,
+                "target_res": resolution,
+                "pooling": pooling,
+                "l2norm": bool(head.get("l2norm", True)),
+                "scope": "object_crop" if unit == "object" else "whole_image",
+                "pad": float(policy.get("pad", 0.12)) if unit == "object" else None,
+            }
             entry = {
                 "head": head,
                 "embeddings": embeddings,
@@ -2203,6 +2238,233 @@ def create_app(
                 })
             stored = app.state.diagnostic_heads.setdefault(key, entry)
         return diagnostic_head_summary(stored, reused=stored is not entry)
+
+    @app.post("/api/v1/diagnostic-references/{context_id}/explanations")
+    def create_diagnostic_explanation(
+        context_id: str,
+        request: CreateDiagnosticExplanationRequest,
+    ) -> dict:
+        with app.state.lock:
+            context = app.state.diagnostic_references.get(context_id)
+            if context is None:
+                raise HTTPException(status_code=404, detail="Diagnostic reference not found")
+            run = app.state.runs.get(context["run_id"])
+            if run is None:
+                raise HTTPException(status_code=409, detail={
+                    "code": "STALE_DIAGNOSTIC_RUN",
+                    "message": "The Visualize run is no longer available.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if request.current_run_id != context["run_id"] or app.state.current_run_id != context["run_id"]:
+                raise HTTPException(status_code=409, detail={
+                    "code": "INCOMPATIBLE_DIAGNOSTIC_RUN",
+                    "message": "The diagnostics reference belongs to a different Visualize run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if public_diagnostic_reference(context)["status"] != "current":
+                raise HTTPException(status_code=409, detail={
+                    "code": "STALE_DIAGNOSTIC_SOURCE",
+                    "message": "The selected source image changed or is unavailable.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            record_index = int(context["record_index"])
+            records = run.get("records", [])
+            paths = run.get("image_paths", [])
+            if record_index >= len(records) or record_index >= len(paths):
+                raise HTTPException(status_code=409, detail={
+                    "code": "STALE_DIAGNOSTIC_RUN",
+                    "message": "The selected record is no longer part of this Visualize run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            model_id = str(context["model_id"])
+            resolution = int(request.resolution)
+            key = diagnostic_head_key(context["run_id"], run, model_id, resolution)
+            head_entry = app.state.diagnostic_heads.get(key)
+            record = dict(records[record_index])
+            source_path = Path(paths[record_index])
+            expected_hash = context.get("source_sha256")
+            run_snapshot = dict(run)
+
+        if head_entry is None:
+            raise HTTPException(status_code=409, detail={
+                "code": "DIAGNOSTIC_HEAD_NOT_READY",
+                "message": "Prepare the exact-resolution classifier head before running an explanation.",
+                "request_id": uuid.uuid4().hex,
+            })
+        try:
+            image = safe_open_image(source_path)
+            if image is None:
+                raise ValueError("The selected source image cannot be read.")
+            original_size = image.size
+            unit = str(context.get("unit") or "image")
+            policy = dict(run_snapshot.get("object_policy") or {})
+            scope = "whole_image"
+            crop_bbox_px = None
+            pad = None
+            input_image = image
+            keep_aspect = False
+            if unit == "object":
+                bbox = context.get("bbox")
+                if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
+                    raise ValueError("The selected object has no valid bounding box.")
+                from object_eval import _adaptive_pad_px
+                from interaction import bbox_to_pixels, crop_bbox
+
+                scope = "object_crop"
+                pad = float(policy.get("pad", 0.12))
+                pad_px = _adaptive_pad_px(bbox, *image.size, pad)
+                crop_bbox_px = bbox_to_pixels(*bbox, *image.size, pad_px=pad_px)
+                input_image = crop_bbox(image, *bbox, pad_px=pad_px)
+                keep_aspect = True
+
+            from dino_explain import (
+                ExplainRequest,
+                _resolve_checkpoint,
+                attention_map,
+                get_explainer,
+                max_norm,
+            )
+
+            checkpoint = _resolve_checkpoint(model_id, None)
+            explainer, checkpoint = get_explainer(
+                model_id, checkpoint, head=str(head_entry["pooling"]),
+            )
+            source_id = f"{expected_hash}:{record.get('obj_index', '')}"
+            explain_request = ExplainRequest(
+                image=input_image,
+                source_id=source_id,
+                scope=scope,
+                model_id=model_id,
+                checkpoint_path=checkpoint,
+                keep_aspect=keep_aspect,
+                target_res=resolution,
+                pooling=str(head_entry["pooling"]),
+                method=request.attention_method,
+                head_index=request.head_index,
+                original_size=original_size,
+                crop_bbox_px=crop_bbox_px,
+                pad=pad,
+            )
+            embeddings = np.asarray(head_entry["embeddings"], dtype=np.float32)
+            if record_index >= len(embeddings):
+                raise ValueError("The prepared head does not contain the selected record.")
+            from dino_head import predict_head
+
+            predicted, confidence, probabilities = predict_head(
+                head_entry["head"], embeddings[record_index:record_index + 1],
+            )
+            classes = [str(value) for value in head_entry["head"].get("classes", [])]
+            payload = {
+                "status": "ready",
+                "run_id": context["run_id"],
+                "context_id": context_id,
+                "record_index": record_index,
+                "resolution": resolution,
+                "model_id": model_id,
+                "unit": unit,
+                "scope": scope,
+                "classes": classes,
+                "predicted_class": str(predicted[0]),
+                "predicted_probability": float(confidence[0]),
+                "class_probabilities": [
+                    {"class_name": name, "probability": float(probabilities[0][index])}
+                    for index, name in enumerate(classes)
+                ],
+                "warning": "Patch evidence is a coarse model explanation, not a defect mask or pixel-accurate localization.",
+            }
+            if request.method == "attention":
+                result = attention_map(
+                    explain_request,
+                    explainer=explainer,
+                )
+                scores = np.asarray(result.display_patch_scores, dtype=np.float32)
+                payload.update({
+                    "method": "attention",
+                    "attention_method": result.method,
+                    "grid": list(result.grid),
+                    "patch_size": int(result.patch_size),
+                    "score_mode": "positive",
+                    "display_scores": scores.tolist(),
+                    "raw_scores": np.asarray(result.raw_patch_scores, dtype=np.float32).tolist(),
+                    "warnings": list(result.warnings),
+                })
+            else:
+                from gradcam_explain import token_gradcam_map
+
+                result = token_gradcam_map(
+                    explain_request,
+                    head_entry["head"],
+                    target_class=request.target_class,
+                    explainer=explainer,
+                )
+                raw_scores = np.asarray(result.raw_patch_scores, dtype=np.float32)
+                if request.display_mode == "positive":
+                    display_scores = max_norm(np.clip(raw_scores, 0.0, None))
+                else:
+                    display_scores = np.asarray(result.display_patch_scores, dtype=np.float32)
+                payload.update({
+                    "method": "gradcam",
+                    "attention_method": None,
+                    "grid": list(result.grid),
+                    "patch_size": int(result.patch_size),
+                    "score_mode": request.display_mode,
+                    "display_scores": display_scores.tolist(),
+                    "raw_scores": raw_scores.tolist(),
+                    "target_class": result.target_class,
+                    "target_score": float(result.target_score),
+                    "reference_class": result.reference_class,
+                    "predicted_class": result.predicted_class,
+                    "predicted_probability": float(result.predicted_probability),
+                    "runner_up_class": result.runner_up_class,
+                    "runner_up_probability": float(result.runner_up_probability),
+                    "probability_margin": float(result.probability_margin),
+                    "target_probability": float(result.target_probability),
+                    "reference_probability": float(result.reference_probability),
+                    "is_predicted_target": bool(result.is_predicted_target),
+                    "positive_mass": float(result.positive_mass),
+                    "negative_mass": float(result.negative_mass),
+                    "faithfulness": result.faithfulness,
+                    "head_diagnostics": result.head_diagnostics,
+                    "sample_oof": result.sample_oof,
+                    "warnings": list(result.warnings),
+                })
+            try:
+                source_is_current = (
+                    source_path.is_file()
+                    and bool(expected_hash)
+                    and _sha256_file(source_path) == expected_hash
+                )
+            except OSError:
+                source_is_current = False
+            if not source_is_current:
+                raise HTTPException(status_code=409, detail={
+                    "code": "STALE_DIAGNOSTIC_SOURCE",
+                    "message": "The selected source image changed while the explanation was running.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            with app.state.lock:
+                if app.state.current_run_id != context["run_id"]:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "INCOMPATIBLE_DIAGNOSTIC_RUN",
+                        "message": "Visualize changed while the explanation was running.",
+                        "request_id": uuid.uuid4().hex,
+                    })
+            return payload
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("LV diagnostics explanation failed")
+            code = "DIAGNOSTIC_EXPLANATION_FAILED"
+            message = "The explanation could not be generated. Check the exact-resolution head and local DINO model, then retry."
+            if isinstance(exc, ValueError) and str(exc) and not any(
+                token in str(exc).lower() for token in ("path", "directory", "checkpoint")
+            ):
+                message = str(exc)
+            raise HTTPException(status_code=422, detail={
+                "code": code,
+                "message": message,
+                "request_id": uuid.uuid4().hex,
+            }) from exc
 
     def curation_store_error() -> HTTPException:
         logger.exception("LV curation store operation failed")
