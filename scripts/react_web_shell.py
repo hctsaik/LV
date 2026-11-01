@@ -14,6 +14,9 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
@@ -59,6 +62,15 @@ class ProjectComparisonRequest(BaseModel):
     min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     max_confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     min_short_px: int = Field(default=0, ge=0, le=4096)
+
+
+class KMeansBlocksRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    method: Literal["pca", "tsne", "umap", "lda", "sumap"]
+    k: int = Field(default=12, ge=4, le=30)
+    label_filter: str | None = Field(default=None, max_length=256)
+    split_filter: str | None = Field(default=None, max_length=128)
+    block_id: int | None = Field(default=None, ge=0, le=29)
 
 
 @dataclass
@@ -123,6 +135,8 @@ def create_app(
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
     app.state.runs = {}
+    app.state.raw_embeddings = {}
+    app.state.block_cache = {}
     app.state.comparison_jobs = {}
     app.state.comparison_runs = {}
     app.state.comparison_projections = {}
@@ -221,12 +235,16 @@ def create_app(
                 raise JobCancelled()
 
             run_id = uuid.uuid4().hex
-            run = {
-                key: value for key, value in result.items() if key != "image_paths"
-            }
+            raw_embeddings = result.pop("_raw_embeddings", {})
+            run = {key: value for key, value in result.items() if key != "image_paths"}
             run["image_paths"] = result["image_paths"]
             with app.state.lock:
+                # Retain high-dimensional vectors only for the active visual run;
+                # old run summaries stay readable without pinning model arrays.
+                app.state.raw_embeddings.clear()
+                app.state.block_cache.clear()
                 app.state.runs[run_id] = run
+                app.state.raw_embeddings[run_id] = raw_embeddings
                 job.run_id = run_id
                 model_count = len(result["models"])
                 expected = len(result["records"]) * model_count
@@ -459,7 +477,103 @@ def create_app(
             run = app.state.runs.get(run_id)
             if run is None:
                 raise HTTPException(status_code=404, detail="Run not found")
-            return {key: value for key, value in run.items() if key != "image_paths"}
+            return {
+                key: value for key, value in run.items()
+                if key not in {"image_paths", "_raw_embeddings"}
+            }
+
+    @app.post("/api/v1/runs/{run_id}/blocks")
+    def get_kmeans_blocks(run_id: str, request: KMeansBlocksRequest) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            raw_by_model = app.state.raw_embeddings.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.get("mode") != "classifier" or run.get("unit") != "image":
+            raise HTTPException(status_code=409, detail="KMeans blocks require classifier image embeddings")
+        raw = (raw_by_model or {}).get(request.model_id)
+        if raw is None:
+            raise HTTPException(status_code=404, detail="Raw embeddings are unavailable for this model")
+        view = next((item for item in run["views"]
+                     if item["model_id"] == request.model_id and item["method"] == request.method), None)
+        if view is None:
+            raise HTTPException(status_code=404, detail="The requested projection is unavailable")
+
+        view_points = [
+            point for point in view["points"]
+            if (request.label_filter is None or point["label"] == request.label_filter)
+            and (request.split_filter is None or point["split"] == request.split_filter)
+        ]
+        if not view_points:
+            raise HTTPException(status_code=422, detail="No images match the current filters")
+
+        cache_key = (
+            run_id, request.model_id, request.method, request.k,
+            request.label_filter, request.split_filter,
+        )
+        with app.state.lock:
+            base = app.state.block_cache.get(cache_key)
+        if base is None:
+            indices = np.asarray([int(point["index"]) for point in view_points], dtype=np.int64)
+            coordinates = np.asarray([
+                [float(point["x"]), float(point["y"]), float(point["z"])]
+                for point in view_points
+            ], dtype=np.float64)
+            kk = max(1, min(request.k, len(indices)))
+            fitted = KMeans(n_clusters=kk, n_init=4, random_state=42).fit(coordinates)
+            counts = np.bincount(fitted.labels_, minlength=kk)
+            centers = [
+                {
+                    "block_id": block_id,
+                    "x": float(center[0]),
+                    "y": float(center[1]),
+                    "z": float(center[2]),
+                    "count": int(counts[block_id]),
+                }
+                for block_id, center in enumerate(fitted.cluster_centers_)
+            ]
+            base = {
+                "k": kk,
+                "centers": centers,
+                "assignments": {
+                    int(index): int(block_id)
+                    for index, block_id in zip(indices, fitted.labels_)
+                },
+                "points_by_index": {int(point["index"]): point for point in view_points},
+            }
+            with app.state.lock:
+                app.state.block_cache[cache_key] = base
+
+        block_points = [
+            {**base["points_by_index"][index], "block_id": block_id}
+            for index, block_id in sorted(base["assignments"].items())
+        ]
+        drilldown_points: list[dict] = []
+        if request.block_id is not None:
+            if request.block_id >= base["k"]:
+                raise HTTPException(status_code=422, detail="The selected block is outside the current KMeans result")
+            members = [
+                index for index, block_id in sorted(base["assignments"].items())
+                if block_id == request.block_id
+            ]
+            member_points = [base["points_by_index"][index] for index in members]
+            member_vectors = raw[members]
+            if len(members) > 2 and float(np.var(member_vectors)) > 0.0:
+                projected = PCA(n_components=2, random_state=42).fit_transform(member_vectors)
+            else:
+                projected = np.asarray([[point["x"], point["y"]] for point in member_points])
+            drilldown_points = [
+                {**point, "x": float(xy[0]), "y": float(xy[1]), "z": 0.0}
+                for point, xy in zip(member_points, projected)
+            ]
+
+        return {
+            "k": base["k"],
+            "centers": base["centers"],
+            "points": block_points,
+            "block_id": request.block_id,
+            "drilldown_points": drilldown_points,
+        }
 
     @app.get("/api/v1/runs/{run_id}/images/{index}")
     def get_run_image(run_id: str, index: int) -> Response:
