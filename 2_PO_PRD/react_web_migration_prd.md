@@ -33,6 +33,8 @@ LV 是成熟的本機影像分析 App。現有 Streamlit 畫面把資料選擇�
 | LV-WEB-09 | 匯出 | 跨工具清單、子集、CSV／ZIP、目的地選擇及來源不變 |
 | LV-WEB-10 | 標註回饋 | 送出帳本、匯入／讀回、套用修正及跨程序持久性 |
 
+每個工具的巢狀使用旅程、既有行為錨點與 React 驗收狀態，以 [React case inventory](../4_PM_Feedback/react_web_shell.md) 維護；PRD 這張表只定義 10 個頂層範圍，不代表巢狀覆蓋已完成。
+
 ## LV-WEB-01 首個垂直流程
 
 首批實作涵蓋 Image Classifier 的整圖模式：選一個或多個資料夾、選一個模型及投影、執行真實 embedding、呈現互動散點與類別／split 篩選、選取點後顯示對應影像。首個驗收 fixture 使用 4 張有效影像，避免原 Streamlit 小樣本規則把 PCA 投影降成一維。此切片用來驗證 React、API、worker、模型與快取；NativeApp host bridge 端到端仍需獨立驗收，其他 LV-WEB case 在各自完成前保持未完成。
