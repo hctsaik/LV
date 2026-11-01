@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   type FalsePositiveCase,
+  type FalsePositiveSearch,
+  type FalsePositiveSearchRow,
   type FalsePositiveRegion,
   type FalsePositiveSource,
 } from "./api";
@@ -40,6 +42,17 @@ function sourceKindLabel(kind: FalsePositiveSource["kind"]) {
   return kind === "screenshot" ? "截圖" : "原圖";
 }
 
+function searchCategoryLabel(category: "normal" | "defect" | "history") {
+  return category === "normal" ? "正常對照"
+    : category === "defect" ? "真瑕疵對照" : "歷史案件";
+}
+
+function searchStatusLabel(row: FalsePositiveSearchRow) {
+  if (row.label_status === "reviewed_normal") return "歷史案件：已確認此區域正常";
+  if (row.label_status === "reviewed_defect") return "歷史案件：已確認此區域有瑕疵";
+  return "資料夾提供類別範圍（尚未人工覆核）";
+}
+
 function shortHash(value: string) {
   return value.slice(0, 12) + "…" + value.slice(-6);
 }
@@ -65,8 +78,8 @@ export default function FalsePositiveCaseWorkspace() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [createSourceKind, setCreateSourceKind] = useState<FalsePositiveSource["kind"]>("screenshot");
-  const [newSourceKind, setNewSourceKind] = useState<FalsePositiveSource["kind"]>("original");
+  const [createSourceKind, setCreateSourceKind] = useState<"original" | "screenshot">("screenshot");
+  const [newSourceKind, setNewSourceKind] = useState<"original" | "screenshot">("original");
   const [newTitle, setNewTitle] = useState("");
   const [newDescription, setNewDescription] = useState("");
   const [newModel, setNewModel] = useState("");
@@ -75,6 +88,13 @@ export default function FalsePositiveCaseWorkspace() {
   const [regionLabel, setRegionLabel] = useState("");
   const [regionScore, setRegionScore] = useState("");
   const [regionRoi, setRegionRoi] = useState<[string, string, string, string]>(["0", "0", "1", "1"]);
+  const [normalFolder, setNormalFolder] = useState("");
+  const [defectFolder, setDefectFolder] = useState("");
+  const [candidateScope, setCandidateScope] = useState<"whole_image" | "same_roi">("whole_image");
+  const [searchLimit, setSearchLimit] = useState(300);
+  const [searchTopK, setSearchTopK] = useState(6);
+  const [includeHistory, setIncludeHistory] = useState(true);
+  const [activeSearchId, setActiveSearchId] = useState("");
   const createFileRef = useRef<HTMLInputElement>(null);
   const addSourceFileRef = useRef<HTMLInputElement>(null);
   const predictionFileRef = useRef<HTMLInputElement>(null);
@@ -90,6 +110,18 @@ export default function FalsePositiveCaseWorkspace() {
     : null;
   const selectedReviewDraft = selectedRegion
     ? updateReviewDraft(reviewDrafts, selectedRegion)
+    : null;
+  const activeSearch = useMemo<FalsePositiveSearch | null>(
+    () => selectedCase?.searches.find((search) => search.id === activeSearchId)
+      || selectedCase?.searches[selectedCase.searches.length - 1]
+      || null,
+    [selectedCase, activeSearchId],
+  );
+  const activeSearchRegion = activeSearch
+    ? selectedCase?.items.find((item) => item.id === activeSearch.query_item_id) || null
+    : null;
+  const activeSearchSource = activeSearchRegion
+    ? selectedCase?.sources.find((source) => source.id === activeSearchRegion.source_id) || null
     : null;
 
   async function refreshCases(selectId?: string) {
@@ -158,6 +190,7 @@ export default function FalsePositiveCaseWorkspace() {
       setSelectedCase(created);
       setSelectedSourceId(created.sources[0]?.id || "");
       setSelectedRegionId("");
+      setActiveSearchId("");
       setNewTitle("");
       setNewDescription("");
       setNewModel("");
@@ -182,6 +215,7 @@ export default function FalsePositiveCaseWorkspace() {
       setSelectedCase(opened);
       setSelectedSourceId(opened.sources[0]?.id || "");
       setSelectedRegionId(opened.items[0]?.id || "");
+      setActiveSearchId(opened.searches[opened.searches.length - 1]?.id || "");
       setReviewDrafts(Object.fromEntries(opened.items.map((item) => [item.id, {
         verdict: item.review.verdict,
         reviewer: item.review.reviewer,
@@ -202,6 +236,7 @@ export default function FalsePositiveCaseWorkspace() {
     try {
       const latest = await api.falsePositiveCase(selectedCase.id);
       setSelectedCase(latest);
+      setActiveSearchId(latest.searches[latest.searches.length - 1]?.id || "");
       setReviewDrafts((current) => {
         const next = { ...current };
         for (const item of latest.items) {
@@ -339,10 +374,65 @@ export default function FalsePositiveCaseWorkspace() {
     }
   }
 
+  async function findComparison(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedCase || !selectedRegion) {
+      setError("先加入或選取一個爭議區域，再找對照。");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const response = await api.searchFalsePositiveCase(selectedCase.id, {
+        expected_revision: selectedCase.revision,
+        item_id: selectedRegion.id,
+        normal_folder: normalFolder,
+        defect_folder: defectFolder,
+        candidate_scope: candidateScope,
+        limit: searchLimit,
+        top_k: searchTopK,
+        include_history: includeHistory,
+      });
+      setSelectedCase(response.case);
+      setActiveSearchId(response.search_id);
+      await refreshCases();
+      setNotice("對照搜尋已保存；相似度只代表 LV 特徵空間的外觀接近程度。");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addSearchCandidate(row: FalsePositiveSearchRow) {
+    if (!selectedCase || !activeSearch) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const response = await api.addFalsePositiveSearchCandidate(
+        selectedCase.id,
+        activeSearch.id,
+        row.id,
+        selectedCase.revision,
+        row.category,
+      );
+      setSelectedCase(response.case);
+      await refreshCases();
+      setNotice(response.added ? "對照已加入待覆核候選；尚未成為人工標籤。" : "此影像與區域已在待覆核候選中。");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function showNewCaseForm() {
     setSelectedCase(null);
     setSelectedSourceId("");
     setSelectedRegionId("");
+    setActiveSearchId("");
     setError("");
     setNotice("");
   }
@@ -391,7 +481,7 @@ export default function FalsePositiveCaseWorkspace() {
                 <input aria-label="案件名稱（可留空）" value={newTitle} onChange={(event) => setNewTitle(event.target.value)} maxLength={240} />
               </label>
               <label>建立時的影像類型
-                <select aria-label="新案件來源類型" value={createSourceKind} onChange={(event) => setCreateSourceKind(event.target.value as FalsePositiveSource["kind"])}>
+                <select aria-label="新案件來源類型" value={createSourceKind} onChange={(event) => setCreateSourceKind(event.target.value as "original" | "screenshot")}>
                   <option value="screenshot">截圖</option>
                   <option value="original">原圖</option>
                 </select>
@@ -477,7 +567,7 @@ export default function FalsePositiveCaseWorkspace() {
                 </>}
                 <form className="fp-add-source-form" onSubmit={(event) => void addSource(event)}>
                   <label>補入來源類型
-                    <select aria-label="補入來源類型" value={newSourceKind} onChange={(event) => setNewSourceKind(event.target.value as FalsePositiveSource["kind"])}>
+                    <select aria-label="補入來源類型" value={newSourceKind} onChange={(event) => setNewSourceKind(event.target.value as "original" | "screenshot")}>
                       <option value="original">原圖</option>
                       <option value="screenshot">截圖</option>
                     </select>
@@ -580,6 +670,111 @@ export default function FalsePositiveCaseWorkspace() {
                 </>}
               </section>
             </div>
+            <section className="fp-card fp-search-card" aria-labelledby="fp-search-title">
+              <div className="fp-card-heading">
+                <div><div className="eyebrow">AUXILIARY RETRIEVAL</div><h3 id="fp-search-title">找對照</h3></div>
+                <span>{selectedCase.searches.length} 筆搜尋</span>
+              </div>
+              <p className="fp-boundary-note">按下「找對照案例」才載入本機 DINOv2-small 並計算；不會自動執行推論或訓練分類 head。LV cosine 相似度是外觀線索，不是外部模型信心或原因。</p>
+              <form className="fp-search-form" onSubmit={(event) => void findComparison(event)}>
+                <label>正常對照資料夾（可留空）
+                  <input aria-label="正常對照資料夾（可留空）" value={normalFolder} onChange={(event) => setNormalFolder(event.target.value)} placeholder="本機資料夾路徑" maxLength={4096} />
+                </label>
+                <label>真瑕疵對照資料夾（可留空）
+                  <input aria-label="真瑕疵對照資料夾（可留空）" value={defectFolder} onChange={(event) => setDefectFolder(event.target.value)} placeholder="本機資料夾路徑" maxLength={4096} />
+                </label>
+                <label>對照圖片比對範圍
+                  <select aria-label="對照圖片比對範圍" value={candidateScope} onChange={(event) => setCandidateScope(event.target.value as "whole_image" | "same_roi")}>
+                    <option value="whole_image">整張對照圖（適合已裁切物件）</option>
+                    <option value="same_roi">相同比例位置（僅適合已對齊影像）</option>
+                  </select>
+                </label>
+                <label>每個來源最多搜尋圖片／區域數
+                  <input aria-label="每個來源最多搜尋圖片／區域數" type="number" min={1} max={5000} value={searchLimit} onChange={(event) => setSearchLimit(Number(event.target.value))} />
+                </label>
+                <label>每欄最多顯示對照數
+                  <input aria-label="每欄最多顯示對照數" type="number" min={1} max={100} value={searchTopK} onChange={(event) => setSearchTopK(Number(event.target.value))} />
+                </label>
+                <label className="fp-history-toggle">
+                  <input type="checkbox" aria-label="包含已覆核歷史案件" checked={includeHistory} onChange={(event) => setIncludeHistory(event.target.checked)} />
+                  <span>包含已覆核歷史案件</span>
+                </label>
+                <button type="submit" className="run-button fp-search-run" data-testid="fp-run-search" disabled={busy || !selectedRegion}>
+                  {busy ? "正在搜尋…" : "找對照案例"}
+                </button>
+              </form>
+              <p className="fp-search-note">正常／瑕疵資料夾是使用者提供的類別範圍，未經人工覆核。缺少其中一側只會顯示沒有找到，不會推斷資料缺漏或外部模型原因。</p>
+
+              {selectedCase.searches.length > 0 && <label className="fp-search-history-select">搜尋紀錄
+                <select aria-label="搜尋紀錄" value={activeSearch?.id || ""} onChange={(event) => setActiveSearchId(event.target.value)}>
+                  {selectedCase.searches.slice().reverse().map((search) => (
+                    <option key={search.id} value={search.id}>{search.at.slice(0, 19)} · {search.query_item_id}</option>
+                  ))}
+                </select>
+              </label>}
+
+              {activeSearch && <>
+                <div className="fp-search-summary" data-testid="fp-search-summary">
+                  <div>
+                    <strong>搜尋起點：{activeSearchSource?.name || activeSearch.query_item_id}</strong>
+                    <span>ROI {activeSearch.query_roi.map((value) => value.toFixed(3)).join(", ")}</span>
+                    <small>{activeSearchSource?.kind === "screenshot" ? "來源為截圖；外部模型原始輸入與判定尚未重現。" : "外部模型判定未重播。"}</small>
+                  </div>
+                  <div>
+                    <strong>{String(activeSearch.recipe.model || "local model")}</strong>
+                    <span>權重 SHA-256 {String(activeSearch.recipe.checkpoint_sha256 || "unknown").slice(0, 16)}…</span>
+                    <small>{activeSearch.candidate_scope === "same_roi" ? "相同比例位置；不同照片不一定對齊。" : "整張候選圖與報案 ROI 比較。"}</small>
+                  </div>
+                </div>
+                <div className="fp-search-source-summary" aria-label="搜尋來源摘要">
+                  {(["normal", "defect", "history"] as const).map((category) => {
+                    const source = activeSearch.sources[category];
+                    const count = source.n_files ?? source.n_regions ?? 0;
+                    return <div key={category}>
+                      <strong>{searchCategoryLabel(category)}</strong>
+                      <span>{category === "history" ? `${count} 個已覆核區域` : `${source.folder_name || "未指定來源"} · ${count}${source.truncated ? "+" : ""} 個檔案`}</span>
+                      {source.folder_sha256 && <small>來源指紋 {source.folder_sha256.slice(0, 16)}…</small>}
+                      {source.truncated && <small>已達搜尋上限，結果不是整個來源的完整覆蓋。</small>}
+                    </div>;
+                  })}
+                </div>
+                {Object.values(activeSearch.sources).some((source) => source.truncated)
+                  && <div className="alert alert-info" role="status">有來源達到搜尋上限；提高上限或縮小來源後再搜尋，才能檢查剩餘部分。</div>}
+                {activeSearch.skipped_total > 0 && <details className="fp-search-skipped">
+                  <summary>{activeSearch.skipped_total} 個檔案無法比對</summary>
+                  <ul>{activeSearch.skipped.map((row, index) => <li key={`${row.category}-${row.name}-${index}`}>{row.category} · {row.name}：{row.reason}</li>)}</ul>
+                </details>}
+                <div className="fp-search-columns" data-testid="fp-search-results">
+                  {(["normal", "defect", "history"] as const).map((category) => (
+                    <section className="fp-search-column" key={category} data-testid={`fp-search-${category}`}>
+                      <h4>{searchCategoryLabel(category)}</h4>
+                      {activeSearch.groups[category].length === 0
+                        ? <div className="fp-search-empty">本次搜尋範圍內沒有可用對照。</div>
+                        : activeSearch.groups[category].map((row) => {
+                          const alreadyAdded = selectedCase.candidates.some((candidate) => candidate.id === row.id);
+                          return <article className="fp-search-result-card" key={`${category}-${row.id}`}>
+                            <img
+                              src={api.falsePositiveSearchImageUrl(selectedCase.id, activeSearch.id, row.id)}
+                              alt={`${searchCategoryLabel(category)} ${row.name}`}
+                              loading="lazy"
+                            />
+                            <div className="fp-search-result-body">
+                              <strong title={row.name}>{row.name}</strong>
+                              <span>cosine 相似度 {row.similarity.toFixed(3)} · {searchStatusLabel(row)}</span>
+                              {row.category === "history" && <small>歷史案件 {row.historical_case} · 外部模型 {row.external_model || "unknown"}；歷史原因不會套用到本案。</small>}
+                              {row.label_conflict && <span className="fp-search-conflict" role="alert">同一內容也出現在另一個標籤來源，請先確認資料夾標籤。</span>}
+                              <small>證據 {row.evidence_id}</small>
+                              <button type="button" className="fp-secondary-button" disabled={busy || alreadyAdded} onClick={() => void addSearchCandidate(row)}>
+                                {alreadyAdded ? "已加入待覆核" : "加入待覆核"}
+                              </button>
+                            </div>
+                          </article>;
+                        })}
+                    </section>
+                  ))}
+                </div>
+              </>}
+            </section>
           </>
         )}
       </section>

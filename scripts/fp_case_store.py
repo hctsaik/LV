@@ -17,8 +17,19 @@ from PIL import Image
 
 
 VERDICTS = {"pending", "normal", "defect", "disputed", "insufficient"}
-SOURCE_KINDS = {"original", "screenshot"}
+SOURCE_KINDS = {"original", "screenshot", "reference"}
 MAX_IMAGE_BYTES = 50 * 1024 * 1024
+CASE_DEFAULTS = {
+    "candidates": [],
+    "searches": [],
+    "claims": [],
+    "batches": [],
+    "reply_status": "draft",
+    "cause_status": "unknown",
+    "improvement_status": "not_evaluated",
+    "effort_minutes": 0.0,
+    "effort_log": [],
+}
 
 
 def utc_now() -> str:
@@ -129,12 +140,21 @@ class FalsePositiveCaseStore:
             "description": str(description)[:10000],
             "sources": [source],
             "items": [],
+            "candidates": [],
+            "searches": [],
+            "claims": [],
+            "batches": [],
             "external": {
                 "model_id": str(model_id).strip()[:240],
                 "threshold": str(threshold).strip()[:120],
                 "raw_output": str(raw_output)[:20000],
                 "replay_status": "not_replayed",
             },
+            "reply_status": "draft",
+            "cause_status": "unknown",
+            "improvement_status": "not_evaluated",
+            "effort_minutes": 0.0,
+            "effort_log": [],
             "evidence": [{
                 "id": "e_" + uuid.uuid4().hex[:12],
                 "role": "reported_output",
@@ -147,6 +167,8 @@ class FalsePositiveCaseStore:
 
     def save(self, case: dict) -> dict:
         value = copy.deepcopy(case)
+        for key, default in CASE_DEFAULTS.items():
+            value.setdefault(key, copy.deepcopy(default))
         old_revision = int(value["revision"])
         value["revision"] = old_revision + 1
         value["updated_at"] = utc_now()
@@ -170,12 +192,19 @@ class FalsePositiveCaseStore:
             row = con.execute("SELECT body FROM cases WHERE id = ?", (case_id,)).fetchone()
         if row is None:
             raise KeyError("找不到案件")
-        return json.loads(row[0])
+        value = json.loads(row[0])
+        for key, default in CASE_DEFAULTS.items():
+            value.setdefault(key, copy.deepcopy(default))
+        return value
 
     def list(self) -> list[dict]:
         with self._connect() as con:
             rows = con.execute("SELECT body FROM cases ORDER BY rowid DESC").fetchall()
-        return [json.loads(row[0]) for row in rows]
+        values = [json.loads(row[0]) for row in rows]
+        for value in values:
+            for key, default in CASE_DEFAULTS.items():
+                value.setdefault(key, copy.deepcopy(default))
+        return values
 
     def image_path(self, source: dict) -> Path:
         asset = source.get("asset", "")
@@ -300,7 +329,17 @@ class FalsePositiveCaseStore:
 
 def public_case(case: dict) -> dict:
     """Return case data without private asset names or filesystem locations."""
-    result = copy.deepcopy(case)
-    for source in result.get("sources", []):
-        source.pop("asset", None)
-    return result
+    private_fields = {"asset", "path", "source_path", "checkpoint_path"}
+
+    def public_value(value):
+        if isinstance(value, dict):
+            return {
+                key: public_value(item)
+                for key, item in value.items()
+                if key not in private_fields
+            }
+        if isinstance(value, list):
+            return [public_value(item) for item in value]
+        return value
+
+    return public_value(copy.deepcopy(case))

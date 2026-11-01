@@ -515,7 +515,7 @@ export type FalsePositiveSource = {
   id: string;
   sha256: string;
   name: string;
-  kind: "original" | "screenshot";
+  kind: "original" | "screenshot" | "reference";
   size: [number, number];
   added_at: string;
 };
@@ -536,6 +536,62 @@ export type FalsePositiveRegion = {
   };
 };
 
+export type FalsePositiveSearchRow = {
+  id: string;
+  sha256: string;
+  name: string;
+  category: "normal" | "defect" | "history";
+  roi: [number, number, number, number];
+  similarity: number;
+  reason: string;
+  label_status: string;
+  source_kind: string;
+  source: FalsePositiveSource;
+  label_conflict: boolean;
+  evidence_id: string;
+  external_model?: string;
+  historical_case?: string;
+  historical_revision?: number;
+  review?: { verdict: string; reviewer: string; reason: string; at: string };
+};
+
+export type FalsePositiveSearchSourceSummary = {
+  folder_name?: string;
+  n_files?: number;
+  n_regions?: number;
+  truncated: boolean;
+  label_status: string;
+  folder_sha256?: string | null;
+};
+
+export type FalsePositiveSearch = {
+  id: string;
+  at: string;
+  query_item_id: string;
+  query_sha256: string;
+  query_roi: [number, number, number, number];
+  candidate_scope: "whole_image" | "same_roi";
+  recipe: Record<string, unknown>;
+  sources: Record<"normal" | "defect" | "history", FalsePositiveSearchSourceSummary>;
+  groups: Record<"normal" | "defect" | "history", FalsePositiveSearchRow[]>;
+  skipped: Array<{ name: string; category: string; reason: string }>;
+  skipped_total: number;
+  top_k: number;
+  limit_per_source: number;
+};
+
+export type FalsePositiveCandidate = {
+  id: string;
+  source: FalsePositiveSource;
+  roi: [number, number, number, number];
+  reason: string;
+  reference_category: "normal" | "defect" | "history";
+  evidence_id: string;
+  similarity: number;
+  label_status: string;
+  review: FalsePositiveRegion["review"];
+};
+
 export type FalsePositiveCase = {
   schema_version: number;
   id: string;
@@ -546,6 +602,8 @@ export type FalsePositiveCase = {
   description: string;
   sources: FalsePositiveSource[];
   items: FalsePositiveRegion[];
+  candidates: FalsePositiveCandidate[];
+  searches: FalsePositiveSearch[];
   external: {
     model_id: string;
     threshold: string;
@@ -893,9 +951,40 @@ export const api = {
       body: JSON.stringify({ expected_revision: expectedRevision, ...input }),
     },
   ),
+  searchFalsePositiveCase: (caseId: string, input: {
+    expected_revision: number;
+    item_id: string;
+    normal_folder: string;
+    defect_folder: string;
+    candidate_scope: "whole_image" | "same_roi";
+    limit: number;
+    top_k: number;
+    include_history: boolean;
+  }) => request<{ case: FalsePositiveCase; search_id: string }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/searches", {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  ),
+  addFalsePositiveSearchCandidate: (
+    caseId: string,
+    searchId: string,
+    resultId: string,
+    expectedRevision: number,
+    category: FalsePositiveSearchRow["category"],
+  ) => request<{ case: FalsePositiveCase; added: boolean }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/searches/"
+      + encodeURIComponent(searchId) + "/results/" + encodeURIComponent(resultId) + "/candidate", {
+      method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision, category }),
+    },
+  ),
   falsePositiveSourceImageUrl: (caseId: string, sourceId: string) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fp-cases/" + encodeURIComponent(caseId)
       + "/sources/" + encodeURIComponent(sourceId) + "/image",
+  falsePositiveSearchImageUrl: (caseId: string, searchId: string, resultId: string) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fp-cases/" + encodeURIComponent(caseId)
+      + "/searches/" + encodeURIComponent(searchId) + "/results/" + encodeURIComponent(resultId) + "/image",
 };
 
 async function requestBlob(path: string, body: unknown): Promise<Blob> {

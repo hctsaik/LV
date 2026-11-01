@@ -2774,3 +2774,98 @@ def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_revi
         str(path): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in (screenshot_path, original_path, predictions_path)
     }, "case intake or review modified its source files"
+
+
+def test_lv_web_05_retrieve_01_visible_explicit_search_and_candidate_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible React search keeps empty groups, evidence and pending candidate status."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+
+    cases_root = tmp_path / "fp-cases"
+    monkeypatch.setenv("LV_CASES_DIR", str(cases_root))
+    normal_folder = tmp_path / "normal-reference"
+    normal_folder.mkdir()
+    Image.new("RGB", (80, 60), (210, 25, 35)).save(normal_folder / "accepted-reflection.png")
+    Image.new("RGB", (80, 60), (30, 70, 210)).save(normal_folder / "blue-background.png")
+    (normal_folder / "unreadable.png").write_bytes(b"not an image")
+    query_path = tmp_path / "reported.png"
+    Image.new("RGB", (80, 60), (220, 20, 30)).save(query_path)
+    reference_hashes = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in [*normal_folder.iterdir(), query_path]
+    }
+    model_calls: list[tuple[int, int]] = []
+
+    def embed(image):
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
+        model_calls.append((image.width, image.height))
+        return pixels.mean(axis=(0, 1)) + 1.0
+
+    recipe = {"model": "fixture-mean", "checkpoint_sha256": "d" * 64, "target_res": 224}
+    application = create_app(
+        model_catalog=lambda: [],
+        model_loader=lambda _model: None,
+        case_search_model_provider=lambda: (recipe, embed),
+    )
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1480, "height": 1024})
+            page.set_default_timeout(15000)
+            search_responses: list[dict] = []
+
+            def capture_search(response):
+                if response.request.method == "POST" and "/searches" in response.url:
+                    search_responses.append(response.json())
+
+            page.on("response", capture_search)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fp-cases").click()
+            page.get_by_label("案件名稱（可留空）").fill("Visible retrieval report")
+            page.get_by_label("建立案件圖片").set_input_files(str(query_path))
+            page.get_by_role("button", name="建立案件", exact=True).click()
+            expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("Visible retrieval report")
+            assert model_calls == [] and search_responses == [], "model retrieval must be explicit"
+
+            page.get_by_label("預測類別／爭議名稱").fill("scratch")
+            page.get_by_label("ROI x1").fill("0.2")
+            page.get_by_label("ROI y1").fill("0.2")
+            page.get_by_label("ROI x2").fill("0.8")
+            page.get_by_label("ROI y2").fill("0.8")
+            page.get_by_role("button", name="加入爭議區域").click()
+            expect(page.get_by_test_id("fp-selected-region-roi")).to_be_visible()
+            assert model_calls == [] and search_responses == [], "adding a region must not run retrieval"
+
+            page.get_by_label("正常對照資料夾（可留空）").fill(str(normal_folder))
+            page.get_by_label("包含已覆核歷史案件").uncheck()
+            page.get_by_test_id("fp-run-search").click()
+            expect(page.get_by_test_id("fp-search-summary")).to_be_visible()
+            expect(page.get_by_test_id("fp-search-normal").get_by_role("heading", name="正常對照")).to_be_visible()
+            expect(page.get_by_test_id("fp-search-defect").get_by_text("本次搜尋範圍內沒有可用對照。", exact=True)).to_be_visible()
+            expect(page.get_by_text("cosine 相似度", exact=False).first).to_be_visible()
+            expect(page.get_by_text("同一內容也出現在另一個標籤來源", exact=False)).to_have_count(0)
+            expect(page.get_by_text("1 個檔案無法比對", exact=False)).to_be_visible()
+            result_cards = page.locator(".fp-search-result-card")
+            expect(result_cards).to_have_count(2)
+            expect(result_cards.first.locator("img")).to_be_visible()
+            expect(result_cards.first.get_by_role("button", name="加入待覆核")).to_be_visible()
+            assert model_calls and len(search_responses) == 1
+            assert str(tmp_path) not in json.dumps(search_responses[0], ensure_ascii=False)
+
+            result_cards.first.get_by_role("button", name="加入待覆核").click()
+            expect(page.get_by_test_id("fp-case-notice")).to_contain_text("尚未成為人工標籤")
+            expect(result_cards.first.get_by_role("button", name="已加入待覆核")).to_be_disabled()
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+
+    assert reference_hashes == {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in [*normal_folder.iterdir(), query_path]
+    }, "case search modified its source files"

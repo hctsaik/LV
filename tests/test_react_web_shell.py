@@ -89,6 +89,7 @@ def _client(
     models=None,
     object_model_loader=None,
     diagnostic_model_loader=None,
+    case_search_model_provider=None,
 ):
     cache_root = tmp_path.parent / f"{tmp_path.name}-lv-cache"
     monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
@@ -98,6 +99,7 @@ def _client(
         model_loader=lambda _model: embedder or _fake_embedder(),
         object_model_loader=object_model_loader,
         diagnostic_model_loader=diagnostic_model_loader,
+        case_search_model_provider=case_search_model_provider,
     ))
 
 
@@ -292,6 +294,281 @@ def test_case_lv_web_05_case_01_manual_roi_and_review_validation(monkeypatch, tm
                 "SELECT COUNT(*) FROM history WHERE id = ?", (created["id"],)
             ).fetchone()[0]
         assert history_count == 4
+
+
+def test_case_lv_web_05_retrieve_01_existing_cases_receive_empty_retrieval_defaults(
+    monkeypatch, tmp_path
+):
+    """Cases saved before retrieval fields existed still open and can be edited."""
+    with _client(monkeypatch, tmp_path / "fp-retrieve-legacy") as client:
+        created = client.post("/api/v1/fp-cases", json={
+            "source_name": "legacy.png",
+            "source_kind": "original",
+            "source_base64": base64.b64encode(_png_bytes((150, 70, 30))).decode("ascii"),
+            "title": "Existing case",
+        }).json()
+        with client.app.state.fp_case_store._connect() as connection:
+            connection.execute(
+                "UPDATE cases SET body = json_remove(body, "
+                "'$.candidates', '$.searches', '$.claims', '$.batches', "
+                "'$.reply_status', '$.cause_status', '$.improvement_status', "
+                "'$.effort_minutes', '$.effort_log') WHERE id = ?",
+                (created["id"],),
+            )
+
+        reopened = client.get(f"/api/v1/fp-cases/{created['id']}")
+        assert reopened.status_code == 200
+        assert reopened.json()["candidates"] == []
+        assert reopened.json()["searches"] == []
+        listed = client.get("/api/v1/fp-cases").json()["items"][0]
+        assert listed["claims"] == [] and listed["batches"] == []
+        assert listed["reply_status"] == "draft"
+        assert listed["cause_status"] == "unknown"
+
+        added = client.post(f"/api/v1/fp-cases/{created['id']}/regions", json={
+            "expected_revision": 1,
+            "source_id": created["sources"][0]["id"],
+            "roi": [0.1, 0.1, 0.8, 0.8],
+            "label": "legacy-region",
+        })
+        assert added.status_code == 201, added.text
+        assert added.json()["case"]["searches"] == []
+
+
+def test_case_lv_web_05_retrieve_01_balanced_results_cache_evidence_and_candidate_copy(
+    monkeypatch, tmp_path
+):
+    normal = tmp_path / "normal"
+    defect = tmp_path / "defect"
+    normal.mkdir()
+    defect.mkdir()
+    (normal / "normal.png").write_bytes(_png_bytes((210, 15, 10)))
+    (normal / "normal-copy.png").write_bytes((normal / "normal.png").read_bytes())
+    (defect / "defect.png").write_bytes(_png_bytes((10, 10, 230)))
+    (defect / "label-conflict.png").write_bytes((normal / "normal.png").read_bytes())
+    (normal / "broken.png").write_bytes(b"not an image")
+    reference_files = [*normal.iterdir(), *defect.iterdir()]
+    reference_before = {path: path.read_bytes() for path in reference_files}
+    calls: list[tuple[int, int]] = []
+
+    def embed(image):
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32)
+        calls.append((image.width, image.height))
+        return pixels.mean(axis=(0, 1)) + 1.0
+
+    recipe = {"model": "fixture-mean", "checkpoint_sha256": "a" * 64, "target_res": 224}
+    with _client(
+        monkeypatch,
+        tmp_path / "fp-retrieve-balanced",
+        case_search_model_provider=lambda: (recipe, embed),
+    ) as client:
+        query_bytes = _png_bytes((220, 10, 10))
+        created = client.post("/api/v1/fp-cases", json={
+            "source_name": "reported.png",
+            "source_kind": "screenshot",
+            "source_base64": base64.b64encode(query_bytes).decode("ascii"),
+            "title": "Color comparison report",
+            "external_model_id": "detector-2026.10",
+        }).json()
+        added = client.post(f"/api/v1/fp-cases/{created['id']}/regions", json={
+            "expected_revision": 1,
+            "source_id": created["sources"][0]["id"],
+            "roi": [0.2, 0.2, 0.8, 0.8],
+            "label": "crack",
+            "score": 0.94,
+        })
+        assert added.status_code == 201, added.text
+        item = added.json()["case"]["items"][0]
+
+        first_response = client.post(f"/api/v1/fp-cases/{created['id']}/searches", json={
+            "expected_revision": 2,
+            "item_id": item["id"],
+            "normal_folder": str(normal),
+            "defect_folder": str(defect),
+            "candidate_scope": "whole_image",
+            "limit": 20,
+            "top_k": 6,
+            "include_history": False,
+        })
+        assert first_response.status_code == 201, first_response.text
+        first_payload = first_response.json()
+        first_case = first_payload["case"]
+        search = first_case["searches"][-1]
+        assert first_case["revision"] == 3
+        assert len(search["groups"]["normal"]) == 1
+        assert len(search["groups"]["defect"]) == 2
+        assert search["groups"]["history"] == []
+        assert search["groups"]["normal"][0]["label_conflict"] is True
+        assert search["sources"]["normal"]["label_status"] == "supplied_folder_label"
+        assert search["sources"]["normal"]["folder_sha256"]
+        assert search["skipped_total"] == 1
+        assert search["skipped"][0]["name"] == "broken.png"
+        assert search["recipe"]["checkpoint_sha256"] == recipe["checkpoint_sha256"]
+        assert str(tmp_path) not in first_response.text
+        result_row = search["groups"]["normal"][0]
+        assert "asset" not in result_row["source"] and "path" not in result_row
+        image = client.get(
+            f"/api/v1/fp-cases/{created['id']}/searches/{search['id']}/results/{result_row['id']}/image"
+        )
+        assert image.status_code == 200
+        assert image.content == (normal / "normal.png").read_bytes()
+        calls_after_first = len(calls)
+
+        second_response = client.post(f"/api/v1/fp-cases/{created['id']}/searches", json={
+            "expected_revision": 3,
+            "item_id": item["id"],
+            "normal_folder": str(normal),
+            "defect_folder": str(defect),
+            "candidate_scope": "whole_image",
+            "limit": 20,
+            "top_k": 6,
+            "include_history": False,
+        })
+        assert second_response.status_code == 201, second_response.text
+        second_case = second_response.json()["case"]
+        assert len(second_case["searches"]) == 2
+        assert len(calls) == calls_after_first, "recipe+content+ROI cache recomputed an unchanged search"
+
+        second_search = second_case["searches"][-1]
+        result = second_search["groups"]["normal"][0]
+        candidate_response = client.post(
+            f"/api/v1/fp-cases/{created['id']}/searches/{second_search['id']}/results/{result['id']}/candidate",
+            json={"expected_revision": 4, "category": "normal"},
+        )
+        assert candidate_response.status_code == 201, candidate_response.text
+        candidate_case = candidate_response.json()["case"]
+        assert candidate_response.json()["added"] is True
+        assert candidate_case["revision"] == 5
+        assert candidate_case["candidates"][0]["id"] == result["id"]
+        assert candidate_case["candidates"][0]["source"]["sha256"] == result["sha256"]
+        assert candidate_case["candidates"][0]["review"]["verdict"] == "pending"
+
+        duplicate_response = client.post(
+            f"/api/v1/fp-cases/{created['id']}/searches/{second_search['id']}/results/{result['id']}/candidate",
+            json={"expected_revision": 5, "category": "normal"},
+        )
+        assert duplicate_response.status_code == 201
+        assert duplicate_response.json()["added"] is False
+        assert duplicate_response.json()["case"]["revision"] == 5
+
+    assert reference_before == {path: path.read_bytes() for path in reference_files}
+
+
+def test_case_lv_web_05_retrieve_01_history_keeps_verdict_model_and_empty_categories(
+    monkeypatch, tmp_path
+):
+    recipe = {"model": "fixture-mean", "checkpoint_sha256": "b" * 64, "target_res": 224}
+
+    def embed(image):
+        return np.asarray(image.convert("RGB"), dtype=np.float32).mean(axis=(0, 1)) + 1.0
+
+    with _client(
+        monkeypatch,
+        tmp_path / "fp-retrieve-history",
+        case_search_model_provider=lambda: (recipe, embed),
+    ) as client:
+        old_bytes = _png_bytes((180, 30, 40))
+        old = client.post("/api/v1/fp-cases", json={
+            "source_name": "old-screenshot.png",
+            "source_kind": "screenshot",
+            "source_base64": base64.b64encode(old_bytes).decode("ascii"),
+            "title": "Earlier reviewed case",
+            "external_model_id": "detector-v1",
+        }).json()
+        old_region = client.post(f"/api/v1/fp-cases/{old['id']}/regions", json={
+            "expected_revision": 1,
+            "source_id": old["sources"][0]["id"],
+            "roi": [0.0, 0.0, 0.5, 0.5],
+            "label": "scratch",
+        }).json()["case"]["items"][0]
+        old_review = client.patch(
+            f"/api/v1/fp-cases/{old['id']}/regions/{old_region['id']}/review",
+            json={"expected_revision": 2, "verdict": "normal", "reviewer": "Old reviewer", "reason": "Accepted reflection."},
+        )
+        assert old_review.status_code == 200
+
+        current = client.post("/api/v1/fp-cases", json={
+            "source_name": "new-report.png",
+            "source_kind": "original",
+            "source_base64": base64.b64encode(_png_bytes((190, 30, 40))).decode("ascii"),
+            "title": "Current case",
+            "external_model_id": "detector-v2",
+        }).json()
+        current_region = client.post(f"/api/v1/fp-cases/{current['id']}/regions", json={
+            "expected_revision": 1,
+            "source_id": current["sources"][0]["id"],
+            "roi": [0.1, 0.1, 0.8, 0.8],
+            "label": "crack",
+        }).json()["case"]["items"][0]
+        searched = client.post(f"/api/v1/fp-cases/{current['id']}/searches", json={
+            "expected_revision": 2,
+            "item_id": current_region["id"],
+            "candidate_scope": "same_roi",
+            "include_history": True,
+            "limit": 20,
+            "top_k": 6,
+        })
+        assert searched.status_code == 201, searched.text
+        case = searched.json()["case"]
+        result = case["searches"][-1]
+        assert result["groups"]["normal"] == []
+        assert result["groups"]["defect"] == []
+        historical = result["groups"]["history"]
+        assert len(historical) == 1
+        assert historical[0]["external_model"] == "detector-v1"
+        assert historical[0]["label_status"] == "reviewed_normal"
+        assert historical[0]["review"]["reviewer"] == "Old reviewer"
+        assert historical[0]["roi"] == [0.0, 0.0, 0.5, 0.5]
+        assert case["external"]["model_id"] == "detector-v2"
+        assert case["cause_status"] == "unknown"
+        assert result["sources"]["normal"]["n_files"] == 0
+        assert result["sources"]["defect"]["n_files"] == 0
+        assert str(tmp_path) not in searched.text
+
+
+def test_case_lv_web_05_retrieve_01_same_roi_and_truncated_source_are_explicit(
+    monkeypatch, tmp_path
+):
+    folder = tmp_path / "references"
+    folder.mkdir()
+    for index, color in enumerate(((210, 20, 30), (200, 30, 40), (180, 50, 60))):
+        (folder / f"candidate-{index}.png").write_bytes(_png_bytes(color))
+    recipe = {"model": "fixture-mean", "checkpoint_sha256": "c" * 64, "target_res": 224}
+
+    def embed(image):
+        return np.asarray(image.convert("RGB"), dtype=np.float32).mean(axis=(0, 1)) + 1.0
+
+    with _client(
+        monkeypatch,
+        tmp_path / "fp-retrieve-roi",
+        case_search_model_provider=lambda: (recipe, embed),
+    ) as client:
+        created = client.post("/api/v1/fp-cases", json={
+            "source_name": "query.png",
+            "source_kind": "original",
+            "source_base64": base64.b64encode(_png_bytes((205, 25, 35))).decode("ascii"),
+        }).json()
+        region = client.post(f"/api/v1/fp-cases/{created['id']}/regions", json={
+            "expected_revision": 1,
+            "source_id": created["sources"][0]["id"],
+            "roi": [0.2, 0.1, 0.7, 0.9],
+            "label": "scratch",
+        }).json()["case"]["items"][0]
+        response = client.post(f"/api/v1/fp-cases/{created['id']}/searches", json={
+            "expected_revision": 2,
+            "item_id": region["id"],
+            "normal_folder": str(folder),
+            "candidate_scope": "same_roi",
+            "include_history": False,
+            "limit": 1,
+            "top_k": 1,
+        })
+        assert response.status_code == 201, response.text
+        result = response.json()["case"]["searches"][-1]
+        assert result["sources"]["normal"]["truncated"] is True
+        assert result["sources"]["normal"]["n_files"] == 1
+        assert result["groups"]["normal"][0]["roi"] == region["roi"]
+        assert result["groups"]["defect"] == []
 
 
 def _run(client: TestClient, folders: list[Path], *, model: str = "dinov2_vits14") -> dict:

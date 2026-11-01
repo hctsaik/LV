@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -44,6 +45,9 @@ from interaction import (
 )
 from curation_store import CurationStore, CurationStoreError
 from fp_case_store import FalsePositiveCaseStore, public_case
+from fp_case_search import add_candidate as add_fp_search_candidate
+from fp_case_search import model_recipe as fp_case_model_recipe
+from fp_case_search import search_case as run_fp_case_search
 from completeness import (
     bucketize,
     build_completeness,
@@ -152,6 +156,22 @@ class ReviewFalsePositiveRegionRequest(BaseModel):
     verdict: Literal["pending", "normal", "defect", "disputed", "insufficient"]
     reviewer: str = Field(default="", max_length=256)
     reason: str = Field(default="", max_length=4000)
+
+
+class CreateFalsePositiveSearchRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    item_id: str = Field(min_length=1, max_length=64)
+    normal_folder: str = Field(default="", max_length=4096)
+    defect_folder: str = Field(default="", max_length=4096)
+    candidate_scope: Literal["whole_image", "same_roi"] = "whole_image"
+    limit: int = Field(default=300, ge=1, le=5000)
+    top_k: int = Field(default=6, ge=1, le=100)
+    include_history: bool = True
+
+
+class AddFalsePositiveSearchCandidateRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    category: Literal["normal", "defect", "history"]
 
 
 class CreateComparisonJob(BaseModel):
@@ -378,6 +398,7 @@ def create_app(
     text_model_loader: Callable[[str], Callable[[str], np.ndarray]] | None = None,
     object_model_loader: Callable | None = None,
     diagnostic_model_loader: Callable[[str, int, bool, str], Callable] | None = None,
+    case_search_model_provider: Callable[[], tuple[dict, Callable]] | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
     has_custom_model_loader = model_loader is not None
@@ -415,6 +436,7 @@ def create_app(
     app.state.coverage_candidates = {}
     app.state.curation_store = CurationStore()
     app.state.fp_case_store = FalsePositiveCaseStore()
+    app.state.case_search_model_provider = case_search_model_provider
     app.state.fp_case_lock = threading.RLock()
     app.state.lock = threading.RLock()
 
@@ -615,6 +637,100 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return save_fp_case(case)
+
+    @app.post("/api/v1/fp-cases/{case_id}/searches", status_code=201)
+    def search_fp_case(case_id: str, request: CreateFalsePositiveSearchRequest) -> dict:
+        with app.state.fp_case_lock:
+            current = get_fp_case(case_id)
+            check_fp_revision(current, request.expected_revision)
+            case_snapshot = copy.deepcopy(current)
+        try:
+            if app.state.case_search_model_provider is not None:
+                recipe, embed_fn = app.state.case_search_model_provider()
+            else:
+                recipe, models_root = fp_case_model_recipe()
+                embed_fn = load_model(
+                    "dinov2_vits14",
+                    models_dir=models_root,
+                    keep_aspect=True,
+                    target_res=224,
+                    head="cls",
+                )
+            result = run_fp_case_search(
+                case_snapshot,
+                request.item_id,
+                app.state.fp_case_store,
+                request.normal_folder,
+                request.defect_folder,
+                candidate_scope=request.candidate_scope,
+                limit=request.limit,
+                top_k=request.top_k,
+                include_history=request.include_history,
+                embed_fn=embed_fn,
+                recipe=recipe,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:  # local weights/backend failures must not leak paths or traces
+            logger.exception("LV false-positive case retrieval failed")
+            raise HTTPException(
+                status_code=503,
+                detail="本機 DINOv2 外觀搜尋失敗；案件原有內容未變更。",
+            ) from exc
+        with app.state.fp_case_lock:
+            latest = get_fp_case(case_id)
+            check_fp_revision(latest, request.expected_revision)
+            saved = save_fp_case(case_snapshot)
+        return {"case": saved, "search_id": result["id"]}
+
+    def fp_case_search_row(case: dict, search_id: str, result_id: str, category: str | None = None) -> dict:
+        result = next((row for row in case.get("searches", []) if row["id"] == search_id), None)
+        if result is None:
+            raise HTTPException(status_code=404, detail="找不到案件搜尋紀錄")
+        for group_name, rows in result.get("groups", {}).items():
+            if category is not None and group_name != category:
+                continue
+            for row in rows:
+                if row["id"] == result_id:
+                    return row
+        raise HTTPException(status_code=404, detail="找不到對照項目")
+
+    @app.get("/api/v1/fp-cases/{case_id}/searches/{search_id}/results/{result_id}/image")
+    def get_fp_case_search_image(case_id: str, search_id: str, result_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            row = fp_case_search_row(case, search_id, result_id)
+            source = row.get("source")
+            if not isinstance(source, dict):
+                raise HTTPException(status_code=404, detail="對照影像副本不存在")
+            try:
+                path = app.state.fp_case_store.image_path(source)
+                content = path.read_bytes()
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return Response(content=content, media_type=media_type, headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.post("/api/v1/fp-cases/{case_id}/searches/{search_id}/results/{result_id}/candidate", status_code=201)
+    def add_fp_case_search_candidate(
+        case_id: str,
+        search_id: str,
+        result_id: str,
+        request: AddFalsePositiveSearchCandidateRequest,
+    ) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            fp_case_search_row(case, search_id, result_id, request.category)
+            try:
+                added = add_fp_search_candidate(case, search_id, result_id, request.category)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            saved = save_fp_case(case) if added else public_case(case)
+            return {"case": saved, "added": added}
 
     @app.get("/api/v1/models")
     def models() -> dict:
