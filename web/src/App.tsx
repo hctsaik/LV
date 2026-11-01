@@ -1,4 +1,12 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   api,
   type EmbeddingPoint,
@@ -33,11 +41,18 @@ function colorMap(points: EmbeddingPoint[]) {
   return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
 }
 
-function MainScatterPlot2D({ points, selectedIndices, onToggleSelection }: {
+function MainScatterPlot2D({ points, selectedIndices, onToggleSelection, onAddSelection }: {
   points: EmbeddingPoint[];
   selectedIndices: number[];
   onToggleSelection: (index: number) => void;
+  onAddSelection: (indices: number[]) => void;
 }) {
+  const [selectionMode, setSelectionMode] = useState<false | "box" | "lasso">(false);
+  const [drag, setDrag] = useState<{
+    start: { x: number; y: number };
+    current: { x: number; y: number };
+    path: Array<{ x: number; y: number }>;
+  } | null>(null);
   const width = 860;
   const height = 480;
   const padding = 42;
@@ -51,9 +66,74 @@ function MainScatterPlot2D({ points, selectedIndices, onToggleSelection }: {
   const ySpan = yMax - yMin || 1;
   const colors = colorMap(points);
 
+  function position(event: ReactPointerEvent<SVGSVGElement>) {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    return {
+      x: (event.clientX - bounds.left) * width / bounds.width,
+      y: (event.clientY - bounds.top) * height / bounds.height,
+    };
+  }
+
+  function startSelection(event: ReactPointerEvent<SVGSVGElement>) {
+    if (!selectionMode) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const point = position(event);
+    setDrag({ start: point, current: point, path: [point] });
+  }
+
+  function updateSelection(event: ReactPointerEvent<SVGSVGElement>) {
+    if (!drag) return;
+    const point = position(event);
+    setDrag((current) => current ? {
+      ...current,
+      current: point,
+      path: selectionMode === "lasso" ? [...current.path, point] : current.path,
+    } : current);
+  }
+
+  function finishSelection(event: ReactPointerEvent<SVGSVGElement>) {
+    if (!drag || !selectionMode) return;
+    const end = position(event);
+    const path = selectionMode === "lasso" ? [...drag.path, end] : [];
+    const insidePolygon = (x: number, y: number) => {
+      let inside = false;
+      for (let i = 0, j = path.length - 1; i < path.length; j = i++) {
+        const a = path[i];
+        const b = path[j];
+        if ((a.y > y) !== (b.y > y) &&
+            x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
+      }
+      return inside;
+    };
+    const picked = points.filter((point) => {
+      const x = padding + ((point.x - xMin) / xSpan) * (width - padding * 2);
+      const y = height - padding - ((point.y - yMin) / ySpan) * (height - padding * 2);
+      if (selectionMode === "lasso") return path.length >= 3 && insidePolygon(x, y);
+      return x >= Math.min(drag.start.x, end.x) && x <= Math.max(drag.start.x, end.x) &&
+        y >= Math.min(drag.start.y, end.y) && y <= Math.max(drag.start.y, end.y);
+    }).map((point) => point.index);
+    if (picked.length) onAddSelection(picked);
+    setDrag(null);
+  }
+
   return (
     <div className="plot-frame" data-testid="embedding-plot">
-      <svg className="scatter" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Image embedding scatter plot">
+      <div className="selection-mode" role="group" aria-label="2D selection mode">
+        <button type="button" data-testid="embedding-selection-mode-box" aria-pressed={selectionMode === "box"} onClick={() => setSelectionMode((mode) => mode === "box" ? false : "box")}>Box select</button>
+        <button type="button" data-testid="embedding-selection-mode-lasso" aria-pressed={selectionMode === "lasso"} onClick={() => setSelectionMode((mode) => mode === "lasso" ? false : "lasso")}>Lasso</button>
+      </div>
+      <svg
+        className={`scatter ${selectionMode ? "scatter-selecting" : ""}`}
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        role="img"
+        aria-label="Image embedding scatter plot"
+        onPointerDown={startSelection}
+        onPointerMove={updateSelection}
+        onPointerUp={finishSelection}
+        onPointerCancel={() => setDrag(null)}
+      >
         <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} className="axis" />
         <line x1={padding} y1={padding} x2={padding} y2={height - padding} className="axis" />
         <text x={width / 2} y={height - 8} className="axis-label">Component 1</text>
@@ -81,7 +161,12 @@ function MainScatterPlot2D({ points, selectedIndices, onToggleSelection }: {
               data-index={point.index}
               className={`point ${active ? "point-active" : ""}`}
               transform={`translate(${x} ${y})`}
-              onClick={() => onToggleSelection(point.index)}
+              onClick={(event) => {
+                if (selectionMode) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                } else onToggleSelection(point.index);
+              }}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") onToggleSelection(point.index);
               }}
@@ -92,6 +177,18 @@ function MainScatterPlot2D({ points, selectedIndices, onToggleSelection }: {
             </g>
           );
         })}
+        {drag && selectionMode === "box" && (
+          <rect
+            className="scatter-selection-box"
+            x={Math.min(drag.start.x, drag.current.x)}
+            y={Math.min(drag.start.y, drag.current.y)}
+            width={Math.abs(drag.current.x - drag.start.x)}
+            height={Math.abs(drag.current.y - drag.start.y)}
+          />
+        )}
+        {drag && selectionMode === "lasso" && (
+          <polyline className="scatter-selection-lasso" points={drag.path.map((point) => `${point.x},${point.y}`).join(" ")} />
+        )}
       </svg>
     </div>
   );
@@ -121,7 +218,7 @@ function ScatterPlot({ points, selectedIndices, onToggleSelection, onAddSelectio
     );
   }
   if (testIdPrefix !== "block") {
-    return <MainScatterPlot2D points={points} selectedIndices={selectedIndices} onToggleSelection={onToggleSelection} />;
+    return <MainScatterPlot2D points={points} selectedIndices={selectedIndices} onToggleSelection={onToggleSelection} onAddSelection={onAddSelection} />;
   }
   return (
     <Suspense fallback={<div className="plot-frame plot-loading" role="status">Loading 2D plot…</div>}>
@@ -160,6 +257,7 @@ export default function App() {
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [showAnnotationOverlay, setShowAnnotationOverlay] = useState(true);
   const [similarChain, setSimilarChain] = useState<number[]>([]);
   const [similarK, setSimilarK] = useState(9);
   const [similarResults, setSimilarResults] = useState<SimilarSearchResult | null>(null);
@@ -223,6 +321,7 @@ export default function App() {
   const labels = useMemo(() => [...new Set(run?.records.map((record) => record.label) || [])].sort(), [run]);
   const splits = useMemo(() => [...new Set(run?.records.map((record) => record.split) || [])].sort(), [run]);
   const selectedRecord = selectedIndex === null ? null : run?.records[selectedIndex] || null;
+  const selectedViewPosition = selectedIndex === null ? -1 : selectedIndices.indexOf(selectedIndex);
   const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
   const canSearchSimilar = run?.mode === "classifier" && run.unit === "image";
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
@@ -319,6 +418,13 @@ export default function App() {
   function clearSelection() {
     setSelectedIndices([]);
     setSelectedIndex(null);
+  }
+
+  function moveSelectedImage(direction: -1 | 1) {
+    if (!selectedIndices.length) return;
+    const current = selectedViewPosition >= 0 ? selectedViewPosition : 0;
+    const next = Math.max(0, Math.min(selectedIndices.length - 1, current + direction));
+    setSelectedIndex(selectedIndices[next]);
   }
 
   function startSimilarSearch(index: number) {
@@ -879,14 +985,68 @@ export default function App() {
                   <span data-testid="selection-count">{selectedIndices.length} selected</span>
                   {selectedIndices.length > 0 && <button type="button" className="clear-selection" onClick={clearSelection}>Clear selection</button>}
                 </div>
+                {selectedIndices.length > 0 && (
+                  <section className="selection-gallery" data-testid="selection-gallery" aria-label="Selected image thumbnails">
+                    <div className="selection-gallery-heading">
+                      <strong>Selected images</strong><span>{selectedIndices.length}</span>
+                    </div>
+                    <div className="selection-gallery-items">
+                      {selectedIndices.map((index) => {
+                        const record = run.records[index];
+                        if (!record) return null;
+                        return (
+                          <button
+                            type="button"
+                            key={index}
+                            data-testid="selection-thumbnail"
+                            data-index={index}
+                            aria-label={`Open ${record.filename}`}
+                            aria-pressed={selectedIndex === index}
+                            onClick={() => setSelectedIndex(index)}
+                          >
+                            <img
+                              src={`/api/v1/runs/${encodeURIComponent(job?.run_id || "")}/images/${index}/thumbnail`}
+                              alt=""
+                              loading="lazy"
+                            />
+                            <span title={record.filename}>{record.filename}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                )}
               </section>
 
               <aside className="detail-card">
                 <div className="detail-card-heading"><div><div className="eyebrow">{selectedRecord && run.unit === "object" ? "OBJECT DETAIL" : "IMAGE DETAIL"}</div><h3>{selectedRecord ? (run.unit === "object" ? "Selected object" : "Selected image") : "Select a point"}</h3></div><span className="detail-count">{selectedRecord ? "#" + (selectedRecord.index + 1) : "—"}</span></div>
                 {selectedRecord && run ? (
                   <>
-                    <div className="image-preview"><div className="image-stage"><img data-testid="selected-image" src={"/api/v1/runs/" + encodeURIComponent(job?.run_id || "") + "/images/" + selectedRecord.index} alt={selectedRecord.filename} />{run.unit === "object" && selectedRecord.bbox && <svg data-testid="selected-object-bbox" aria-label="Selected object bounding box" viewBox="0 0 1 1" preserveAspectRatio="none"><rect x={selectedRecord.bbox[0] - selectedRecord.bbox[2] / 2} y={selectedRecord.bbox[1] - selectedRecord.bbox[3] / 2} width={selectedRecord.bbox[2]} height={selectedRecord.bbox[3]} /></svg>}</div></div>
+                    <div className="image-preview"><div className="image-stage"><img
+                      data-testid="selected-image"
+                      src={"/api/v1/runs/" + encodeURIComponent(job?.run_id || "") + "/images/" + selectedRecord.index +
+                        (run.mode === "detector" && run.unit === "image" && showAnnotationOverlay ? "/overlay" : "")}
+                      alt={selectedRecord.filename}
+                    />{run.unit === "object" && selectedRecord.bbox && <svg data-testid="selected-object-bbox" aria-label="Selected object bounding box" viewBox="0 0 1 1" preserveAspectRatio="none"><rect x={selectedRecord.bbox[0] - selectedRecord.bbox[2] / 2} y={selectedRecord.bbox[1] - selectedRecord.bbox[3] / 2} width={selectedRecord.bbox[2]} height={selectedRecord.bbox[3]} /></svg>}</div></div>
                     <div className="image-name" data-testid="selected-image-name" title={selectedRecord.filename}>{selectedRecord.filename}</div>
+                    {selectedViewPosition >= 0 && (
+                      <div className="selected-image-navigation" data-testid="selected-image-navigation">
+                        <button type="button" aria-label="Previous selected image" data-testid="selected-image-previous" disabled={selectedViewPosition <= 0} onClick={() => moveSelectedImage(-1)}>◀</button>
+                        <span>{selectedViewPosition + 1} / {selectedIndices.length} selected</span>
+                        <button type="button" aria-label="Next selected image" data-testid="selected-image-next" disabled={selectedViewPosition >= selectedIndices.length - 1} onClick={() => moveSelectedImage(1)}>▶</button>
+                      </div>
+                    )}
+                    {run.mode === "detector" && run.unit === "image" && run.class_names.length > 0 && (
+                      <label className="annotation-overlay-toggle">
+                        <input
+                          type="checkbox"
+                          aria-label="Show annotation boxes"
+                          checked={showAnnotationOverlay}
+                          onChange={(event) => setShowAnnotationOverlay(event.target.checked)}
+                        />
+                        <span>Show annotation boxes</span>
+                      </label>
+                    )}
                     <div className="metadata-list">
                       <div><span>Class</span><strong>{selectedRecord.label}</strong></div>
                       <div><span>Split</span><strong>{selectedRecord.split}</strong></div>

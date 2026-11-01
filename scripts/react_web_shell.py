@@ -6,6 +6,7 @@ import mimetypes
 import os
 import threading
 import uuid
+from io import BytesIO
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,9 +22,10 @@ from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
 from _utils import available_models, load_model
-from interaction import records_to_csv
+from interaction import draw_yolo_boxes, records_to_csv, yolo_label_path_for
 from react_compare import ComparisonInputError, project_comparison, run_comparison
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
+from safe_io import safe_open_image
 
 API_VERSION = "1"
 logger = logging.getLogger("lv.react_web")
@@ -461,6 +463,55 @@ def create_app(
             raise HTTPException(status_code=404, detail="Image is no longer available") from exc
         media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         return Response(content=content, media_type=media_type, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/runs/{run_id}/images/{index}/thumbnail")
+    def get_run_thumbnail(run_id: str, index: int) -> Response:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            paths: list[Path] = run["image_paths"]
+            if index < 0 or index >= len(paths):
+                raise HTTPException(status_code=404, detail="Image not found")
+            path = paths[index]
+        thumbnail = safe_open_image(path)
+        if thumbnail is None:
+            raise HTTPException(status_code=404, detail="Image is no longer available")
+        thumbnail.thumbnail((256, 256))
+        output = BytesIO()
+        thumbnail.save(output, format="JPEG", quality=84, optimize=True)
+        return Response(
+            content=output.getvalue(),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/v1/runs/{run_id}/images/{index}/overlay")
+    def get_run_image_overlay(run_id: str, index: int) -> Response:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            if run.get("mode") != "detector" or run.get("unit") != "image":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Annotation overlay requires detector whole-image mode",
+                )
+            paths: list[Path] = run["image_paths"]
+            if index < 0 or index >= len(paths):
+                raise HTTPException(status_code=404, detail="Image not found")
+            path = paths[index]
+            class_names = run.get("class_names") or None
+        image = draw_yolo_boxes(path, yolo_label_path_for(path), class_names)
+        if image is None:
+            raise HTTPException(status_code=404, detail="Image is no longer available")
+        output = BytesIO()
+        image.save(output, format="PNG")
+        return Response(
+            content=output.getvalue(),
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/v1/jobs/{job_id}")
     def get_job(job_id: str) -> dict:

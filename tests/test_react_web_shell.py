@@ -1,9 +1,10 @@
-"""AC tests for LV-WEB-01-IC-01; see 4_PM_Feedback/react_web_shell.md."""
+"""React web API acceptance tests; case status is tracked in the feedback matrix."""
 
 from __future__ import annotations
 
 import csv
 import hashlib
+from io import BytesIO
 import os
 import sys
 import time
@@ -659,6 +660,9 @@ def test_case_lv_web_01_od_01_whole_image_detector_taxonomy_and_models(
         assert job["state"] == "completed", job
         run = client.get("/api/v1/runs/" + job["run_id"]).json()
         run_response = client.get("/api/v1/runs/" + job["run_id"])
+        thumbnail = client.get(f"/api/v1/runs/{job['run_id']}/images/0/thumbnail")
+        overlay = client.get(f"/api/v1/runs/{job['run_id']}/images/0/overlay")
+        original = client.get(f"/api/v1/runs/{job['run_id']}/images/0")
 
     assert run["mode"] == "detector"
     assert run["class_names"] == ["scratch", "stain"]
@@ -672,6 +676,13 @@ def test_case_lv_web_01_od_01_whole_image_detector_taxonomy_and_models(
     ]
     assert len(calls) == 8
     assert all(len(view["points"]) == 4 for view in run["views"])
+    assert thumbnail.status_code == 200 and thumbnail.headers["content-type"] == "image/jpeg"
+    assert Image.open(BytesIO(thumbnail.content)).size == (32, 32)
+    assert overlay.status_code == 200 and overlay.headers["content-type"] == "image/png"
+    assert not np.array_equal(
+        np.asarray(Image.open(BytesIO(overlay.content)).convert("RGB")),
+        np.asarray(Image.open(BytesIO(original.content)).convert("RGB")),
+    )
     assert source_before == {
         path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in source_root.rglob("*") if path.is_file()

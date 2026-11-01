@@ -1,10 +1,10 @@
-"""Visible LV-WEB-01-IC-01 acceptance against a real DINOv2 model."""
+"""Visible LV React acceptance journeys against fixture and real model data."""
 
 from __future__ import annotations
 
 import csv
-import os
 import hashlib
+import os
 import socket
 import sys
 import threading
@@ -12,6 +12,7 @@ import time
 import types
 import urllib.error
 import urllib.request
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
@@ -424,6 +425,99 @@ def test_lv_web_01_search_01_similar_images_chain_model_switch_and_csv(
             assert len(rows) == 6
             assert rows[1][0:2] == ["1", "image-01.png"]
             assert [int(row[0]) for row in rows[2:]] == switched_order
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_view_01_selected_gallery_navigation_and_yolo_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible selection thumbnails navigate in order and preserve overlay state."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    folders = _detector_fixture(tmp_path / "detector-viewer")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            index = int(path.stem)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[index] = 1.0
+            vector[10] = index / 10.0
+            return vector
+        return embed
+
+    application = create_app(model_catalog=lambda: ["fixture-model"], model_loader=fixture_loader)
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(10_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Analysis mode").select_option("detector")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in folders:
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+            page.get_by_test_id("embedding-point").nth(0).click()
+            page.get_by_test_id("embedding-point").nth(1).click()
+            expect(page.get_by_test_id("selection-gallery")).to_be_visible()
+            thumbs = page.get_by_test_id("selection-thumbnail")
+            expect(thumbs).to_have_count(2)
+            assert [int(thumb.get_attribute("data-index")) for thumb in thumbs.all()] == [0, 1]
+            assert page.request.get(base_url + thumbs.nth(0).locator("img").get_attribute("src")).status == 200
+
+            thumbs.nth(0).click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("01.png")
+            page.get_by_test_id("selected-image-next").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("02.png")
+            selected_image = page.get_by_test_id("selected-image")
+            overlay_url = selected_image.get_attribute("src")
+            assert overlay_url and overlay_url.endswith("/images/1/overlay")
+            overlay_response = page.request.get(base_url + overlay_url)
+            original_response = page.request.get(base_url + overlay_url.removesuffix("/overlay"))
+            overlaid = np.asarray(Image.open(BytesIO(overlay_response.body())).convert("RGB"))
+            original = np.asarray(Image.open(BytesIO(original_response.body())).convert("RGB"))
+            assert not np.array_equal(overlaid, original)
+
+            page.get_by_label("Show annotation boxes").uncheck()
+            expect(selected_image).not_to_have_attribute("src", overlay_url)
+            page.get_by_label("Show annotation boxes").check()
+            expect(selected_image).to_have_attribute("src", overlay_url)
+
+            for mode, point_index, expected_count in (("box", 2, 3), ("lasso", 3, 4)):
+                page.get_by_test_id("embedding-selection-mode-" + mode).click()
+                point_bounds = page.locator(f'[data-testid="embedding-point"][data-index="{point_index}"]').bounding_box()
+                assert point_bounds is not None
+                x0, y0 = point_bounds["x"] + point_bounds["width"] / 2, point_bounds["y"] + point_bounds["height"] / 2
+                page.mouse.move(x0 - 10, y0 - 10)
+                page.mouse.down()
+                if mode == "box":
+                    page.mouse.move(x0 + 10, y0 + 10, steps=5)
+                else:
+                    page.mouse.move(x0 + 10, y0 - 10, steps=3)
+                    page.mouse.move(x0 + 10, y0 + 10, steps=3)
+                    page.mouse.move(x0 - 10, y0 + 10, steps=3)
+                    page.mouse.move(x0 - 10, y0 - 10, steps=3)
+                page.mouse.up()
+                expect(page.get_by_test_id("selection-count")).to_have_text(f"{expected_count} selected")
+
+            page.get_by_label("Analysis mode").select_option("classifier")
+            expect(page.get_by_test_id("selected-image")).to_have_count(0)
+            expect(page.get_by_test_id("selection-gallery")).to_have_count(0)
             browser.close()
     finally:
         if server is not None:
