@@ -55,3 +55,6 @@ tests/e2e/_*.log
 
 # U-Net workflow runtime state (contract-hash baseline + active-role marker)
 .unet/
+# React/Vite generated artifacts
+web/node_modules/
+web/dist/
