@@ -35,9 +35,11 @@ LV 是成熟的本機影像分析 App。現有 Streamlit 畫面把資料選擇�
 
 每個工具的巢狀使用旅程、既有行為錨點與 React 驗收狀態，以 [React case inventory](../4_PM_Feedback/react_web_shell.md) 維護；PRD 這張表只定義 10 個頂層範圍，不代表巢狀覆蓋已完成。
 
-## LV-WEB-01 首個垂直流程
+## LV-WEB-01 已實作垂直流程與後續切片
 
-首批實作涵蓋 Image Classifier 的整圖模式：選一個或多個資料夾、勾選一個或多個模型及投影、執行真實 embedding、切換 2D／3D 檢視與類別／split 篩選、選取點後顯示對應影像。首個驗收 fixture 使用 4 張有效影像，避免原 Streamlit 小樣本規則把 PCA 投影降成一維。此切片用來驗證 React、API、worker、模型與快取；跨 run 固定 UMAP 座標、NativeApp host bridge 端到端仍需獨立驗收，其他 LV-WEB case 在各自完成前保持未完成。
+首個垂直流程涵蓋 Image Classifier 整圖模式：選取資料夾、模型與投影，執行 embedding、切換 2D／3D 與類別／split 篩選，並選點讀回對應影像。其 4 張影像 fixture 避免原 Streamlit 小樣本規則把 PCA 投影降成一維。
+
+後續實作加入 Object Detector 整圖模式：選取含 `images/` 的資料夾、多模型與投影，按 YOLO `labels/` 的 class ID 標記每張影像；資料集旁的 `classes.txt` 優先於手動類別名稱。缺少類別檔時，只有提供手動類別名稱才可繼續。這個 fixture 流程先驗證 React、API、worker 和標籤語義；尚未完成真實模型數值 parity 與 NativeApp host bridge 驗收。Object Detector 物件級、固定 UMAP 參考座標、其他 Visualize 巢狀操作及其餘 LV-WEB case 仍各自保持未完成。
 
 ## 完成門檻
 

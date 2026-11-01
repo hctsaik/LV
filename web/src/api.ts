@@ -38,6 +38,8 @@ export type VisualizationView = {
 };
 
 export type VisualizationRun = {
+  mode: "classifier" | "detector";
+  class_names: string[];
   model_id: string;
   method: ProjectionMethod;
   records: RunRecord[];
@@ -145,10 +147,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean; api_version: string; models_available: number }>("/api/v1/health"),
   models: () => request<{ items: ModelOption[] }>("/api/v1/models"),
-  createJob: (folders: string[], modelIds: string[], methods: ProjectionMethod[]) =>
+  createJob: (
+    folders: string[],
+    modelIds: string[],
+    methods: ProjectionMethod[],
+    options: { mode?: "classifier" | "detector"; classNames?: string[] } = {},
+  ) =>
     request<{ job_id: string; state: string }>("/api/v1/visualize/jobs", {
       method: "POST",
-      body: JSON.stringify({ folders, model_ids: modelIds, methods }),
+      body: JSON.stringify({
+        folders,
+        model_ids: modelIds,
+        methods,
+        mode: options.mode || "classifier",
+        class_names: options.classNames || [],
+      }),
     }),
   job: (jobId: string) => request<JobStatus>("/api/v1/jobs/" + encodeURIComponent(jobId)),
   cancel: (jobId: string) => request<{ job_id: string; state: string }>(

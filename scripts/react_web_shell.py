@@ -19,7 +19,7 @@ from starlette.staticfiles import StaticFiles
 
 from _utils import available_models, load_model
 from react_compare import ComparisonInputError, project_comparison, run_comparison
-from react_visualize import JobCancelled, VisualizationInputError, run_image_classifier
+from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 
 API_VERSION = "1"
 logger = logging.getLogger("lv.react_web")
@@ -27,6 +27,8 @@ logger = logging.getLogger("lv.react_web")
 
 class CreateVisualizationJob(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
+    mode: Literal["classifier", "detector"] = "classifier"
+    class_names: list[str] = Field(default_factory=list, max_length=256)
     model_id: str | None = Field(default=None, min_length=1, max_length=128)
     method: str = "pca"
     model_ids: list[str] = Field(default_factory=list, max_length=8)
@@ -197,10 +199,12 @@ def create_app(
                     job.total = total
                     job.message = f"Extracting embeddings ({done}/{total})"
 
-            result = run_image_classifier(
+            result = run_image_visualization(
                 job.request.folders,
                 model_names=selected_models,
                 methods=selected_methods,
+                mode=job.request.mode,
+                class_names=job.request.class_names,
                 model_loader=loader,
                 progress=update_progress,
                 cancelled=job.cancel_event.is_set,

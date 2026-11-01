@@ -320,3 +320,93 @@ def test_case_lv_web_01_edge_01_supervised_projection_skips_small_sample(
     assert any("lda skipped because at least four images are required" in warning
                for warning in run["warnings"])
     assert any("PCA was used" in warning for warning in run["warnings"])
+
+
+def _detector_fixture(root: Path, *, with_classes: bool = True) -> list[Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    if with_classes:
+        (root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    folders = [root / "train", root / "test"]
+    images = [
+        (folders[0], "01.png", "0 0.5 0.5 0.4 0.4\n"),
+        (folders[0], "02.png", "0 0.5 0.5 0.4 0.4\n1 0.5 0.5 0.2 0.2\n"),
+        (folders[1], "03.png", "1 0.5 0.5 0.3 0.3\n"),
+        (folders[1], "04.png", "8 0.5 0.5 0.2 0.2\n"),
+    ]
+    for index, (folder, filename, label_text) in enumerate(images):
+        (folder / "images").mkdir(parents=True, exist_ok=True)
+        (folder / "labels").mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32), (30 + index * 30, 70, 160)).save(folder / "images" / filename)
+        (folder / "labels" / (Path(filename).stem + ".txt")).write_text(label_text, encoding="utf-8")
+    return folders
+
+
+def test_case_lv_web_01_od_01_whole_image_detector_taxonomy_and_models(
+    monkeypatch, tmp_path
+):
+    """Detector whole-image points keep YOLO class IDs, class-file precedence, and model order."""
+    folders = _detector_fixture(tmp_path / "detector")
+    source_root = tmp_path / "detector"
+    source_before = {
+        path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_root.rglob("*") if path.is_file()
+    }
+    calls: list[str] = []
+    selected_models = ["dinov2_vits14", "resnet50"]
+    with _client(
+        monkeypatch,
+        tmp_path / "detector-run",
+        embedder=_fake_embedder(calls),
+        models=selected_models,
+    ) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in folders],
+            "mode": "detector",
+            "class_names": ["manual-wrong-name"],
+            "model_ids": selected_models,
+            "methods": ["pca"],
+        })
+        assert job["state"] == "completed", job
+        run = client.get("/api/v1/runs/" + job["run_id"]).json()
+        run_response = client.get("/api/v1/runs/" + job["run_id"])
+
+    assert run["mode"] == "detector"
+    assert run["class_names"] == ["scratch", "stain"]
+    assert run["models"] == selected_models
+    assert str(source_root) not in run_response.text
+    assert [(row["filename"], row["split"], row["label"]) for row in run["records"]] == [
+        ("01.png", "train", "scratch"),
+        ("02.png", "train", "mix"),
+        ("03.png", "test", "stain"),
+        ("04.png", "test", "class_8"),
+    ]
+    assert len(calls) == 8
+    assert all(len(view["points"]) == 4 for view in run["views"])
+    assert source_before == {
+        path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_root.rglob("*") if path.is_file()
+    }
+
+
+def test_case_lv_web_01_od_01_missing_classes_are_explicit(monkeypatch, tmp_path):
+    folders = _detector_fixture(tmp_path / "detector", with_classes=False)
+    with _client(monkeypatch, tmp_path / "detector-run") as client:
+        missing = _run_custom(client, {
+            "folders": [str(folder) for folder in folders],
+            "mode": "detector",
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["pca"],
+        })
+        fallback = _run_custom(client, {
+            "folders": [str(folder) for folder in folders],
+            "mode": "detector",
+            "class_names": ["scratch", "stain"],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["pca"],
+        })
+        fallback_run = client.get("/api/v1/runs/" + fallback["run_id"]).json()
+
+    assert missing["state"] == "failed"
+    assert missing["error"]["code"] == "CLASS_NAMES_UNAVAILABLE"
+    assert fallback["state"] == "completed", fallback
+    assert fallback_run["class_names"] == ["scratch", "stain"]

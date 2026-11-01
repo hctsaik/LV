@@ -109,6 +109,8 @@ function ScatterPlot({ points, selectedIndex, onSelect, dimension, viewKey }: {
 }
 
 export default function App() {
+  const [analysisMode, setAnalysisMode] = useState<"classifier" | "detector">("classifier");
+  const [classNamesDraft, setClassNamesDraft] = useState("");
   const [activeTool, setActiveTool] = useState<"visualize" | "compare">("visualize");
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -214,6 +216,22 @@ export default function App() {
     );
   }
 
+  function changeAnalysisMode(mode: "classifier" | "detector") {
+    if (mode === analysisMode) return;
+    setAnalysisMode(mode);
+    setFolders([]);
+    setFolderDraft("");
+    setClassNamesDraft("");
+    setRun(null);
+    setJob(null);
+    setSelectedIndex(null);
+    setLabelFilter("all");
+    setSplitFilter("all");
+    setDimension(2);
+    setError("");
+    setNotice("Previous results and folder choices were cleared because the analysis mode changed.");
+  }
+
   async function runAnalysis() {
     const selectedFolders = [...folders];
     const draft = folderDraft.trim();
@@ -240,7 +258,11 @@ export default function App() {
     setBusy(true);
     setJob(null);
     try {
-      const created = await api.createJob(selectedFolders, selectedModelIds, selectedMethods);
+      const classNames = classNamesDraft.split(",").map((name) => name.trim()).filter(Boolean);
+      const created = await api.createJob(selectedFolders, selectedModelIds, selectedMethods, {
+        mode: analysisMode,
+        classNames,
+      });
       setJob({
         job_id: created.job_id,
         state: "queued",
@@ -324,6 +346,37 @@ export default function App() {
           <div className="eyebrow">VISUALIZE EMBEDDINGS</div>
           <h1>Explore your image space</h1>
           <p className="intro">Compare how your local image collections group together using the models already installed on this device.</p>
+
+          <section className="control-section">
+            <div className="section-heading"><span className="step-number">00</span><h2>Analysis mode</h2></div>
+            <label className="field-label" htmlFor="analysis-mode">Visualize dataset type</label>
+            <select
+              id="analysis-mode"
+              data-testid="analysis-mode"
+              aria-label="Analysis mode"
+              value={analysisMode}
+              onChange={(event) => changeAnalysisMode(event.target.value as "classifier" | "detector")}
+              disabled={busy}
+            >
+              <option value="classifier">Image Classifier</option>
+              <option value="detector">Object Detector (whole image)</option>
+            </select>
+            {analysisMode === "detector" && (
+              <>
+                <label className="field-label field-label-spaced" htmlFor="detector-class-names">Class names fallback</label>
+                <input
+                  id="detector-class-names"
+                  data-testid="detector-class-names"
+                  aria-label="Detector class names fallback"
+                  value={classNamesDraft}
+                  onChange={(event) => setClassNamesDraft(event.target.value)}
+                  placeholder="Used only when classes.txt is unavailable"
+                  disabled={busy}
+                />
+                <div className="field-note">A dataset classes.txt takes priority. Enter comma-separated names only when the dataset has no class file.</div>
+              </>
+            )}
+          </section>
 
           <section className="control-section">
             <div className="section-heading"><span className="step-number">01</span><h2>Image folders</h2></div>

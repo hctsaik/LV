@@ -16,8 +16,8 @@ from manifest import (
     update_manifest,
     write_manifest,
 )
-from safe_io import partition_readable
-from visualize_embeddings import discover_images_classifier
+from safe_io import partition_readable, safe_read_text
+from visualize_embeddings import discover_images, discover_images_classifier
 
 
 class JobCancelled(Exception):
@@ -123,17 +123,56 @@ def _project_embeddings(embeddings: np.ndarray, labels: Sequence[str], methods: 
     return projections, warnings
 
 
-def run_image_classifier(
+def _detector_class_names(folders: Sequence[Path], manual: Sequence[str]) -> list[str]:
+    """Resolve detector labels with legacy classes-file precedence.
+
+    The legacy UI checks the dataset-adjacent classes.txt before its manual
+    names field. A shared taxonomy must resolve identically for every selected
+    split; silently mixing class-id maps would corrupt point labels.
+    """
+    detected: list[list[str]] = []
+    for folder in folders:
+        names: list[str] | None = None
+        for candidate in (folder.parent / "classes.txt", folder / "classes.txt", folder.parent.parent / "classes.txt"):
+            if not candidate.is_file():
+                continue
+            lines = [line.strip() for line in safe_read_text(candidate).splitlines() if line.strip()]
+            if lines:
+                names = lines
+                break
+        if names is not None:
+            detected.append(names)
+    if detected:
+        first = detected[0]
+        if any(names != first for names in detected[1:]):
+            raise VisualizationInputError(
+                "CLASS_NAMES_MISMATCH",
+                "Selected detector folders use different classes.txt taxonomies.",
+            )
+        return first
+
+    fallback = list(dict.fromkeys(name.strip() for name in manual if name.strip()))
+    if fallback:
+        return fallback
+    raise VisualizationInputError(
+        "CLASS_NAMES_UNAVAILABLE",
+        "No classes.txt was found. Enter class names separated by commas to continue.",
+    )
+
+
+def run_image_visualization(
     folders: Sequence[str | Path],
     model_name: str | None = None,
     *,
     model_names: Sequence[str] | None = None,
     methods: Sequence[str] = ("pca",),
+    mode: str = "classifier",
+    class_names: Sequence[str] = (),
     model_loader: Callable[[str], Callable[[Path], np.ndarray]] = load_model,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict:
-    """Run the legacy whole-image classifier flow without Streamlit state.
+    """Run a whole-image Visualize flow without Streamlit state.
 
     Discovery, per-model content-hash embedding caches, projection parameters,
     and label/split alignment follow the existing Visualize Embeddings path.
@@ -175,7 +214,22 @@ def run_image_classifier(
         raise VisualizationInputError("METHOD_UNAVAILABLE", "A selected projection method is unavailable.")
 
     check_cancelled()
-    records = discover_images_classifier(resolved_folders, allow_flat=True)
+    if mode == "classifier":
+        resolved_class_names: list[str] = []
+        records = discover_images_classifier(resolved_folders, allow_flat=True)
+    elif mode == "detector":
+        resolved_class_names = _detector_class_names(resolved_folders, class_names)
+        invalid = [folder for folder in resolved_folders
+                   if not (folder / "images").is_dir()
+                   and not (folder / "JPEGImages").is_dir()]
+        if invalid:
+            raise VisualizationInputError(
+                "INVALID_DETECTOR_DATASET",
+                "Each detector folder must contain an images/ or JPEGImages/ directory.",
+            )
+        records = discover_images(resolved_folders, resolved_class_names)
+    else:
+        raise VisualizationInputError("INVALID_MODE", "Choose Image Classifier or Object Detector.")
     if not records:
         raise VisualizationInputError("NO_IMAGES", "No images were found in the selected folders.")
 
@@ -202,6 +256,8 @@ def run_image_classifier(
     embedding_shapes: dict[str, list[int]] = {}
     warnings: list[str] = []
     labels = [str(record["label"]) for record in records]
+    if mode == "classifier":
+        resolved_class_names = sorted(set(labels))
 
     for selected_model in selected_models:
         check_cancelled()
@@ -283,6 +339,8 @@ def run_image_classifier(
     primary = views[0]
     base_warnings = ([f"Skipped {len(unreadable)} unreadable image(s)."] if unreadable else [])
     return {
+        "mode": mode,
+        "class_names": resolved_class_names,
         "model_id": primary["model_id"],
         "method": primary["method"],
         "records": public_records,

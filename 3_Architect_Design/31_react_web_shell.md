@@ -19,7 +19,7 @@
 |---|---|---|
 | `GET /api/v1/health` | worker readiness | API 版本、模型目錄狀態、可用模型數 |
 | `GET /api/v1/models` | 讀取模型清單 | model ID、名稱、可用狀態；不載入所有權重 |
-| `POST /api/v1/visualize/jobs` | 建立 Image Classifier run | job ID、queued 狀態 |
+| `POST /api/v1/visualize/jobs` | 建立 Image Classifier 或 Object Detector 整圖 run | job ID、queued 狀態 |
 | `POST /api/v1/compare/jobs` | 建立 A/B 比較 run | folders A/B、模型、粒度、可選 object policy、job ID |
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
@@ -30,7 +30,7 @@
 | `POST /api/v1/comparisons/{run_id}/projections` | 計算選定群組的投影 | PCA、t-SNE、UMAP、LDA、Supervised UMAP、維度與物件篩選 |
 | `GET /api/v1/comparisons/{run_id}/images/{side}/{index}` | 讀取對應來源影像 | 只依本次比較登錄的 group/index 解析，不接受檔案路徑 |
 
-Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`methods`（PCA、t-SNE、UMAP、LDA、Supervised UMAP，最多 5 個）。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
+Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`，預設 `classifier`）、可選的逗號類別名稱 fallback、`model_ids`（最多 8 個）和 `methods`（PCA、t-SNE、UMAP、LDA、Supervised UMAP，最多 5 個）。Detector 讀取 YOLO `images/` 與 `labels/`；資料集旁 `classes.txt` 優先於手動 fallback，選取的類別表不一致時明確失敗。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
 
 ## 3. 計算語義
 
@@ -65,4 +65,4 @@ Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`meth
 
 ## 6. 未涵蓋
 
-Object Detector 整圖／物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選的完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖已有 React／API fixture 流程；真實模型數值 parity 與 NativeApp host bridge 尚待驗。Object Detector 物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選的完整 parity、其它八個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。

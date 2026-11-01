@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 import uvicorn
@@ -62,6 +63,25 @@ def _fixture(root: Path) -> Path:
     }
     assert actual == FIXTURE_SHA256
     return root
+
+
+def _detector_fixture(root: Path, *, with_classes: bool = True) -> list[Path]:
+    root.mkdir(parents=True, exist_ok=True)
+    if with_classes:
+        (root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    folders = [root / "train", root / "test"]
+    samples = [
+        (folders[0], "01.png", "0 0.5 0.5 0.4 0.4\n"),
+        (folders[0], "02.png", "0 0.5 0.5 0.4 0.4\n1 0.5 0.5 0.2 0.2\n"),
+        (folders[1], "03.png", "1 0.5 0.5 0.3 0.3\n"),
+        (folders[1], "04.png", "8 0.5 0.5 0.2 0.2\n"),
+    ]
+    for index, (folder, filename, label_text) in enumerate(samples):
+        (folder / "images").mkdir(parents=True, exist_ok=True)
+        (folder / "labels").mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32), (30 + index * 30, 70, 160)).save(folder / "images" / filename)
+        (folder / "labels" / (Path(filename).stem + ".txt")).write_text(label_text, encoding="utf-8")
+    return folders
 
 
 def _start_api(application):
@@ -237,6 +257,112 @@ def test_lv_web_01_ic_01_cancel_is_visible_in_react(tmp_path: Path, monkeypatch:
             browser.close()
     finally:
         release_loader.set()
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_od_01_detector_runs_through_visible_react_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The browser UI sends detector mode, preserves classes.txt priority, and displays YOLO labels."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    dataset = tmp_path / "detector-fixture"
+    folders = _detector_fixture(dataset)
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def fake_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = len(path.name) / 10.0
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14", "resnet50"],
+        model_loader=fake_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+            page.on(
+                "response",
+                lambda response: run_payloads.append(response.json())
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Analysis mode").select_option("detector")
+            page.get_by_label("Detector class names fallback").fill("manual-wrong-name")
+            page.get_by_test_id("model-choice-resnet50").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in folders:
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=30_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            assert run_payloads
+            assert run_payloads[-1]["mode"] == "detector"
+            assert run_payloads[-1]["class_names"] == ["scratch", "stain"]
+            assert run_payloads[-1]["models"] == ["dinov2_vits14", "resnet50"]
+
+            page.get_by_label("Filter by class").select_option(label="scratch")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(1)
+            page.get_by_label("Filter by class").select_option(label="All classes")
+            page.get_by_test_id("embedding-point").nth(2).click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text("03.png")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_od_01_missing_class_names_is_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Detector mode does not invent class names when both metadata and fallback are absent."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    folders = _detector_fixture(tmp_path / "detector-fixture", with_classes=False)
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda _model_id: lambda _path: np.array([1.0] + [0.0] * 383, dtype=np.float32),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Analysis mode").select_option("detector")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in folders:
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_role("alert")).to_contain_text("No classes.txt was found", timeout=10_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(0)
+            browser.close()
+    finally:
         if server is not None:
             server.should_exit = True
         if server_thread is not None:
