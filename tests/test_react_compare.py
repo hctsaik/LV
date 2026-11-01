@@ -153,6 +153,25 @@ def test_case_lv_web_02_obj_01_compares_shared_classes_and_keeps_boxes_private(
     assert len(result["autotune_rows"]) == 6
     assert result["records_a"][0]["bbox"] == [0.5, 0.5, 0.7, 0.6]
     assert "path" not in result["records_a"][0]
+    from interaction import crop_bbox, discover_yolo_objects
+
+    def legacy_fixture_embedding(image_path: Path) -> np.ndarray:
+        meta = discover_yolo_objects([image_path], ["widget"])[0]
+        with Image.open(image_path) as source:
+            original = source.convert("RGB")
+        cx, cy, width, height = meta["bbox"]
+        pad_px = int(min(64, max(8, round(result["policy"]["pad"] * max(
+            width * original.width, height * original.height,
+        )))))
+        crop = crop_bbox(original, cx, cy, width, height, pad_px=pad_px)
+        return _object_embedder(crop)
+
+    legacy_mean_a = legacy_fixture_embedding(roots[0] / "images" / "same-name.png")
+    legacy_mean_b = legacy_fixture_embedding(roots[1] / "images" / "same-name.png")
+    legacy_mean_a /= np.linalg.norm(legacy_mean_a) + 1e-9
+    legacy_mean_b /= np.linalg.norm(legacy_mean_b) + 1e-9
+    legacy_drift = round(max(0.0, 1.0 - float(legacy_mean_a @ legacy_mean_b)), 4)
+    assert result["rows"][0]["drift"] == legacy_drift
     assert len(projection.json()["points"]) == 2
     assert np.allclose(
         [[point["x"], point["y"]] for point in projection.json()["points"]],
