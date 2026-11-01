@@ -13,6 +13,7 @@ import {
   type EmbeddingPoint,
   type KMeansBlocks,
   type ComparisonObjectPolicy,
+  type DiagnosticReference,
   type DuplicateScanInput,
   type DuplicateScanResult,
   type JobStatus,
@@ -247,7 +248,7 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "compare" | "curation" | "coverage">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "curation" | "coverage">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -264,6 +265,7 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [job, setJob] = useState<JobStatus | null>(null);
   const [run, setRun] = useState<VisualizationRun | null>(null);
+  const [diagnosticReference, setDiagnosticReference] = useState<DiagnosticReference | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const [rankedViewerContext, setRankedViewerContext] = useState<number[] | null>(null);
@@ -365,8 +367,22 @@ export default function App() {
   const labels = useMemo(() => [...new Set(run?.records.map((record) => record.label) || [])].sort(), [run]);
   const splits = useMemo(() => [...new Set(run?.records.map((record) => record.split) || [])].sort(), [run]);
   const selectedRecord = selectedIndex === null ? null : run?.records[selectedIndex] || null;
+  const currentRunId = run && job?.run_id ? job.run_id : null;
   const viewerIndices = rankedViewerContext ?? selectedIndices;
   const selectedViewPosition = selectedIndex === null ? -1 : viewerIndices.indexOf(selectedIndex);
+
+  useEffect(() => {
+    if (activeTool !== "diagnostics" || !diagnosticReference) return;
+    let active = true;
+    api.diagnosticReference(diagnosticReference.context_id, currentRunId)
+      .then((latest) => active && setDiagnosticReference(latest))
+      .catch(() => active && setDiagnosticReference((current) => current ? {
+        ...current,
+        status: "stale",
+        reason: "The source could not be verified; diagnostics remain blocked.",
+      } : current));
+    return () => { active = false; };
+  }, [activeTool, diagnosticReference?.context_id, currentRunId]);
   const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
   const canSearchSimilar = run?.mode === "classifier" && run.unit === "image";
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
@@ -858,6 +874,32 @@ export default function App() {
     }
   }
 
+  async function openDiagnosticsReference(recordIndex: number) {
+    if (!job?.run_id || !run || !activeModelId) return;
+    setError("");
+    try {
+      const reference = await api.createDiagnosticReference(job.run_id, recordIndex, activeModelId);
+      setDiagnosticReference(reference);
+      setActiveTool("diagnostics");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not create the diagnostics reference.");
+    }
+  }
+
+  async function recheckDiagnosticsReference() {
+    if (!diagnosticReference) return;
+    try {
+      const latest = await api.diagnosticReference(diagnosticReference.context_id, currentRunId);
+      setDiagnosticReference(latest);
+    } catch {
+      setDiagnosticReference((current) => current ? {
+        ...current,
+        status: "stale",
+        reason: "The source could not be verified; diagnostics remain blocked.",
+      } : current);
+    }
+  }
+
   async function cancelAnalysis() {
     if (!job?.job_id) return;
     try {
@@ -888,6 +930,7 @@ export default function App() {
         </div>
         <nav className="tool-nav" aria-label="LV tools">
           <button type="button" className={activeTool === "visualize" ? "active" : ""} aria-current={activeTool === "visualize" ? "page" : undefined} onClick={() => setActiveTool("visualize")}>Visualize</button>
+          {diagnosticReference && <button type="button" data-testid="open-diagnostics" className={activeTool === "diagnostics" ? "active" : ""} aria-current={activeTool === "diagnostics" ? "page" : undefined} onClick={() => setActiveTool("diagnostics")}>Diagnostics</button>}
           <button type="button" className={activeTool === "compare" ? "active" : ""} aria-current={activeTool === "compare" ? "page" : undefined} onClick={() => setActiveTool("compare")}>Compare</button>
           <button type="button" className={activeTool === "coverage" ? "active" : ""} aria-current={activeTool === "coverage" ? "page" : undefined} onClick={() => { setCoverageMounted(true); setActiveTool("coverage"); }}>Coverage</button>
           <button type="button" data-testid="open-curation" className={activeTool === "curation" ? "active" : ""} aria-current={activeTool === "curation" ? "page" : undefined} onClick={() => setActiveTool("curation")}>Curation{curationCount === null ? "" : ` (${curationCount})`}</button>
@@ -911,7 +954,37 @@ export default function App() {
         </div>
       )}
 
-      {activeTool === "curation" ? (
+      {activeTool === "diagnostics" ? (
+        <main className="diagnostics-workspace" aria-labelledby="diagnostics-title">
+          <section className="diagnostics-card">
+            <div className="eyebrow">MODEL DIAGNOSTICS</div>
+            <h1 id="diagnostics-title">Diagnostics reference</h1>
+            {diagnosticReference ? <>
+              <div
+                className={`diagnostic-reference-status diagnostic-status-${diagnosticReference.status}`}
+                data-testid="diagnostic-reference-status"
+                role={diagnosticReference.status === "current" ? "status" : "alert"}
+                aria-live="polite"
+              >
+                Context {diagnosticReference.status}: {diagnosticReference.reason}
+              </div>
+              <dl className="diagnostic-reference-details">
+                <div><dt>Image</dt><dd data-testid="diagnostic-reference-image">{diagnosticReference.filename}</dd></div>
+                <div><dt>Label / split</dt><dd>{diagnosticReference.label || "—"} / {diagnosticReference.split || "—"}</dd></div>
+                <div><dt>Model</dt><dd>{diagnosticReference.model_id}</dd></div>
+                <div><dt>Visualize run</dt><dd data-testid="diagnostic-reference-run">{diagnosticReference.run_id}</dd></div>
+                <div><dt>Source SHA-256</dt><dd data-testid="diagnostic-reference-hash">{diagnosticReference.source_sha256 || "Unavailable"}</dd></div>
+                {diagnosticReference.object_index !== null && <div><dt>Object</dt><dd>{diagnosticReference.object_index + 1}</dd></div>}
+              </dl>
+              <p className="diagnostics-no-auto-inference" data-testid="diagnostics-no-auto-inference">Opening this page only checks the selected source reference. It does not start model inference.</p>
+              <div className="diagnostics-actions">
+                <button type="button" className="secondary-action" data-testid="diagnostic-recheck" onClick={recheckDiagnosticsReference}>Check source again</button>
+                <button type="button" className="secondary-action" onClick={() => setActiveTool("visualize")}>Return to Visualize</button>
+              </div>
+            </> : <p>Select a Visualize record to create a diagnostics reference.</p>}
+          </section>
+        </main>
+      ) : activeTool === "curation" ? (
         <CurationWorkspace onCountChange={setCurationCount} />
       ) : activeTool === "compare" ? (
         <CompareDistributions models={models} loadingModels={loadingModels} connected={connected} onCurationCountChange={setCurationCount} />
@@ -1325,6 +1398,14 @@ export default function App() {
                       <div><span>Model</span><strong>{activeModelId}</strong></div>
                       <div><span>Method</span><strong>{currentView.method.toUpperCase()}</strong></div>
                     </div>
+                    <button
+                      type="button"
+                      className="similar-start-button"
+                      data-testid="open-diagnostics-reference"
+                      onClick={() => openDiagnosticsReference(selectedRecord.index)}
+                    >
+                      Open diagnostics reference
+                    </button>
                     {canSearchSimilar && (
                       <button
                         type="button"

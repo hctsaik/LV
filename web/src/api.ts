@@ -53,6 +53,22 @@ export type UmapReferenceStatus = {
   new_points: number;
 };
 
+export type DiagnosticReference = {
+  context_id: string;
+  run_id: string;
+  record_index: number;
+  filename: string;
+  label: string;
+  split: string;
+  unit: VisualizeUnit;
+  model_id: string;
+  object_index: number | null;
+  bbox: [number, number, number, number] | null;
+  source_sha256: string | null;
+  status: "current" | "stale" | "incompatible";
+  reason: string;
+};
+
 export type VisualizationRun = {
   mode: "classifier" | "detector";
   unit: VisualizeUnit;
@@ -482,6 +498,18 @@ export const api = {
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
   ),
+  createDiagnosticReference: (runId: string, recordIndex: number, modelId: string) =>
+    request<DiagnosticReference>("/api/v1/diagnostic-references", {
+      method: "POST",
+      body: JSON.stringify({ run_id: runId, record_index: recordIndex, model_id: modelId }),
+    }),
+  diagnosticReference: (contextId: string, currentRunId: string | null) => {
+    const current = currentRunId === null ? "" : currentRunId;
+    return request<DiagnosticReference>(
+      "/api/v1/diagnostic-references/" + encodeURIComponent(contextId) +
+        "?current_run_id=" + encodeURIComponent(current),
+    );
+  },
   createCoverageJob: (
     folders: string[],
     modelId: string,

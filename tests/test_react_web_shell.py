@@ -679,6 +679,66 @@ def test_case_lv_web_01_ic_01_selected_image_is_run_bound(
     assert invalid.json()["code"] == "NOT_FOUND"
 
 
+def test_case_lv_web_04_ctx_01_diagnostic_reference_tracks_source_and_run(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    calls: list[str] = []
+    with _client(monkeypatch, tmp_path, embedder=_fake_embedder(calls)) as client:
+        job = _run(client, classifier_fixture["folders"])
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        index = next(i for i, record in enumerate(run["records"]) if record["filename"] == "03.png")
+        source = classifier_fixture["root"] / "train" / "banana" / "03.png"
+        expected_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+        inference_calls_after_run = len(calls)
+
+        created = client.post("/api/v1/diagnostic-references", json={
+            "run_id": run_id,
+            "record_index": index,
+            "model_id": "dinov2_vits14",
+        })
+        assert created.status_code == 201, created.text
+        reference = created.json()
+        assert reference["status"] == "current"
+        assert reference["filename"] == "03.png"
+        assert reference["label"] == "banana"
+        assert reference["split"] == "train"
+        assert reference["source_sha256"] == expected_hash
+        assert "source_path" not in reference
+        assert str(classifier_fixture["root"]) not in created.text
+
+        current = client.get(
+            f"/api/v1/diagnostic-references/{reference['context_id']}",
+            params={"current_run_id": run_id},
+        ).json()
+        assert current["status"] == "current"
+
+        source.write_bytes(source.read_bytes() + b"changed after the Visualize run")
+        stale = client.get(
+            f"/api/v1/diagnostic-references/{reference['context_id']}",
+            params={"current_run_id": run_id},
+        ).json()
+        incompatible = client.get(
+            f"/api/v1/diagnostic-references/{reference['context_id']}",
+            params={"current_run_id": "new-visualize-run"},
+        ).json()
+        invalid_index = client.post("/api/v1/diagnostic-references", json={
+            "run_id": run_id,
+            "record_index": 999,
+            "model_id": "dinov2_vits14",
+        })
+        public_run = client.get(f"/api/v1/runs/{run_id}").json()
+
+    assert stale["status"] == "stale"
+    assert "SHA-256 changed" in stale["reason"]
+    assert incompatible["status"] == "incompatible"
+    assert invalid_index.status_code == 422
+    assert invalid_index.json()["code"] == "INVALID_RECORD_INDEX"
+    assert "_source_sha256" not in public_run
+    assert len(calls) == inference_calls_after_run
+
+
 def test_case_lv_web_01_rank_01_legacy_scores_stable_order_filters_and_csv(
     classifier_fixture, monkeypatch, tmp_path
 ):

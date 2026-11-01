@@ -535,6 +535,13 @@ def run_image_visualization(
             record_phashes.append(
                 manifest_by_folder[folder].get(rel_key(folder, path), {}).get("phash")
             )
+    record_source_hashes: list[str] = []
+    for record in records:
+        path = Path(record["path"]).resolve()
+        folder = next(folder for folder in resolved_folders if _is_under(path, folder))
+        record_source_hashes.append(
+            str(manifest_by_folder[folder][rel_key(folder, path)]["sha256"])
+        )
     return {
         "mode": mode,
         "unit": unit,
@@ -557,6 +564,10 @@ def run_image_visualization(
             "by_model": umap_reference_by_model,
         },
         "image_paths": [Path(record["path"]).resolve() for record in records],
+        # Keep the content identity aligned with the manifest keys used by
+        # embedding extraction. The web adapter stores this privately so a
+        # later diagnostics handoff can detect edits made after this run.
+        "_source_sha256": record_source_hashes,
         # dHash values are computed and cached by the run's manifest. Keep them
         # worker-private and aligned to records for duplicate review.
         "_phashes": record_phashes,

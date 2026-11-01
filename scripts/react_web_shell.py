@@ -62,6 +62,14 @@ API_VERSION = "1"
 logger = logging.getLogger("lv.react_web")
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class ComparisonObjectPolicy(BaseModel):
     pad: float = Field(ge=0.0, le=0.5)
     target_res: Literal[168, 196, 224, 280, 336, 392, 448]
@@ -80,6 +88,12 @@ class CreateVisualizationJob(BaseModel):
     methods: list[str] = Field(default_factory=list, max_length=5)
     umap_reference: bool = False
     umap_rebuild: bool = False
+
+
+class CreateDiagnosticReferenceRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=128)
+    record_index: int = Field(ge=0)
+    model_id: str = Field(min_length=1, max_length=128)
 
 
 class CreateComparisonJob(BaseModel):
@@ -320,6 +334,7 @@ def create_app(
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
     app.state.runs = {}
+    app.state.diagnostic_references = {}
     app.state.raw_embeddings = {}
     app.state.ranking_scores = {}
     app.state.text_encoders = {}
@@ -1824,8 +1839,100 @@ def create_app(
                 raise HTTPException(status_code=404, detail="Run not found")
             return {
                 key: value for key, value in run.items()
-                if key not in {"image_paths", "_raw_embeddings", "_phashes"}
+                if key not in {"image_paths", "_raw_embeddings", "_phashes", "_source_sha256"}
             }
+
+    def public_diagnostic_reference(
+        context: dict,
+        *,
+        current_run_id: str | None = None,
+        check_run: bool = False,
+    ) -> dict:
+        status = "current"
+        reason = "The selected record still matches its Visualize source."
+        if check_run and current_run_id != context["run_id"]:
+            status = "incompatible"
+            reason = "Visualize produced a different run; this reference remains historical."
+        else:
+            source_path = Path(context["_source_path"])
+            expected_hash = context.get("source_sha256")
+            try:
+                actual_hash = _sha256_file(source_path) if source_path.is_file() else None
+            except OSError:
+                actual_hash = None
+            if not expected_hash or actual_hash != expected_hash:
+                status = "stale"
+                reason = (
+                    "The source image is missing or its SHA-256 changed after the Visualize run."
+                )
+        return {
+            key: context[key]
+            for key in (
+                "context_id", "run_id", "record_index", "filename", "label", "split",
+                "unit", "model_id", "object_index", "bbox", "source_sha256",
+            )
+        } | {"status": status, "reason": reason}
+
+    @app.post("/api/v1/diagnostic-references", status_code=201)
+    def create_diagnostic_reference(request: CreateDiagnosticReferenceRequest) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(request.run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            records = run.get("records", [])
+            paths = run.get("image_paths", [])
+            source_hashes = run.get("_source_sha256", [])
+            if request.record_index >= len(records) or request.record_index >= len(paths):
+                raise HTTPException(status_code=422, detail={
+                    "code": "INVALID_RECORD_INDEX",
+                    "message": "The selected record is not part of this Visualize run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if request.model_id not in run.get("models", []):
+                raise HTTPException(status_code=422, detail={
+                    "code": "MODEL_NOT_IN_RUN",
+                    "message": "The selected model is not part of this Visualize run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            record = dict(records[request.record_index])
+            source_path = Path(paths[request.record_index]).expanduser().resolve()
+            source_hash = (
+                str(source_hashes[request.record_index])
+                if request.record_index < len(source_hashes) else None
+            )
+        context_id = uuid.uuid4().hex
+        context = {
+            "context_id": context_id,
+            "run_id": request.run_id,
+            "record_index": request.record_index,
+            "filename": str(record.get("filename", source_path.name)),
+            "label": str(record.get("label", "")),
+            "split": str(record.get("split", "")),
+            "unit": str(run.get("unit", "image")),
+            "model_id": request.model_id,
+            "object_index": record.get("obj_index"),
+            "bbox": record.get("bbox"),
+            "source_sha256": source_hash,
+            "_source_path": str(source_path),
+        }
+        with app.state.lock:
+            app.state.diagnostic_references[context_id] = context
+        return public_diagnostic_reference(context)
+
+    @app.get("/api/v1/diagnostic-references/{context_id}")
+    def get_diagnostic_reference(
+        context_id: str,
+        current_run_id: str | None = None,
+    ) -> dict:
+        with app.state.lock:
+            context = app.state.diagnostic_references.get(context_id)
+            if context is None:
+                raise HTTPException(status_code=404, detail="Diagnostic reference not found")
+        return public_diagnostic_reference(
+            context,
+            current_run_id=current_run_id,
+            check_run=current_run_id is not None,
+        )
 
     def curation_store_error() -> HTTPException:
         logger.exception("LV curation store operation failed")

@@ -2183,3 +2183,95 @@ def test_lv_web_01_od_01_real_model_visible_detector_ui(
         path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in dataset.rglob("*") if path.is_file()
     }, "React analysis changed the detector source files"
+
+
+def test_lv_web_04_ctx_01_diagnostics_reference_stale_and_run_incompatible_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible diagnostics handoff rechecks identity and never infers on page entry."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "diagnostic-fixture")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    inference_calls: list[str] = []
+
+    def fixture_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            inference_calls.append(str(path))
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = np.asarray(Image.open(path).convert("RGB")).mean(axis=(0, 1)) / 255.0
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=fixture_loader,
+    )
+    server = server_thread = None
+    source_path: Path | None = None
+    original_source: bytes | None = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            page.get_by_test_id("embedding-point").nth(0).click()
+
+            with page.expect_response(lambda response: response.url.endswith("/api/v1/diagnostic-references")
+                                      and response.request.method == "POST") as created_response:
+                page.get_by_test_id("open-diagnostics-reference").click()
+            created = created_response.value
+            assert created.status == 201
+            assert str(dataset) not in (created.request.post_data or "")
+            reference = created.json()
+            assert reference["status"] == "current"
+            assert reference["source_sha256"]
+            assert str(dataset) not in created.text()
+            expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context current")
+            expect(page.get_by_test_id("diagnostics-no-auto-inference")).to_be_visible()
+
+            inference_calls_at_handoff = len(inference_calls)
+            page.get_by_test_id("diagnostic-recheck").click()
+            expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context current")
+            assert len(inference_calls) == inference_calls_at_handoff
+
+            source_path = next(dataset.rglob(reference["filename"]))
+            original_source = source_path.read_bytes()
+            Image.new("RGB", (64, 64), (2, 3, 4)).save(source_path)
+            page.get_by_test_id("diagnostic-recheck").click()
+            expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text("Context stale")
+            assert len(inference_calls) == inference_calls_at_handoff
+            source_path.write_bytes(original_source)
+
+            page.get_by_role("button", name="Visualize", exact=True).click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            page.get_by_test_id("open-diagnostics").click()
+            expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text(
+                "Context incompatible"
+            )
+            browser.close()
+    finally:
+        if source_path is not None and original_source is not None:
+            source_path.write_bytes(original_source)
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert len(inference_calls) > 0, "the fixture run should have invoked its model before handoff"

@@ -548,3 +548,19 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 @media (max-width: 520px) { .coverage-object-panel { padding: 10px; }.coverage-object-filters { grid-template-columns: 1fr; } }
 @media (max-width: 680px) { .coverage-candidate-worklists { grid-template-columns: 1fr; }.coverage-reference-metrics { grid-template-columns: 1fr; } }
 @media (max-width: 800px) { .coverage-workspace { display: flex; flex-direction: column; }.coverage-workspace .control-panel { border-right: 0; border-bottom: 1px solid #e7ebf1; }.coverage-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }.coverage-results { padding: 24px 18px 16px; } }
+
+
+.diagnostics-workspace { min-height: calc(100vh - 62px); padding: 34px clamp(18px, 4vw, 64px); background: #f5f7fa; }
+.diagnostics-card { max-width: 900px; margin: 0 auto; padding: 26px; border: 1px solid #e2e8f0; border-radius: 12px; background: #fff; box-shadow: 0 8px 24px #2538580a; }
+.diagnostics-card h1 { margin: 6px 0 20px; color: #233249; font-size: 24px; }
+.diagnostic-reference-status { padding: 12px 14px; border: 1px solid; border-radius: 8px; font-size: 13px; line-height: 1.5; }
+.diagnostic-status-current { border-color: #a9d8bf; background: #f0faf4; color: #24633e; }
+.diagnostic-status-stale { border-color: #efc57f; background: #fff9eb; color: #80560b; }
+.diagnostic-status-incompatible { border-color: #e6a8a8; background: #fff3f3; color: #8a3030; }
+.diagnostic-reference-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px 24px; margin: 22px 0; }
+.diagnostic-reference-details div { min-width: 0; }
+.diagnostic-reference-details dt { margin-bottom: 4px; color: #758196; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.diagnostic-reference-details dd { margin: 0; color: #2c3b52; font-size: 13px; overflow-wrap: anywhere; }
+.diagnostics-no-auto-inference { color: #617087; font-size: 13px; }
+.diagnostics-actions { display: flex; gap: 10px; margin-top: 20px; }
+.diagnostics-actions .secondary-action { cursor: pointer; }
