@@ -204,6 +204,25 @@ export type ComparisonJobInput = {
   object_policy?: ComparisonObjectPolicy;
 };
 
+export type CurationItem = {
+  id: string;
+  index: number;
+  filename: string;
+  label: string;
+  split: string;
+  sha256: string;
+  source: string;
+  score: number | null;
+  reason: string;
+  level: "image" | "object";
+  bbox?: [number, number, number, number] | null;
+  obj_index?: number | null;
+  added_at: string;
+};
+
+export type CurationItemsResponse = { items: CurationItem[]; total: number };
+export type AddCurationResponse = CurationItemsResponse & { added: number; skipped: number };
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const base = window.NATIVEAPP_LOCAL_API || "";
   const response = await fetch(base + path, {
@@ -343,6 +362,27 @@ export const api = {
   comparisonImageUrl: (runId: string, side: "a" | "b", index: number) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/comparisons/" + encodeURIComponent(runId)
       + "/images/" + side + "/" + index,
+  curationItems: () => request<CurationItemsResponse>("/api/v1/curation/items"),
+  addCuration: (runId: string, indices: number[], source = "manual", reason = "") =>
+    request<AddCurationResponse>("/api/v1/runs/" + encodeURIComponent(runId) + "/curation/items", {
+      method: "POST",
+      body: JSON.stringify({ indices, source, reason }),
+    }),
+  setCurationReason: (itemIds: string[], reason: string) =>
+    request<CurationItemsResponse & { updated: number }>("/api/v1/curation/items/reason", {
+      method: "PATCH",
+      body: JSON.stringify({ item_ids: itemIds, reason }),
+    }),
+  removeCurationItem: (itemId: string) => request<CurationItemsResponse & { removed: boolean }>(
+    "/api/v1/curation/items/" + encodeURIComponent(itemId), { method: "DELETE" },
+  ),
+  clearCuration: () => request<{ cleared: number; items: CurationItem[]; total: number }>(
+    "/api/v1/curation/items", { method: "DELETE" },
+  ),
+  curationExport: (format: "csv" | "json" | "zip") =>
+    requestGetBlob("/api/v1/curation." + format),
+  curationThumbnailUrl: (itemId: string) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/curation/items/" + encodeURIComponent(itemId) + "/thumbnail",
 };
 
 async function requestBlob(path: string, body: unknown): Promise<Blob> {

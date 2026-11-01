@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
+import multiprocessing
 import os
 import socket
 import sys
@@ -12,6 +14,7 @@ import time
 import types
 import urllib.error
 import urllib.request
+import zipfile
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
@@ -76,6 +79,38 @@ def _wait_http(url: str, server_thread: threading.Thread, timeout: float = 60) -
         except (OSError, urllib.error.URLError):
             time.sleep(0.2)
     pytest.fail(f"service did not become ready: {url}")
+
+
+def _worker_fixture_model(_model_id: str):
+    def embed(path: Path) -> np.ndarray:
+        pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        vector = np.zeros(384, dtype=np.float32)
+        vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+        vector[3] = len(path.name) / 10.0
+        return vector
+    return embed
+
+
+def _serve_curation_worker(port: int, cache_root: str) -> None:
+    os.environ["LV_CACHE_DIR"] = cache_root
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=_worker_fixture_model,
+    )
+    uvicorn.run(application, host="127.0.0.1", port=port, log_level="error", access_log=False)
+
+
+def _start_curation_worker(cache_root: Path):
+    port = _free_port()
+    process = multiprocessing.get_context("spawn").Process(
+        target=_serve_curation_worker,
+        args=(port, str(cache_root)),
+        daemon=True,
+    )
+    process.start()
+    base_url = f"http://127.0.0.1:{port}"
+    _wait_http(f"{base_url}/api/v1/health", process)
+    return process, base_url
 
 
 def _fixture(root: Path) -> Path:
@@ -717,6 +752,113 @@ def test_lv_web_01_view_01_selected_gallery_navigation_and_yolo_overlay(
             server.should_exit = True
         if server_thread is not None:
             server_thread.join(timeout=10)
+
+
+def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible React preserves selection/cart semantics through run and worker restarts."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "curation-fixture")
+    source_before = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    cache_root = tmp_path / "curation-cache"
+    worker = None
+    browser = None
+    playwright = None
+    try:
+        worker, base_url = _start_curation_worker(cache_root)
+        first_pid = worker.pid
+        from playwright.sync_api import expect, sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1500, "height": 1100}, accept_downloads=True)
+        page.set_default_timeout(15_000)
+        page.goto(base_url, wait_until="networkidle")
+        page.get_by_test_id("model-choice-fixture-model").check()
+        page.get_by_label("Supervised UMAP").uncheck()
+        page.get_by_label("PCA").check()
+        page.get_by_label("Image folder").fill(str(dataset / "train"))
+        page.get_by_role("button", name="Add folder").click()
+        page.get_by_label("Image folder").fill(str(dataset / "test"))
+        page.get_by_role("button", name="Add folder").click()
+        page.get_by_role("button", name="Run analysis").click()
+        expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+        expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+        page.get_by_test_id("open-curation").click()
+        expect(page.get_by_test_id("curation-empty")).to_be_visible()
+        expect(page.get_by_test_id("curation-export-csv")).to_be_disabled()
+        page.get_by_role("button", name="Visualize").click()
+        page.get_by_test_id("embedding-point").nth(0).click()
+        page.get_by_test_id("embedding-point").nth(1).click()
+        expect(page.get_by_test_id("selection-count")).to_have_text("2 selected")
+
+        page.get_by_test_id("add-selection-to-curation").click()
+        expect(page.locator(".alert-info")).to_contain_text("Added 2 item(s) to curation; skipped 0 duplicate(s).")
+        page.get_by_test_id("add-selection-to-curation").click()
+        expect(page.locator(".alert-info")).to_contain_text("Added 0 item(s) to curation; skipped 2 duplicate(s).")
+
+        page.get_by_role("button", name="Run analysis").click()
+        expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+        expect(page.get_by_test_id("selection-count")).to_have_text("0 selected")
+        page.get_by_test_id("open-curation").click()
+        expect(page.get_by_test_id("curation-item")).to_have_count(2)
+        expect(page.get_by_test_id("open-curation")).to_contain_text("2")
+        page.get_by_label("Reason for visible curation items").fill("checked in the visible React review")
+        page.get_by_role("button", name="Apply reason").click()
+        expect(page.locator(".curation-item-reason")).to_have_count(2)
+        expect(page.locator(".curation-item-reason").first).to_have_text("checked in the visible React review")
+
+        with page.expect_download() as csv_download:
+            page.get_by_test_id("curation-export-csv").click()
+        with Path(csv_download.value.path()).open(encoding="utf-8-sig", newline="") as handle:
+            csv_rows = list(csv.DictReader(handle))
+        assert len(csv_rows) == 2
+        assert all(row["source"] == "manual" for row in csv_rows)
+        assert all(row["reason"] == "checked in the visible React review" for row in csv_rows)
+        assert all(len(row["sha256"]) == 64 for row in csv_rows)
+
+        with page.expect_download() as json_download:
+            page.get_by_test_id("curation-export-json").click()
+        json_items = json.loads(Path(json_download.value.path()).read_text(encoding="utf-8"))
+        assert len(json_items) == 2
+        assert all(Path(item["path"]).is_file() for item in json_items)
+        assert all(item["reason"] == "checked in the visible React review" for item in json_items)
+
+        with page.expect_download() as zip_download:
+            page.get_by_test_id("curation-export-zip").click()
+        with zipfile.ZipFile(zip_download.value.path()) as archive:
+            assert "manifest.csv" in archive.namelist()
+            assert len([name for name in archive.namelist() if name.startswith("images/")]) == 2
+
+        worker.terminate()
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        worker, restarted_url = _start_curation_worker(cache_root)
+        assert worker.pid != first_pid
+        page.goto(restarted_url, wait_until="networkidle")
+        page.get_by_test_id("open-curation").click()
+        expect(page.get_by_test_id("curation-item")).to_have_count(2)
+        expect(page.locator(".curation-item-reason").first).to_have_text("checked in the visible React review")
+        assert worker.pid != first_pid
+    finally:
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
+        if worker is not None and worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=10)
+        assert source_before == {
+            path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in dataset.rglob("*") if path.is_file()
+        }
 
 
 def test_lv_web_01_ic_03_umap_reference_visible_journey(

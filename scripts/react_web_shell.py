@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import logging
 import mimetypes
@@ -29,8 +30,11 @@ from interaction import (
     find_duplicate_pairs_embedding,
     find_duplicate_pairs_phash,
     records_to_csv,
+    snapshots_to_csv,
+    zip_selected_images,
     yolo_label_path_for,
 )
+from curation_store import CurationStore, CurationStoreError
 from react_compare import ComparisonInputError, project_comparison, run_comparison
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 from safe_io import safe_open_image
@@ -107,6 +111,17 @@ class DuplicateScanRequest(BaseModel):
     max_pairs: int = Field(default=200, ge=1, le=200)
 
 
+class AddCurationRequest(BaseModel):
+    indices: list[int] = Field(min_length=1, max_length=10000)
+    source: str = Field(default="manual", min_length=1, max_length=128)
+    reason: str = Field(default="", max_length=2000)
+
+
+class SetCurationReasonRequest(BaseModel):
+    item_ids: list[str] = Field(min_length=1, max_length=10000)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -179,6 +194,7 @@ def create_app(
     app.state.comparison_jobs = {}
     app.state.comparison_runs = {}
     app.state.comparison_projections = {}
+    app.state.curation_store = CurationStore()
     app.state.lock = threading.RLock()
 
     def has_active_job() -> bool:
@@ -574,6 +590,159 @@ def create_app(
                 key: value for key, value in run.items()
                 if key not in {"image_paths", "_raw_embeddings", "_phashes"}
             }
+
+    def curation_store_error() -> HTTPException:
+        logger.exception("LV curation store operation failed")
+        return HTTPException(status_code=500, detail={
+            "code": "CURATION_STORE_ERROR",
+            "message": "The local curation list could not be read or saved. Existing cache data was preserved.",
+            "request_id": uuid.uuid4().hex,
+        })
+
+    def public_curation_item(item: dict) -> dict:
+        return {key: value for key, value in item.items() if key not in {"path", "image_path"}}
+
+    def curation_snapshot() -> list[dict]:
+        try:
+            return app.state.curation_store.list_items()
+        except CurationStoreError as exc:
+            raise curation_store_error() from exc
+
+    @app.get("/api/v1/curation/items")
+    def get_curation_items() -> dict:
+        items = curation_snapshot()
+        return {"items": [public_curation_item(item) for item in items], "total": len(items)}
+
+    @app.post("/api/v1/runs/{run_id}/curation/items", status_code=201)
+    def add_run_records_to_curation(run_id: str, request: AddCurationRequest) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            records = run.get("records", [])
+            paths: list[Path] = run.get("image_paths", [])
+            if any(index < 0 or index >= len(records) or index >= len(paths) for index in request.indices):
+                raise HTTPException(status_code=422, detail={
+                    "code": "INVALID_RECORD_INDEX",
+                    "message": "A selected record is not part of this run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            entries = []
+            for index in dict.fromkeys(request.indices):
+                record = records[index]
+                try:
+                    path = Path(paths[index]).expanduser().resolve(strict=True)
+                    if not path.is_file():
+                        raise OSError("source is not a file")
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                except OSError as exc:
+                    raise HTTPException(status_code=404, detail={
+                        "code": "CURATION_IMAGE_UNAVAILABLE",
+                        "message": "A selected image is no longer available.",
+                        "request_id": uuid.uuid4().hex,
+                    }) from exc
+                entry = {
+                    "index": index,
+                    "filename": str(record.get("filename", path.name)),
+                    "path": str(path),
+                    "label": str(record.get("label", "")),
+                    "split": str(record.get("split", "")),
+                    "sha256": digest.hexdigest(),
+                    "source": request.source,
+                    "score": None,
+                    "reason": request.reason.strip(),
+                    "level": run.get("unit", "image"),
+                }
+                if run.get("unit") == "object":
+                    entry["image_path"] = str(path)
+                    entry["bbox"] = record.get("bbox")
+                    entry["obj_index"] = record.get("obj_index")
+                entries.append(entry)
+            try:
+                added, skipped = app.state.curation_store.add(entries)
+                items = app.state.curation_store.list_items()
+            except CurationStoreError as exc:
+                raise curation_store_error() from exc
+        return {
+            "added": added,
+            "skipped": skipped,
+            "items": [public_curation_item(item) for item in items],
+            "total": len(items),
+        }
+
+    @app.patch("/api/v1/curation/items/reason")
+    def set_curation_reason(request: SetCurationReasonRequest) -> dict:
+        reason = request.reason.strip()
+        if not reason:
+            raise HTTPException(status_code=422, detail="A non-empty reason is required")
+        try:
+            updated = app.state.curation_store.set_reason(request.item_ids, reason)
+            items = app.state.curation_store.list_items()
+        except CurationStoreError as exc:
+            raise curation_store_error() from exc
+        return {"updated": updated, "items": [public_curation_item(item) for item in items], "total": len(items)}
+
+    @app.delete("/api/v1/curation/items/{item_id}")
+    def remove_curation_item(item_id: str) -> dict:
+        if len(item_id) != 64:
+            raise HTTPException(status_code=404, detail="Curation item not found")
+        try:
+            removed = app.state.curation_store.remove(item_id)
+            items = app.state.curation_store.list_items()
+        except CurationStoreError as exc:
+            raise curation_store_error() from exc
+        if not removed:
+            raise HTTPException(status_code=404, detail="Curation item not found")
+        return {"removed": True, "items": [public_curation_item(item) for item in items], "total": len(items)}
+
+    @app.delete("/api/v1/curation/items")
+    def clear_curation_items() -> dict:
+        try:
+            cleared = app.state.curation_store.clear()
+        except CurationStoreError as exc:
+            raise curation_store_error() from exc
+        return {"cleared": cleared, "items": [], "total": 0}
+
+    @app.get("/api/v1/curation/items/{item_id}/thumbnail")
+    def get_curation_thumbnail(item_id: str) -> Response:
+        item = next((row for row in curation_snapshot() if row.get("id") == item_id), None)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Curation item not found")
+        path = Path(item["path"])
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="Image is no longer available") from exc
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return Response(content=content, media_type=media_type, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/curation.csv")
+    def export_curation_csv() -> Response:
+        items = curation_snapshot()
+        content = snapshots_to_csv(items).encode("utf-8")
+        return Response(content=content, media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="curation_cart.csv"'})
+
+    @app.get("/api/v1/curation.json")
+    def export_curation_json() -> Response:
+        items = curation_snapshot()
+        content = json.dumps(items, ensure_ascii=False, indent=2, allow_nan=False).encode("utf-8")
+        return Response(content=content, media_type="application/json; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="curation_cart.json"'})
+
+    @app.get("/api/v1/curation.zip")
+    def export_curation_zip() -> Response:
+        items = curation_snapshot()
+        records = [
+            {"path": Path(item["path"]), "label": item.get("label", ""), "split": item.get("split", "")}
+            for item in items
+        ]
+        content = zip_selected_images(records, list(range(len(records))))
+        return Response(content=content, media_type="application/zip",
+                        headers={"Content-Disposition": 'attachment; filename="curation_cart_images.zip"'})
 
     def ranked_rows(
         run_id: str,

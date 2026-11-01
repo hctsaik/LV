@@ -1,8 +1,8 @@
 # Export Subset / 我的子集 — 設計文件
 
-> 2026-06-21 · **設計層級,尚未開發**（多代理 /loop 五輪討論,五視角全簽:PO／架構師／資料工程／UX／懷疑論者）
+> 2026-06-21 · **匯出子集仍屬設計；React 持久 cart 已完成第一個 Visualize 切片，完整功能尚未完成**。
 > 承接:[匯出清單 × 組考卷設計討論](export_list_quiz_design_discussion.md);守 `defect_*.md`「探索與治理分離」「誠實命名」紀律。
-> 重用:`scripts/labeling_handoff.py`(已會把 sha256 命名的子集影像複製到資料夾)、`scripts/manifest.py`(每圖 sha256/phash/labels,存 `.lv_cache`)、cart(`_batch_add` + `output/curation_log.jsonl`)。
+> 重用:`scripts/labeling_handoff.py`(已會把 sha256 命名的子集影像複製到資料夾)、`scripts/manifest.py`(每圖 sha256/phash/labels,存 `.lv_cache`)。
 > 硬約束:**no-dataset-writes** —— app 只寫 `.lv_cache`;絕不寫回使用者資料集。
 
 ---
@@ -15,7 +15,7 @@
 **這頁是 cart 這個唯一收集器的「臉」+ 一個新的 export-to-folder 出口,不是第二個收集器。**
 
 ### 現況校正（Round 1 查證）
-現有架構其實已乾淨:**一個收集器 cart(= `viz_export_list` 記憶體清單,on-disk `curation_log.jsonl`)+ 三個下游出口(→組考卷／→灰帶覆核／→labeling_handoff)**。唯一會把影像複製到磁碟資料夾的是 `labeling_handoff`(寫 app 暫存區)。**目前沒有「export to folder」,也沒有 dst-in-source 防護** —— no-dataset-writes 目前靠「輸出固定導向 `.lv_cache`」的設計保證,不是 runtime 檢查。本功能第一次讓使用者把任意寫入路徑交給 app,故 dst 防護是新的硬需求。
+目前的 Streamlit `viz_export_list` 是 `session_state` dict，只跨同一 session 的 rerun／Run 保留；`scripts/app.py` 的 `output/curation_log.jsonl` 記錄選取歷史與理由，不是購物車。React M24 現在將 Visualize 手選項目存入 `LV_CACHE_DIR/curation_log.jsonl`，可跨 worker 重開讀回。Streamlit session cart 尚無自動匯入流程；CSV／JSON 匯入與其它工具接入仍待實作。**目前沒有「export to folder」,也沒有 dst-in-source 防護** —— no-dataset-writes 目前靠既有輸出固定導向 `.lv_cache` 的設計保證,不是 runtime 檢查。本功能第一次讓使用者把任意寫入路徑交給 app,故 dst 防護是新的硬需求。
 
 ---
 
@@ -27,22 +27,23 @@
 
 ## 2. 核心不變式 INV-1（單一 store・release gate）
 
-**全案唯一 on-disk store = cart 的 `curation_log.jsonl`**(置於 `.lv_cache`)。`viz_export_list` 收斂進來,**不做兩份檔案 sync**。
+**React cart 的唯一 on-disk store = `LV_CACHE_DIR/curation_log.jsonl`**。React UI 不維護另一份持久化清單。Streamlit session state 與它是兩個尚未完成退場／匯入的執行路徑；Streamlit 的 `output/curation_log.jsonl` 是另一種選取歷史日誌，不能當成 cart 讀取。
 
 - **INV-1**(release gate):刪掉/清空 `curation_log.jsonl` 後,「我的子集 / Export」頁面必須**一無所有**(零筆/零類/零來源)。
 - **INV-1a**:磁碟上不存在第二份持久化收集清單(grep 不到第二個寫檔點)。
 - **INV-1b**:各工具「加入子集」鈕收斂為**唯一一個 `cart.add()` 寫入口**。
 - **INV-1c**:頁面只**讀** store + 提供 export 出口,**無自己的 add/remove 私有狀態**(它是視圖,不是收集器)。
 
-### 2.1 一次性遷移（Round 4 懷疑論者捕捉 → 驗收標準）
-INV-1 不能在既有資料上反咬:**既不可讀取期 fallback 讀 viz_export_list(會讓 gate 造假、第二進水口從後門復活),也不可完全不讀(會讓既有使用者升級後子集靜默歸零=吃資料)。**
-化解:**升級時把 viz_export_list 既有內容一次性匯入 `curation_log`(去重),匯入結果列入 log/ExportReport,完成後停讀並封存 viz_export_list;部分匯入失敗必須 surface,不得靜默。**
+### 2.1 Streamlit session cart 遷移（尚未實作）
+`viz_export_list` 沒有持久化副本，worker 關閉後無法自動讀取；也不能把 `output/curation_log.jsonl` 的選取歷史誤當成 cart。切換前需要明確的 session handoff 或使用者匯出後匯入流程，匯入需去重、列帳並顯示部分失敗。React 目前提供 CSV／JSON 匯出，但尚無匯入入口；此項仍是切換／發版前的資料延續工作。
 
 ---
 
 ## 3. 統一資料模型（SelectionSet）
 
 `curation_log.jsonl`(append-only 事件日誌)折疊後的記憶體視圖 = `SelectionSet`。每筆:
+
+React M24 目前已實作的 cart event snapshot 欄位為 `id`、`index`、`filename`、`path`、`label`、`split`、`sha256`、`source`、`score`、`reason`、`level`、`bbox`、`obj_index`、`added_at`。`id` 以正規化來源路徑產生，object level 再含 `obj_index`；SHA-256 用於匯出識別，不是目前 cart 去重鍵。下表的 `source_tool`、`source_tag`、`dataset_id`、跨來源 object ID 聯集與 `to_selection_set()` 仍屬完整跨工具／匯出資料模型，不能視為已由此切片實作。
 
 | 欄位 | 說明 |
 |---|---|
@@ -61,6 +62,8 @@ INV-1 不能在既有資料上反咬:**既不可讀取期 fallback 讀 viz_expor
 ---
 
 ## 4. 統一入口「加入子集」
+
+React M24 現在只有 Visualize 的手動選取按鈕接入該 store，透過 run ID／record index 建立 snapshot；同一路徑重複加入會略過且保留第一次 provenance。清單頁已提供來源篩選、理由、單筆移除、確認清空、CSV／JSON／ZIP 下載。完整度、物件覆蓋、灰帶覆核與組考卷尚未接入；下列 UI 命名與自動 provenance 是目標契約，非已完成狀態。
 
 - 各工具的收集鈕**統一命名「加入子集」**,餵同一個 store(INV-1b)。觸發點:縮圖角落 `+ 加入子集`(已加入→`✓ 已在子集`,再點移除)、表格列尾/表頭、批次 action bar。
 - **加入時自動帶 provenance**(source_tool/tag/reason/level/bbox),使用者**不可手填**(保證可信)。
@@ -111,6 +114,8 @@ framework-free（純 stdlib,可單測);**`labeling_handoff` 反過來成為它�
 ---
 
 ## 8. 驗收標準（給 /pm）
+
+React 的第一個 cart slice 已有 API 與可見 UI 證據，包含不同 worker PID 重開讀回；目前只涵蓋 Visualize 手選，未完成 Streamlit session 匯入、其它工具共用、`export_subset` 資料夾匯出與目的地保護。以下仍是整個「我的子集」功能的驗收門檻，不能以 cart UI 已完成替代。
 
 1. **INV-1 release gate**:刪 `curation_log` → 頁面一無所有;+ INV-1a/b/c(無第二份持久化、單一 `cart.add()` 寫入口、頁面無私有 add/remove 狀態)。
 2. **一次性遷移**:升級時 viz_export_list 一次性匯入 curation_log(去重)、列帳、完成後停讀封存;部分失敗 surface 不靜默。

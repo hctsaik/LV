@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的本機 React UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier 和 LV-WEB-02 Compare Distributions 的局部流程；Compare 的 fixture 測試不代表真模型、NativeApp 或完整 parity 已驗收。
+> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單和 LV-WEB-02 Compare Distributions 的局部流程；Compare 的 fixture 測試不代表真模型、NativeApp 或完整 parity 已驗收。
 
 ## 1. 邊界
 
@@ -26,6 +26,12 @@
 | `GET /api/v1/compare/jobs/{job_id}` / `DELETE ...` | 讀取或取消 A/B 比較 | 與 visualize 共用單一 active-job gate |
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
 | `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案 |
+| `POST /api/v1/runs/{run_id}/curation/items` | 將選定 run records 加入持久策展清單 | 只收 record indices、source、reason；以 run 內已登錄路徑取 SHA-256；重複項略過且不覆蓋初次 provenance |
+| `GET /api/v1/curation/items` | 讀取策展清單 | opaque item ID、檔名、類別、split、SHA、source、score、reason；不回傳本機路徑 |
+| `PATCH /api/v1/curation/items/reason` | 為指定清單項目加註理由 | reason 與更新後的清單摘要 |
+| `DELETE /api/v1/curation/items/{item_id}` / `DELETE /api/v1/curation/items` | 移除單項／清空清單 | 更新後清單與移除數 |
+| `GET /api/v1/curation/items/{item_id}/thumbnail` | 讀取已在清單中的影像 | 僅依 opaque item ID 解析來源；不接受任意路徑 |
+| `GET /api/v1/curation.csv` / `.json` / `.zip` | 明確匯出策展清單 | 下載時提供路徑、身分與理由；ZIP 含影像與 `manifest.csv` |
 | `POST /api/v1/runs/{run_id}/text-search` | Chinese-CLIP 文字查詢影像 | query、model ID、依 cosine distance 排序的 run record index；相同距離以 index 穩定排序 |
 | `POST /api/v1/runs/{run_id}/text-search.csv` | 匯出文字搜尋結果 | 使用者明確匯出時才包含影像路徑 |
 | `POST /api/v1/runs/{run_id}/duplicates` | 掃描 dHash 或 embedding 重複候選 | 成對 run record index、距離、跨 split 篩選；不回傳本機路徑 |
@@ -49,12 +55,14 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 9. 物件比較讀取支援的 detection boxes，按較小資料群執行 object policy autotune，再以同一 policy 對 A/B crop embedding；只對共同類別計算 centroid drift，並明示只出現在單側的類別。操作者可改 pad、解析度與 head，明確套用後重跑；API 會驗證手動 policy，結果同時保留自動候選的整體及物件大小分桶純度。
 10. React 可切換比較類別／投影、2D／3D、confidence 與物件短邊門檻；點選及框選只改變 run record 選取，雙欄縮圖仍讀回原圖並可顯示 bbox。投影距離只供檢視，不作為 drift 指標。
 11. Image Classifier 整圖 run 可使用已載入的 Chinese-CLIP image embedding 進行文字搜尋；文字塔沿用本機 Chinese-CLIP encoder 的查詢正規化，使用 exact cosine distance 遞增排序，同距離依 record index 排序。dHash 重複掃描重用 run manifest 指紋，embedding 掃描重用 run 向量；兩者依距離排序、最多回傳 200 對，可只保留跨 split 候選。搜尋結果和配對都以 run ID／record index 操作；本機路徑只在使用者明確下載 CSV 時輸出。配對只是人工覆核線索，不自動刪除或判定洩漏。固定 fixture 的 API 和可見 React 流程已驗；真實 Chinese-CLIP 權重、Windows ARM64 模型相容性與數值逐項對照尚未驗；React 尚未實作跨工具 Labeling handoff。
+12. Visualize 手選把 record index 和 run ID 傳給 worker；worker 在 `LV_CACHE_DIR/curation_log.jsonl` 寫唯一的 append-only cart store。Store 以正規化來源路徑去重，物件級再以 `obj_index` 區分框；同一路徑再次加入不覆蓋初次 source／score／reason。React 清單提供來源篩選、批次理由、移除、確認清空與 CSV／JSON／ZIP；一般 API 不回傳路徑，只有明確下載會包含路徑。Visible React fixture case 驗證 rerun 清空暫存 selection、cart 不清空，並停止 worker 後由不同 PID 讀回資料。舊 Streamlit `viz_export_list` 只存在 session state；`output/curation_log.jsonl` 是獨立的選取日誌，不是 cart store，因此自動匯入尚未實作；NativeApp 實際 cache-root handoff 也未驗證。
 
 ## 4. 實作狀態與整合限制
 
 - API 目前以本機路徑陣列建立 run；React 的資料夾按鈕會呼叫公開 `window.cimHost.chooseFile()`，但 LV 尚未接入 NativeApp 發布包，因此真實 OS picker、grant 驗證與殼管理 worker 的端到端仍待驗。
 - 手動路徑欄只供本機開發及測試。React build 與 API 可由單一本機 FastAPI 預覽；NativeApp 交付仍須使用平台 host bridge 和 worker 管理流程。
 - Visualize classifier、detector 整圖與物件級的固定 DINOv2-small 可見 UI 路徑已在 Windows ARM64 通過；Compare 的 deterministic API 與整圖／物件 UI E2E 使用 fixture embedder。來源 Streamlit 數值逐項對照、完整 object candidate workflow、NativeApp folder grant／lifecycle 及 Compare 真實模型仍未驗證。詳細 case 狀態見 [React case inventory](../4_PM_Feedback/react_web_shell.md)。
+- Curation cart 的 fixture API 與可見 Chromium E2E（含不同 worker PID 重開）已通過；這只完成 Visualize 到 cart 的 case slice，不代表跨工具統一收集器、legacy state import、subset folder export 或 NativeApp cache-root 接線完成。
 
 ## 5. React 驗收契約
 

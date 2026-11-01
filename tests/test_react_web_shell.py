@@ -11,6 +11,7 @@ import time
 import types
 from pathlib import Path
 from threading import Event
+from zipfile import ZipFile
 
 import numpy as np
 import pytest
@@ -965,3 +966,134 @@ def test_case_lv_web_01_od_02_object_detector_uses_crops_and_content_cache(
         hashlib.sha256(path.read_bytes()).hexdigest() == source_before[path.relative_to(source_root).as_posix()]
         for path in source_root.rglob("*.png")
     )
+
+
+def test_case_lv_web_01_cart_01_curation_round_trip_and_worker_reopen(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """The React curation cart preserves legacy identity/provenance and survives worker recreation."""
+    paths_by_name = {Path(path).name: Path(path) for path in classifier_fixture["hashes"]}
+    with _client(monkeypatch, tmp_path) as client:
+        job = _run(client, classifier_fixture["folders"])
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        indices = [
+            next(index for index, record in enumerate(run["records"]) if record["filename"] == filename)
+            for filename in ("01.jpg", "02.jpg")
+        ]
+        assert client.post(
+            f"/api/v1/runs/{run_id}/curation/items", json={"indices": []},
+        ).status_code == 422
+
+        added = client.post(f"/api/v1/runs/{run_id}/curation/items", json={"indices": indices})
+        assert added.status_code == 201, added.text
+        assert (added.json()["added"], added.json()["skipped"], added.json()["total"]) == (2, 0, 2)
+        first_items = added.json()["items"]
+        assert all("path" not in item and "image_path" not in item for item in first_items)
+        assert [item["source"] for item in first_items] == ["manual", "manual"]
+        assert [item["sha256"] for item in first_items] == [
+            classifier_fixture["hashes"][str(paths_by_name[filename])]
+            for filename in ("01.jpg", "02.jpg")
+        ]
+
+        duplicate = client.post(
+            f"/api/v1/runs/{run_id}/curation/items",
+            json={"indices": indices, "source": "search", "reason": "do not replace first provenance"},
+        )
+        assert (duplicate.json()["added"], duplicate.json()["skipped"]) == (0, 2)
+        assert [item["source"] for item in duplicate.json()["items"]] == ["manual", "manual"]
+        assert [item["reason"] for item in duplicate.json()["items"]] == ["", ""]
+
+        item_ids = [item["id"] for item in first_items]
+        reason = client.patch("/api/v1/curation/items/reason", json={
+            "item_ids": item_ids,
+            "reason": "check the unusual edge cases",
+        })
+        assert reason.status_code == 200, reason.text
+        assert reason.json()["updated"] == 2
+        assert all(item["reason"] == "check the unusual edge cases" for item in reason.json()["items"])
+
+        listing = client.get("/api/v1/curation/items").json()
+        assert listing["total"] == 2
+        assert [item["filename"] for item in listing["items"]] == ["01.jpg", "02.jpg"]
+        image = client.get(f"/api/v1/curation/items/{item_ids[0]}/thumbnail")
+        assert image.status_code == 200
+        assert image.content == paths_by_name["01.jpg"].read_bytes()
+
+        csv_response = client.get("/api/v1/curation.csv")
+        assert csv_response.status_code == 200
+        with StringIO(csv_response.text.lstrip("\ufeff")) as csv_file:
+            rows = list(csv.DictReader(csv_file))
+        assert csv_response.text.lstrip("\ufeff").splitlines()[0] == (
+            "index,filename,path,label,split,sha256,source,score,reason"
+        )
+        assert len(rows) == 2
+        assert [row["filename"] for row in rows] == ["01.jpg", "02.jpg"]
+        assert all(len(row["sha256"]) == 64 and row["source"] == "manual" for row in rows)
+        assert all(row["reason"] == "check the unusual edge cases" for row in rows)
+        assert all(Path(row["path"]).is_file() for row in rows)
+
+        json_items = client.get("/api/v1/curation.json").json()
+        assert [item["filename"] for item in json_items] == ["01.jpg", "02.jpg"]
+        assert all(Path(item["path"]).is_file() for item in json_items)
+        assert all(item["reason"] == "check the unusual edge cases" for item in json_items)
+
+        with ZipFile(BytesIO(client.get("/api/v1/curation.zip").content)) as archive:
+            names = archive.namelist()
+            assert "manifest.csv" in names
+            image_names = [name for name in names if name.startswith("images/")]
+            assert len(image_names) == 2
+            assert {archive.read(name) for name in image_names} == {
+                paths_by_name["01.jpg"].read_bytes(), paths_by_name["02.jpg"].read_bytes(),
+            }
+
+        for path, expected_hash in classifier_fixture["hashes"].items():
+            assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == expected_hash
+
+    # A new API worker instance uses the same app cache and reconstructs the cart.
+    with TestClient(create_app(model_catalog=lambda: [], model_loader=lambda _model: None)) as restarted:
+        readback = restarted.get("/api/v1/curation/items").json()
+        assert readback["total"] == 2
+        assert [item["filename"] for item in readback["items"]] == ["01.jpg", "02.jpg"]
+        removed = restarted.delete(f"/api/v1/curation/items/{readback['items'][0]['id']}")
+        assert removed.status_code == 200 and removed.json()["total"] == 1
+        cleared = restarted.delete("/api/v1/curation/items")
+        assert cleared.status_code == 200 and cleared.json()["cleared"] == 1
+        assert restarted.get("/api/v1/curation/items").json() == {"items": [], "total": 0}
+
+
+def test_case_lv_web_01_cart_01_object_records_keep_object_identity(
+    monkeypatch, tmp_path
+):
+    """Selecting two boxes from one image retains both object IDs in the cart."""
+    folders = _detector_fixture(tmp_path / "detector")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "object-cart-cache"))
+    object_loader = lambda _model_id, **_kwargs: (lambda _crop: np.ones(384, dtype=np.float32))
+    with TestClient(create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: _fake_embedder(),
+        object_model_loader=object_loader,
+    )) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in folders],
+            "mode": "detector",
+            "unit": "object",
+            "model_id": "fixture-model",
+            "method": "pca",
+        })
+        assert job["state"] == "completed", job
+        run = client.get(f"/api/v1/runs/{job['run_id']}").json()
+        indices = [
+            index for index, record in enumerate(run["records"])
+            if record["filename"] == "02.png"
+        ]
+        assert len(indices) == 2
+        response = client.post(
+            f"/api/v1/runs/{job['run_id']}/curation/items", json={"indices": indices},
+        )
+        assert response.status_code == 201, response.text
+        items = response.json()["items"]
+        assert [item["obj_index"] for item in items] == [0, 1]
+        assert all(item["level"] == "object" for item in items)
+        assert items[0]["id"] != items[1]["id"]
+        assert all("image_path" not in item and "path" not in item for item in items)

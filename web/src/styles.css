@@ -321,6 +321,35 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 @media (max-width: 800px) { .tool-nav { margin: 0 0 0 auto; }.tool-nav button { padding: 7px 9px; }.topbar { gap: 12px; }.compare-workspace { display: flex; flex-direction: column; }.compare-controls { border-right: 0; border-bottom: 1px solid #e7ebf1; }.compare-gallery-columns { grid-template-columns: 1fr; }.compare-results { padding: 22px 16px; }.compare-legend small { flex-basis: 100%; margin-left: 0; } }
 
 .search-workspace { margin-top: 18px; padding: 16px; border: 1px solid #e5e9ef; border-radius: 9px; background: #fff; box-shadow: 0 4px 14px #25385808; }
+.curation-workspace { min-height: calc(100vh - 72px); padding: 30px clamp(18px, 4vw, 54px); background: #f7f8fa; }
+.curation-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; margin-bottom: 22px; }
+.curation-header h1 { margin: 5px 0 7px; color: #202b40; font: 800 25px/1.2 Manrope, "Segoe UI", sans-serif; letter-spacing: -.6px; }
+.curation-header p { margin: 0; color: #7f8b9e; font-size: 11px; }
+.curation-export-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.curation-export-actions button, .curation-controls > button, .curation-clear-confirm button { min-height: 32px; border: 1px solid #dbe4f0; border-radius: 6px; padding: 0 11px; background: #fff; color: #49658e; font-size: 10px; font-weight: 700; cursor: pointer; }
+.curation-export-actions button:disabled, .curation-controls button:disabled { cursor: default; opacity: .5; }
+.curation-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; padding: 13px; border: 1px solid #e5e9ef; border-radius: 8px; background: #fff; }
+.curation-controls label { display: grid; gap: 5px; color: #78869a; font-size: 9px; }
+.curation-controls select, .curation-controls input { min-width: 155px; min-height: 32px; border: 1px solid #dfe4ec; border-radius: 5px; padding: 0 8px; background: #fff; color: #34425b; font-size: 10px; }
+.curation-controls .curation-reason-control { flex: 1; min-width: 210px; }
+.curation-controls .curation-reason-control input { width: 100%; }
+.curation-controls .curation-clear { margin-left: auto; color: #945d5d; }
+.curation-clear-confirm { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-left: auto; color: #8c6161; font-size: 9px; }
+.curation-clear-confirm button:first-of-type { border-color: #e2c1c1; color: #8a4b4b; }
+.curation-empty { display: grid; min-height: 35vh; place-items: center; border: 1px dashed #dfe4ec; border-radius: 9px; background: #fff; color: #8d98a8; font-size: 12px; text-align: center; }
+.curation-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(285px, 1fr)); gap: 12px; }
+.curation-item { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 12px; min-width: 0; padding: 10px; border: 1px solid #e5e9ef; border-radius: 8px; background: #fff; box-shadow: 0 3px 11px #25385808; }
+.curation-item > img { width: 96px; height: 92px; border-radius: 5px; object-fit: contain; background: #f3f5f8; }
+.curation-item-content { min-width: 0; }
+.curation-item-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.curation-item-heading strong { overflow: hidden; color: #35425a; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.curation-item-heading button { flex: 0 0 auto; border: 0; padding: 0; background: transparent; color: #8a6262; font-size: 9px; cursor: pointer; }
+.curation-item-meta, .curation-item-sha { overflow: hidden; margin-top: 6px; color: #8995a6; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.curation-item-sha { color: #9aa4b2; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.curation-item-reason { margin: 7px 0 0; color: #56657b; font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
+.curation-workspace .alert { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.curation-workspace .alert button { border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; }
+@media (max-width: 700px) { .curation-header { flex-direction: column; }.curation-controls { align-items: stretch; flex-direction: column; }.curation-controls > button, .curation-controls .curation-clear { margin-left: 0; }.curation-clear-confirm { margin-left: 0; } }
 .search-workspace-heading, .search-tool-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .search-workspace-heading h3 { margin: 4px 0 0; color: #35425a; font: 700 14px Manrope, "Segoe UI", sans-serif; }
 .search-workspace-heading > span { color: #98a2b0; font-size: 9px; }

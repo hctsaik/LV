@@ -26,6 +26,7 @@ import {
   type VisualizationRun,
 } from "./api";
 import CompareDistributions from "./CompareDistributions";
+import CurationWorkspace from "./CurationWorkspace";
 const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
 
@@ -245,7 +246,7 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "compare">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "compare" | "curation">("visualize");
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
   const [selectedMethods, setSelectedMethods] = useState<ProjectionMethod[]>(["sumap"]);
@@ -302,6 +303,8 @@ export default function App() {
   const [splitFilter, setSplitFilter] = useState("all");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [curationCount, setCurationCount] = useState<number | null>(null);
+  const [addingToCuration, setAddingToCuration] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -320,6 +323,16 @@ export default function App() {
         if (active) setError(reason instanceof Error ? reason.message : "The local worker is unavailable.");
       })
       .finally(() => active && setLoadingModels(false));
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    api.curationItems().then((response) => {
+      if (active) setCurationCount(response.total);
+    }).catch(() => {
+      if (active) setCurationCount(null);
+    });
     return () => { active = false; };
   }, []);
 
@@ -505,6 +518,22 @@ export default function App() {
     setRankedViewerContext(null);
     setSelectedIndices([]);
     setSelectedIndex(null);
+  }
+
+  async function addSelectedToCuration() {
+    if (!job?.run_id || !selectedIndices.length || addingToCuration) return;
+    setAddingToCuration(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.addCuration(job.run_id, selectedIndices);
+      setCurationCount(result.total);
+      setNotice(`Added ${result.added} item(s) to curation; skipped ${result.skipped} duplicate(s).`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not add the selected images to curation.");
+    } finally {
+      setAddingToCuration(false);
+    }
   }
 
   function moveSelectedImage(direction: -1 | 1) {
@@ -858,6 +887,7 @@ export default function App() {
         <nav className="tool-nav" aria-label="LV tools">
           <button type="button" className={activeTool === "visualize" ? "active" : ""} aria-current={activeTool === "visualize" ? "page" : undefined} onClick={() => setActiveTool("visualize")}>Visualize</button>
           <button type="button" className={activeTool === "compare" ? "active" : ""} aria-current={activeTool === "compare" ? "page" : undefined} onClick={() => setActiveTool("compare")}>Compare</button>
+          <button type="button" data-testid="open-curation" className={activeTool === "curation" ? "active" : ""} aria-current={activeTool === "curation" ? "page" : undefined} onClick={() => setActiveTool("curation")}>Curation{curationCount === null ? "" : ` (${curationCount})`}</button>
         </nav>
         <div className={"connection " + (connected ? "connection-ready" : "connection-waiting")}>
           <span className="connection-dot" />
@@ -865,7 +895,9 @@ export default function App() {
         </div>
       </header>
 
-      {activeTool === "compare" ? (
+      {activeTool === "curation" ? (
+        <CurationWorkspace onCountChange={setCurationCount} />
+      ) : activeTool === "compare" ? (
         <CompareDistributions models={models} loadingModels={loadingModels} connected={connected} />
       ) : <div className="workspace">
         <aside className="control-panel">
@@ -1202,6 +1234,7 @@ export default function App() {
                   <span className="legend-separator" />
                   <small>● train　■ test　◆ valid</small>
                   <span data-testid="selection-count">{selectedIndices.length} selected</span>
+                  {selectedIndices.length > 0 && <button type="button" data-testid="add-selection-to-curation" className="add-curation-selection" disabled={addingToCuration || !job?.run_id} onClick={() => void addSelectedToCuration()}>{addingToCuration ? "Adding…" : "Add selected to curation"}</button>}
                   {selectedIndices.length > 0 && <button type="button" className="clear-selection" onClick={clearSelection}>Clear selection</button>}
                 </div>
                 {selectedIndices.length > 0 && (
