@@ -1009,8 +1009,8 @@ def test_x_diversity_sampling(flow_page):
 
 # ── (y) §1 annotator-agreement quiz tool ────────────────────────────────
 
-@pytest.mark.skip(reason="工具列精簡:組考卷/灰帶/評估已自 tool_switch 隱藏(commit 319dd80),"
-                         "改由購物車 handoff 進入;toolbar 驅動的 E2E 不再適用。")
+@pytest.mark.skip(reason="組考卷已退出獨立工具列旅程；舊 Streamlit 路由不可達。"
+                         "多人派件／重複標註移至 ANnoTation，LV agreement/kappa successor 另行驗收。")
 def test_y_quiz_tool(app_page, tmp_path):
     import numpy as np
     from PIL import Image
@@ -1052,8 +1052,8 @@ def test_y_quiz_tool(app_page, tmp_path):
 
 # ── (z) §3 gray-zone review (propose → approve double sign-off) ─────────
 
-@pytest.mark.skip(reason="工具列精簡:組考卷/灰帶/評估已自 tool_switch 隱藏(commit 319dd80),"
-                         "改由購物車 handoff 進入;toolbar 驅動的 E2E 不再適用。")
+@pytest.mark.skip(reason="灰帶覆核已退出獨立工具列旅程；舊 Streamlit 路由不可達。"
+                         "後續 adjudication queue 應在標註迴圈旅程中驗收。")
 def test_z_gray_zone_review(app_page, tmp_path):
     import numpy as np
     from PIL import Image
@@ -1090,6 +1090,14 @@ def test_z_gray_zone_review(app_page, tmp_path):
     wait_idle(page)
     expect(page.locator('.st-key-gray_disp_csv')).to_be_visible()
     _no_exception(page)
+
+
+def test_zz_hidden_quiz_and_gray_routes_not_in_toolbar(flow_page):
+    """The retired standalone routes must not appear as selectable tools."""
+    toolbar = flow_page.locator('.st-key-tool_switch')
+    expect(toolbar.get_by_text("組考卷", exact=True)).to_have_count(0)
+    expect(toolbar.get_by_text("灰帶覆核", exact=True)).to_have_count(0)
+    _no_exception(flow_page)
 
 
 # ── (aa) curation log: record selection + reason, persist, re-select ────
