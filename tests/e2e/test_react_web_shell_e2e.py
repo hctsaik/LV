@@ -929,6 +929,8 @@ def test_lv_web_01_search_02_text_and_duplicate_review_visible_journey(
     Image.fromarray(np.random.default_rng(31).integers(0, 255, (48, 48, 3), dtype=np.uint8)).save(train_banana / "image-03.png")
     (test_banana / "image-04.png").write_bytes((train_apple / "image-01.png").read_bytes())
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setenv("CIM_LOG_DIR", str(tmp_path / "labeling-inbox"))
 
     vectors = {
         "image-01.png": [1.0, 0.0, 0.0],
@@ -1000,6 +1002,16 @@ def test_lv_web_01_search_02_text_and_duplicate_review_visible_journey(
             assert len(duplicate_rows) == 2
             assert duplicate_rows[1][0:2] == ["0", "image-01.png"]
             assert duplicate_rows[1][4:6] == ["3", "image-04.png"]
+            page.get_by_test_id("duplicate-labeling-handoff").click()
+            expect(page.get_by_test_id("duplicate-handoff-status")).to_contain_text("Saved 1 pair(s) with 1 unique image(s) to the Labeling inbox")
+            handoff_specs = list((tmp_path / "labeling-inbox" / "lv_labeling_handoff").glob("*/_handoff.json"))
+            assert len(handoff_specs) == 1
+            handoff = json.loads(handoff_specs[0].read_text(encoding="utf-8"))
+            assert handoff["task"] == "verify"
+            assert handoff["payload"]["kind"] == "duplicate_pair_review"
+            assert handoff["payload"]["pairs"][0]["left_filename"] == "image-01.png"
+            assert handoff["payload"]["pairs"][0]["right_filename"] == "image-04.png"
+            assert handoff["payload"]["pairs"][0]["distance"] == pytest.approx(1 - 0.998 / np.sqrt(0.998**2 + 0.063**2), abs=5e-7)
             browser.close()
     finally:
         if server is not None:

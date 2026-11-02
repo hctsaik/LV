@@ -722,6 +722,18 @@ export type DuplicateScanResult = {
   results: Array<{ left_index: number; right_index: number; distance: number }>;
 };
 
+export type DuplicateLabelingHandoffResult = {
+  handoff_id: string;
+  task: string;
+  sent: number;
+  pair_count: number;
+  skipped_handled: number;
+  skipped_pairs: number;
+  round_id: string;
+  created_round: boolean;
+  saved_to_local_inbox: boolean;
+};
+
 export type RankingMetric = "outlier" | "disagreement";
 export type RankingResult = {
   model_id: string;
@@ -1608,6 +1620,14 @@ export const api = {
     request<DuplicateScanResult>("/api/v1/runs/" + encodeURIComponent(runId) + "/duplicates", {
       method: "POST", body: JSON.stringify(input),
     }),
+  sendDuplicatePairsToLabeling: (
+    runId: string,
+    input: DuplicateScanInput & { include_handled?: boolean; new_round?: boolean; round_id?: string | null },
+  ) => request<DuplicateLabelingHandoffResult>(
+    "/api/v1/runs/" + encodeURIComponent(runId) + "/duplicates/labeling-handoff", {
+      method: "POST", body: JSON.stringify(input),
+    },
+  ),
   duplicatePairsCsv: (runId: string, input: DuplicateScanInput) =>
     requestBlob("/api/v1/runs/" + encodeURIComponent(runId) + "/duplicates.csv", input),
   createComparisonJob: (input: ComparisonJobInput) =>

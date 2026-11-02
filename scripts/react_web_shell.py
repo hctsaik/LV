@@ -633,6 +633,12 @@ class DuplicateScanRequest(BaseModel):
     max_pairs: int = Field(default=200, ge=1, le=200)
 
 
+class DuplicateLabelingHandoffRequest(DuplicateScanRequest):
+    include_handled: bool = False
+    new_round: bool = True
+    round_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class AddCurationRequest(BaseModel):
     indices: list[int] = Field(min_length=1, max_length=10000)
     source: str = Field(default="manual", min_length=1, max_length=128)
@@ -6776,6 +6782,185 @@ def create_app(
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="duplicate_pairs.csv"'},
         )
+
+    @app.post("/api/v1/runs/{run_id}/duplicates/labeling-handoff", status_code=201)
+    def send_duplicate_pairs_to_labeling(
+        run_id: str, request: DuplicateLabelingHandoffRequest,
+    ) -> dict:
+        import labeling_handoff as _labeling_handoff
+        import pool_registry as _pool_registry
+        import round_ledger as _round_ledger
+
+        with app.state.lock:
+            run, pairs = duplicate_scan_result(run_id, request)
+            if not pairs:
+                raise HTTPException(status_code=422, detail={
+                    "code": "DUPLICATE_HANDOFF_EMPTY",
+                    "message": "There are no duplicate pairs to send for review.",
+                    "request_id": uuid.uuid4().hex,
+                })
+
+            records: list[dict] = []
+            manifest: dict[str, dict] = {}
+            local_index_by_run_index: dict[int, int] = {}
+            sha_by_run_index: dict[int, str] = {}
+            expected_hashes = run.get("_source_sha256") or []
+            run_indices = sorted({index for left, right, _ in pairs for index in (left, right)})
+            for run_index in run_indices:
+                try:
+                    path = Path(run["image_paths"][run_index]).expanduser().resolve(strict=True)
+                    if not path.is_file():
+                        raise OSError("source is not a file")
+                    sha = _sha256_file(path)
+                except (OSError, RuntimeError, ValueError, IndexError, TypeError) as exc:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "DUPLICATE_SOURCE_UNAVAILABLE",
+                        "message": "A duplicate-review image is no longer available. Re-run the scan before sending it.",
+                        "request_id": uuid.uuid4().hex,
+                    }) from exc
+                expected = expected_hashes[run_index] if run_index < len(expected_hashes) else None
+                if expected and sha != expected:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "DUPLICATE_SOURCE_CHANGED",
+                        "message": "A duplicate-review image changed after the scan. Re-run the scan before sending it.",
+                        "request_id": uuid.uuid4().hex,
+                    })
+                source_record = run["records"][run_index]
+                local_index_by_run_index[run_index] = len(records)
+                sha_by_run_index[run_index] = sha
+                records.append({
+                    "path": str(path),
+                    "filename": str(source_record.get("filename") or path.name),
+                    "label": str(source_record.get("label") or ""),
+                    "split": str(source_record.get("split") or ""),
+                })
+                manifest[str(path)] = {"sha256": sha}
+
+            unique_shas = list(dict.fromkeys(sha_by_run_index.values()))
+            new_shas, handled_shas = _pool_registry.partition_new(unique_shas)
+            new_set = set(new_shas)
+            eligible_pairs = [
+                (left, right, distance)
+                for left, right, distance in pairs
+                if request.include_handled
+                or (sha_by_run_index[left] in new_set and sha_by_run_index[right] in new_set)
+            ]
+            if not eligible_pairs:
+                raise HTTPException(status_code=422, detail={
+                    "code": "DUPLICATE_HANDOFF_EMPTY",
+                    "message": "All duplicate pairs contain previously sent images. Enable the explicit override to include them.",
+                    "request_id": uuid.uuid4().hex,
+                })
+
+            participating_indices = {
+                index
+                for left, right, _ in eligible_pairs
+                for index in (left, right)
+            }
+            send_indices = [
+                local_index_by_run_index[index]
+                for index in sorted(participating_indices)
+            ]
+            send_shas = {sha_by_run_index[index] for index in participating_indices}
+            handoff_pairs = []
+            for left, right, distance in eligible_pairs:
+                left_record = run["records"][left]
+                right_record = run["records"][right]
+                handoff_pairs.append({
+                    "left_sha256": sha_by_run_index[left],
+                    "right_sha256": sha_by_run_index[right],
+                    "left_filename": str(left_record.get("filename") or Path(run["image_paths"][left]).name),
+                    "right_filename": str(right_record.get("filename") or Path(run["image_paths"][right]).name),
+                    "left_split": str(left_record.get("split") or ""),
+                    "right_split": str(right_record.get("split") or ""),
+                    "distance": int(distance) if request.method == "phash" else float(distance),
+                })
+
+            rounds = _round_ledger.load_rounds()
+            round_ids = {row["round_id"] for row in rounds}
+            target_round = request.round_id
+            if not request.new_round and target_round is None and rounds:
+                target_round = rounds[-1]["round_id"]
+            if not request.new_round and target_round is not None and target_round not in round_ids:
+                raise HTTPException(status_code=404, detail={
+                    "code": "ROUND_NOT_FOUND",
+                    "message": "The selected active-learning round no longer exists.",
+                    "request_id": uuid.uuid4().hex,
+                })
+
+            class_options = list(dict.fromkeys(
+                records[local_index_by_run_index[index]]["label"]
+                for index in sorted(participating_indices)
+                if records[local_index_by_run_index[index]]["label"]
+            )) or ["object"]
+            payload = {
+                "kind": "duplicate_pair_review",
+                "method": request.method,
+                "model_id": request.model_id if request.method == "embedding" else None,
+                "cross_split_only": request.cross_split_only,
+                "pairs": handoff_pairs,
+            }
+            try:
+                handoff_dir = _labeling_handoff.send_to_labeling(
+                    records,
+                    send_indices,
+                    source="duplicate",
+                    task=_labeling_handoff.TASK_VERIFY,
+                    class_options=class_options,
+                    manifest=manifest,
+                    original_labels={
+                        index: record["label"]
+                        for index, record in enumerate(records)
+                    },
+                    payload=payload,
+                    instructions=(
+                        "Review each supplied pair together as a possible duplicate or split leak. "
+                        "Keep/drop decisions are human review only; do not delete source images automatically."
+                    ),
+                )
+                if handoff_dir is None:
+                    raise ValueError("no images were materialized")
+                spec = _labeling_handoff.load_spec(handoff_dir)
+                sent_shas = [item["sha256"] for item in spec.get("items", [])]
+                batch_id = str(spec.get("handoff_id") or Path(handoff_dir).name)
+                if not sent_shas or not send_shas.intersection(sent_shas):
+                    raise ValueError("the handoff contains no selected duplicate-review images")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                logger.exception("LV duplicate-pair handoff could not be materialized")
+                raise HTTPException(status_code=422, detail={
+                    "code": "DUPLICATE_HANDOFF_FAILED",
+                    "message": "The duplicate-review images could not be prepared for Labeling. Check that the source files are still readable.",
+                    "request_id": uuid.uuid4().hex,
+                }) from exc
+
+            _pool_registry.mark_sent(sent_shas, batch_id, tool="duplicate")
+            created_round = request.new_round or not rounds
+            if created_round:
+                round_id = _round_ledger.start_round(
+                    "duplicate",
+                    {
+                        "method": request.method,
+                        "model_id": request.model_id if request.method == "embedding" else None,
+                        "cross_split_only": request.cross_split_only,
+                        "max_hamming": request.max_hamming,
+                        "max_distance": request.max_distance,
+                    },
+                    "duplicate",
+                )
+            else:
+                round_id = target_round or rounds[-1]["round_id"]
+            _round_ledger.attach_batch(round_id, batch_id, len(sent_shas))
+            return {
+                "handoff_id": batch_id,
+                "task": str(spec.get("task") or _labeling_handoff.TASK_VERIFY),
+                "sent": len(sent_shas),
+                "pair_count": len(handoff_pairs),
+                "skipped_handled": len(handled_shas) if not request.include_handled else 0,
+                "skipped_pairs": len(pairs) - len(eligible_pairs),
+                "round_id": round_id,
+                "created_round": created_round,
+                "saved_to_local_inbox": True,
+            }
 
     @app.post("/api/v1/runs/{run_id}/blocks")
     def get_kmeans_blocks(run_id: str, request: KMeansBlocksRequest) -> dict:

@@ -115,6 +115,99 @@ def test_react_curation_handoff_deduplicates_guards_override_and_records_rounds(
         assert saved_round["metrics"][-1]["value"] == 0.875
 
 
+def test_duplicate_pairs_handoff_preserves_pair_metadata_and_guards_handled_images(
+    monkeypatch, tmp_path: Path,
+):
+    cache_dir = tmp_path / "cache"
+    output_dir = tmp_path / "output"
+    inbox_dir = tmp_path / "labeling-inbox"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("CIM_LOG_DIR", str(inbox_dir))
+
+    train = tmp_path / "dataset" / "train" / "apple" / "train.png"
+    test = tmp_path / "dataset" / "test" / "apple" / "test.png"
+    train.parent.mkdir(parents=True)
+    test.parent.mkdir(parents=True)
+    Image.new("RGB", (24, 18), (120, 30, 80)).save(train)
+    Image.new("RGB", (24, 18), (80, 120, 30)).save(test)
+    paths = [train, test]
+    source_shas = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    run_id = "duplicate-handoff-fixture"
+    application.state.runs[run_id] = {
+        "mode": "classifier",
+        "unit": "image",
+        "records": [
+            {"index": 0, "filename": train.name, "label": "apple", "split": "train"},
+            {"index": 1, "filename": test.name, "label": "apple", "split": "test"},
+        ],
+        "image_paths": paths,
+        "_source_sha256": source_shas,
+        "_phashes": ["0000000000000000", "0000000000000000"],
+    }
+
+    with TestClient(application) as client:
+        response = client.post(f"/api/v1/runs/{run_id}/duplicates/labeling-handoff", json={
+            "method": "phash", "max_hamming": 0, "cross_split_only": True,
+        })
+        assert response.status_code == 201, response.text
+        result = response.json()
+        assert result["sent"] == 2
+        assert result["pair_count"] == 1
+        assert result["task"] == "verify"
+        assert result["saved_to_local_inbox"] is True
+        assert str(tmp_path) not in response.text
+
+        handoff_dir = inbox_dir / "lv_labeling_handoff" / result["handoff_id"]
+        spec = json.loads((handoff_dir / "_handoff.json").read_text(encoding="utf-8"))
+        assert spec["source"] == "duplicate"
+        assert spec["task"] == "verify"
+        assert spec["payload"]["kind"] == "duplicate_pair_review"
+        assert spec["payload"]["pairs"] == [{
+            "left_sha256": source_shas[0],
+            "right_sha256": source_shas[1],
+            "left_filename": train.name,
+            "right_filename": test.name,
+            "left_split": "train",
+            "right_split": "test",
+            "distance": 0,
+        }]
+        assert {item["sha256"] for item in spec["items"]} == set(source_shas)
+
+        continued = client.post(f"/api/v1/runs/{run_id}/duplicates/labeling-handoff", json={
+            "method": "phash", "max_hamming": 0, "cross_split_only": True,
+            "include_handled": True, "new_round": False,
+            "round_id": result["round_id"],
+        })
+        assert continued.status_code == 201, continued.text
+        assert continued.json()["round_id"] == result["round_id"]
+        assert continued.json()["created_round"] is False
+
+        blocked = client.post(f"/api/v1/runs/{run_id}/duplicates/labeling-handoff", json={
+            "method": "phash", "max_hamming": 0, "cross_split_only": True,
+        })
+        assert blocked.status_code == 422
+        assert blocked.json()["code"] == "DUPLICATE_HANDOFF_EMPTY"
+
+        overridden = client.post(f"/api/v1/runs/{run_id}/duplicates/labeling-handoff", json={
+            "method": "phash", "max_hamming": 0, "cross_split_only": True,
+            "include_handled": True,
+        })
+        assert overridden.status_code == 201, overridden.text
+        assert overridden.json()["sent"] == 2
+        assert overridden.json()["skipped_handled"] == 0
+
+        train.write_bytes(b"changed after scan")
+        changed = client.post(f"/api/v1/runs/{run_id}/duplicates/labeling-handoff", json={
+            "method": "phash", "max_hamming": 0, "cross_split_only": True,
+            "include_handled": True,
+        })
+        assert changed.status_code == 409
+        assert changed.json()["code"] == "DUPLICATE_SOURCE_CHANGED"
+
+
 def test_react_labeling_readback_updates_run_overlay_pool_round_and_audit(
     monkeypatch, tmp_path: Path,
 ):

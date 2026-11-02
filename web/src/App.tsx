@@ -19,6 +19,8 @@ import {
   type DiagnosticReference,
   type DuplicateScanInput,
   type DuplicateScanResult,
+  type DuplicateLabelingHandoffResult,
+  type ActiveLearningRound,
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
@@ -338,9 +340,16 @@ export default function App() {
   const [duplicateDistance, setDuplicateDistance] = useState(0.05);
   const [duplicateResults, setDuplicateResults] = useState<DuplicateScanResult | null>(null);
   const [duplicateScanUsed, setDuplicateScanUsed] = useState<DuplicateScanInput | null>(null);
+  const [duplicateHandoff, setDuplicateHandoff] = useState<DuplicateLabelingHandoffResult | null>(null);
+  const [duplicateIncludeHandled, setDuplicateIncludeHandled] = useState(false);
+  const [duplicateNewRound, setDuplicateNewRound] = useState(true);
+  const [duplicateRounds, setDuplicateRounds] = useState<ActiveLearningRound[]>([]);
+  const [duplicateRoundId, setDuplicateRoundId] = useState("");
+  const [duplicateHandoffLoading, setDuplicateHandoffLoading] = useState(false);
   const [duplicateLoading, setDuplicateLoading] = useState(false);
   const [duplicateError, setDuplicateError] = useState("");
   const duplicateRequest = useRef(0);
+  const duplicateHandoffRequest = useRef(0);
   const rankingRequest = useRef(0);
   const [blockCount, setBlockCount] = useState(12);
   const [selectedBlock, setSelectedBlock] = useState<number | null>(null);
@@ -460,12 +469,19 @@ export default function App() {
     textRequest.current += 1;
     rankingRequest.current += 1;
     duplicateRequest.current += 1;
+    duplicateHandoffRequest.current += 1;
     setTextResults(null);
     setTextSearchInput(null);
     setTextError("");
     setTextLoading(false);
     setDuplicateResults(null);
     setDuplicateScanUsed(null);
+    setDuplicateHandoff(null);
+    setDuplicateIncludeHandled(false);
+    setDuplicateNewRound(true);
+    setDuplicateRounds([]);
+    setDuplicateRoundId("");
+    setDuplicateHandoffLoading(false);
     setDuplicateError("");
     setDuplicateLoading(false);
     setRankingResults(null);
@@ -474,6 +490,25 @@ export default function App() {
     setRankingVisibleCount(24);
     setRankedViewerContext(null);
   }, [job?.run_id]);
+
+  useEffect(() => {
+    let active = true;
+    if (!duplicateResults?.results.length) {
+      setDuplicateRounds([]);
+      setDuplicateRoundId("");
+      return () => { active = false; };
+    }
+    api.activeLearningRounds().then((response) => {
+      if (!active) return;
+      setDuplicateRounds(response.rounds);
+      setDuplicateRoundId((current) => response.rounds.some((round) => round.round_id === current)
+        ? current
+        : response.rounds.at(-1)?.round_id || "");
+    }).catch(() => {
+      if (active) setDuplicateRounds([]);
+    });
+    return () => { active = false; };
+  }, [duplicateResults]);
 
   useEffect(() => {
     const requestId = ++rankingRequest.current;
@@ -764,9 +799,13 @@ export default function App() {
     const runId = job?.run_id;
     if (!runId || run?.mode !== "classifier" || run.unit !== "image") return;
     const requestId = ++duplicateRequest.current;
+    duplicateHandoffRequest.current += 1;
     const input = duplicateScanInput();
     setDuplicateResults(null);
     setDuplicateScanUsed(null);
+    setDuplicateHandoff(null);
+    setDuplicateIncludeHandled(false);
+    setDuplicateHandoffLoading(false);
     setDuplicateError("");
     setDuplicateLoading(true);
     try {
@@ -799,6 +838,36 @@ export default function App() {
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (reason) {
       setDuplicateError(reason instanceof Error ? reason.message : "Could not export duplicate candidates.");
+    }
+  }
+
+  async function sendDuplicateCandidatesToLabeling() {
+    const runId = job?.run_id;
+    if (!runId || !duplicateResults?.results.length || !duplicateScanUsed) return;
+    const requestId = ++duplicateHandoffRequest.current;
+    setDuplicateHandoff(null);
+    setDuplicateError("");
+    setDuplicateHandoffLoading(true);
+    try {
+      const result = await api.sendDuplicatePairsToLabeling(runId, {
+        ...duplicateScanUsed,
+        include_handled: duplicateIncludeHandled,
+        new_round: duplicateNewRound,
+        round_id: duplicateNewRound ? null : duplicateRoundId || null,
+      });
+      if (duplicateHandoffRequest.current === requestId) {
+        setDuplicateHandoff(result);
+        if (result.created_round) setDuplicateRoundId(result.round_id);
+      }
+      void api.activeLearningRounds().then((response) => {
+        if (duplicateHandoffRequest.current === requestId) setDuplicateRounds(response.rounds);
+      }).catch(() => undefined);
+    } catch (reason) {
+      if (duplicateHandoffRequest.current === requestId) {
+        setDuplicateError(reason instanceof Error ? reason.message : "Could not send duplicate pairs to Labeling.");
+      }
+    } finally {
+      if (duplicateHandoffRequest.current === requestId) setDuplicateHandoffLoading(false);
     }
   }
 
@@ -2001,6 +2070,53 @@ export default function App() {
                           </div>
                         ) : <p className="search-tool-note">No duplicate candidates under the current settings.</p>}
                         {duplicateResults.results.length > 0 && <button type="button" className="search-export-button" data-testid="duplicate-export" onClick={() => void exportDuplicateCandidates()}>Export candidate pairs CSV</button>}
+                        {duplicateResults.results.length > 0 && (
+                          <div className="duplicate-handoff-controls" data-testid="duplicate-handoff-controls">
+                            <label>
+                              <input
+                                type="checkbox"
+                                aria-label="Include previously reviewed images"
+                                checked={duplicateIncludeHandled}
+                                onChange={(event) => setDuplicateIncludeHandled(event.target.checked)}
+                              />
+                              <span>Include previously reviewed images</span>
+                            </label>
+                            <label>
+                              <input
+                                type="checkbox"
+                                aria-label="Record as a new duplicate review round"
+                                checked={duplicateNewRound}
+                                onChange={(event) => setDuplicateNewRound(event.target.checked)}
+                              />
+                              <span>Record as a new round</span>
+                            </label>
+                            {!duplicateNewRound && duplicateRounds.length > 0 && (
+                              <label>
+                                <span>Round to continue</span>
+                                <select aria-label="Duplicate review round to continue" value={duplicateRoundId} onChange={(event) => setDuplicateRoundId(event.target.value)}>
+                                  {[...duplicateRounds].reverse().map((round) => (
+                                    <option key={round.round_id} value={round.round_id}>{round.round_id} · {round.strategy || "—"}</option>
+                                  ))}
+                                </select>
+                              </label>
+                            )}
+                            <button
+                              type="button"
+                              data-testid="duplicate-labeling-handoff"
+                              onClick={() => void sendDuplicateCandidatesToLabeling()}
+                              disabled={duplicateHandoffLoading || busy || (!duplicateNewRound && duplicateRounds.length > 0 && !duplicateRoundId)}
+                            >
+                              {duplicateHandoffLoading ? "Preparing review…" : "Send pairs to Labeling"}
+                            </button>
+                          </div>
+                        )}
+                        {duplicateHandoff && (
+                          <p className="search-status" data-testid="duplicate-handoff-status" role="status">
+                            Saved {duplicateHandoff.pair_count} pair(s) with {duplicateHandoff.sent} unique image(s) to the Labeling inbox · round {duplicateHandoff.round_id}
+                            {duplicateHandoff.skipped_pairs ? ` · skipped ${duplicateHandoff.skipped_pairs} pair(s) already handled` : ""}
+                            {duplicateHandoff.skipped_handled ? ` · ${duplicateHandoff.skipped_handled} previously handled image(s) excluded` : ""}
+                          </p>
+                        )}
                       </>
                     )}
                   </section>
