@@ -57,13 +57,13 @@ def wait_for_job(client: TestClient, job_id: str) -> dict:
     raise AssertionError("anomaly model job did not finish")
 
 
-def make_app(monkeypatch, tmp_path: Path, *, anomaly_scorer=None) -> TestClient:
+def make_app(monkeypatch, tmp_path: Path, *, anomaly_scorer=None, anomaly_model_builder=fixture_builder) -> TestClient:
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
     return TestClient(create_app(
         model_catalog=lambda: ["fixture-model"],
         model_loader=lambda _model: lambda _path: np.zeros(2, dtype=np.float32),
-        anomaly_model_builder=fixture_builder,
+        anomaly_model_builder=anomaly_model_builder,
         anomaly_scorer=anomaly_scorer,
     ))
 
@@ -218,6 +218,14 @@ def test_anomaly_score_rank_confirm_reapply_and_heatmap(monkeypatch, tmp_path: P
         assert page.json()["total"] == 1
         assert page.json()["items"][0]["filename"] == "target.png"
         assert str(image_path) not in page.text
+        unavailable = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/preview", json={
+            "expected_revision": 1,
+            "min_conf": 0.5,
+            "target_classes": [],
+        })
+        assert unavailable.status_code == 409
+        assert unavailable.json()["code"] == "PRELABEL_HEAD_UNAVAILABLE"
+        assert "分類頭" in unavailable.json()["message"]
         preview = client.get(f"/api/v1/anomaly/runs/{run_id}/objects/0/preview.jpg")
         assert preview.status_code == 200
         assert preview.headers["content-type"] == "image/jpeg"
@@ -274,6 +282,126 @@ def test_anomaly_score_rank_confirm_reapply_and_heatmap(monkeypatch, tmp_path: P
             "indices": [1],
         })
         assert stale_curation.status_code == 409
+
+
+def test_anomaly_prelabel_preview_safe_export_and_revision_guard(monkeypatch, tmp_path: Path):
+    from PIL import Image
+
+    source = tmp_path / "source"
+    source.mkdir()
+    image_path = source / "target.png"
+    Image.new("RGB", (96, 64), (120, 140, 160)).save(image_path)
+    training = tmp_path / "training"
+    training.mkdir()
+    output = tmp_path / "prelabel-output"
+
+    def builder(request: dict, *, progress=None) -> dict:
+        bundle = fixture_builder(request, progress=progress)
+        bundle["head"] = {"classes": ["scratch", "stain"], "dim": 2}
+        bundle["summary"].update({
+            "has_head": True,
+            "head_status": "能分辨瑕疵種類",
+            "eligible_classes": ["scratch", "stain"],
+        })
+        return bundle
+
+    def scorer(request, bundle, *, progress=None) -> dict:
+        return {
+            "records": [
+                {"image_path": str(image_path), "bbox": [0.5, 0.5, 0.4, 0.6], "label": "part", "split": "test", "obj_index": i}
+                for i in range(2)
+            ],
+            "obj_emb": np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+            "scores": np.asarray([0.9, 0.95], dtype=np.float64),
+            "labels": np.asarray(["bad", "bad"], dtype=object),
+            "ranking": [1, 0],
+            "threshold": 0.5,
+            "n_bad": 2,
+            "auroc": None,
+            "score_mode": "patch",
+            "model_id": bundle["meta"]["model"],
+            "model_meta": bundle["meta"],
+            "model_bank_sha256": "b" * 64,
+            "object_source": "yolo",
+            "bank": None,
+            "skipped_count": 0,
+            "fewshot_aligned": {},
+            "fewshot_unmatched": 0,
+            "confirmed": {},
+            "contamination": float(request["contamination"]),
+            "created_at": 1_798_000_000.0,
+        }
+
+    import dino_head
+
+    def predict_head(_head, embeddings):
+        rows = np.asarray(embeddings)
+        labels = np.where(rows[:, 0] > 0, "scratch", "stain")
+        confidence = np.asarray([0.91, 0.83], dtype=np.float32)
+        probabilities = np.asarray([[0.91, 0.09], [0.17, 0.83]], dtype=np.float32)
+        return labels, confidence, probabilities
+
+    def gated_predict(head, embeddings, scores, *, anomaly_threshold, min_conf=0.5):
+        labels, confidence, _ = predict_head(head, embeddings)
+        return [
+            label if score >= anomaly_threshold and conf >= min_conf else "Unknown"
+            for label, conf, score in zip(labels, confidence, scores)
+        ]
+
+    monkeypatch.setattr(dino_head, "predict_head", predict_head)
+    monkeypatch.setattr(dino_head, "gated_predict", gated_predict)
+
+    with make_app(monkeypatch, tmp_path, anomaly_scorer=scorer, anomaly_model_builder=builder) as client:
+        created = client.post("/api/v1/anomaly/models/jobs", json={
+            "train_folders": [str(training)], "model_id": "fixture-model", "label_semantic": "defect",
+        })
+        model_job = wait_for_job(client, created.json()["job_id"])
+        assert model_job["state"] == "completed", model_job
+        model_bundle_id = model_job["result"]["model_id"]
+        scored = client.post("/api/v1/anomaly/score-jobs", json={
+            "target_folders": [str(source)], "contamination": 0.05,
+        })
+        score_job = wait_for_score_job(client, scored.json()["job_id"])
+        assert score_job["state"] == "completed", score_job
+        assert score_job["result"]["model_bundle_id"] == model_bundle_id
+        run_id = score_job["result"]["run_id"]
+
+        preview = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/preview", json={
+            "expected_revision": 1, "min_conf": 0.5, "target_classes": ["scratch"], "limit": 1,
+        })
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["accepted"] == 1
+        assert preview.json()["total"] == 2
+        assert preview.json()["items"][0]["pred"] == "scratch"
+        assert preview.json()["items"][0]["accept"] is True
+        assert str(image_path) not in preview.text
+        assert "obj_emb" not in preview.text
+
+        exported = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/export", json={
+            "expected_revision": 1, "min_conf": 0.5, "target_classes": ["scratch"],
+            "output_dir": str(output),
+        })
+        assert exported.status_code == 200, exported.text
+        assert exported.json()["accepted"] == exported.json()["objects"] == 1
+        assert exported.json()["written"] == 1
+        assert str(output) not in exported.text
+        assert (output / "labels" / "target.txt").read_text(encoding="utf-8") == "0 0.500000 0.500000 0.400000 0.600000\n"
+        assert (output / "classes.txt").read_text(encoding="utf-8").splitlines() == ["scratch", "stain"]
+        assert list(source.iterdir()) == [image_path]
+
+        unsafe = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/export", json={
+            "expected_revision": 1, "min_conf": 0.5, "target_classes": ["scratch"],
+            "output_dir": str(source),
+        })
+        assert unsafe.status_code == 422
+        assert unsafe.json()["code"] == "PRELABEL_EXPORT_UNSAFE"
+        assert list(source.iterdir()) == [image_path]
+
+        conflict = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/preview", json={
+            "expected_revision": 2, "min_conf": 0.5, "target_classes": ["scratch"],
+        })
+        assert conflict.status_code == 409
+        assert conflict.json()["code"] == "ANOMALY_RUN_REVISION_CONFLICT"
 
 
 def test_yolo_target_without_labels_returns_friendly_error(monkeypatch, tmp_path: Path):

@@ -186,6 +186,7 @@ export type AnomalyRun = {
   run_id: string;
   revision: number;
   model_id: string;
+  model_bundle_id: string | null;
   model_meta: AnomalyModel["meta"];
   model_bank_sha256: string;
   score_mode: "patch" | "object";
@@ -224,6 +225,46 @@ export type AnomalyObjectPage = {
   limit: number;
   total: number;
   items: AnomalyObject[];
+};
+
+export type AnomalyPrelabelItem = {
+  index: number;
+  filename: string;
+  label: string;
+  obj_index: number;
+  bbox: [number, number, number, number];
+  score: number;
+  pred: string;
+  confidence: number;
+  accept: boolean;
+};
+
+export type AnomalyPrelabelPreview = {
+  run_id: string;
+  revision: number;
+  min_conf: number;
+  target_classes: string[];
+  class_names: string[];
+  total: number;
+  accepted: number;
+  offset: number;
+  limit: number;
+  items: AnomalyPrelabelItem[];
+};
+
+export type AnomalyPrelabelOptions = {
+  expected_revision: number;
+  min_conf: number;
+  target_classes: string[];
+};
+
+export type AnomalyPrelabelExport = {
+  run_id: string;
+  revision: number;
+  accepted: number;
+  written: number;
+  objects: number;
+  class_names: string[];
 };
 
 export type RunRecord = {
@@ -1220,6 +1261,16 @@ export const api = {
       "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/objects?" + query.toString(),
     );
   },
+  previewAnomalyPrelabels: (runId: string, input: AnomalyPrelabelOptions & { offset?: number; limit?: number }) =>
+    request<AnomalyPrelabelPreview>(
+      "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/prelabel/preview",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  exportAnomalyPrelabels: (runId: string, input: AnomalyPrelabelOptions & { output_dir: string }) =>
+    request<AnomalyPrelabelExport>(
+      "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/prelabel/export",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
   reapplyAnomalyRun: (runId: string, input: {
     expected_revision: number;
     contamination: number;

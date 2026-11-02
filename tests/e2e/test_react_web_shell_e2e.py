@@ -3703,6 +3703,157 @@ def test_lv_web_06_review_01_visible_anomaly_candidate_cart_exports_original_ima
         server_thread.join(timeout=10)
 
 
+def test_lv_web_10_prelabel_01_visible_preview_safe_export_and_no_head_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """M11 preview/count/readback and C6 source protection are visible in React."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
+    training = tmp_path / "training"
+    training.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    source_image = target / "panel.png"
+    Image.new("RGB", (128, 96), (145, 80, 55)).save(source_image)
+    source_before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in target.iterdir()}
+    output = tmp_path / "prelabel-output"
+
+    def prelabel_builder(request: dict, *, progress=None) -> dict:
+        bundle = _fixture_anomaly_model_builder(request, progress=progress)
+        if request.get("label_semantic") == "defect":
+            bundle["head"] = {"classes": ["scratch", "stain"], "dim": 2}
+            bundle["summary"].update({
+                "has_head": True,
+                "head_status": "能分辨瑕疵種類",
+                "eligible_classes": ["scratch", "stain"],
+            })
+        return bundle
+
+    def score_prelabel_targets(request: dict, bundle: dict, *, progress=None) -> dict:
+        if progress:
+            progress(90, 100, "Fixture anomaly candidates ready")
+        return {
+            "records": [
+                {"image_path": str(source_image), "bbox": [0.5, 0.5, 0.4, 0.6], "label": "part", "split": "test", "obj_index": index}
+                for index in range(2)
+            ],
+            "obj_emb": np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+            "scores": np.asarray([0.9, 0.95], dtype=np.float64),
+            "labels": np.asarray(["bad", "bad"], dtype=object),
+            "ranking": [1, 0],
+            "threshold": 0.5,
+            "n_bad": 2,
+            "auroc": None,
+            "score_mode": "patch",
+            "model_id": bundle["meta"]["model"],
+            "model_meta": bundle["meta"],
+            "model_bank_sha256": "c" * 64,
+            "object_source": "yolo",
+            "bank": None,
+            "skipped_count": 0,
+            "fewshot_aligned": {},
+            "fewshot_unmatched": 0,
+            "confirmed": {},
+            "contamination": float(request["contamination"]),
+            "created_at": 1_798_000_000.0,
+        }
+
+    import dino_head
+
+    def predict_head(_head, embeddings):
+        rows = np.asarray(embeddings)
+        labels = np.where(rows[:, 0] > 0, "scratch", "stain")
+        confidence = np.asarray([0.91, 0.83], dtype=np.float32)
+        probabilities = np.asarray([[0.91, 0.09], [0.17, 0.83]], dtype=np.float32)
+        return labels, confidence, probabilities
+
+    def gated_predict(head, embeddings, scores, *, anomaly_threshold, min_conf=0.5):
+        labels, confidence, _ = predict_head(head, embeddings)
+        return [
+            label if score >= anomaly_threshold and conf >= min_conf else "Unknown"
+            for label, conf, score in zip(labels, confidence, scores)
+        ]
+
+    monkeypatch.setattr(dino_head, "predict_head", predict_head)
+    monkeypatch.setattr(dino_head, "gated_predict", gated_predict)
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: lambda _path: np.zeros(2, dtype=np.float32),
+        anomaly_model_builder=prelabel_builder,
+        anomaly_scorer=score_prelabel_targets,
+    )
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page.set_default_timeout(15000)
+            api_responses: list[str] = []
+
+            def capture_api_json(response):
+                if (
+                    "/api/v1/anomaly/" in response.url and response.ok
+                    and response.headers.get("content-type", "").startswith("application/json")
+                ):
+                    api_responses.append(response.text())
+
+            page.on("response", capture_api_json)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-anomaly-bank").click()
+            page.get_by_test_id("anomaly-train-folders").fill(str(training))
+            page.get_by_test_id("anomaly-model").select_option("fixture-model")
+
+            # No classification head: friendly message and no export control.
+            page.get_by_test_id("anomaly-build").click()
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("只做異常偵測")
+            page.get_by_test_id("anomaly-target-folders").fill(str(target))
+            page.get_by_test_id("anomaly-score").click()
+            expect(page.get_by_test_id("anomaly-prelabel-unavailable")).to_contain_text("沒有瑕疵分類頭")
+            expect(page.get_by_test_id("anomaly-prelabel-export")).to_have_count(0)
+
+            # A defect head enables M11 preview and safe export.
+            page.get_by_test_id("anomaly-label-semantic").select_option("defect")
+            page.get_by_test_id("anomaly-build").click()
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("能分辨瑕疵種類")
+            page.get_by_test_id("anomaly-score").click()
+            expect(page.get_by_test_id("anomaly-prelabel-workspace")).to_be_visible()
+            page.get_by_label("預標類別 stain").uncheck()
+            page.get_by_test_id("anomaly-prelabel-preview").click()
+            expect(page.get_by_test_id("anomaly-prelabel-summary")).to_contain_text("接受 1 / 2 個物件")
+            expect(page.get_by_test_id("anomaly-prelabel-item-0")).to_contain_text("scratch")
+            expect(page.get_by_test_id("anomaly-prelabel-item-1")).to_contain_text("不接受")
+            page.get_by_label("預標類別 stain").check()
+            expect(page.get_by_test_id("anomaly-prelabel-summary")).to_have_count(0)
+            page.get_by_label("預標類別 stain").uncheck()
+            page.get_by_test_id("anomaly-prelabel-preview").click()
+            expect(page.get_by_test_id("anomaly-prelabel-summary")).to_contain_text("接受 1 / 2 個物件")
+            page.wait_for_function(
+                "document.querySelector('[data-testid=\"anomaly-prelabel-item-0\"] img')?.naturalWidth > 0",
+                timeout=15000,
+            )
+            page.get_by_test_id("anomaly-prelabel-output-dir").fill(str(output))
+            page.get_by_test_id("anomaly-prelabel-export").click()
+            expect(page.get_by_test_id("anomaly-notice")).to_contain_text("預標匯出完成")
+
+            label_file = output / "labels" / "panel.txt"
+            assert label_file.read_text(encoding="utf-8").splitlines() == [
+                "0 0.500000 0.500000 0.400000 0.600000",
+            ]
+            assert (output / "classes.txt").read_text(encoding="utf-8").splitlines() == ["scratch", "stain"]
+            assert {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in target.iterdir()} == source_before
+            assert all(str(tmp_path) not in body for body in api_responses)
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+
+
 def test_lv_web_07_scan_01_visible_reviews_and_appends_fewshot_candidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

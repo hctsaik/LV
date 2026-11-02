@@ -304,6 +304,21 @@ class ReapplyAnomalyRunRequest(BaseModel):
     confirmed: dict[str, Literal["good", "bad", ""]] = Field(default_factory=dict, max_length=10000)
 
 
+class AnomalyPrelabelRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    min_conf: float = Field(default=0.5, ge=0.0, le=1.0, allow_inf_nan=False)
+    target_classes: list[str] | None = Field(default=None, max_length=256)
+
+
+class AnomalyPrelabelPreviewRequest(AnomalyPrelabelRequest):
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=40, ge=1, le=200)
+
+
+class AnomalyPrelabelExportRequest(AnomalyPrelabelRequest):
+    output_dir: str = Field(min_length=1, max_length=4096)
+
+
 class LoadAnomalyModelRequest(BaseModel):
     model_id: str = Field(min_length=1, max_length=64)
 
@@ -2497,6 +2512,8 @@ def create_app(
                 raise ValueError("找不到符合模型物件來源的目標影像或標註")
             run_id = uuid.uuid4().hex
             run["run_id"] = run_id
+            run["model_bundle_id"] = job.model_id
+            run["target_folders"] = list(job.request.target_folders)
             run["labels"] = np.asarray(run["labels"], dtype=object)
             run["revision"] = 1
             from react_anomaly import anomaly_run_view
@@ -2599,6 +2616,184 @@ def create_app(
                 run, offset=offset, limit=limit, verdict=verdict,
                 class_label=class_label, score_min=score_min, score_max=score_max,
             )
+
+    def anomaly_prelabel_state(run_id: str, expected_revision: int) -> dict:
+        with app.state.lock:
+            run = app.state.anomaly_runs.get(run_id)
+            if run is None or app.state.current_anomaly_run_id != run_id:
+                raise HTTPException(status_code=404, detail={
+                    "code": "ANOMALY_RUN_NOT_FOUND",
+                    "message": "找不到目前 worker 的瑕疵偵測結果，請重新套用模型。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if int(run["revision"]) != expected_revision:
+                raise HTTPException(status_code=409, detail={
+                    "code": "ANOMALY_RUN_REVISION_CONFLICT",
+                    "message": "偵測結果已更新，請重新預覽預標。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            bundle_id = app.state.current_anomaly_model_id
+            bundle = app.state.anomaly_models.get(bundle_id) if bundle_id else None
+            if not bundle or run.get("model_bundle_id") != bundle_id:
+                raise HTTPException(status_code=409, detail={
+                    "code": "PRELABEL_MODEL_UNAVAILABLE",
+                    "message": "目前載入的模型與這次偵測結果不一致，請重新套用模型。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            head = bundle.get("head")
+            if not head:
+                raise HTTPException(status_code=409, detail={
+                    "code": "PRELABEL_HEAD_UNAVAILABLE",
+                    "message": "此模型沒有瑕疵分類頭，無法預標。請使用瑕疵類別語義建立並載入分類頭模型。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            records = list(run.get("records") or [])
+            raw_embeddings = run.get("obj_emb")
+            raw_scores = run.get("scores")
+            if raw_embeddings is None or raw_scores is None:
+                raise HTTPException(status_code=409, detail={
+                    "code": "PRELABEL_EMBEDDINGS_UNAVAILABLE",
+                    "message": "這次結果沒有可用的物件 embedding，無法預標；請重新套用物件層級模型。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+            scores = np.asarray(raw_scores, dtype=np.float64)
+            if (
+                embeddings.ndim != 2 or embeddings.shape[0] != len(records)
+                or scores.ndim != 1 or len(scores) != len(records)
+                or not np.isfinite(embeddings).all() or not np.isfinite(scores).all()
+            ):
+                raise HTTPException(status_code=409, detail={
+                    "code": "PRELABEL_EMBEDDINGS_UNAVAILABLE",
+                    "message": "物件 embedding 與偵測結果沒有對齊，請重新套用模型。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            return {
+                "run": run,
+                "records": records,
+                "embeddings": embeddings,
+                "scores": scores,
+                "threshold": float(run["threshold"]),
+                "head": head,
+                "class_names": [str(value) for value in (head.get("classes") or [])],
+                "source_dirs": list(run.get("target_folders") or []),
+                "model_bundle_id": bundle_id,
+                "revision": int(run["revision"]),
+            }
+
+    def anomaly_prelabel_decisions(state: dict, request: AnomalyPrelabelRequest) -> list[dict]:
+        classes = set(state["class_names"])
+        if request.target_classes is not None and not set(request.target_classes) <= classes:
+            raise HTTPException(status_code=422, detail={
+                "code": "PRELABEL_CLASS_SELECTION_INVALID",
+                "message": "預標類別不在目前模型的分類頭中，請重新選擇。",
+                "request_id": uuid.uuid4().hex,
+            })
+        try:
+            import prelabel as _prelabel
+            return _prelabel.prelabel_records(
+                state["records"], state["embeddings"], state["scores"], state["head"],
+                anomaly_threshold=state["threshold"], min_conf=request.min_conf,
+                target_classes=request.target_classes,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={
+                "code": "PRELABEL_EVALUATION_INVALID",
+                "message": f"無法計算預標：{exc}",
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+
+    @app.post("/api/v1/anomaly/runs/{run_id}/prelabel/preview")
+    def preview_anomaly_prelabels(
+        run_id: str, request: AnomalyPrelabelPreviewRequest,
+    ) -> dict:
+        state = anomaly_prelabel_state(run_id, request.expected_revision)
+        decisions = anomaly_prelabel_decisions(state, request)
+        start = min(request.offset, len(decisions))
+        rows = []
+        for decision in decisions[start:start + request.limit]:
+            index = int(decision["item"])
+            record = state["records"][index]
+            rows.append({
+                "index": index,
+                "filename": Path(str(record.get("image_path") or "")).name,
+                "label": str(record.get("label") or ""),
+                "obj_index": int(record.get("obj_index") or 0),
+                "bbox": [float(value) for value in record["bbox"]],
+                "score": float(state["scores"][index]),
+                "pred": str(decision["pred"]),
+                "confidence": float(decision["conf"]),
+                "accept": bool(decision["accept"]),
+            })
+        return {
+            "run_id": run_id,
+            "revision": state["revision"],
+            "min_conf": request.min_conf,
+            "target_classes": request.target_classes if request.target_classes is not None else state["class_names"],
+            "class_names": state["class_names"],
+            "total": len(decisions),
+            "accepted": sum(1 for decision in decisions if decision["accept"]),
+            "offset": start,
+            "limit": request.limit,
+            "items": rows,
+        }
+
+    @app.post("/api/v1/anomaly/runs/{run_id}/prelabel/export")
+    def export_anomaly_prelabels(
+        run_id: str, request: AnomalyPrelabelExportRequest,
+    ) -> dict:
+        state = anomaly_prelabel_state(run_id, request.expected_revision)
+        decisions = anomaly_prelabel_decisions(state, request)
+        try:
+            import prelabel as _prelabel
+            lines = _prelabel.to_yolo_lines(
+                state["records"], decisions, class_names=state["class_names"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={
+                "code": "PRELABEL_EXPORT_INVALID",
+                "message": f"無法準備 YOLO 預標：{exc}",
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+        with app.state.lock:
+            current = app.state.anomaly_runs.get(run_id)
+            if (
+                current is None or app.state.current_anomaly_run_id != run_id
+                or int(current["revision"]) != state["revision"]
+                or app.state.current_anomaly_model_id != state["model_bundle_id"]
+            ):
+                raise HTTPException(status_code=409, detail={
+                    "code": "ANOMALY_RUN_REVISION_CONFLICT",
+                    "message": "偵測結果或模型已更新，請重新預覽預標後再匯出。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            try:
+                result = _prelabel.export_prelabels(
+                    lines, request.output_dir, class_names=state["class_names"],
+                    source_dirs=state["source_dirs"],
+                )
+            except ValueError as exc:
+                logger.info("LV prelabel export rejected (run=%s): %s", run_id, exc)
+                raise HTTPException(status_code=422, detail={
+                    "code": "PRELABEL_EXPORT_UNSAFE",
+                    "message": "匯出安全檢查未通過：請選來源資料夾之外、且不含 images 子資料夾的輸出位置。",
+                    "request_id": uuid.uuid4().hex,
+                }) from exc
+            except OSError:
+                logger.exception("LV prelabel export failed (run=%s)", run_id)
+                raise HTTPException(status_code=500, detail={
+                    "code": "PRELABEL_EXPORT_FAILED",
+                    "message": "無法寫入預標輸出位置。請確認資料夾可寫入後重試。",
+                    "request_id": uuid.uuid4().hex,
+                }) from None
+        return {
+            "run_id": run_id,
+            "revision": state["revision"],
+            "accepted": sum(1 for decision in decisions if decision["accept"]),
+            "written": int(result["written"]),
+            "objects": int(result["objects"]),
+            "class_names": state["class_names"],
+        }
 
     @app.post("/api/v1/anomaly/runs/{run_id}/reapply")
     def reapply_anomaly_run(run_id: str, request: ReapplyAnomalyRunRequest) -> dict:

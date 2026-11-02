@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, type AnomalyModel, type AnomalyObject, type AnomalyRun, type ModelOption } from "./api";
+import { api, type AnomalyModel, type AnomalyObject, type AnomalyPrelabelPreview, type AnomalyRun, type ModelOption } from "./api";
 
 type Props = {
   models: ModelOption[];
@@ -52,6 +52,12 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
   const [heatmapIndex, setHeatmapIndex] = useState<number | null>(null);
   const [selectedCuration, setSelectedCuration] = useState<Set<number>>(() => new Set());
   const [curationWorking, setCurationWorking] = useState(false);
+  const [prelabelMinConf, setPrelabelMinConf] = useState(0.5);
+  const [prelabelClasses, setPrelabelClasses] = useState<string[]>([]);
+  const [prelabelOutputDir, setPrelabelOutputDir] = useState("");
+  const [prelabelPreview, setPrelabelPreview] = useState<AnomalyPrelabelPreview | null>(null);
+  const [prelabelOffset, setPrelabelOffset] = useState(0);
+  const [prelabelWorking, setPrelabelWorking] = useState(false);
 
   const availableModels = useMemo(() => models.filter((item) => item.available), [models]);
 
@@ -108,6 +114,8 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
       setActiveModel(job.result);
       setRun(null);
       setObjects([]);
+      setPrelabelPreview(null);
+      setPrelabelClasses(job.result.summary.eligible_classes);
       setDraftConfirmed({});
       setSelectedCuration(new Set());
       setNotice("模型已建立於本機 worker 記憶體。按「保存模型」後，才能在新 worker 程序重新載入。");
@@ -147,6 +155,8 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
       setActiveModel(result.model);
       setRun(null);
       setObjects([]);
+      setPrelabelPreview(null);
+      setPrelabelClasses(result.model.summary.eligible_classes);
       setDraftConfirmed({});
       setSelectedCuration(new Set());
       setNotice("已從 LV_CACHE_DIR 載入模型；建模時的模型、解析度、分數依據與語義已鎖定。");
@@ -186,6 +196,7 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
     setNotice("");
     setRun(null);
     setObjects([]);
+    setPrelabelPreview(null);
     setSelectedCuration(new Set());
     setProgress("排入套用工作…");
     try {
@@ -204,6 +215,8 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
         throw new Error(job.error?.message || job.message || "套用瑕疵偵測模型失敗。");
       }
       setRun(job.result);
+      setPrelabelClasses(activeModel.summary.eligible_classes);
+      setPrelabelPreview(null);
       setDraftConfirmed({});
       setHeatmapIndex(null);
       await loadObjects(0, job.result.run_id);
@@ -228,6 +241,7 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
         confirmed: draftConfirmed,
       });
       setRun(updated);
+      setPrelabelPreview(null);
       setDraftConfirmed({});
       setSelectedCuration(new Set());
       await loadObjects(0, updated.run_id);
@@ -258,6 +272,51 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
       setCurationWorking(false);
     }
   }
+
+  async function previewPrelabels(offset = 0) {
+    if (!run) return;
+    setPrelabelWorking(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.previewAnomalyPrelabels(run.run_id, {
+        expected_revision: run.revision,
+        min_conf: prelabelMinConf,
+        target_classes: prelabelClasses,
+        offset,
+        limit: 40,
+      });
+      setPrelabelPreview(result);
+      setPrelabelOffset(result.offset);
+    } catch (reason) {
+      setPrelabelPreview(null);
+      setError(reason instanceof Error ? reason.message : "計算瑕疵預標失敗。");
+    } finally {
+      setPrelabelWorking(false);
+    }
+  }
+
+  async function exportPrelabels() {
+    if (!run || !prelabelPreview || !prelabelOutputDir.trim()) return;
+    setPrelabelWorking(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.exportAnomalyPrelabels(run.run_id, {
+        expected_revision: run.revision,
+        min_conf: prelabelMinConf,
+        target_classes: prelabelClasses,
+        output_dir: prelabelOutputDir.trim(),
+      });
+      setNotice(`預標匯出完成：接受 ${result.accepted} 個物件，寫入 ${result.written} 個標註檔。來源資料未修改。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "預標匯出失敗。");
+    } finally {
+      setPrelabelWorking(false);
+    }
+  }
+
+  const canPrelabel = Boolean(run && activeModel?.summary.has_head && activeModel.model_id === run.model_bundle_id);
 
   return (
     <main className="anomaly-workspace" aria-labelledby="anomaly-title" data-testid="anomaly-bank-workspace">
@@ -365,6 +424,69 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
           <small>結果 {run.run_id.slice(0, 12)} · bank SHA-256 {run.model_bank_sha256.slice(0, 16)}… · revision {run.revision} · 已對齊 few-shot {run.fewshot_aligned} 筆</small>
         </div>}
       </section>
+
+      {run && <section className="anomaly-card" aria-labelledby="anomaly-prelabel-title" data-testid="anomaly-prelabel-workspace">
+        <div className="eyebrow">M11 · PRELABEL</div>
+        <h2 id="anomaly-prelabel-title">瑕疵預標與安全 YOLO 匯出</h2>
+        <p>分類頭只提供預標建議；檢查預覽後可匯出到來源資料夾以外的位置，人工仍需確認標註。</p>
+        {!canPrelabel ? <div className="alert alert-info" role="status" data-testid="anomaly-prelabel-unavailable">
+          {activeModel?.model_id !== run.model_bundle_id
+            ? "目前載入的模型與這次偵測結果不同，請重新套用模型。"
+            : "此模型沒有瑕疵分類頭，無法分辨瑕疵類別，因此不提供預標匯出。請以瑕疵類別語義建立並載入分類頭模型。"}
+        </div> : <>
+          <div className="anomaly-prelabel-controls">
+            <label>最低信心 <strong>{prelabelMinConf.toFixed(2)}</strong>
+              <input aria-label="預標最低信心" data-testid="anomaly-prelabel-min-conf" type="range" min={0} max={1} step={0.05} value={prelabelMinConf} disabled={prelabelWorking} onChange={(event) => { setPrelabelMinConf(Number(event.target.value)); setPrelabelPreview(null); }} />
+            </label>
+            <fieldset className="anomaly-prelabel-classes">
+              <legend>接受的目標類別</legend>
+              {activeModel?.summary.eligible_classes.map((label) => <label key={label}>
+                <input type="checkbox" aria-label={`預標類別 ${label}`} checked={prelabelClasses.includes(label)} disabled={prelabelWorking} onChange={(event) => {
+                  setPrelabelClasses((current) => event.target.checked
+                    ? [...current, label]
+                    : current.filter((item) => item !== label));
+                  setPrelabelPreview(null);
+                }} />
+                {label}
+              </label>)}
+              {activeModel?.summary.eligible_classes.length === 0 && <small>模型沒有可用的瑕疵類別。</small>}
+            </fieldset>
+            <button type="button" className="run-button" data-testid="anomaly-prelabel-preview" disabled={prelabelWorking || !connected} onClick={() => void previewPrelabels(0)}>
+              {prelabelWorking ? "正在計算…" : "產生預標預覽"}
+            </button>
+          </div>
+          {prelabelPreview && <>
+            <div className="anomaly-prelabel-summary" role="status" data-testid="anomaly-prelabel-summary">
+              接受 {prelabelPreview.accepted} / {prelabelPreview.total} 個物件 · 分頁 {prelabelPreview.total ? `${prelabelOffset + 1}–${Math.min(prelabelOffset + prelabelPreview.items.length, prelabelPreview.total)}` : "0 筆"}
+            </div>
+            <div className="anomaly-prelabel-list" data-testid="anomaly-prelabel-list">
+              {prelabelPreview.items.map((item) => <article key={item.index} className="anomaly-prelabel-item" data-testid={`anomaly-prelabel-item-${item.index}`}>
+                <img className="anomaly-object-preview" src={api.anomalyObjectImageUrl(run.run_id, item.index, "preview")} alt={`${item.filename} 預標物件預覽`} loading="lazy" />
+                <div>
+                  <strong>{item.filename} · 物件 {item.obj_index + 1}</strong>
+                  <span>原標籤 {item.label || "未命名"} · 異常分數 {item.score.toFixed(5)}</span>
+                  <span>預測 {item.pred} · 信心 {item.confidence.toFixed(3)} · {item.accept ? "接受" : "不接受"}</span>
+                  <span>框 [ {item.bbox.map((value) => value.toFixed(3)).join(", ")} ]</span>
+                </div>
+              </article>)}
+              {prelabelPreview.items.length === 0 && <p className="anomaly-empty-results">目前沒有物件可預覽。</p>}
+            </div>
+            <div className="anomaly-pagination">
+              <button type="button" className="secondary-action" disabled={prelabelWorking || prelabelOffset <= 0} onClick={() => void previewPrelabels(Math.max(0, prelabelOffset - 40))}>上一頁</button>
+              <span>{prelabelPreview.total ? `${prelabelOffset + 1}–${Math.min(prelabelOffset + prelabelPreview.items.length, prelabelPreview.total)} / ${prelabelPreview.total}` : "0 筆"}</span>
+              <button type="button" className="secondary-action" disabled={prelabelWorking || prelabelOffset + prelabelPreview.items.length >= prelabelPreview.total} onClick={() => void previewPrelabels(prelabelOffset + 40)}>下一頁</button>
+            </div>
+            <div className="anomaly-prelabel-export">
+              <label>YOLO 標註輸出資料夾（須位於來源資料夾之外）
+                <input aria-label="預標輸出資料夾" data-testid="anomaly-prelabel-output-dir" value={prelabelOutputDir} disabled={prelabelWorking} onChange={(event) => setPrelabelOutputDir(event.target.value)} placeholder="C:\\data\\prelabel-output" />
+              </label>
+              <button type="button" className="run-button" data-testid="anomaly-prelabel-export" disabled={prelabelWorking || !prelabelOutputDir.trim() || !connected} onClick={() => void exportPrelabels()}>
+                {prelabelWorking ? "正在匯出…" : `匯出接受的預標（${prelabelPreview.accepted}）`}
+              </button>
+            </div>
+          </>}
+        </>}
+      </section>}
 
       {run && <section className="anomaly-card" aria-labelledby="anomaly-review-title" data-testid="anomaly-review-workspace">
         <div className="eyebrow">SCORE REVIEW</div>

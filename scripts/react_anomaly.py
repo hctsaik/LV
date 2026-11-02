@@ -216,6 +216,10 @@ def score_targets(request: dict, bundle: dict, *, progress=None) -> dict:
     ).hexdigest()
     return {
         "records": result["records"],
+        # The React prelabel workflow reuses the same object-level embeddings and
+        # model head as Streamlit; keep them worker-private, never in the API view.
+        "obj_emb": np.asarray(result["obj_emb"], dtype=np.float32)
+        if result.get("obj_emb") is not None else None,
         "scores": scores,
         "labels": np.asarray(classification["labels"], dtype=object),
         "ranking": list(classification["ranking"]),
@@ -248,6 +252,7 @@ def anomaly_run_view(run: dict) -> dict:
         "run_id": run["run_id"],
         "revision": int(run["revision"]),
         "model_id": run["model_id"],
+        "model_bundle_id": run.get("model_bundle_id"),
         "model_meta": {key: value for key, value in run["model_meta"].items()},
         "model_bank_sha256": run["model_bank_sha256"],
         "score_mode": run["score_mode"],
