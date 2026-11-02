@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import {
   api,
   type ClassSimilarityBoxSummary,
@@ -6,6 +6,7 @@ import {
   type ClassSimilarityMetric,
   type ClassSimilarityResult,
   type ClassSimilarityEvaluationPreview,
+  type ClassSimilarityScatterItem,
   type VisualizeUnit,
   type RunRecord,
 } from "./api";
@@ -47,11 +48,11 @@ function PrecisionRecallPlot({ points }: { points: ClassSimilarityEvaluationPrev
   </svg>;
 }
 
-function BoxPlot({ rows, threshold = null }: { rows: ClassSimilarityBoxSummary[]; threshold?: number | null }) {
+function BoxPlot({ rows, threshold = null, domain }: { rows: ClassSimilarityBoxSummary[]; threshold?: number | null; domain?: [number, number] }) {
   const scored = rows.filter((row) => row.q1 !== undefined && row.q3 !== undefined);
   if (!scored.length) return <p className="class-similarity-empty">No records have a score for this measure.</p>;
-  const min = Math.min(...scored.map((row) => row.whisker_low ?? row.q1 ?? 0));
-  const max = Math.max(...scored.map((row) => row.whisker_high ?? row.q3 ?? 0));
+  const min = domain?.[0] ?? Math.min(...scored.map((row) => row.whisker_low ?? row.q1 ?? 0));
+  const max = domain?.[1] ?? Math.max(...scored.map((row) => row.whisker_high ?? row.q3 ?? 0));
   const span = max - min || 1;
   const left = 150;
   const right = 760;
@@ -86,14 +87,110 @@ function BoxPlot({ rows, threshold = null }: { rows: ClassSimilarityBoxSummary[]
   );
 }
 
-function metricValue(item: ClassSimilarityItem, metric: ClassSimilarityMetric) {
-  return item[metric];
+function ScatterPlot({
+  items, labels, metric, domain, threshold, candidateIds, selectedIds,
+  onInspect, onBoxSelect,
+}: {
+  items: ClassSimilarityScatterItem[];
+  labels: string[];
+  metric: ClassSimilarityMetric;
+  domain: [number, number];
+  threshold: number | null;
+  candidateIds: Set<string>;
+  selectedIds: string[];
+  onInspect: (recordId: string) => void;
+  onBoxSelect: (recordIds: string[]) => void;
+}) {
+  const width = 800;
+  const height = 390;
+  const left = 72;
+  const right = 782;
+  const top = 18;
+  const bottom = 342;
+  const span = domain[1] - domain[0] || 1;
+  const step = labels.length > 1 ? (right - left) / (labels.length - 1) : 0;
+  const xAt = (item: ClassSimilarityScatterItem) => Math.max(left, Math.min(right, left + labels.indexOf(item.label || "") * step + item.jitter * Math.max(step, 48)));
+  const yAt = (value: number) => bottom - ((value - domain[0]) / span) * (bottom - top);
+  const points = items.filter((item) => labels.includes(item.label || ""));
+  const startRef = useRef<{ x: number; y: number } | null>(null);
+  const draggedRef = useRef(false);
+  const [drag, setDrag] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+
+  function point(event: ReactPointerEvent<SVGSVGElement>) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return { x: (event.clientX - rect.left) * width / rect.width, y: (event.clientY - rect.top) * height / rect.height };
+  }
+
+  function pointerDown(event: ReactPointerEvent<SVGSVGElement>) {
+    if (event.button !== 0) return;
+    const p = point(event);
+    startRef.current = p;
+    draggedRef.current = false;
+    setDrag({ x1: p.x, y1: p.y, x2: p.x, y2: p.y });
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function pointerMove(event: ReactPointerEvent<SVGSVGElement>) {
+    if (!startRef.current) return;
+    const p = point(event);
+    if (Math.abs(p.x - startRef.current.x) + Math.abs(p.y - startRef.current.y) > 5) draggedRef.current = true;
+    setDrag({ x1: startRef.current.x, y1: startRef.current.y, x2: p.x, y2: p.y });
+  }
+
+  function pointerUp() {
+    if (!startRef.current || !drag) return;
+    if (draggedRef.current) {
+      const x1 = Math.min(drag.x1, drag.x2), x2 = Math.max(drag.x1, drag.x2);
+      const y1 = Math.min(drag.y1, drag.y2), y2 = Math.max(drag.y1, drag.y2);
+      const selected = points.filter((item) => {
+        const x = xAt(item), y = yAt(item.value);
+        return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+      }).map((item) => item.record_id);
+      if (selected.length) onBoxSelect(selected);
+      window.setTimeout(() => { draggedRef.current = false; }, 0);
+    }
+    startRef.current = null;
+    setDrag(null);
+  }
+
+  const selected = new Set(selectedIds);
+  return <svg className="class-similarity-scatter" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${metric} distribution scatter plot`}
+    onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp}>
+    {[0, 0.25, 0.5, 0.75, 1].map((fraction) => {
+      const value = domain[0] + span * fraction;
+      const y = yAt(value);
+      return <g key={fraction}><line x1={left} x2={right} y1={y} y2={y} className="class-similarity-scatter-grid" /><text x={left - 8} y={y + 4} textAnchor="end" className="class-similarity-scatter-axis">{value.toFixed(2)}</text></g>;
+    })}
+    {metric === "margin" && domain[0] <= 0 && domain[1] >= 0 && <line x1={left} x2={right} y1={yAt(0)} y2={yAt(0)} className="class-similarity-scatter-zero" />}
+    {threshold !== null && threshold >= domain[0] && threshold <= domain[1] && <line x1={left} x2={right} y1={yAt(threshold)} y2={yAt(threshold)} className="class-similarity-scatter-threshold" />}
+    {labels.map((label, index) => <g key={label}><line x1={labels.length === 1 ? (left + right) / 2 : left + index * step} x2={labels.length === 1 ? (left + right) / 2 : left + index * step} y1={top} y2={bottom} className="class-similarity-scatter-class-guide" /><text x={labels.length === 1 ? (left + right) / 2 : left + index * step} y={bottom + 24} textAnchor="middle" className="class-similarity-scatter-axis">{label.length > 18 ? `${label.slice(0, 16)}…` : label}</text></g>)}
+    {points.map((item) => <circle key={item.record_id} cx={xAt(item)} cy={yAt(item.value)} r={selected.has(item.record_id) ? 5.5 : 4} className={candidateIds.has(item.record_id) ? "class-similarity-scatter-point candidate" : "class-similarity-scatter-point"} data-record-id={item.record_id} onClick={(event) => { event.stopPropagation(); if (!draggedRef.current) onInspect(item.record_id); }}><title>{`${item.label || "Unclassified"} · ${item.value.toFixed(4)} · ${item.record_id}`}</title></circle>)}
+    {draggedRef.current && drag && <rect x={Math.min(drag.x1, drag.x2)} y={Math.min(drag.y1, drag.y2)} width={Math.abs(drag.x2 - drag.x1)} height={Math.abs(drag.y2 - drag.y1)} className="class-similarity-scatter-selection" />}
+    <text x={(left + right) / 2} y={height - 4} textAnchor="middle" className="class-similarity-scatter-axis">Drag a box to add points to selection · click a point to inspect</text>
+  </svg>;
+}
+
+function WorkloadCurve({ points }: { points: Array<{ candidate_n: number; mode: string; threshold: number | null }> }) {
+  if (points.length < 2) return null;
+  const width = 760, height = 170, left = 36, right = 744, top = 16, bottom = 140;
+  const max = Math.max(1, ...points.map((point) => point.candidate_n));
+  const coords = points.map((point, index) => `${left + index * (right - left) / (points.length - 1)},${bottom - point.candidate_n / max * (bottom - top)}`).join(" ");
+  return <svg className="class-similarity-workload-plot" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Workload curve">
+    {[0, 0.5, 1].map((fraction) => { const y = bottom - fraction * (bottom - top); return <g key={fraction}><line x1={left} x2={right} y1={y} y2={y} className="class-similarity-scatter-grid" /><text x={left - 7} y={y + 4} textAnchor="end" className="class-similarity-scatter-axis">{Math.round(max * fraction)}</text></g>; })}
+    <polyline points={coords} className="class-similarity-workload-line" />
+    <text x={(left + right) / 2} y={height - 4} textAnchor="middle" className="class-similarity-scatter-axis">Threshold rank · {points.length - 2} distinct scored margins</text>
+  </svg>;
 }
 
 export default function ClassSimilarityWorkspace({ runId, modelId, unit, records, onReturn, onOpenRecord }: Props) {
   const [k, setK] = useState(5);
   const [analysisSplit, setAnalysisSplit] = useState("all");
   const [metric, setMetric] = useState<ClassSimilarityMetric>("margin");
+  const [visibleClasses, setVisibleClasses] = useState<string[]>([]);
+  const [axisMode, setAxisMode] = useState<"full" | "data">("full");
+  const [onlyCandidates, setOnlyCandidates] = useState(false);
+  const [onlyNegative, setOnlyNegative] = useState(false);
+  const [confusionFilter, setConfusionFilter] = useState<"tp" | "fp" | "fn" | "tn" | null>(null);
   const [jobId, setJobId] = useState("");
   const [jobState, setJobState] = useState("");
   const [progress, setProgress] = useState(0);
@@ -114,26 +211,64 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
   const [evaluationMessage, setEvaluationMessage] = useState("");
   const [reportBusy, setReportBusy] = useState(false);
 
-  const splits = useMemo(() => [...new Set(records.map((record) => record.split).filter(Boolean))].sort(), [records]);
-  const rows = useMemo(() => {
-    if (!result) return [];
-    return [...result.items].sort((a, b) => {
-      const av = metricValue(a, metric);
-      const bv = metricValue(b, metric);
-      if (av === null && bv === null) return a.index - b.index;
-      if (av === null) return 1;
-      if (bv === null) return -1;
-      return av - bv || a.index - b.index;
-    });
-  }, [result, metric]);
-  const eligibleCount = result?.items.filter((item) => item.margin !== null).length || 0;
   const candidateIds = useMemo(() => {
     if (!result || candidateMode === "none") return [];
     return result.items.filter((item) => item.margin !== null && (
       candidateMode === "all_eligible" || item.margin < threshold
     )).map((item) => item.record_id);
   }, [result, candidateMode, threshold]);
-
+  const splits = useMemo(() => [...new Set(records.map((record) => record.split).filter(Boolean))].sort(), [records]);
+  const classes = useMemo(() => [...new Set((result?.items || []).map((item) => item.label).filter((label): label is string => Boolean(label)))].sort(), [result]);
+  const chartClasses = visibleClasses.length ? visibleClasses : classes;
+  const candidateIdSet = useMemo(() => new Set(candidateIds), [candidateIds]);
+  const itemById = useMemo(() => new Map((result?.items || []).map((item) => [item.record_id, item])), [result]);
+  const visibleMetricValues = (result?.items || []).filter((item) => chartClasses.includes(item.label || "")).map((item) => item[metric]).filter((value): value is number => value !== null && Number.isFinite(value));
+  const plotDomain = useMemo<[number, number]>(() => {
+    if (axisMode === "full") return metric === "margin" ? [-2, 2] : [-1, 1];
+    if (!visibleMetricValues.length) return metric === "margin" ? [-2, 2] : [-1, 1];
+    const lo = Math.min(...visibleMetricValues), hi = Math.max(...visibleMetricValues);
+    const pad = Math.max((hi - lo) * 0.05, 1e-4);
+    return [lo - pad, hi + pad];
+  }, [axisMode, metric, result, visibleClasses]);
+  const workloadCurve = useMemo(() => {
+    const margins = [...new Set((result?.items || []).map((item) => item.margin).filter((value): value is number => value !== null && Number.isFinite(value)))].sort((a, b) => a - b);
+    const eligible = result?.items.filter((item) => item.margin !== null && Number.isFinite(item.margin)).length || 0;
+    return [{ candidate_n: 0, mode: "none", threshold: null }, ...margins.map((value, index) => ({
+      candidate_n: index + 1,
+      mode: "threshold", threshold: value,
+    })), { candidate_n: eligible, mode: "all_eligible", threshold: null }];
+  }, [result]);
+  const perClassSummary = useMemo(() => {
+    const summary = new Map<string, { label: string; total: number; scored: number; candidates: number }>();
+    for (const item of result?.items || []) {
+      const label = item.label || "未分類／標籤無效";
+      const row = summary.get(label) || { label, total: 0, scored: 0, candidates: 0 };
+      row.total += 1;
+      if (item.margin !== null) row.scored += 1;
+      if (candidateIdSet.has(item.record_id)) row.candidates += 1;
+      summary.set(label, row);
+    }
+    return [...summary.values()].sort((a, b) => a.label.localeCompare(b.label));
+  }, [result, candidateIdSet]);
+  const rows = useMemo(() => {
+    if (!result) return [];
+    let filtered = [...result.items];
+    if (onlyCandidates) filtered = filtered.filter((item) => candidateIdSet.has(item.record_id));
+    if (onlyNegative) filtered = filtered.filter((item) => item.margin !== null && item.margin < 0);
+    if (confusionFilter && evaluationPreview?.counts?.confusion_ids) {
+      const ids = new Set(evaluationPreview.counts.confusion_ids[confusionFilter] || []);
+      filtered = filtered.filter((item) => ids.has(item.record_id));
+    }
+    return filtered.sort((a, b) => {
+      const av = a.margin;
+      const bv = b.margin;
+      if (av === null && bv === null) return a.index - b.index;
+      if (av === null) return 1;
+      if (bv === null) return -1;
+      return av - bv || a.index - b.index;
+    });
+  }, [result, onlyCandidates, onlyNegative, confusionFilter, evaluationPreview, candidateIdSet]);
+  const eligibleCount = result?.items.filter((item) => item.margin !== null).length || 0;
   const currentPolicy: ClassSimilarityEvaluationPreview["policy"] = {
     mode: candidateMode,
     threshold: candidateMode === "threshold" ? threshold : null,
@@ -165,7 +300,11 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
         setJobState(status.state);
         setProgress(status.percent);
         if (terminalStates.has(status.state)) {
-          if (status.state === "completed" && status.result) setResult(status.result);
+          if (status.state === "completed" && status.result) {
+            setResult(status.result);
+            const nextClasses = [...new Set(status.result.items.map((item) => item.label).filter((label): label is string => Boolean(label)))].sort();
+            setVisibleClasses(nextClasses.slice(0, 10));
+          }
           else if (status.state === "failed") setError(status.error?.message || "Class-similarity analysis failed.");
           break;
         }
@@ -368,7 +507,35 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
                 {(Object.keys(metricLabels) as ClassSimilarityMetric[]).map((key) => <option value={key} key={key}>{metricLabels[key]}</option>)}
               </select></label>
             </div>
-            <BoxPlot rows={result.summaries[metric]} threshold={metric === "margin" && candidateMode === "threshold" ? threshold : null} />
+            <div className="class-similarity-chart-controls">
+              <label><span>Visible classes · up to 10</span><select aria-label="Visible classes" multiple size={Math.max(2, Math.min(6, classes.length))} value={visibleClasses} onChange={(event) => {
+                const next = Array.from(event.currentTarget.selectedOptions).map((option) => option.value);
+                setVisibleClasses(next.slice(0, 10));
+              }}>{classes.map((label) => <option key={label} value={label}>{label}</option>)}</select></label>
+              <label><span>Y-axis range</span><select aria-label="Class similarity axis range" value={axisMode} onChange={(event) => setAxisMode(event.target.value as "full" | "data")}>
+                <option value="full">Full metric range</option><option value="data">Visible data range</option>
+              </select></label>
+              <button type="button" className="secondary-action" onClick={() => setAxisMode("full")}>Reset full range</button>
+            </div>
+            <p className="class-similarity-empty">{visibleClasses.length ? `Showing ${visibleClasses.length} class(es); analysis and candidate counts still use all records.` : "No class filter is selected; showing every class."}</p>
+            <BoxPlot rows={result.summaries[metric].filter((row) => chartClasses.includes(row.label))} domain={plotDomain} threshold={metric === "margin" && candidateMode === "threshold" ? threshold : null} />
+            <ScatterPlot
+              items={result.scatter_items[metric].filter((item) => chartClasses.includes(item.label || ""))}
+              labels={chartClasses}
+              metric={metric}
+              domain={plotDomain}
+              threshold={metric === "margin" && candidateMode === "threshold" ? threshold : null}
+              candidateIds={candidateIdSet}
+              selectedIds={selectedIds}
+              onInspect={(recordId) => setSelected(itemById.get(recordId) || null)}
+              onBoxSelect={(recordIds) => setSelectedIds((current) => [...new Set([...current, ...recordIds])])}
+            />
+            <details className="class-similarity-class-summary">
+              <summary>Per-class candidate summary</summary>
+              <table><thead><tr><th>Class</th><th>Records</th><th>Scored</th><th>Candidates</th><th>Candidate ratio</th></tr></thead>
+                <tbody>{perClassSummary.map((row) => <tr key={row.label}><td>{row.label}</td><td>{row.total}</td><td>{row.scored}</td><td>{row.candidates}</td><td>{row.scored ? `${(row.candidates / row.scored * 100).toFixed(1)}%` : "—"}</td></tr>)}</tbody>
+              </table>
+            </details>
           </section>
 
           <section className="class-similarity-threshold-panel" aria-label="Threshold candidate preview">
@@ -390,6 +557,11 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
               <button type="button" className="primary-action" onClick={() => void addSelectedToCuration()} disabled={!selectedIds.length || cartBusy}>{cartBusy ? "Adding…" : "Add selected to Curation"}</button>
             </div>
             {cartMessage && <div className="class-similarity-progress" role="status">{cartMessage}</div>}
+          </section>
+
+          <section className="class-similarity-workload-panel" aria-labelledby="class-similarity-workload-title">
+            <div className="class-similarity-panel-heading"><div><div className="eyebrow">REVIEW VOLUME</div><h2 id="class-similarity-workload-title">Workload curve · threshold to candidate count</h2></div><span>{eligibleCount.toLocaleString()} scored records</span></div>
+            <WorkloadCurve points={workloadCurve} />
           </section>
 
           <section className="class-similarity-evaluation" aria-labelledby="class-similarity-evaluation-title">
@@ -420,7 +592,7 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
                 <span><strong>{evaluationPreview.counts?.precision === null || evaluationPreview.counts?.precision === undefined ? "—" : evaluationPreview.counts.precision.toFixed(3)}</strong> precision</span>
                 <span><strong>{evaluationPreview.counts?.recall === null || evaluationPreview.counts?.recall === undefined ? "—" : evaluationPreview.counts.recall.toFixed(3)}</strong> recall</span>
               </div>
-              {evaluationPreview.counts?.status === "ready" ? <p>TP {evaluationPreview.counts.tp} · FP {evaluationPreview.counts.fp} · FN {evaluationPreview.counts.fn} · TN {evaluationPreview.counts.tn} · {evaluationPreview.evaluation.purpose}</p> : <p className="class-similarity-empty">Precision / Recall unavailable: {evaluationPreview.counts?.unavailable_reason || "review enough frozen items first"}.</p>}
+              {evaluationPreview.counts?.status === "ready" ? <div className="class-similarity-confusion-drill" aria-label="Filter records by confusion category">{(["tp", "fp", "fn", "tn"] as const).map((key) => <button type="button" className={confusionFilter === key ? "active" : ""} key={key} onClick={() => setConfusionFilter((current) => current === key ? null : key)}>{key.toUpperCase()} {evaluationPreview.counts?.[key]}</button>)}<span>{evaluationPreview.evaluation.purpose}</span></div> : <p className="class-similarity-empty">Precision / Recall unavailable: {evaluationPreview.counts?.unavailable_reason || "review enough frozen items first"}.</p>}
               {evaluationPreview.evaluation.purpose === "tuning" && <PrecisionRecallPlot points={evaluationPreview.precision_recall_curve} />}
               {!evaluationPreviewIsCurrent && <p className="class-similarity-empty">The threshold changed. Evaluate again to update these metrics.</p>}
             </div>}
@@ -437,6 +609,11 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
           <div className="class-similarity-results-grid">
             <section className="class-similarity-table-panel" aria-labelledby="class-similarity-table-title">
               <div className="class-similarity-panel-heading"><div><div className="eyebrow">RECORDS</div><h2 id="class-similarity-table-title">Ranked evidence</h2></div><span>{rows.length.toLocaleString()} rows</span></div>
+              <div className="class-similarity-table-controls">
+                <label><input type="checkbox" checked={onlyCandidates} onChange={(event) => setOnlyCandidates(event.target.checked)} /><span>Only candidates</span></label>
+                <label><input type="checkbox" checked={onlyNegative} onChange={(event) => setOnlyNegative(event.target.checked)} /><span>Only margin &lt; 0</span></label>
+                {confusionFilter && <button type="button" className="secondary-action" onClick={() => setConfusionFilter(null)}>Clear {confusionFilter.toUpperCase()} filter</button>}
+              </div>
               <div className="class-similarity-table-scroll">
                 <table>
                   <thead><tr><th>Image / object</th><th>Class</th><th>Same</th><th>Rival</th><th>Margin</th><th>Status</th></tr></thead>

@@ -134,6 +134,12 @@ def test_class_similarity_api_uses_current_raw_embeddings_and_keeps_paths_privat
         assert len(result["items"]) == 4
         assert all(item["same_neighbors"] for item in result["items"])
         assert all(item["rival_neighbors"] for item in result["items"])
+        for metric in ("margin", "same", "other"):
+            assert {item["record_id"] for item in result["scatter_items"][metric]} == {
+                item["record_id"] for item in result["items"]
+                if item[metric] is not None
+            }
+            assert all(abs(item["jitter"]) <= 0.18 for item in result["scatter_items"][metric])
         assert str(tmp_path) not in analysis.__repr__()
         assert {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in source_hashes} == source_hashes
 

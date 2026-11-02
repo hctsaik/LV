@@ -475,6 +475,14 @@ export type ClassSimilarityBoxSummary = {
   whisker_high?: number;
 };
 
+export type ClassSimilarityScatterItem = {
+  record_id: string;
+  index: number;
+  label: string | null;
+  value: number;
+  jitter: number;
+};
+
 export type ClassSimilarityResult = {
   analysis_key: string;
   run_id: string;
@@ -490,6 +498,7 @@ export type ClassSimilarityResult = {
     per_class_counts: Record<string, number>;
   };
   summaries: Record<ClassSimilarityMetric, ClassSimilarityBoxSummary[]>;
+  scatter_items: Record<ClassSimilarityMetric, ClassSimilarityScatterItem[]>;
   items: ClassSimilarityItem[];
 };
 

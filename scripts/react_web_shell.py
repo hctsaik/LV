@@ -97,6 +97,8 @@ from class_similarity_export import evaluation_template as class_similarity_eval
 from class_similarity_export import export_report as export_class_similarity_report
 from class_similarity_records import canonical_path as canonical_class_similarity_path
 from class_similarity_records import prepare_records as prepare_class_similarity_records
+from class_similarity_visuals import jitter_x as class_similarity_jitter_x
+from class_similarity_visuals import sample_scatter_rows as sample_class_similarity_scatter_rows
 from class_similarity_threshold import (
     candidate_mask as class_similarity_candidate_mask,
     evaluate_threshold as evaluate_class_similarity_threshold,
@@ -5059,6 +5061,18 @@ def create_app(
                 metric: build_box_summary(analysis.items, metric)
                 for metric in ("margin", "same", "other")
             }
+            scatter_items = {
+                metric: [{
+                    "record_id": item.record_id,
+                    "index": int(prepared.original_index[item.input_index]),
+                    "label": item.label,
+                    "value": float(getattr(item, metric)),
+                    "jitter": class_similarity_jitter_x(prepared.analysis_key, item.record_id),
+                } for item in sample_class_similarity_scatter_rows(
+                    analysis.items, metric, prepared.analysis_key,
+                )]
+                for metric in ("margin", "same", "other")
+            }
             result = {
                 "analysis_key": prepared.analysis_key,
                 "run_id": job.run_id,
@@ -5074,6 +5088,7 @@ def create_app(
                     "per_class_counts": analysis.per_class_counts,
                 },
                 "summaries": summaries,
+                "scatter_items": scatter_items,
                 "items": items,
             }
             with app.state.lock:

@@ -1354,6 +1354,30 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .class-similarity-export-controls > span { color: var(--muted, #64748b); }
 .class-similarity-export-controls > div { display: inline-flex; align-items: center; gap: 0.4rem; }
 .class-similarity-export-controls strong { margin-right: 0.15rem; font-size: 0.83rem; }
+.class-similarity-chart-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 0.8rem; margin: 0.8rem 0; }
+.class-similarity-chart-controls label { display: grid; gap: 0.35rem; color: var(--muted, #64748b); font-size: 0.82rem; }
+.class-similarity-chart-controls select { min-width: 170px; padding: 0.45rem; border: 1px solid var(--line, #dce3ec); border-radius: 7px; background: var(--surface, #fff); color: var(--text, #172033); }
+.class-similarity-scatter { width: min(100%, 900px); margin: 0.6rem 0; overflow: visible; touch-action: none; user-select: none; }
+.class-similarity-scatter-grid { stroke: var(--line, #dce3ec); stroke-width: 1; }
+.class-similarity-scatter-class-guide { stroke: var(--line, #dce3ec); stroke-width: 1; stroke-dasharray: 2 5; opacity: 0.7; }
+.class-similarity-scatter-axis { fill: var(--muted, #64748b); font-size: 10px; }
+.class-similarity-scatter-zero { stroke: #8793a2; stroke-dasharray: 3 4; stroke-width: 1.3; }
+.class-similarity-scatter-threshold { stroke: #bf3b35; stroke-width: 2; }
+.class-similarity-scatter-point { fill: #2f6db4; stroke: var(--surface, #fff); stroke-width: 1.2; cursor: pointer; }
+.class-similarity-scatter-point.candidate { fill: #d35400; }
+.class-similarity-scatter-point:hover { stroke: #111827; stroke-width: 2; }
+.class-similarity-scatter-selection { fill: rgba(39, 105, 194, 0.14); stroke: #2769c2; stroke-width: 1.4; stroke-dasharray: 5 3; pointer-events: none; }
+.class-similarity-class-summary { margin-top: 0.8rem; color: var(--muted, #64748b); }
+.class-similarity-class-summary table { width: 100%; margin-top: 0.55rem; border-collapse: collapse; color: var(--text, #172033); }
+.class-similarity-class-summary th, .class-similarity-class-summary td { padding: 0.4rem; border-bottom: 1px solid var(--line, #dce3ec); text-align: left; }
+.class-similarity-workload-panel { margin: 1rem 0; padding: 1.2rem; border: 1px solid var(--line, #dce3ec); border-radius: 14px; background: var(--surface, #fff); }
+.class-similarity-workload-plot { width: min(100%, 800px); }
+.class-similarity-workload-line { fill: none; stroke: #2459a6; stroke-width: 2.4; }
+.class-similarity-confusion-drill { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.class-similarity-confusion-drill button { padding: 0.35rem 0.55rem; border: 1px solid var(--line, #dce3ec); border-radius: 6px; background: var(--surface, #fff); cursor: pointer; }
+.class-similarity-confusion-drill button.active { color: #fff; background: var(--accent, #2459a6); }
+.class-similarity-table-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; margin: 0.6rem 0; color: var(--muted, #64748b); }
+.class-similarity-table-controls label { display: inline-flex; align-items: center; gap: 0.35rem; }
 
 @media (max-width: 900px) {
   .class-similarity-workspace { padding: 1rem; }
