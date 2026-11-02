@@ -3691,3 +3691,195 @@ def test_lv_web_07_scan_01_visible_reviews_and_appends_fewshot_candidates(
             server_thread.join(timeout=10)
 
     assert source_hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes}
+
+
+def test_lv_web_07_export_01_visible_monitor_queue_without_anomaly_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Initialize and run the local monitor, review queue items, and download its profile."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    sample_root = tmp_path / "fewshot-samples"
+    (sample_root / "images").mkdir(parents=True)
+    (sample_root / "labels").mkdir()
+    (sample_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    Image.new("RGB", (48, 40), (220, 30, 40)).save(sample_root / "images" / "sample-0.png")
+    Image.new("RGB", (48, 40), (20, 180, 80)).save(sample_root / "images" / "sample-1.png")
+    (sample_root / "labels" / "sample-0.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n1 0.25 0.25 0.25 0.25\n", encoding="utf-8",
+    )
+    (sample_root / "labels" / "sample-1.txt").write_text(
+        "0 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+    )
+    target_root = tmp_path / "fewshot-targets"
+    (target_root / "images").mkdir(parents=True)
+    (target_root / "labels").mkdir()
+    (target_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    Image.new("RGB", (48, 40), (220, 30, 40)).save(target_root / "images" / "target-0.png")
+    Image.new("RGB", (48, 40), (20, 180, 80)).save(target_root / "images" / "target-1.png")
+    (target_root / "labels" / "target-0.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n1 0.25 0.25 0.25 0.25\n", encoding="utf-8",
+    )
+    (target_root / "labels" / "target-1.txt").write_text(
+        "0 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+    )
+    source_files = [path for root in (sample_root, target_root) for path in root.rglob("*") if path.is_file()]
+    source_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: lambda crop: np.asarray(
+            [np.asarray(crop.convert("RGB"), dtype=np.float32).mean(), crop.width, crop.height, 1],
+            dtype=np.float32,
+        ),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1100}, accept_downloads=True)
+            page.set_default_timeout(20_000)
+            anomaly_model_build_requests: list[str] = []
+            page.on("request", lambda request: anomaly_model_build_requests.append(request.url)
+                    if "/api/v1/anomaly/models/jobs" in request.url else None)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fewshot-samples").click()
+            page.get_by_test_id("fewshot-sample-folders").fill(str(sample_root))
+            page.get_by_test_id("fewshot-object-source").select_option("yolo")
+            page.get_by_test_id("fewshot-build-bank").click()
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("3 個樣本", timeout=60_000)
+
+            page.get_by_test_id("fewshot-target-folders").fill(str(target_root))
+            page.get_by_test_id("fewshot-monitor-directory").fill(str(tmp_path / "fewshot-monitor"))
+            page.get_by_test_id("fewshot-monitor-scan").click()
+            expect(page.get_by_test_id("fewshot-monitor-summary")).to_contain_text("待標佇列 3 項", timeout=60_000)
+            items = page.get_by_test_id("fewshot-monitor-queue-item")
+            expect(items).to_have_count(3)
+            preview = items.nth(0).get_by_test_id("fewshot-monitor-preview")
+            page.wait_for_function(
+                "element => element.complete && element.naturalWidth > 0",
+                arg=preview.element_handle(),
+                timeout=15_000,
+            )
+
+            items.nth(0).get_by_role("combobox").select_option(label="stain")
+            page.get_by_test_id("fewshot-monitor-accept-0").click()
+            expect(items.nth(0)).to_contain_text("已採納 stain", timeout=15_000)
+            page.get_by_test_id("fewshot-monitor-skip-1").click()
+            expect(items.nth(1)).to_contain_text("已略過（下輪仍保留）", timeout=15_000)
+
+            with page.expect_download() as profile_download:
+                page.get_by_test_id("fewshot-monitor-export-profile").click()
+            profile_path = Path(profile_download.value.path())
+            assert "objective: retrieve" in profile_path.read_text(encoding="utf-8")
+            assert anomaly_model_build_requests == []
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes}
+
+
+def test_lv_web_07_export_01_visible_yolo_csv_export_tracks_unchecked_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Export checked scan results to a separate YOLO+CSV directory without source writes."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    sample_root = tmp_path / "fewshot-samples"
+    (sample_root / "images").mkdir(parents=True)
+    (sample_root / "labels").mkdir()
+    (sample_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    Image.new("RGB", (48, 40), (220, 30, 40)).save(sample_root / "images" / "sample-0.png")
+    Image.new("RGB", (48, 40), (20, 180, 80)).save(sample_root / "images" / "sample-1.png")
+    (sample_root / "labels" / "sample-0.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n1 0.25 0.25 0.25 0.25\n", encoding="utf-8",
+    )
+    (sample_root / "labels" / "sample-1.txt").write_text(
+        "0 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+    )
+    target_root = tmp_path / "fewshot-targets"
+    (target_root / "images").mkdir(parents=True)
+    (target_root / "labels").mkdir()
+    (target_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    Image.new("RGB", (48, 40), (220, 30, 40)).save(target_root / "images" / "target-0.png")
+    Image.new("RGB", (48, 40), (20, 180, 80)).save(target_root / "images" / "target-1.png")
+    (target_root / "labels" / "target-0.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n1 0.25 0.25 0.25 0.25\n", encoding="utf-8",
+    )
+    (target_root / "labels" / "target-1.txt").write_text(
+        "0 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+    )
+    source_files = [path for root in (sample_root, target_root) for path in root.rglob("*") if path.is_file()]
+    source_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: lambda crop: np.asarray(
+            [np.asarray(crop.convert("RGB"), dtype=np.float32).mean(), crop.width, crop.height, 1],
+            dtype=np.float32,
+        ),
+    )
+    server = server_thread = None
+    out_all = tmp_path / "fewshot-export-all"
+    out_less = tmp_path / "fewshot-export-less"
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1050})
+            page.set_default_timeout(20_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fewshot-samples").click()
+            page.get_by_test_id("fewshot-sample-folders").fill(str(sample_root))
+            page.get_by_test_id("fewshot-object-source").select_option("yolo")
+            page.get_by_test_id("fewshot-build-bank").click()
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("3 個樣本", timeout=60_000)
+
+            page.get_by_test_id("fewshot-target-folders").fill(str(target_root))
+            page.get_by_test_id("fewshot-theta").fill("0.9")
+            page.get_by_test_id("fewshot-scan").click()
+            expect(page.get_by_test_id("fewshot-scan-summary")).to_contain_text("候選 3", timeout=60_000)
+            expect(page.get_by_test_id("fewshot-export-copy-images")).to_be_checked()
+            page.get_by_test_id("fewshot-export-directory").fill(str(out_all))
+            page.get_by_test_id("fewshot-export").click()
+            expect(page.get_by_test_id("fewshot-export-notice")).to_contain_text("已匯出 3 個 YOLO 標註", timeout=30_000)
+
+            candidates = page.get_by_test_id("fewshot-candidate")
+            expect(candidates).to_have_count(3)
+            candidates.nth(0).get_by_role("checkbox").uncheck()
+            page.get_by_test_id("fewshot-export-directory").fill(str(out_less))
+            page.get_by_test_id("fewshot-export").click()
+            expect(page.get_by_test_id("fewshot-export-notice")).to_contain_text("已匯出 2 個 YOLO 標註", timeout=30_000)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    def exported_object_count(folder: Path) -> int:
+        return sum(len(path.read_text(encoding="utf-8").splitlines())
+                   for path in (folder / "labels").glob("*.txt"))
+
+    assert exported_object_count(out_all) == 3
+    assert exported_object_count(out_less) == 2
+    for folder in (out_all, out_less):
+        assert (folder / "retrieval_report.csv").is_file()
+        assert (folder / "classes.txt").read_text(encoding="utf-8").splitlines() == ["scratch", "stain"]
+        image_stems = {path.stem for path in (folder / "images").iterdir() if path.is_file()}
+        label_stems = {path.stem for path in (folder / "labels").glob("*.txt")}
+        assert image_stems and label_stems <= image_stems
+    assert source_hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes}

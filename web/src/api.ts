@@ -135,6 +135,53 @@ export type FewshotScanJob = Omit<FewshotSampleBankJob, "result"> & {
   result: FewshotScan | null;
 };
 
+export type FewshotMonitorQueueItem = {
+  index: number;
+  item_id: string;
+  filename: string;
+  bbox: [number, number, number, number];
+  obj_index: number;
+  suggested_class: string;
+  similarity: number;
+  reason: string;
+  run_id: string;
+  status: string;
+  human_decision: "defect" | "skip" | null;
+  human_label: string;
+};
+
+export type FewshotMonitorStatus = {
+  monitor_workspace_id: string;
+  last_run: {
+    run_id?: string;
+    at?: number;
+    new?: number;
+    changed?: number;
+    deleted?: number;
+    objects_scored?: number;
+    queue_len?: number;
+    model_version?: string | null;
+    objective?: string;
+    done?: boolean;
+  } | null;
+  queue_len: number;
+  locked: boolean;
+  items: FewshotMonitorQueueItem[];
+};
+
+export type FewshotMonitorJob = Omit<FewshotSampleBankJob, "result"> & {
+  result: {
+    status: string;
+    run_id: string;
+    new: number;
+    changed: number;
+    deleted: number;
+    objects_scored: number;
+    queue_len: number;
+    done: boolean;
+  } | null;
+};
+
 export type AnomalyRun = {
   run_id: string;
   revision: number;
@@ -936,6 +983,57 @@ export const api = {
     "/api/v1/fewshot/sample-banks/add-candidates",
     { method: "POST", body: JSON.stringify(input) },
   ),
+  exportFewshotCandidates: (input: {
+    sample_bank_id: string;
+    scan_id: string;
+    accepted_item_ids: string[];
+    theta: number;
+    class_overrides: Record<string, string>;
+    output_dir: string;
+    copy_images: boolean;
+  }) => request<{
+    written: number;
+    objects: number;
+    csv_rows: number;
+    out_dir: string;
+    images_copied: number;
+  }>("/api/v1/fewshot/scans/exports", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  createFewshotMonitorWorkspace: (input: {
+    sample_bank_id: string;
+    target_folders: string[];
+    workspace_dir: string;
+    k: number;
+  }) => request<FewshotMonitorStatus>("/api/v1/fewshot/monitors/workspaces", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  createFewshotMonitorScanJob: (monitorWorkspaceId: string) => request<{ job_id: string; state: string }>(
+    "/api/v1/fewshot/monitors/scans/jobs",
+    { method: "POST", body: JSON.stringify({ monitor_workspace_id: monitorWorkspaceId }) },
+  ),
+  fewshotMonitorScanJob: (jobId: string) => request<FewshotMonitorJob>(
+    "/api/v1/fewshot/jobs/" + encodeURIComponent(jobId),
+  ),
+  fewshotMonitorStatus: (monitorWorkspaceId: string) => request<FewshotMonitorStatus>(
+    "/api/v1/fewshot/monitors/workspaces/" + encodeURIComponent(monitorWorkspaceId),
+  ),
+  fewshotMonitorPreviewUrl: (monitorWorkspaceId: string, index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fewshot/monitors/workspaces/"
+      + encodeURIComponent(monitorWorkspaceId) + "/queue/" + index + "/preview.jpg",
+  labelFewshotMonitorItem: (monitorWorkspaceId: string, input: {
+    item_id: string;
+    decision: "defect" | "skip";
+    label: string;
+  }) => request<{ decision: "defect" | "skip"; item_id: string }>(
+    "/api/v1/fewshot/monitors/workspaces/" + encodeURIComponent(monitorWorkspaceId) + "/labels",
+    { method: "POST", body: JSON.stringify(input) },
+  ),
+  fewshotMonitorProfileUrl: (monitorWorkspaceId: string) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fewshot/monitors/workspaces/"
+      + encodeURIComponent(monitorWorkspaceId) + "/profile.yaml",
   anomalyJob: (jobId: string) => request<AnomalyModelJob>(
     "/api/v1/anomaly/jobs/" + encodeURIComponent(jobId),
   ),

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import time
 from pathlib import Path
@@ -266,3 +268,178 @@ def test_fewshot_whole_image_scan_keeps_full_image_boxes_and_source_identity(mon
         assert result["object_source"] == "whole_image"
         assert result["candidate_count"] == 2
         assert all(item["bbox"] == [0.5, 0.5, 1.0, 1.0] for item in result["candidates"])
+
+
+def test_fewshot_export_respects_acceptance_theta_relabel_and_c6(monkeypatch, tmp_path: Path):
+    samples = _samples(tmp_path / "sample-set", with_labels=True)
+    targets = _samples(tmp_path / "target-set", with_labels=True)
+    source_hashes = {
+        path: path.read_bytes()
+        for root in (samples, targets)
+        for path in root.rglob("*") if path.is_file()
+    }
+    with _client(monkeypatch, tmp_path) as worker:
+        created_bank = worker.post("/api/v1/fewshot/sample-banks/jobs", json={
+            "sample_folders": [str(samples)],
+            "model_id": "fixture-model",
+            "object_source": "yolo",
+        })
+        assert created_bank.status_code == 202, created_bank.text
+        bank = _wait_job(worker, created_bank.json()["job_id"])["result"]
+        created_scan = worker.post("/api/v1/fewshot/scans/jobs", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "target_folders": [str(targets)],
+            "k": 20,
+            "min_proposal_conf": 0.0,
+        })
+        assert created_scan.status_code == 202, created_scan.text
+        scan = _wait_job(worker, created_scan.json()["job_id"])["result"]
+        candidates = scan["candidates"]
+        assert len(candidates) == 3
+        relabel = next(item for item in candidates if item["suggested_class"] == "scratch")
+        other = next(item for item in candidates if item["item_id"] != relabel["item_id"])
+        accepted = [relabel["item_id"], other["item_id"]]
+        output_dir = tmp_path / "retrieval-export"
+
+        exported = worker.post("/api/v1/fewshot/scans/exports", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "scan_id": scan["scan_id"],
+            "accepted_item_ids": accepted,
+            "theta": 0.9,
+            "class_overrides": {relabel["item_id"]: "stain"},
+            "output_dir": str(output_dir),
+            "copy_images": True,
+        })
+        assert exported.status_code == 200, exported.text
+        assert exported.json()["objects"] == 2
+        assert exported.json()["csv_rows"] == 3
+        assert (output_dir / "classes.txt").read_text(encoding="utf-8").splitlines() == ["scratch", "stain"]
+        label_files = list((output_dir / "labels").glob("*.txt"))
+        assert sum(len(path.read_text(encoding="utf-8").splitlines()) for path in label_files) == 2
+        label_rows = [line for path in label_files for line in path.read_text(encoding="utf-8").splitlines()]
+        assert "1 0.500000 0.500000 0.500000 0.500000" in label_rows
+        with (output_dir / "retrieval_report.csv").open(encoding="utf-8", newline="") as stream:
+            report = list(csv.DictReader(stream))
+        assert len(report) == 3
+        assert {row["decision"] for row in report} == {"accepted", "relabeled", "skipped"}
+        relabeled_row = next(row for row in report if row["image_path"].endswith("sample-0.png")
+                             and row["final_class"] == "stain")
+        assert relabeled_row["decision"] == "relabeled"
+        copied_images = list((output_dir / "images").iterdir())
+        assert copied_images
+
+        unsafe_dir = targets / "nested-output"
+        rejected = worker.post("/api/v1/fewshot/scans/exports", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "scan_id": scan["scan_id"],
+            "accepted_item_ids": accepted,
+            "theta": 0.9,
+            "class_overrides": {},
+            "output_dir": str(unsafe_dir),
+            "copy_images": False,
+        })
+        assert rejected.status_code == 422
+        assert str(tmp_path) not in rejected.text
+        assert not unsafe_dir.exists()
+
+    assert {path: path.read_bytes() for path in source_hashes} == source_hashes
+
+
+def test_fewshot_monitor_runs_without_anomaly_model_and_persists_queue_labels(monkeypatch, tmp_path: Path):
+    samples = _samples(tmp_path / "sample-set", with_labels=True)
+    targets = _samples(tmp_path / "target-set", with_labels=True)
+    source_hashes = {
+        path: path.read_bytes()
+        for root in (samples, targets)
+        for path in root.rglob("*") if path.is_file()
+    }
+    with _client(monkeypatch, tmp_path) as worker:
+        created_bank = worker.post("/api/v1/fewshot/sample-banks/jobs", json={
+            "sample_folders": [str(samples)],
+            "model_id": "fixture-model",
+            "object_source": "yolo",
+        })
+        assert created_bank.status_code == 202, created_bank.text
+        bank = _wait_job(worker, created_bank.json()["job_id"])["result"]
+        workspace_dir = tmp_path / "fewshot-monitor"
+        unsafe_workspace = tmp_path / "cache" / "fewshot_sample_banks" / bank["sample_bank_id"] / "monitor"
+        unsafe = worker.post("/api/v1/fewshot/monitors/workspaces", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "target_folders": [str(targets)],
+            "workspace_dir": str(unsafe_workspace),
+            "k": 20,
+        })
+        assert unsafe.status_code == 422
+        assert str(tmp_path) not in unsafe.text
+        assert not unsafe_workspace.exists()
+        initialized = worker.post("/api/v1/fewshot/monitors/workspaces", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "target_folders": [str(targets)],
+            "workspace_dir": str(workspace_dir),
+            "k": 20,
+        })
+        assert initialized.status_code == 201, initialized.text
+        workspace_id = initialized.json()["monitor_workspace_id"]
+        assert initialized.json()["queue_len"] == 0
+        assert str(tmp_path) not in initialized.text
+        reinitialized = worker.post("/api/v1/fewshot/monitors/workspaces", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "target_folders": [str(targets)],
+            "workspace_dir": str(workspace_dir),
+            "k": 20,
+        })
+        assert reinitialized.status_code == 201, reinitialized.text
+        assert reinitialized.json()["monitor_workspace_id"] == workspace_id
+        profile = worker.get(f"/api/v1/fewshot/monitors/workspaces/{workspace_id}/profile.yaml")
+        assert profile.status_code == 200
+        assert "objective: retrieve" in profile.text
+        assert "model_dir: ''" in profile.text
+
+        first_run = worker.post("/api/v1/fewshot/monitors/scans/jobs", json={
+            "monitor_workspace_id": workspace_id,
+        })
+        assert first_run.status_code == 202, first_run.text
+        first_job = _wait_job(worker, first_run.json()["job_id"])
+        assert first_job["state"] == "completed", first_job
+        assert first_job["result"]["new"] == 2
+        status = worker.get(f"/api/v1/fewshot/monitors/workspaces/{workspace_id}")
+        assert status.status_code == 200, status.text
+        view = status.json()
+        assert view["queue_len"] == 3
+        assert len(view["items"]) == 3
+        assert str(tmp_path) not in status.text
+        preview = worker.get(
+            f"/api/v1/fewshot/monitors/workspaces/{workspace_id}/queue/0/preview.jpg"
+        )
+        assert preview.status_code == 200
+        assert Image.open(__import__("io").BytesIO(preview.content)).size[0] > 0
+
+        accepted, skipped = view["items"][:2]
+        accepted_response = worker.post(
+            f"/api/v1/fewshot/monitors/workspaces/{workspace_id}/labels",
+            json={"item_id": accepted["item_id"], "decision": "defect", "label": "stain"},
+        )
+        assert accepted_response.status_code == 200, accepted_response.text
+        skipped_response = worker.post(
+            f"/api/v1/fewshot/monitors/workspaces/{workspace_id}/labels",
+            json={"item_id": skipped["item_id"], "decision": "skip", "label": "scratch"},
+        )
+        assert skipped_response.status_code == 200, skipped_response.text
+        labels_view = worker.get(f"/api/v1/fewshot/monitors/workspaces/{workspace_id}").json()
+        decisions = {item["item_id"]: item["human_decision"] for item in labels_view["items"]}
+        assert decisions[accepted["item_id"]] == "defect"
+        assert decisions[skipped["item_id"]] == "skip"
+
+        second_run = worker.post("/api/v1/fewshot/monitors/scans/jobs", json={
+            "monitor_workspace_id": workspace_id,
+        })
+        assert second_run.status_code == 202, second_run.text
+        second_job = _wait_job(worker, second_run.json()["job_id"])
+        assert second_job["state"] == "completed", second_job
+        next_queue = worker.get(f"/api/v1/fewshot/monitors/workspaces/{workspace_id}").json()
+        assert next_queue["queue_len"] == 2
+        assert accepted["item_id"] not in {item["item_id"] for item in next_queue["items"]}
+        assert skipped["item_id"] in {item["item_id"] for item in next_queue["items"]}
+        assert worker.get("/api/v1/anomaly/models").json()["items"] == []
+
+    assert {path: path.read_bytes() for path in source_hashes} == source_hashes

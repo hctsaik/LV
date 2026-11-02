@@ -259,6 +259,33 @@ class AddFewshotCandidatesRequest(BaseModel):
     class_overrides: dict[str, str] = Field(default_factory=dict, max_length=500)
 
 
+class ExportFewshotCandidatesRequest(BaseModel):
+    sample_bank_id: str = Field(min_length=36, max_length=36)
+    scan_id: str = Field(min_length=36, max_length=36)
+    accepted_item_ids: list[str] = Field(default_factory=list, max_length=500)
+    theta: float = Field(default=0.3, ge=0.0, le=1.0, allow_inf_nan=False)
+    class_overrides: dict[str, str] = Field(default_factory=dict, max_length=500)
+    output_dir: str = Field(min_length=1, max_length=4096)
+    copy_images: bool = True
+
+
+class CreateFewshotMonitorWorkspaceRequest(BaseModel):
+    sample_bank_id: str = Field(min_length=36, max_length=36)
+    target_folders: list[str] = Field(min_length=1, max_length=32)
+    workspace_dir: str = Field(min_length=1, max_length=4096)
+    k: int = Field(default=100, ge=10, le=500, multiple_of=10)
+
+
+class CreateFewshotMonitorScanRequest(BaseModel):
+    monitor_workspace_id: str = Field(min_length=36, max_length=36)
+
+
+class LabelFewshotMonitorItemRequest(BaseModel):
+    item_id: str = Field(min_length=1, max_length=256)
+    decision: Literal["defect", "skip"]
+    label: str = Field(default="", max_length=128)
+
+
 class CreateAnomalyScoreJobRequest(BaseModel):
     target_folders: list[str] = Field(min_length=1, max_length=32)
     contamination: float = Field(default=0.05, ge=0.0, le=1.0, allow_inf_nan=False)
@@ -541,6 +568,19 @@ class _FewshotScanJob:
 
 
 @dataclass
+class _FewshotMonitorScanJob:
+    job_id: str
+    monitor_workspace_id: str
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    result: dict | None = None
+    error: dict | None = None
+
+
+@dataclass
 class _AnomalyScoreJob:
     job_id: str
     model_id: str
@@ -586,7 +626,9 @@ def _anomaly_job_view(job: _AnomalyModelJob) -> dict:
     }
 
 
-def _fewshot_sample_bank_job_view(job: _FewshotSampleBankJob | _FewshotScanJob) -> dict:
+def _fewshot_sample_bank_job_view(
+    job: _FewshotSampleBankJob | _FewshotScanJob | _FewshotMonitorScanJob,
+) -> dict:
     return {
         "job_id": job.job_id,
         "state": job.state,
@@ -667,7 +709,9 @@ def create_app(
     app.state.anomaly_score_jobs = {}
     app.state.fewshot_sample_bank_jobs = {}
     app.state.fewshot_scan_jobs = {}
+    app.state.fewshot_monitor_scan_jobs = {}
     app.state.fewshot_scans = {}
+    app.state.fewshot_monitor_workspaces = {}
     app.state.fewshot_lock = threading.RLock()
     app.state.anomaly_runs = {}
     app.state.current_anomaly_run_id = None
@@ -692,6 +736,7 @@ def create_app(
             + list(app.state.anomaly_score_jobs.values())
             + list(app.state.fewshot_sample_bank_jobs.values())
             + list(app.state.fewshot_scan_jobs.values())
+            + list(app.state.fewshot_monitor_scan_jobs.values())
         )
         return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
@@ -1476,7 +1521,8 @@ def create_app(
     def get_fewshot_sample_bank_job(job_id: str) -> dict:
         with app.state.lock:
             job = (app.state.fewshot_sample_bank_jobs.get(job_id)
-                   or app.state.fewshot_scan_jobs.get(job_id))
+                   or app.state.fewshot_scan_jobs.get(job_id)
+                   or app.state.fewshot_monitor_scan_jobs.get(job_id))
             if job is None:
                 raise HTTPException(status_code=404, detail="找不到以樣搜樣工作")
             return _fewshot_sample_bank_job_view(job)
@@ -1580,6 +1626,7 @@ def create_app(
                     "model_id": str(bank["model"]),
                     "target_res": int(bank["target_res"]),
                     "object_source": str(bank.get("object_source") or "yolo"),
+                    "target_folders": [str(root) for root in roots],
                     "records": records,
                 }
             with app.state.lock:
@@ -1810,6 +1857,342 @@ def create_app(
                 "skipped": skipped,
                 "sample_bank": fewshot_sample_bank_view(request.sample_bank_id, merged),
             }
+
+    @app.post("/api/v1/fewshot/scans/exports")
+    def export_fewshot_scan(request: ExportFewshotCandidatesRequest) -> dict:
+        with app.state.fewshot_lock:
+            scan = app.state.fewshot_scans.get(request.scan_id)
+            if scan is None:
+                raise HTTPException(status_code=404, detail="找不到此 worker 的海掃結果；請重新海掃")
+            if scan["sample_bank_id"] != request.sample_bank_id:
+                raise HTTPException(status_code=409, detail="海掃結果與所選樣本集不相符")
+            try:
+                import sample_bank
+                bank_dir = fewshot_sample_bank_path(request.sample_bank_id)
+                bank = sample_bank.load_sample_bank(bank_dir)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=422, detail="樣本集損毀或格式不相容") from exc
+            if (str(bank["model"]) != scan["model_id"]
+                    or int(bank["target_res"]) != scan["target_res"]
+                    or str(bank.get("object_source") or "yolo") != scan["object_source"]):
+                raise HTTPException(status_code=409, detail="樣本集特徵身分已變更；請重新海掃")
+
+            records = scan["records"]
+            records_by_id = {str(record["item_id"]): record for record in records}
+            accepted_ids = set(request.accepted_item_ids)
+            if accepted_ids - set(records_by_id):
+                raise HTTPException(status_code=422, detail="海掃候選清單已過期；請重新海掃")
+            eligible_ids = {
+                item_id for item_id, record in records_by_id.items()
+                if float(record.get("similarity") or 0.0) >= request.theta
+            }
+            if accepted_ids - eligible_ids:
+                raise HTTPException(status_code=422, detail="只可匯出達目前相似度門檻的候選")
+            if set(request.class_overrides) - accepted_ids:
+                raise HTTPException(status_code=422, detail="類別修改清單包含未採納的候選")
+
+            class_names = sorted({str(label) for label in np.asarray(bank["labels"]).tolist()})
+            if any(label not in class_names for label in request.class_overrides.values()):
+                raise HTTPException(status_code=422, detail="候選類別必須來自目前樣本集")
+            decisions = []
+            for index, record in enumerate(records):
+                item_id = str(record["item_id"])
+                similarity = float(record.get("similarity") or 0.0)
+                if similarity < request.theta:
+                    decision, final_class = "pending", None
+                elif item_id not in accepted_ids:
+                    decision, final_class = "skipped", None
+                else:
+                    suggested = str(record.get("suggested_class") or "")
+                    final_class = request.class_overrides.get(item_id, suggested)
+                    if not final_class:
+                        raise HTTPException(status_code=422, detail="採納候選沒有可匯出的類別")
+                    decision = "relabeled" if final_class != suggested else "accepted"
+                    try:
+                        source = Path(record["image_path"]).resolve(strict=True)
+                        if not source.is_file() or _sha256_file(source)[:16] != item_id.split(":", 1)[0]:
+                            raise OSError("source changed")
+                    except (KeyError, OSError, RuntimeError) as exc:
+                        raise HTTPException(status_code=409, detail="候選原始影像已變更或無法讀取，請重新海掃") from exc
+                decisions.append({"item": index, "decision": decision, "final_class": final_class})
+
+            try:
+                import retrieval_export
+                out_dir = Path(request.output_dir).expanduser().resolve()
+                result = retrieval_export.export_retrieval(
+                    records,
+                    decisions,
+                    out_dir,
+                    class_names=class_names,
+                    source_dirs=scan["target_folders"],
+                    copy_images=request.copy_images,
+                )
+            except ValueError as exc:
+                # The helper checks C6 before writing. Keep local source/output paths out of API errors.
+                raise HTTPException(status_code=422, detail="輸出資料夾不安全或無法匯出") from exc
+            except (OSError, RuntimeError) as exc:
+                raise HTTPException(status_code=500, detail="寫入匯出資料時失敗") from exc
+            return result
+
+    def fewshot_monitor_workspace(monitor_workspace_id: str) -> dict:
+        if (len(monitor_workspace_id) != 36 or not monitor_workspace_id.startswith("fwm_")
+                or any(char not in "0123456789abcdef" for char in monitor_workspace_id[4:])):
+            raise HTTPException(status_code=404, detail="找不到此監看工作區")
+        with app.state.fewshot_lock:
+            workspace = app.state.fewshot_monitor_workspaces.get(monitor_workspace_id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="找不到此 worker 的監看工作區；請重新初始化")
+        return workspace
+
+    def fewshot_monitor_status(workspace: dict) -> dict:
+        import al_service
+        import al_workspace
+
+        status = al_service.status(workspace["path"])
+        queue = al_workspace.read_queue(workspace["path"])
+        labels_by_id = {str(item.get("id") or ""): item for item in al_workspace.read_labels(workspace["path"])}
+        last = status.get("last_run") or {}
+        last_run = ({key: last.get(key) for key in (
+            "run_id", "at", "new", "changed", "deleted", "objects_scored",
+            "queue_len", "model_version", "objective", "done",
+        )} if last else None)
+        items = []
+        for index, item in enumerate(queue):
+            human = labels_by_id.get(str(item.get("id") or ""), {})
+            items.append({
+                "index": index,
+                "item_id": str(item.get("id") or ""),
+                "filename": Path(str(item.get("image_path") or "candidate")).name,
+                "bbox": [float(value) for value in item.get("bbox", [0.5, 0.5, 1.0, 1.0])],
+                "obj_index": int(item.get("obj_index") or 0),
+                "suggested_class": str(item.get("suggested_class") or ""),
+                "similarity": float(item.get("similarity") or 0.0),
+                "reason": str(item.get("reason") or ""),
+                "run_id": str(item.get("run_id") or ""),
+                "status": str(item.get("status") or "pending"),
+                "human_decision": human.get("decision"),
+                "human_label": str(human.get("label") or ""),
+            })
+        return {
+            "monitor_workspace_id": workspace["id"],
+            "last_run": last_run,
+            "queue_len": len(queue),
+            "locked": bool(status.get("locked")),
+            "items": items,
+        }
+
+    @app.post("/api/v1/fewshot/monitors/workspaces", status_code=201)
+    def create_fewshot_monitor_workspace(request: CreateFewshotMonitorWorkspaceRequest) -> dict:
+        try:
+            import sample_bank
+            bank_dir = fewshot_sample_bank_path(request.sample_bank_id)
+            bank = sample_bank.load_sample_bank(bank_dir)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=404, detail="找不到此樣本集或樣本集格式不相容") from exc
+        roots: list[Path] = []
+        for value in request.target_folders:
+            try:
+                root = Path(value).expanduser().resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise HTTPException(status_code=422, detail="目標資料夾不存在或無法讀取") from exc
+            if not root.is_dir():
+                raise HTTPException(status_code=422, detail="目標資料夾不存在或無法讀取")
+            roots.append(root)
+        try:
+            workspace_path = Path(request.workspace_dir).expanduser().resolve()
+            bank_path = Path(bank_dir).resolve()
+            if (workspace_path == bank_path or workspace_path in bank_path.parents
+                    or bank_path in workspace_path.parents):
+                raise ValueError("monitor workspace overlaps sample bank storage")
+            with app.state.fewshot_lock:
+                prior_ids = [key for key, prior in app.state.fewshot_monitor_workspaces.items()
+                             if prior["path"] == workspace_path]
+            with app.state.lock:
+                if any(job.monitor_workspace_id in prior_ids
+                       and job.state in {"queued", "running", "cancelling"}
+                       for job in app.state.fewshot_monitor_scan_jobs.values()):
+                    raise HTTPException(status_code=409, detail="監看掃描進行中，無法重新初始化工作區")
+            import al_service
+            import al_workspace
+            al_workspace.assert_safe_workspace(workspace_path, roots)
+            al_service.init_workspace(
+                workspace_path,
+                name=roots[0].name or "以樣搜樣監看",
+                watch_folders=[str(root) for root in roots],
+                model_dir="",
+                objective="retrieve",
+                k=int(request.k),
+                sample_bank_dir=str(bank_dir),
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="監看工作區不安全或無法初始化") from exc
+        with app.state.fewshot_lock:
+            workspace_id = next((key for key, prior in app.state.fewshot_monitor_workspaces.items()
+                                  if prior["path"] == workspace_path), "")
+        workspace_id = workspace_id or ("fwm_" + uuid.uuid4().hex)
+        workspace = {
+            "id": workspace_id,
+            "path": workspace_path,
+            "sample_bank_id": request.sample_bank_id,
+            "sample_bank_dir": bank_dir,
+            "target_folders": [str(root) for root in roots],
+            "k": int(request.k),
+            "classes": sorted({str(label) for label in np.asarray(bank["labels"]).tolist()}),
+        }
+        with app.state.fewshot_lock:
+            app.state.fewshot_monitor_workspaces[workspace_id] = workspace
+        return fewshot_monitor_status(workspace)
+
+    def execute_fewshot_monitor_scan_job(job: _FewshotMonitorScanJob, workspace: dict) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase, job.message = "running", "scanning", "正在執行以樣搜樣監看掃描"
+            import al_service
+
+            embedder: Callable | None = None
+
+            def embed_fn(crop):
+                nonlocal embedder
+                if embedder is None:
+                    import sample_bank
+                    bank = sample_bank.load_sample_bank(workspace["sample_bank_dir"])
+                    if has_custom_object_model_loader or not has_custom_model_loader:
+                        embedder = object_loader(
+                            bank["model"], keep_aspect=True,
+                            target_res=int(bank["target_res"]), head="cls",
+                        )
+                    else:
+                        embedder = loader(bank["model"])
+                return embedder(crop)
+
+            def update_progress(data: dict) -> None:
+                with app.state.lock:
+                    job.phase = "scanning"
+                    job.done = max(0, int(data.get("images_processed") or 0))
+                    job.total = max(1, int(data.get("images_total") or 1))
+                    job.message = f"監看掃描 {job.done}/{job.total} 張影像"
+
+            result = al_service.run_once(workspace["path"], embed_fn=embed_fn, progress=update_progress)
+            if result.get("status") != "ok":
+                with app.state.lock:
+                    job.state, job.phase, job.message = "failed", "failed", "監看掃描未完成"
+                    job.error = {
+                        "code": "MONITOR_SCAN_FAILED",
+                        "message": "監看掃描未完成。請確認工作區、樣本集與目標資料夾。",
+                        "request_id": job.job_id,
+                    }
+                return
+            status = fewshot_monitor_status(workspace)
+            summary = status.get("last_run") or {}
+            with app.state.lock:
+                job.result = {
+                    "status": "ok",
+                    "run_id": summary.get("run_id") or result.get("run_id"),
+                    "new": int(summary.get("new") or 0),
+                    "changed": int(summary.get("changed") or 0),
+                    "deleted": int(summary.get("deleted") or 0),
+                    "objects_scored": int(summary.get("objects_scored") or 0),
+                    "queue_len": status["queue_len"],
+                    "done": bool(summary.get("done")),
+                }
+                job.done = job.total = max(job.total, 1)
+                job.state, job.phase, job.message = "completed", "completed", "監看掃描完成"
+        except Exception:
+            logger.exception("LV few-shot monitor scan failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "監看掃描失敗"
+                job.error = {
+                    "code": "MONITOR_SCAN_FAILED",
+                    "message": "監看掃描失敗。請檢查資料夾、樣本集與 worker 記錄。",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/fewshot/monitors/scans/jobs", status_code=202)
+    def create_fewshot_monitor_scan_job(request: CreateFewshotMonitorScanRequest) -> dict:
+        workspace = fewshot_monitor_workspace(request.monitor_workspace_id)
+        job_id = uuid.uuid4().hex
+        job = _FewshotMonitorScanJob(job_id=job_id, monitor_workspace_id=request.monitor_workspace_id)
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "請等目前分析完成後再開始監看掃描。",
+                    "request_id": job_id,
+                })
+            app.state.fewshot_monitor_scan_jobs[job_id] = job
+        threading.Thread(
+            target=execute_fewshot_monitor_scan_job,
+            args=(job, workspace),
+            daemon=True,
+            name=f"lv-fewshot-monitor-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/fewshot/monitors/workspaces/{monitor_workspace_id}")
+    def get_fewshot_monitor_workspace(monitor_workspace_id: str) -> dict:
+        return fewshot_monitor_status(fewshot_monitor_workspace(monitor_workspace_id))
+
+    @app.get("/api/v1/fewshot/monitors/workspaces/{monitor_workspace_id}/queue/{index}/preview.jpg")
+    def get_fewshot_monitor_queue_preview(monitor_workspace_id: str, index: int) -> Response:
+        workspace = fewshot_monitor_workspace(monitor_workspace_id)
+        import al_workspace
+        queue = al_workspace.read_queue(workspace["path"])
+        if index < 0 or index >= len(queue):
+            raise HTTPException(status_code=404, detail="找不到此監看候選")
+        record = queue[index]
+        try:
+            image_path = Path(record["image_path"]).resolve(strict=True)
+            item_id = str(record.get("id") or "")
+            if not image_path.is_file() or _sha256_file(image_path)[:16] != item_id.split(":", 1)[0]:
+                raise OSError("source changed")
+        except (KeyError, OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail="候選原始影像已變更或無法讀取，請重新監看掃描") from exc
+        image = safe_open_image(image_path)
+        if image is None:
+            raise HTTPException(status_code=404, detail="候選原始影像無法解碼")
+        crop = crop_bbox(image, *record.get("bbox", [0.5, 0.5, 1.0, 1.0]), pad=0.1)
+        crop.thumbnail((768, 768))
+        output = BytesIO()
+        crop.convert("RGB").save(output, format="JPEG", quality=86, optimize=True)
+        return Response(content=output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/v1/fewshot/monitors/workspaces/{monitor_workspace_id}/labels")
+    def label_fewshot_monitor_item(
+        monitor_workspace_id: str, request: LabelFewshotMonitorItemRequest,
+    ) -> dict:
+        workspace = fewshot_monitor_workspace(monitor_workspace_id)
+        import al_workspace
+        queue = al_workspace.read_queue(workspace["path"])
+        if not any(str(item.get("id") or "") == request.item_id for item in queue):
+            raise HTTPException(status_code=404, detail="找不到此監看候選")
+        label = request.label.strip()
+        if request.decision == "defect" and label not in workspace["classes"]:
+            raise HTTPException(status_code=422, detail="採納類別必須來自目前樣本集")
+        with app.state.lock:
+            if any(job.monitor_workspace_id == monitor_workspace_id
+                   and job.state in {"queued", "running", "cancelling"}
+                   for job in app.state.fewshot_monitor_scan_jobs.values()):
+                raise HTTPException(status_code=409, detail="監看掃描進行中，請完成後再標記佇列")
+        import time
+        al_workspace.append_label(workspace["path"], {
+            "id": request.item_id,
+            "decision": request.decision,
+            "label": label,
+            "decided_at": time.time(),
+        })
+        return {"decision": request.decision, "item_id": request.item_id}
+
+    @app.get("/api/v1/fewshot/monitors/workspaces/{monitor_workspace_id}/profile.yaml")
+    def export_fewshot_monitor_profile(monitor_workspace_id: str) -> Response:
+        workspace = fewshot_monitor_workspace(monitor_workspace_id)
+        profile = Path(workspace["path"]) / "profile.yaml"
+        if not profile.is_file():
+            raise HTTPException(status_code=404, detail="找不到監看設定；請重新初始化")
+        return Response(
+            content=profile.read_bytes(),
+            media_type="application/yaml",
+            headers={"Content-Disposition": f'attachment; filename="al_profile_{monitor_workspace_id}.yaml"'},
+        )
 
     def execute(job: _Job) -> None:
         try:
