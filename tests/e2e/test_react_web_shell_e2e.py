@@ -4243,3 +4243,103 @@ def test_lv_web_07_export_01_visible_yolo_csv_export_tracks_unchecked_candidates
         label_stems = {path.stem for path in (folder / "labels").glob("*.txt")}
         assert image_stems and label_stems <= image_stems
     assert source_hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes}
+
+
+def test_lv_web_10_eval_01_visible_react_detection_evaluation_and_escape_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = tmp_path / "evaluation-dataset"
+    dataset.mkdir()
+    (dataset / "classes.txt").write_text("dent\n", encoding="utf-8")
+    for filename, color in (
+        ("matched.png", (20, 110, 210)),
+        ("missed.png", (210, 80, 40)),
+        ("gray.png", (80, 180, 70)),
+    ):
+        (dataset / "images").mkdir(exist_ok=True)
+        (dataset / "labels").mkdir(exist_ok=True)
+        Image.new("RGB", (64, 48), color).save(dataset / "images" / filename)
+        (dataset / "labels" / f"{Path(filename).stem}.txt").write_text(
+            "0 0.5 0.5 0.25 0.25\n", encoding="utf-8",
+        )
+    source_hashes = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "evaluation-cache"))
+    application = create_app()
+    server = server_thread = browser = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-evaluation").click()
+            expect(page.get_by_test_id("evaluation-workspace")).to_be_visible()
+            page.get_by_test_id("run-evaluation-demo").click()
+            expect(page.get_by_test_id("evaluation-results")).to_be_visible()
+            expect(page.get_by_role("status").filter(has_text="範例資料")).to_be_visible()
+            expect(page.get_by_test_id("evaluation-escape-count")).not_to_have_text("0")
+
+            page.get_by_label("Dataset folder path").fill(str(dataset))
+            page.get_by_role("button", name="Add dataset folder").click()
+            expect(page.get_by_test_id("evaluation-folder-list")).to_contain_text(str(dataset))
+
+            page.get_by_test_id("run-detection-evaluation").click()
+            expect(page.get_by_role("alert")).to_contain_text("predictions.csv")
+
+            predictions = (
+                "filename,class,cx,cy,w,h,score\n"
+                "matched.png,dent,0.5,0.5,0.25,0.25,0.9\n"
+            )
+            consensus = (
+                "filename,consensus,cx,cy,w,h\n"
+                "matched.png,true,0.5,0.5,0.25,0.25\n"
+                "missed.png,true,0.5,0.5,0.25,0.25\n"
+                "gray.png,false,0.5,0.5,0.25,0.25\n"
+            )
+            page.get_by_test_id("evaluation-predictions-file").set_input_files({
+                "name": "predictions.csv", "mimeType": "text/csv", "buffer": predictions.encode(),
+            })
+            page.get_by_test_id("evaluation-consensus-file").set_input_files({
+                "name": "consensus_set.csv", "mimeType": "text/csv", "buffer": consensus.encode(),
+            })
+            page.get_by_test_id("run-detection-evaluation").click()
+
+            expect(page.get_by_test_id("evaluation-results")).to_be_visible()
+            expect(page.get_by_test_id("evaluation-overall-recall")).to_have_text("50.0%")
+            expect(page.get_by_test_id("evaluation-overall-precision")).to_have_text("100.0%")
+            expect(page.get_by_test_id("evaluation-escape-count")).to_have_text("1")
+            expect(page.get_by_test_id("evaluation-per-class-table").locator("tbody tr")).to_have_count(1)
+            expect(page.get_by_text("共識 GT 2 · 灰帶 GT 1")).to_be_visible()
+            image = page.locator("img[alt*='missed.png']")
+            expect(image).to_be_visible()
+            page.wait_for_function(
+                "() => { const image = document.querySelector(\"img[alt*='missed.png']\"); "
+                "return image && image.complete && image.naturalWidth > 0; }",
+            )
+            with page.expect_download() as download_info:
+                page.get_by_test_id("download-evaluation-escapes").click()
+            download = download_info.value
+            assert download.suggested_filename == "escapes.csv"
+            exported = Path(download.path()).read_text(encoding="utf-8")
+            assert "missed.png,dent,0.5,0.5,0.25,0.25" in exported
+            browser.close()
+            browser = None
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }

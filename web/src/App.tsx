@@ -31,6 +31,7 @@ import {
 } from "./api";
 import CompareDistributions from "./CompareDistributions";
 import CurationWorkspace from "./CurationWorkspace";
+import EvaluationWorkspace from "./EvaluationWorkspace";
 import FalsePositiveCaseWorkspace from "./FalsePositiveCaseWorkspace";
 const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
@@ -279,7 +280,7 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "anomaly" | "fewshot">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "evaluation" | "anomaly" | "fewshot">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -1078,6 +1079,7 @@ export default function App() {
           <button type="button" data-testid="open-fewshot-samples" className={activeTool === "fewshot" ? "active" : ""} aria-current={activeTool === "fewshot" ? "page" : undefined} onClick={() => setActiveTool("fewshot")}>以樣搜樣</button>
           <button type="button" data-testid="open-anomaly-bank" className={activeTool === "anomaly" ? "active" : ""} aria-current={activeTool === "anomaly" ? "page" : undefined} onClick={() => setActiveTool("anomaly")}>瑕疵偵測</button>
           <button type="button" data-testid="open-groupdiff" className={activeTool === "groupdiff" ? "active" : ""} aria-current={activeTool === "groupdiff" ? "page" : undefined} onClick={() => setActiveTool("groupdiff")}>差異探索</button>
+          <button type="button" data-testid="open-evaluation" className={activeTool === "evaluation" ? "active" : ""} aria-current={activeTool === "evaluation" ? "page" : undefined} onClick={() => setActiveTool("evaluation")}>評估</button>
           <button type="button" data-testid="open-curation" className={activeTool === "curation" ? "active" : ""} aria-current={activeTool === "curation" ? "page" : undefined} onClick={() => setActiveTool("curation")}>Curation{curationCount === null ? "" : ` (${curationCount})`}</button>
           <button type="button" data-testid="open-fp-cases" className={activeTool === "false_positive" ? "active" : ""} aria-current={activeTool === "false_positive" ? "page" : undefined} onClick={() => setActiveTool("false_positive")}>誤逮案件</button>
         </nav>
@@ -1338,6 +1340,8 @@ export default function App() {
         </main>
       ) : activeTool === "false_positive" ? (
         <FalsePositiveCaseWorkspace />
+      ) : activeTool === "evaluation" ? (
+        <EvaluationWorkspace />
       ) : activeTool === "fewshot" ? (
         <Suspense fallback={<div className="coverage-loading" role="status">Loading few-shot workspace…</div>}>
           <LazyFewshotSampleBankWorkspace models={models} connected={connected} />

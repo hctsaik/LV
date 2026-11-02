@@ -233,6 +233,9 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 }
 
 .tool-nav { display: flex; align-items: center; gap: 5px; margin: 0 auto 0 52px; }
+.tool-nav { min-width: 0; flex: 1 1 auto; overflow-x: auto; scrollbar-width: none; }
+.tool-nav::-webkit-scrollbar { display: none; }
+.tool-nav button { flex: 0 0 auto; white-space: nowrap; }
 .tool-nav button { border: 1px solid transparent; border-radius: 7px; padding: 8px 13px; color: #718097; background: transparent; font-size: 11px; font-weight: 700; }
 .tool-nav button:hover { background: #f5f7fb; color: #3a4f74; }
 .tool-nav button.active { border-color: #dfe6f1; background: #f3f6fb; color: #2e4771; }
@@ -974,5 +977,50 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .anomaly-pagination { justify-content: center; }
 .anomaly-pagination > span { min-width: 120px; text-align: center; }
 .anomaly-boundary { margin: 0; padding: 10px 12px; border-left: 3px solid #d8c39b; background: #fffaf1; color: #88755e; font-size: 10px; line-height: 1.6; }
+
+.evaluation-page { width: min(1320px, calc(100% - 48px)); margin: 30px auto 50px; }
+.evaluation-header { display: flex; justify-content: space-between; gap: 22px; margin-bottom: 22px; }
+.evaluation-header h1 { margin: 8px 0 7px; color: #202b40; font: 800 24px/1.2 Manrope, "Segoe UI", sans-serif; letter-spacing: -.6px; }
+.evaluation-header p, .evaluation-result-heading p { margin: 0; color: #7d889a; font-size: 11px; line-height: 1.6; }
+.evaluation-demo { align-self: flex-start; white-space: nowrap; }
+.evaluation-inputs { display: grid; grid-template-columns: 1.15fr 1.1fr .9fr; align-items: start; gap: 14px; }
+.evaluation-card, .evaluation-results { min-width: 0; border: 1px solid #e3e8f0; border-radius: 10px; padding: 18px; background: #fff; box-shadow: 0 3px 10px #223a6410; }
+.evaluation-card .section-heading { margin-bottom: 9px; }
+.evaluation-card .field-note { margin: 4px 0 11px; }
+.evaluation-card input[type="file"] { width: 100%; min-width: 0; border: 1px solid #e1e6ee; border-radius: 7px; padding: 7px; color: #65748a; background: #fafbfd; font-size: 10px; }
+.evaluation-card .evaluation-slider-label { display: flex; justify-content: space-between; margin: 14px 0 5px; color: #64738a; font-size: 10px; font-weight: 650; }
+.evaluation-slider-label output { color: #2e4771; font-variant-numeric: tabular-nums; }
+.evaluation-card input[type="range"] { width: 100%; accent-color: #355889; }
+.evaluation-checkbox { display: flex; align-items: center; gap: 8px; margin-top: 17px; color: #5c6a80; font-size: 10px; }
+.evaluation-checkbox input { accent-color: #355889; }
+.evaluation-card .run-button { margin-top: 18px; }
+.evaluation-error, .evaluation-notice { margin-top: 12px; border: 1px solid #f0d9da; border-radius: 7px; padding: 9px 11px; background: #fff7f7; color: #9d4850; font-size: 10px; line-height: 1.5; }
+.evaluation-notice { border-color: #eee1c3; background: #fffaf0; color: #806b40; }
+.evaluation-results { margin-top: 18px; padding: 20px; }
+.evaluation-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.evaluation-result-heading h2 { margin: 6px 0; color: #273852; font: 750 17px Manrope, "Segoe UI", sans-serif; }
+.evaluation-export { flex: 0 0 auto; text-decoration: none; }
+.evaluation-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+.evaluation-metrics article { display: grid; gap: 5px; border: 1px solid #e7ecf3; border-radius: 8px; padding: 12px; background: #fbfcfe; }
+.evaluation-metrics article span, .evaluation-metrics article small { color: #7a879b; font-size: 9px; }
+.evaluation-metrics article strong { color: #2e4771; font-size: 20px; font-variant-numeric: tabular-nums; }
+.evaluation-consensus-note { margin: 10px 0 0; color: #7d889a; font-size: 10px; }
+.evaluation-table-section, .evaluation-escape-section, .evaluation-confusion-section { margin-top: 20px; }
+.evaluation-table-section h3, .evaluation-escape-section h3, .evaluation-confusion-section h3 { margin: 0 0 10px; color: #34435b; font: 700 12px Manrope, "Segoe UI", sans-serif; }
+.evaluation-table-scroll { overflow-x: auto; }
+.evaluation-table-scroll table { width: 100%; border-collapse: collapse; font-size: 10px; text-align: right; }
+.evaluation-table-scroll th, .evaluation-table-scroll td { border-bottom: 1px solid #edf0f4; padding: 8px 10px; white-space: nowrap; }
+.evaluation-table-scroll th:first-child, .evaluation-table-scroll tbody th { text-align: left; }
+.evaluation-table-scroll thead th { color: #7b8798; font-weight: 650; }
+.evaluation-table-scroll tbody th { color: #34435b; font-weight: 700; }
+.evaluation-escape-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(155px, 1fr)); gap: 10px; }
+.evaluation-escape-grid figure { min-width: 0; overflow: hidden; margin: 0; border: 1px solid #e4e9f0; border-radius: 8px; background: #fbfcfe; }
+.evaluation-escape-grid img { display: block; width: 100%; height: 150px; object-fit: contain; background: #eef1f5; }
+.evaluation-escape-grid figcaption { display: grid; gap: 3px; padding: 7px 9px; color: #7c8798; font-size: 9px; }
+.evaluation-escape-grid figcaption strong { color: #35455e; font-size: 10px; }
+.evaluation-escape-grid figcaption span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.evaluation-confusion-section ul { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0; padding-left: 17px; color: #68768a; font-size: 10px; }
+@media (max-width: 980px) { .evaluation-inputs { grid-template-columns: repeat(2, minmax(0, 1fr)); }.evaluation-inputs .evaluation-card:last-child { grid-column: 1 / -1; } }
+@media (max-width: 640px) { .evaluation-page { width: calc(100% - 22px); margin-top: 16px; }.evaluation-header { align-items: flex-start; flex-direction: column; }.evaluation-inputs { grid-template-columns: 1fr; }.evaluation-inputs .evaluation-card:last-child { grid-column: auto; }.evaluation-result-heading { align-items: flex-start; flex-direction: column; }.evaluation-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }.evaluation-results { padding: 15px; } }
 @media (max-width: 780px) { .anomaly-build-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-run-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-persist-controls { grid-template-columns: 1fr 1fr; }.anomaly-persist-controls label { grid-column: 1 / -1; }.anomaly-prelabel-controls { grid-template-columns: 1fr 1fr; }.anomaly-prelabel-controls > button { grid-column: 1 / -1; } }
 @media (max-width: 560px) { .anomaly-workspace { width: calc(100% - 22px); margin-top: 14px; }.anomaly-card { padding: 15px; }.anomaly-build-form, .anomaly-score-form, .anomaly-run-filters, .anomaly-persist-controls, .anomaly-prelabel-controls, .anomaly-prelabel-export { grid-template-columns: 1fr; }.anomaly-build-form .anomaly-wide, .anomaly-score-form .anomaly-wide, .anomaly-persist-controls label { grid-column: auto; }.anomaly-run-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-object, .anomaly-prelabel-item { grid-template-columns: 84px minmax(0, 1fr); }.anomaly-object-preview { width: 84px; height: 88px; }.anomaly-object-details { grid-template-columns: minmax(0, 1fr); }.anomaly-object-details > .secondary-action { grid-column: 1; grid-row: auto; }.anomaly-object-details > label { grid-column: 1; }.anomaly-review-actions { align-items: stretch; flex-direction: column; }.anomaly-review-buttons { justify-content: stretch; flex-direction: column; }.anomaly-review-buttons > button { width: 100%; } }

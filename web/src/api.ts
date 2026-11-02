@@ -25,6 +25,37 @@ export type JobStatus = {
   can_cancel: boolean;
 };
 
+export type DetectionEvaluationClass = {
+  class_name: string;
+  tp: number;
+  fp: number;
+  fn: number;
+  n_gt: number;
+  precision: number;
+  recall: number;
+};
+
+export type DetectionEvaluation = {
+  evaluation_id: string;
+  demo?: boolean;
+  overall: Omit<DetectionEvaluationClass, "class_name">;
+  per_class: DetectionEvaluationClass[];
+  escape_count: number;
+  escapes: Array<{
+    index: number;
+    filename: string;
+    class_name: string;
+    box: { cx: number; cy: number; w: number; h: number };
+  }>;
+  confusion: Array<{ ground_truth: string; predicted: string; count: number }>;
+  gray_gt_count: number;
+  consensus_gt_count: number | null;
+  image_count: number;
+  prediction_image_count: number;
+  used_consensus: boolean;
+  warnings: Array<"NO_PREDICTIONS_MATCHED" | "CLASS_NAMESPACE_MISMATCH" | "CONSENSUS_NOT_PROVIDED">;
+};
+
 const nativeFolderGrants = new Map<string, string>();
 
 export type AnomalyModel = {
@@ -1324,6 +1355,34 @@ export const api = {
     nativeFolderGrants.set(path, grantId);
   },
   folderGrantIds: (paths: string[]) => paths.map((path) => nativeFolderGrants.get(path) || null),
+  evaluateDetections: (input: {
+    folders: string[];
+    folderGrantIds: Array<string | null>;
+    predictionCsv: string;
+    consensusCsv?: string | null;
+    iouThresh: number;
+    confThresh: number;
+    classAware: boolean;
+  }) => request<DetectionEvaluation>("/api/v1/evaluations", {
+    method: "POST",
+    body: JSON.stringify({
+      folders: input.folders,
+      folder_grant_ids: input.folderGrantIds,
+      prediction_csv: input.predictionCsv,
+      consensus_csv: input.consensusCsv,
+      iou_thresh: input.iouThresh,
+      conf_thresh: input.confThresh,
+      class_aware: input.classAware,
+    }),
+  }),
+  demoDetectionEvaluation: () => request<DetectionEvaluation>("/api/v1/evaluations/demo", {
+    method: "POST",
+  }),
+  evaluationEscapesCsvUrl: (evaluationId: string) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/evaluations/" + encodeURIComponent(evaluationId) + "/escapes.csv",
+  evaluationEscapeThumbnailUrl: (evaluationId: string, index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/evaluations/" + encodeURIComponent(evaluationId)
+      + "/escapes/" + index + "/thumbnail.jpg",
   job: (jobId: string) => request<JobStatus>("/api/v1/jobs/" + encodeURIComponent(jobId)),
   cancel: (jobId: string) => request<{ job_id: string; state: string }>(
     "/api/v1/jobs/" + encodeURIComponent(jobId),

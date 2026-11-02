@@ -2711,3 +2711,142 @@ def test_case_lv_web_01_cart_01_object_records_keep_object_identity(
         assert all(item["level"] == "object" for item in items)
         assert items[0]["id"] != items[1]["id"]
         assert all("image_path" not in item and "path" not in item for item in items)
+
+
+def _make_detection_evaluation_fixture(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "classes.txt").write_text("dent\n", encoding="utf-8")
+    for filename, color in (
+        ("matched.png", (20, 110, 210)),
+        ("missed.png", (210, 80, 40)),
+        ("gray.png", (80, 180, 70)),
+    ):
+        (root / "images").mkdir(exist_ok=True)
+        (root / "labels").mkdir(exist_ok=True)
+        Image.new("RGB", (64, 48), color).save(root / "images" / filename)
+        (root / "labels" / f"{Path(filename).stem}.txt").write_text(
+            "0 0.5 0.5 0.25 0.25\n", encoding="utf-8",
+        )
+    return root
+
+
+def test_case_lv_web_10_eval_01_api_reuses_legacy_core_and_exports_path_safe_escapes(
+    monkeypatch, tmp_path
+):
+    root = _make_detection_evaluation_fixture(tmp_path / "detection-evaluation")
+    source_hashes = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*") if path.is_file()
+    }
+    prediction_csv = (
+        "filename,class,cx,cy,w,h,score\n"
+        "matched.png,dent,0.5,0.5,0.25,0.25,0.9\n"
+    )
+    consensus_csv = (
+        "filename,consensus,cx,cy,w,h\n"
+        "matched.png,true,0.5,0.5,0.25,0.25\n"
+        "missed.png,true,0.5,0.5,0.25,0.25\n"
+        "gray.png,false,0.5,0.5,0.25,0.25\n"
+    )
+
+    with _client(monkeypatch, tmp_path / "eval-api") as client:
+        response = client.post("/api/v1/evaluations", json={
+            "folders": [str(root)],
+            "prediction_csv": prediction_csv,
+            "consensus_csv": consensus_csv,
+            "iou_thresh": 0.5,
+            "conf_thresh": 0.0,
+            "class_aware": True,
+        })
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["overall"] == {
+            "tp": 1, "fp": 0, "fn": 1, "n_gt": 2,
+            "precision": 1.0, "recall": 0.5,
+        }
+        assert result["per_class"] == [{
+            "class_name": "dent", "tp": 1, "fp": 0, "fn": 1,
+            "n_gt": 2, "precision": 1.0, "recall": 0.5,
+        }]
+        assert result["escape_count"] == 1
+        assert result["escapes"][0]["filename"] == "missed.png"
+        assert result["gray_gt_count"] == 1
+        assert result["consensus_gt_count"] == 2
+        assert "CONSENSUS_NOT_PROVIDED" not in result["warnings"]
+        assert str(root) not in response.text
+
+        evaluation_id = result["evaluation_id"]
+        image = client.get(
+            f"/api/v1/evaluations/{evaluation_id}/escapes/0/thumbnail.jpg",
+        )
+        assert image.status_code == 200
+        assert image.headers["content-type"] == "image/jpeg"
+        exported = client.get(f"/api/v1/evaluations/{evaluation_id}/escapes.csv")
+        assert exported.status_code == 200
+        rows = list(csv.DictReader(StringIO(exported.text)))
+        assert rows == [{
+            "filename": "missed.png", "cls": "dent", "cx": "0.5", "cy": "0.5",
+            "w": "0.25", "h": "0.25",
+        }]
+
+        duplicate_root = tmp_path / "duplicate-dataset"
+        (duplicate_root / "images").mkdir(parents=True)
+        (duplicate_root / "labels").mkdir()
+        Image.new("RGB", (64, 48), (30, 40, 50)).save(duplicate_root / "images" / "matched.png")
+        (duplicate_root / "labels" / "matched.txt").write_text(
+            "0 0.5 0.5 0.25 0.25\n", encoding="utf-8",
+        )
+        duplicate = client.post("/api/v1/evaluations", json={
+            "folders": [str(root), str(duplicate_root)],
+            "prediction_csv": prediction_csv,
+        })
+        assert duplicate.status_code == 400
+        assert duplicate.json()["code"] == "DUPLICATE_IMAGE_FILENAMES"
+        assert "matched.png" in duplicate.json()["message"]
+
+    assert source_hashes == {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*") if path.is_file()
+    }
+
+
+def test_case_lv_web_10_eval_01_managed_app_requires_granted_dataset_folder(
+    monkeypatch, tmp_path
+):
+    root = _make_detection_evaluation_fixture(tmp_path / "managed-evaluation")
+    prediction_csv = "filename,class,cx,cy,w,h\nmatched.png,dent,0.5,0.5,0.25,0.25\n"
+    monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+    monkeypatch.setattr(
+        react_web_shell,
+        "_resolve_nativeapp_folder_grant",
+        lambda grant_id, app_id: root.resolve(),
+    )
+    with _client(monkeypatch, tmp_path / "eval-managed") as client:
+        payload = {"folders": [str(root)], "prediction_csv": prediction_csv}
+        denied = client.post("/api/v1/evaluations", json=payload)
+        assert denied.status_code == 403
+        assert denied.json()["code"] == "FOLDER_GRANT_REQUIRED"
+
+        allowed = client.post("/api/v1/evaluations", json={
+            **payload, "folder_grant_ids": ["hostgrant_fixture"],
+        })
+        assert allowed.status_code == 200, allowed.text
+
+
+def test_case_lv_web_10_eval_01_demo_is_explicit_sample_with_fn_and_gray_band(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "evaluation-demo-cache"))
+    with _client(monkeypatch, tmp_path / "eval-demo") as client:
+        response = client.post("/api/v1/evaluations/demo")
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["demo"] is True
+        assert result["used_consensus"] is True
+        assert result["escape_count"] > 0
+        assert result["gray_gt_count"] > 0
+        assert result["consensus_gt_count"] > 0
+        assert str(tmp_path) not in response.text
+        exported = client.get(f"/api/v1/evaluations/{result['evaluation_id']}/escapes.csv")
+        assert exported.status_code == 200
+        assert len(list(csv.DictReader(StringIO(exported.text)))) == result["escape_count"]

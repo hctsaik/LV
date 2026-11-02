@@ -10,7 +10,7 @@ from evaluation import (
     iou_xywh,
     match_image,
 )
-from interaction import load_predictions_csv
+from interaction import load_predictions_csv, parse_predictions_csv_text
 
 
 def box(cls, cx, cy, w=0.2, h=0.2, score=None):
@@ -131,6 +131,7 @@ def test_load_predictions_csv(tmp_path):
     assert set(out) == {"a.jpg"} and len(out["a.jpg"]) == 2
     assert out["a.jpg"][0] == {"cls": "crack", "cx": 0.5, "cy": 0.5,
                                "w": 0.2, "h": 0.2, "score": 0.91}
+    assert parse_predictions_csv_text(p.read_text(encoding="utf-8")) == out
 
 
 def test_load_predictions_csv_confidence_alias_and_missing(tmp_path):

@@ -86,6 +86,11 @@ from react_coverage import (
     coverage_sparsity,
     sparse_threshold,
 )
+from react_evaluation import (
+    EvaluationInputError,
+    run_detection_evaluation,
+    run_detection_evaluation_demo,
+)
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 from safe_io import safe_open_image
 
@@ -120,6 +125,16 @@ class CreateVisualizationJob(BaseModel):
     methods: list[str] = Field(default_factory=list, max_length=5)
     umap_reference: bool = False
     umap_rebuild: bool = False
+
+
+class CreateDetectionEvaluationRequest(BaseModel):
+    folders: list[str] = Field(default_factory=list, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
+    prediction_csv: str = Field(min_length=1)
+    consensus_csv: str | None = None
+    iou_thresh: float = Field(default=0.5, ge=0.1, le=0.9)
+    conf_thresh: float = Field(default=0.0, ge=0.0, le=1.0)
+    class_aware: bool = True
 
 
 def _resolve_nativeapp_folder_grant(grant_id: str, app_id: str) -> Path:
@@ -192,7 +207,9 @@ def _folder_permission_error(status_code: int, code: str, message: str) -> HTTPE
     )
 
 
-def _visualization_folders_for_request(request: CreateVisualizationJob) -> list[str]:
+def _resolve_request_folders(
+    request: CreateVisualizationJob | CreateDetectionEvaluationRequest,
+) -> list[str]:
     app_id = os.environ.get("NATIVEAPP_APP_ID", "").strip()
     if not app_id:
         if any(request.folder_grant_ids):
@@ -934,6 +951,7 @@ def create_app(
     app.state.case_search_model_provider = case_search_model_provider
     app.state.fp_case_lock = threading.RLock()
     app.state.lock = threading.RLock()
+    app.state.evaluation_runs = {}
 
     def has_active_job() -> bool:
         jobs = (
@@ -2500,9 +2518,113 @@ def create_app(
                     "request_id": job.job_id,
                 }
 
+    def store_detection_evaluation(evaluated: dict, *, demo: bool = False) -> dict:
+        evaluation_id = uuid.uuid4().hex
+        escape_csv = StringIO()
+        escape_writer = csv.writer(escape_csv)
+        escape_writer.writerow(["filename", "cls", "cx", "cy", "w", "h"])
+        for item in evaluated["escapes"]:
+            box = item["box"]
+            escape_writer.writerow([item["filename"], item["cls"], box["cx"], box["cy"], box["w"], box["h"]])
+        preview_escapes = evaluated["escapes"][:40]
+        preview_image_names = {item["filename"] for item in preview_escapes}
+        with app.state.lock:
+            app.state.evaluation_runs[evaluation_id] = {
+                "escape_csv": escape_csv.getvalue(),
+                "image_by_name": {
+                    name: evaluated["image_by_name"][name]
+                    for name in preview_image_names
+                    if name in evaluated["image_by_name"]
+                },
+                "escapes": preview_escapes,
+            }
+            while len(app.state.evaluation_runs) > 16:
+                app.state.evaluation_runs.pop(next(iter(app.state.evaluation_runs)))
+        response = {"evaluation_id": evaluation_id, **evaluated["summary"]}
+        if demo:
+            response["demo"] = True
+        return response
+
+    def detection_evaluation_error(exc: EvaluationInputError) -> HTTPException:
+        return HTTPException(status_code=400, detail={
+            "code": exc.code,
+            "message": str(exc),
+            "request_id": uuid.uuid4().hex,
+        })
+
+    @app.post("/api/v1/evaluations")
+    def create_detection_evaluation(request: CreateDetectionEvaluationRequest) -> dict:
+        folders = _resolve_request_folders(request)
+        try:
+            evaluated = run_detection_evaluation(
+                folders,
+                request.prediction_csv,
+                request.consensus_csv,
+                iou_thresh=request.iou_thresh,
+                conf_thresh=request.conf_thresh,
+                class_aware=request.class_aware,
+            )
+        except EvaluationInputError as exc:
+            raise detection_evaluation_error(exc) from exc
+        return store_detection_evaluation(evaluated)
+
+    @app.post("/api/v1/evaluations/demo")
+    def create_detection_evaluation_demo() -> dict:
+        sample_root = Path(
+            os.environ.get("LV_CACHE_DIR")
+            or (Path(tempfile.gettempdir()) / "visuallatent")
+        ) / "_samples"
+        try:
+            evaluated = run_detection_evaluation_demo(sample_root)
+        except EvaluationInputError as exc:
+            raise detection_evaluation_error(exc) from exc
+        return store_detection_evaluation(evaluated, demo=True)
+
+    @app.get("/api/v1/evaluations/{evaluation_id}/escapes.csv")
+    def detection_evaluation_escapes_csv(evaluation_id: str) -> Response:
+        with app.state.lock:
+            evaluated = app.state.evaluation_runs.get(evaluation_id)
+        if evaluated is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "EVALUATION_NOT_FOUND",
+                "message": "This evaluation is no longer available. Run it again.",
+                "request_id": uuid.uuid4().hex,
+            })
+        return Response(
+            content=evaluated["escape_csv"],
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="escapes.csv"'},
+        )
+
+    @app.get("/api/v1/evaluations/{evaluation_id}/escapes/{index}/thumbnail.jpg")
+    def detection_evaluation_escape_thumbnail(evaluation_id: str, index: int) -> Response:
+        with app.state.lock:
+            evaluated = app.state.evaluation_runs.get(evaluation_id)
+        if evaluated is None or index < 0 or index >= len(evaluated["escapes"]):
+            raise HTTPException(status_code=404, detail={
+                "code": "EVALUATION_IMAGE_NOT_FOUND",
+                "message": "This escape image is no longer available.",
+                "request_id": uuid.uuid4().hex,
+            })
+        item = evaluated["escapes"][index]
+        image_path = evaluated["image_by_name"].get(item["filename"])
+        image = safe_open_image(Path(image_path)) if image_path else None
+        if image is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "EVALUATION_IMAGE_NOT_FOUND",
+                "message": "This escape image is no longer available.",
+                "request_id": uuid.uuid4().hex,
+            })
+        box = item["box"]
+        crop = crop_bbox(image, box["cx"], box["cy"], box["w"], box["h"], pad=0.4)
+        crop.thumbnail((180, 180))
+        buffer = BytesIO()
+        crop.convert("RGB").save(buffer, format="JPEG", quality=88)
+        return Response(content=buffer.getvalue(), media_type="image/jpeg")
+
     @app.post("/api/v1/visualize/jobs", status_code=202)
     def create_visualization_job(request: CreateVisualizationJob) -> dict:
-        resolved_folders = _visualization_folders_for_request(request)
+        resolved_folders = _resolve_request_folders(request)
         request = request.model_copy(update={
             "folders": resolved_folders,
             "folder_grant_ids": [],
