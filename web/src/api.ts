@@ -778,6 +778,46 @@ export type CurationSubsetExport = {
   training_warning: string;
 };
 
+export type CurationHandoffPreview = {
+  selected: number;
+  available: number;
+  unavailable: number;
+  unique_images: number;
+  deduplicated: number;
+  new_images: number;
+  handled_images: number;
+  sendable_images: number;
+  skipped_handled: number;
+};
+export type CurationHandoffResult = {
+  handoff_id: string;
+  task: string;
+  sent: number;
+  deduplicated: number;
+  skipped_handled: number;
+  round_id: string;
+  created_round: boolean;
+  saved_to_local_inbox: boolean;
+};
+export type ActiveLearningRound = {
+  round_id: string;
+  ts: string;
+  strategy: string;
+  params: Record<string, unknown>;
+  tool: string;
+  note: string;
+  batches: Array<{ batch_id: string; n_sent: number }>;
+  n_sent: number;
+  readbacks: Array<Record<string, unknown>>;
+  n_labeled: number;
+  n_changed: number;
+  metrics: Array<{ name: string; value: number | null; source: string; ts: string }>;
+};
+export type ActiveLearningRoundsResponse = {
+  rounds: ActiveLearningRound[];
+  orphan_events: Array<Record<string, unknown>>;
+};
+
 export type FalsePositiveSource = {
   id: string;
   sha256: string;
@@ -1424,6 +1464,23 @@ export const api = {
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/comparisons/" + encodeURIComponent(runId)
       + "/images/" + side + "/" + index,
   curationItems: () => request<CurationItemsResponse>("/api/v1/curation/items"),
+  previewCurationHandoff: (itemIds: string[], includeHandled = false) =>
+    request<CurationHandoffPreview>("/api/v1/curation/labeling-handoff/preview", {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds, include_handled: includeHandled }),
+    }),
+  sendCurationToLabeling: (input: {
+    item_ids: string[]; include_handled?: boolean; new_round?: boolean; round_id?: string | null;
+  }) => request<CurationHandoffResult>("/api/v1/curation/labeling-handoff/send", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  activeLearningRounds: () => request<ActiveLearningRoundsResponse>("/api/v1/rounds"),
+  attachRoundMetric: (roundId: string, input: { name: string; value: number; source?: string; note?: string }) =>
+    request<ActiveLearningRoundsResponse>("/api/v1/rounds/" + encodeURIComponent(roundId) + "/metrics", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   curationSubsetPreview: (input: CurationSubsetOptions) =>
     request<CurationSubsetPreview>("/api/v1/curation/subset/preview", {
       method: "POST",

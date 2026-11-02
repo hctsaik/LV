@@ -501,6 +501,23 @@ class CurationSubsetExportRequest(CurationSubsetPreviewRequest):
     preview_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
+class CurationHandoffRequest(BaseModel):
+    item_ids: list[str] = Field(min_length=1, max_length=10000)
+    include_handled: bool = False
+
+
+class SendCurationHandoffRequest(CurationHandoffRequest):
+    new_round: bool = True
+    round_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class AttachRoundMetricRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    value: float = Field(allow_inf_nan=False)
+    source: str = Field(default="manual", min_length=1, max_length=128)
+    note: str = Field(default="", max_length=2000)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -4977,6 +4994,216 @@ def create_app(
     def get_curation_items() -> dict:
         items = curation_snapshot()
         return {"items": [public_curation_item(item) for item in items], "total": len(items)}
+
+    def curation_handoff_plan(item_ids: list[str], include_handled: bool) -> dict:
+        """Resolve cart rows to readable original images and apply the shared pool guard."""
+        import pool_registry as _pool_registry
+
+        selected = curation_snapshot()
+        by_id = {str(item.get("id", "")): item for item in selected}
+        requested_ids = list(dict.fromkeys(item_ids))
+        missing_ids = [item_id for item_id in requested_ids if item_id not in by_id]
+        if missing_ids:
+            raise HTTPException(status_code=409, detail={
+                "code": "CURATION_HANDOFF_ITEMS_CHANGED",
+                "message": "The curation list changed. Reload it before sending to Labeling.",
+                "request_id": uuid.uuid4().hex,
+            })
+
+        records: list[dict] = []
+        manifest: dict[str, dict] = {}
+        unavailable = 0
+        for item_id in requested_ids:
+            item = by_id[item_id]
+            raw_path = item.get("image_path") if item.get("level") == "object" else item.get("path")
+            try:
+                path = Path(raw_path or "").expanduser().resolve(strict=True)
+                if not path.is_file():
+                    raise OSError("source is not a file")
+                digest = _sha256_file(path)
+            except (OSError, RuntimeError, ValueError):
+                unavailable += 1
+                continue
+            records.append({
+                "path": str(path),
+                "filename": str(item.get("filename") or path.name),
+                "label": str(item.get("label") or ""),
+                "split": str(item.get("split") or ""),
+            })
+            manifest[str(path)] = {"sha256": digest}
+
+        sha_by_index = {
+            index: manifest[record["path"]]["sha256"]
+            for index, record in enumerate(records)
+        }
+        unique_shas = list(dict.fromkeys(sha_by_index.values()))
+        new_shas, handled = _pool_registry.partition_new(unique_shas)
+        new_set = set(new_shas)
+        send_indices = [
+            index for index, sha in sha_by_index.items()
+            if include_handled or sha in new_set
+        ]
+        send_shas = list(dict.fromkeys(sha_by_index[index] for index in send_indices))
+
+        # Reuse dataset class order when the source contains classes.txt/data.yaml;
+        # cart-only or non-classifier images fall back to their recorded labels.
+        class_options: list[str] = []
+        class_seen: set[str] = set()
+        for record in records:
+            image_path = Path(record["path"])
+            for folder in list(image_path.parents)[:7]:
+                names: list[str] = []
+                class_file = folder / "classes.txt"
+                if class_file.is_file():
+                    try:
+                        names = [
+                            line.strip()
+                            for line in class_file.read_text(encoding="utf-8-sig").splitlines()
+                            if line.strip()
+                        ]
+                    except OSError:
+                        names = []
+                if not names:
+                    names = yaml_class_names(folder / "data.yaml")
+                if names:
+                    for name in names:
+                        if name not in class_seen:
+                            class_options.append(name)
+                            class_seen.add(name)
+                    break
+        for record in records:
+            name = record["label"]
+            if name and name not in class_seen:
+                class_options.append(name)
+                class_seen.add(name)
+        if not class_options:
+            class_options = ["object"]
+
+        return {
+            "records": records,
+            "manifest": manifest,
+            "sha_by_index": sha_by_index,
+            "send_indices": send_indices,
+            "send_shas": send_shas,
+            "class_options": class_options,
+            "selected": len(requested_ids),
+            "available": len(records),
+            "unavailable": unavailable,
+            "unique_images": len(unique_shas),
+            "deduplicated": max(0, len(records) - len(unique_shas)),
+            "new_images": len(new_shas),
+            "handled_images": len(handled),
+            "sendable_images": len(send_shas),
+            "skipped_handled": 0 if include_handled else len(handled),
+        }
+
+    @app.post("/api/v1/curation/labeling-handoff/preview")
+    def preview_curation_handoff(request: CurationHandoffRequest) -> dict:
+        plan = curation_handoff_plan(request.item_ids, request.include_handled)
+        return {key: plan[key] for key in (
+            "selected", "available", "unavailable", "unique_images", "deduplicated",
+            "new_images", "handled_images", "sendable_images", "skipped_handled",
+        )}
+
+    @app.post("/api/v1/curation/labeling-handoff/send", status_code=201)
+    def send_curation_handoff(request: SendCurationHandoffRequest) -> dict:
+        import labeling_handoff as _labeling_handoff
+        import pool_registry as _pool_registry
+        import round_ledger as _round_ledger
+
+        with app.state.lock:
+            plan = curation_handoff_plan(request.item_ids, request.include_handled)
+            rounds = _round_ledger.load_rounds()
+            round_ids = {row["round_id"] for row in rounds}
+            target_round = request.round_id
+            if not request.new_round and target_round is not None and target_round not in round_ids:
+                raise HTTPException(status_code=404, detail={
+                    "code": "ROUND_NOT_FOUND",
+                    "message": "The selected active-learning round no longer exists.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if not plan["send_indices"]:
+                raise HTTPException(status_code=422, detail={
+                    "code": "CURATION_HANDOFF_EMPTY",
+                    "message": "There are no available new images to send. Enable the explicit override to include previously handled samples.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            try:
+                handoff_dir = _labeling_handoff.send_to_labeling(
+                    plan["records"],
+                    plan["send_indices"],
+                    source="cart",
+                    task=_labeling_handoff.TASK_RELABEL,
+                    class_options=plan["class_options"],
+                    manifest=plan["manifest"],
+                    original_labels={
+                        index: record["label"]
+                        for index, record in enumerate(plan["records"])
+                    },
+                    payload={"curation_item_ids": list(dict.fromkeys(request.item_ids))},
+                )
+                if handoff_dir is None:
+                    raise ValueError("no images were materialized")
+                spec = _labeling_handoff.load_spec(handoff_dir)
+                sent_shas = [item["sha256"] for item in spec.get("items", [])]
+                batch_id = str(spec.get("handoff_id") or Path(handoff_dir).name)
+                if not sent_shas:
+                    raise ValueError("the handoff contains no readable images")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                logger.exception("LV curation handoff could not be materialized")
+                raise HTTPException(status_code=422, detail={
+                    "code": "CURATION_HANDOFF_FAILED",
+                    "message": "The selected images could not be prepared for Labeling. Check that the source files are still readable.",
+                    "request_id": uuid.uuid4().hex,
+                }) from exc
+
+            _pool_registry.mark_sent(sent_shas, batch_id, tool="cart")
+            created_round = request.new_round or not rounds
+            if created_round:
+                round_id = _round_ledger.start_round("cart", {}, "cart")
+            else:
+                round_id = target_round or rounds[-1]["round_id"]
+            _round_ledger.attach_batch(round_id, batch_id, len(sent_shas))
+            return {
+                "handoff_id": batch_id,
+                "task": str(spec.get("task") or _labeling_handoff.TASK_RELABEL),
+                "sent": len(sent_shas),
+                "deduplicated": max(0, len(plan["send_indices"]) - len(sent_shas)),
+                "skipped_handled": plan["skipped_handled"],
+                "round_id": round_id,
+                "created_round": created_round,
+                "saved_to_local_inbox": True,
+            }
+
+    @app.get("/api/v1/rounds")
+    def get_active_learning_rounds() -> dict:
+        import round_ledger as _round_ledger
+
+        return {
+            "rounds": _round_ledger.load_rounds(),
+            "orphan_events": _round_ledger.orphan_events(),
+        }
+
+    @app.post("/api/v1/rounds/{round_id}/metrics")
+    def add_active_learning_metric(round_id: str, request: AttachRoundMetricRequest) -> dict:
+        import round_ledger as _round_ledger
+
+        with app.state.lock:
+            rounds = _round_ledger.load_rounds()
+            if not any(row["round_id"] == round_id for row in rounds):
+                raise HTTPException(status_code=404, detail={
+                    "code": "ROUND_NOT_FOUND",
+                    "message": "The selected active-learning round no longer exists.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            _round_ledger.attach_metric(
+                round_id,
+                request.name.strip(),
+                request.value,
+                request.source,
+                request.note,
+            )
+            return {"rounds": _round_ledger.load_rounds()}
 
     def build_curation_subset_plan(source: str) -> tuple[list, list[Path], dict, str]:
         """Translate the saved cart into the framework-free subset contract."""

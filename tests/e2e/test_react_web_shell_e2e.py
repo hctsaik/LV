@@ -158,6 +158,8 @@ def _stop_worker(process) -> None:
 
 def _serve_curation_worker(port: int, cache_root: str) -> None:
     os.environ["LV_CACHE_DIR"] = cache_root
+    os.environ["LV_OUTPUT_DIR"] = str(Path(cache_root) / "output")
+    os.environ["CIM_LOG_DIR"] = str(Path(cache_root) / "labeling-inbox")
     application = create_app(
         model_catalog=lambda: ["fixture-model"],
         model_loader=_worker_fixture_model,
@@ -1569,6 +1571,32 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         expect(page.locator(".curation-item-reason")).to_have_count(2)
         expect(page.locator(".curation-item-reason").first).to_have_text("checked in the visible React review")
 
+        expect(page.get_by_test_id("curation-labeling-preview")).to_contain_text("2 sendable · 2 new · 0 already handled")
+        page.get_by_test_id("curation-send-labeling").click()
+        expect(page.locator(".alert-info")).to_contain_text("Saved 2 image(s) to the local Labeling inbox")
+        expect(page.get_by_test_id("curation-labeling-preview")).to_contain_text("0 sendable · 0 new · 2 already handled")
+        expect(page.get_by_test_id("curation-send-labeling")).to_be_disabled()
+        page.get_by_label("Include previously handled samples").check()
+        expect(page.get_by_test_id("curation-labeling-preview")).to_contain_text("2 sendable · 0 new · 2 already handled")
+        page.get_by_test_id("curation-send-labeling").click()
+        expect(page.locator(".alert-info")).to_contain_text("Saved 2 image(s) to the local Labeling inbox")
+
+        rounds = page.request.get(base_url + "/api/v1/rounds").json()["rounds"]
+        assert len(rounds) == 2
+        assert [row["n_sent"] for row in rounds] == [2, 2]
+        for round_row, value in zip(rounds, (0.75, 0.9), strict=True):
+            page.get_by_label("Metric round").select_option(round_row["round_id"])
+            page.get_by_label("Metric name").fill("review_accuracy")
+            page.get_by_label("Metric value").fill(str(value))
+            page.get_by_role("button", name="Add metric").click()
+            expect(page.locator(".alert-info")).to_contain_text("Added review_accuracy to round")
+        expect(page.get_by_test_id("active-learning-curve-chart")).to_be_visible()
+        expect(page.get_by_test_id("active-learning-round")).to_have_count(2)
+        handoff_root = cache_root / "labeling-inbox" / "lv_labeling_handoff"
+        handoff_specs = list(handoff_root.glob("*/_handoff.json"))
+        assert len(handoff_specs) == 1
+        assert len(json.loads(handoff_specs[0].read_text(encoding="utf-8"))["items"]) == 2
+
         subset_dir = tmp_path / "curation-yolo-subset"
         page.get_by_label("Subset destination folder").fill(str(subset_dir))
         page.get_by_test_id("curation-subset-preview-button").click()
@@ -1612,6 +1640,8 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         page.get_by_test_id("open-curation").click()
         expect(page.get_by_test_id("curation-item")).to_have_count(2)
         expect(page.locator(".curation-item-reason").first).to_have_text("checked in the visible React review")
+        expect(page.get_by_test_id("active-learning-round")).to_have_count(2)
+        assert len(page.request.get(restarted_url + "/api/v1/rounds").json()["rounds"]) == 2
         assert worker.pid != first_pid
     finally:
         if browser is not None:

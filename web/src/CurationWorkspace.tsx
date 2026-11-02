@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, CurationItem, CurationSubsetOptions, CurationSubsetPreview } from "./api";
+import { api, ActiveLearningRound, CurationHandoffPreview, CurationItem, CurationSubsetOptions, CurationSubsetPreview } from "./api";
 
 type Props = { onCountChange: (count: number) => void };
 
@@ -17,6 +17,15 @@ export default function CurationWorkspace({ onCountChange }: Props) {
   const [subsetMode, setSubsetMode] = useState<CurationSubsetOptions["mode"]>("copy");
   const [subsetOnExists, setSubsetOnExists] = useState<CurationSubsetOptions["on_exists"]>("skip");
   const [subsetPreview, setSubsetPreview] = useState<{ key: string; data: CurationSubsetPreview } | null>(null);
+  const [handoffPreview, setHandoffPreview] = useState<CurationHandoffPreview | null>(null);
+  const [includeHandled, setIncludeHandled] = useState(false);
+  const [newRound, setNewRound] = useState(true);
+  const [selectedRoundId, setSelectedRoundId] = useState("");
+  const [rounds, setRounds] = useState<ActiveLearningRound[]>([]);
+  const [curveMetric, setCurveMetric] = useState("");
+  const [metricRoundId, setMetricRoundId] = useState("");
+  const [metricName, setMetricName] = useState("");
+  const [metricValue, setMetricValue] = useState("0");
   const [clearConfirmation, setClearConfirmation] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -59,6 +68,48 @@ export default function CurationWorkspace({ onCountChange }: Props) {
     itemIds: visibleItems.map((item) => item.id),
   }), [subsetRequest, visibleItems]);
   const currentSubsetPreview = subsetPreview?.key === subsetKey ? subsetPreview.data : null;
+  const visibleItemIds = useMemo(() => visibleItems.map((item) => item.id), [visibleItems]);
+  const visibleItemKey = useMemo(() => JSON.stringify(visibleItemIds), [visibleItemIds]);
+  const metricNames = useMemo(() => [...new Set(
+    rounds.flatMap((round) => round.metrics.map((metric) => metric.name).filter(Boolean)),
+  )].sort(), [rounds]);
+  const activeCurveMetric = metricNames.includes(curveMetric) ? curveMetric : metricNames[0] || "";
+  const curvePoints = useMemo(() => {
+    let cumulative = 0;
+    return [...rounds].sort((a, b) => a.ts.localeCompare(b.ts)).flatMap((round) => {
+      cumulative += round.n_labeled || 0;
+      const metric = [...round.metrics].reverse().find((row) => row.name === activeCurveMetric && row.value !== null);
+      return metric ? [{ x: cumulative, y: Number(metric.value), roundId: round.round_id }] : [];
+    });
+  }, [rounds, activeCurveMetric]);
+
+  useEffect(() => {
+    if (!visibleItemIds.length) {
+      setHandoffPreview(null);
+      return;
+    }
+    let active = true;
+    api.previewCurationHandoff(visibleItemIds, includeHandled)
+      .then((response) => active && setHandoffPreview(response))
+      .catch((reason: unknown) => active && setError(reason instanceof Error ? reason.message : "Could not check the Labeling send set."));
+    return () => { active = false; };
+  }, [visibleItemKey, includeHandled]);
+
+  useEffect(() => {
+    let active = true;
+    api.activeLearningRounds().then((response) => {
+      if (!active) return;
+      setRounds(response.rounds);
+      const latestRound = response.rounds[response.rounds.length - 1];
+      if (latestRound) {
+        setSelectedRoundId((current) => current || latestRound.round_id);
+        setMetricRoundId((current) => current || latestRound.round_id);
+      }
+    }).catch((reason: unknown) => {
+      if (active) setError(reason instanceof Error ? reason.message : "Could not load the active-learning rounds.");
+    });
+    return () => { active = false; };
+  }, []);
 
   async function removeItem(itemId: string) {
     setBusy(true);
@@ -180,6 +231,70 @@ export default function CurationWorkspace({ onCountChange }: Props) {
     }
   }
 
+  async function refreshRounds() {
+    const response = await api.activeLearningRounds();
+    setRounds(response.rounds);
+    const latestRound = response.rounds[response.rounds.length - 1];
+    if (latestRound) {
+      setSelectedRoundId((current) => current || latestRound.round_id);
+      setMetricRoundId((current) => current || latestRound.round_id);
+    }
+    return response.rounds;
+  }
+
+  async function sendToLabeling() {
+    if (!visibleItemIds.length || !handoffPreview?.sendable_images) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const response = await api.sendCurationToLabeling({
+        item_ids: visibleItemIds,
+        include_handled: includeHandled,
+        new_round: newRound,
+        round_id: newRound ? null : selectedRoundId || null,
+      });
+      const refreshedRounds = await refreshRounds();
+      if (response.created_round) {
+        const latestRound = refreshedRounds[refreshedRounds.length - 1];
+        if (latestRound) {
+          setSelectedRoundId(latestRound.round_id);
+          setMetricRoundId(latestRound.round_id);
+        }
+      }
+      setHandoffPreview(await api.previewCurationHandoff(visibleItemIds, includeHandled));
+      setNotice(
+        `Saved ${response.sent} image(s) to the local Labeling inbox · `
+        + `${response.deduplicated} duplicate(s) merged · round ${response.round_id}`
+        + (response.skipped_handled ? ` · skipped ${response.skipped_handled} previously handled` : ""),
+      );
+      setIncludeHandled(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not send the curation items to Labeling.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addRoundMetric() {
+    if (!metricRoundId || !metricName.trim()) return;
+    const value = Number(metricValue);
+    if (!Number.isFinite(value)) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api.attachRoundMetric(metricRoundId, { name: metricName.trim(), value, source: "manual" });
+      await refreshRounds();
+      setNotice(`Added ${metricName.trim()} to round ${metricRoundId}.`);
+      setMetricName("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not add the round metric.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function retryLoad() {
     setLoading(true);
     setError("");
@@ -231,6 +346,58 @@ export default function CurationWorkspace({ onCountChange }: Props) {
           </div>
         ) : (
           <button type="button" className="curation-clear" disabled={busy || !items.length} onClick={() => void clearItems()}>Clear list</button>
+        )}
+      </section>
+
+      <section className="curation-subset-panel" aria-label="Send curation items to Labeling" data-testid="curation-labeling-handoff">
+        <div className="curation-subset-heading">
+          <div>
+            <h2>Send to Labeling</h2>
+            <p>Creates a durable local handoff. Previously sent or labeled images are skipped unless you explicitly include them again.</p>
+          </div>
+          <span>{visibleItems.length} cart item(s)</span>
+        </div>
+        <div className="curation-subset-controls">
+          <label className="curation-checkbox-control">
+            <input
+              type="checkbox"
+              aria-label="Include previously handled samples"
+              checked={includeHandled}
+              onChange={(event) => setIncludeHandled(event.target.checked)}
+            />
+            <span>Include previously sent or labeled samples</span>
+          </label>
+          <label className="curation-checkbox-control">
+            <input
+              type="checkbox"
+              aria-label="Record as a new round"
+              checked={newRound}
+              onChange={(event) => setNewRound(event.target.checked)}
+            />
+            <span>Record as a new active-learning round</span>
+          </label>
+          {!newRound && rounds.length > 0 && (
+            <label>
+              <span>Round to continue</span>
+              <select aria-label="Round to continue" value={selectedRoundId} onChange={(event) => setSelectedRoundId(event.target.value)}>
+                {[...rounds].reverse().map((round) => (
+                  <option key={round.round_id} value={round.round_id}>{round.round_id} · {round.strategy || "—"}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div className="curation-subset-buttons">
+            <button type="button" className="primary" data-testid="curation-send-labeling" disabled={busy || !visibleItemIds.length || !handoffPreview?.sendable_images || (!newRound && rounds.length > 0 && !selectedRoundId)} onClick={() => void sendToLabeling()}>
+              Send {handoffPreview ? `(${handoffPreview.sendable_images})` : ""} to Labeling
+            </button>
+          </div>
+        </div>
+        {handoffPreview && (
+          <div className="curation-subset-preview" data-testid="curation-labeling-preview" role="status">
+            <strong>{handoffPreview.sendable_images} sendable · {handoffPreview.new_images} new · {handoffPreview.handled_images} already handled</strong>
+            <span>{handoffPreview.unique_images} unique source image(s) · {handoffPreview.deduplicated} duplicate(s) merged · {handoffPreview.unavailable} unavailable</span>
+            {handoffPreview.skipped_handled > 0 && <span>Default send skips {handoffPreview.skipped_handled} already handled image(s). The checkbox above is the explicit override.</span>}
+          </div>
         )}
       </section>
 
@@ -305,6 +472,84 @@ export default function CurationWorkspace({ onCountChange }: Props) {
           ))}
         </section>
       )}
+
+      <section className="active-learning-timeline" aria-label="Active-learning rounds" data-testid="active-learning-timeline">
+        <header className="active-learning-heading">
+          <div>
+            <div className="eyebrow">LABELING FEEDBACK</div>
+            <h2>Active-learning rounds</h2>
+            <p>Durable local history of sent batches, read-back counts, and manually recorded metrics.</p>
+          </div>
+          <button type="button" className="secondary-action" disabled={busy} onClick={() => void refreshRounds()}>Refresh rounds</button>
+        </header>
+        {rounds.length === 0 ? (
+          <div className="curation-empty" data-testid="active-learning-empty">No rounds yet. Send a curation batch to Labeling to start one.</div>
+        ) : (
+          <>
+            <form className="active-learning-metric-form" onSubmit={(event) => { event.preventDefault(); void addRoundMetric(); }}>
+              <label>
+                <span>Round</span>
+                <select aria-label="Metric round" value={metricRoundId} onChange={(event) => setMetricRoundId(event.target.value)}>
+                  {[...rounds].reverse().map((round) => <option key={round.round_id} value={round.round_id}>{round.round_id}</option>)}
+                </select>
+              </label>
+              <label>
+                <span>Metric name</span>
+                <input aria-label="Metric name" value={metricName} maxLength={128} onChange={(event) => setMetricName(event.target.value)} placeholder="e.g. accuracy" />
+              </label>
+              <label>
+                <span>Value</span>
+                <input aria-label="Metric value" type="number" step="any" value={metricValue} onChange={(event) => setMetricValue(event.target.value)} />
+              </label>
+              <button type="submit" disabled={busy || !metricRoundId || !metricName.trim() || !Number.isFinite(Number(metricValue))}>Add metric</button>
+            </form>
+            {metricNames.length > 0 && (
+              <div className="active-learning-curve" data-testid="active-learning-curve">
+                <div className="active-learning-curve-heading">
+                  <strong>Learning curve · cumulative labeled images</strong>
+                  <label><span>Metric</span><select aria-label="Learning curve metric" value={activeCurveMetric} onChange={(event) => setCurveMetric(event.target.value)}>{metricNames.map((name) => <option key={name} value={name}>{name}</option>)}</select></label>
+                </div>
+                {curvePoints.length < 2 ? <p>Record this metric in at least two rounds to draw a curve.</p> : (() => {
+                  const width = 720;
+                  const height = 190;
+                  const pad = 28;
+                  const xs = curvePoints.map((point) => point.x);
+                  const ys = curvePoints.map((point) => point.y);
+                  const xMin = Math.min(...xs);
+                  const xMax = Math.max(...xs);
+                  const yMin = Math.min(...ys);
+                  const yMax = Math.max(...ys);
+                  const xSpan = xMax - xMin || 1;
+                  const ySpan = yMax - yMin || 1;
+                  const coords = curvePoints.map((point) => ({
+                    ...point,
+                    px: pad + ((point.x - xMin) / xSpan) * (width - pad * 2),
+                    py: height - pad - ((point.y - yMin) / ySpan) * (height - pad * 2),
+                  }));
+                  return <svg className="active-learning-curve-chart" data-testid="active-learning-curve-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${activeCurveMetric} by cumulative labeled images`}>
+                    <line x1={pad} y1={height - pad} x2={width - pad} y2={height - pad} />
+                    <line x1={pad} y1={pad} x2={pad} y2={height - pad} />
+                    <polyline points={coords.map((point) => `${point.px},${point.py}`).join(" ")} />
+                    {coords.map((point) => <circle key={point.roundId} cx={point.px} cy={point.py} r="5"><title>{`${point.roundId}: ${point.x} labeled · ${activeCurveMetric}=${point.y}`}</title></circle>)}
+                    <text x={width / 2} y={height - 3}>Cumulative labeled images</text>
+                    <text x={13} y={height / 2} transform={`rotate(-90 13 ${height / 2})`}>{activeCurveMetric}</text>
+                  </svg>;
+                })()}
+                <p className="active-learning-curve-note">Metrics are descriptive. Review model quality on an independent hold-out set before deciding to stop.</p>
+              </div>
+            )}
+            <div className="active-learning-cards">
+              {[...rounds].reverse().map((round) => (
+                <article className="active-learning-card" key={round.round_id} data-testid="active-learning-round">
+                  <div><strong>{round.round_id}</strong><span>Strategy: {round.strategy || "—"}</span></div>
+                  <p>Sent {round.n_sent} · Read back {round.n_labeled} · Changed {round.n_changed}</p>
+                  {round.metrics.length > 0 && <p>Metrics: {round.metrics.map((metric) => `${metric.name}=${metric.value ?? "—"}`).join(" · ")}</p>}
+                </article>
+              ))}
+            </div>
+          </>
+        )}
+      </section>
     </main>
   );
 }
