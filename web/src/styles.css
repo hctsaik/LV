@@ -1043,3 +1043,300 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 @media (max-width: 640px) { .evaluation-page { width: calc(100% - 22px); margin-top: 16px; }.evaluation-header { align-items: flex-start; flex-direction: column; }.evaluation-inputs { grid-template-columns: 1fr; }.evaluation-inputs .evaluation-card:last-child { grid-column: auto; }.evaluation-result-heading { align-items: flex-start; flex-direction: column; }.evaluation-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }.evaluation-results { padding: 15px; }.evaluation-round-attachment { grid-template-columns: 1fr; }.evaluation-round-controls { align-items: stretch; flex-direction: column; }.evaluation-round-controls select { max-width: none; } }
 @media (max-width: 780px) { .anomaly-build-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-run-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-persist-controls { grid-template-columns: 1fr 1fr; }.anomaly-persist-controls label { grid-column: 1 / -1; }.anomaly-prelabel-controls { grid-template-columns: 1fr 1fr; }.anomaly-prelabel-controls > button { grid-column: 1 / -1; } }
 @media (max-width: 560px) { .anomaly-workspace { width: calc(100% - 22px); margin-top: 14px; }.anomaly-card { padding: 15px; }.anomaly-build-form, .anomaly-score-form, .anomaly-run-filters, .anomaly-persist-controls, .anomaly-prelabel-controls, .anomaly-prelabel-export { grid-template-columns: 1fr; }.anomaly-build-form .anomaly-wide, .anomaly-score-form .anomaly-wide, .anomaly-persist-controls label { grid-column: auto; }.anomaly-run-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-object, .anomaly-prelabel-item { grid-template-columns: 84px minmax(0, 1fr); }.anomaly-object-preview { width: 84px; height: 88px; }.anomaly-object-details { grid-template-columns: minmax(0, 1fr); }.anomaly-object-details > .secondary-action { grid-column: 1; grid-row: auto; }.anomaly-object-details > label { grid-column: 1; }.anomaly-review-actions { align-items: stretch; flex-direction: column; }.anomaly-review-buttons { justify-content: stretch; flex-direction: column; }.anomaly-review-buttons > button { width: 100%; } }
+.class-similarity-workspace {
+  display: grid;
+  gap: 1.25rem;
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.class-similarity-header,
+.class-similarity-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.class-similarity-header h1,
+.class-similarity-panel-heading h2,
+.class-similarity-evidence h2 {
+  margin: 0.25rem 0;
+}
+
+.class-similarity-header p {
+  max-width: 850px;
+  color: var(--muted, #64748b);
+}
+
+.class-similarity-controls,
+.class-similarity-summary,
+.class-similarity-chart-panel,
+.class-similarity-table-panel,
+.class-similarity-evidence {
+  padding: 1rem;
+  border: 1px solid var(--line, #dce3ec);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+}
+
+.class-similarity-controls,
+.class-similarity-summary {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 0.9rem;
+}
+
+.class-similarity-controls label,
+.class-similarity-panel-heading label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--muted, #64748b);
+  font-size: 0.84rem;
+}
+
+.class-similarity-controls input,
+.class-similarity-controls select,
+.class-similarity-panel-heading select {
+  min-width: 9rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--line, #dce3ec);
+  border-radius: 7px;
+  color: var(--ink, #172033);
+  background: var(--surface, #fff);
+}
+
+.class-similarity-summary {
+  align-items: center;
+  color: var(--muted, #64748b);
+}
+
+.class-similarity-summary strong {
+  color: var(--ink, #172033);
+}
+
+.class-similarity-chart-panel {
+  overflow: hidden;
+}
+
+.class-similarity-boxplot {
+  display: block;
+  width: 100%;
+  min-height: 80px;
+  margin-top: 0.75rem;
+  overflow: visible;
+}
+
+.class-similarity-axis-label,
+.class-similarity-axis-value,
+.class-similarity-unscored,
+.class-similarity-count {
+  fill: var(--muted, #64748b);
+  font-size: 12px;
+}
+
+.class-similarity-whisker,
+.class-similarity-whisker-cap {
+  stroke: #66768d;
+  stroke-width: 1.5;
+}
+
+.class-similarity-box {
+  fill: #dce8fb;
+  stroke: #4976d0;
+  stroke-width: 1.5;
+}
+
+.class-similarity-median {
+  stroke: #173c79;
+  stroke-width: 2.5;
+}
+
+.class-similarity-threshold-line {
+  stroke: #c74444;
+  stroke-width: 2;
+  stroke-dasharray: 5 4;
+}
+
+.class-similarity-threshold-panel {
+  display: grid;
+  gap: 0.8rem;
+  padding: 1rem;
+  border: 1px solid var(--line, #dce3ec);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+}
+
+.class-similarity-threshold-panel .class-similarity-panel-heading > span {
+  color: var(--muted, #64748b);
+  font-size: 0.84rem;
+}
+
+.class-similarity-threshold-controls,
+.class-similarity-selection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.class-similarity-threshold-controls label {
+  display: grid;
+  gap: 0.3rem;
+  color: var(--muted, #64748b);
+  font-size: 0.84rem;
+}
+
+.class-similarity-threshold-controls input[type="number"] {
+  width: 8rem;
+  padding: 0.5rem;
+  border: 1px solid var(--line, #dce3ec);
+  border-radius: 7px;
+}
+
+.class-similarity-threshold-controls input[type="range"] {
+  flex: 1 1 220px;
+}
+
+.class-similarity-threshold-controls button {
+  padding: 0.5rem 0.7rem;
+  border: 1px solid var(--line, #dce3ec);
+  border-radius: 7px;
+  color: var(--ink, #172033);
+  background: var(--surface, #fff);
+  cursor: pointer;
+}
+
+.class-similarity-threshold-controls button.active {
+  color: #173c79;
+  border-color: #4976d0;
+  background: #eff5ff;
+}
+
+.class-similarity-candidate-count {
+  margin: 0;
+  font-weight: 600;
+}
+
+.class-similarity-table-panel td:first-child {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.class-similarity-results-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.65fr) minmax(280px, 0.8fr);
+  align-items: start;
+  gap: 1rem;
+}
+
+.class-similarity-table-scroll {
+  max-height: 68vh;
+  margin-top: 0.75rem;
+  overflow: auto;
+}
+
+.class-similarity-table-panel table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.88rem;
+}
+
+.class-similarity-table-panel th,
+.class-similarity-table-panel td {
+  padding: 0.55rem 0.45rem;
+  border-bottom: 1px solid var(--line, #dce3ec);
+  white-space: nowrap;
+}
+
+.class-similarity-table-panel tr.selected {
+  background: #eff5ff;
+}
+
+.class-similarity-record-link {
+  padding: 0;
+  border: 0;
+  color: var(--accent, #2459a6);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.class-similarity-evidence {
+  position: sticky;
+  top: 1rem;
+}
+
+.class-similarity-preview {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+  margin: 0.75rem auto;
+  object-fit: contain;
+}
+
+.class-similarity-neighbors {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.class-similarity-neighbors h3 {
+  margin: 0.75rem 0 0.25rem;
+}
+
+.class-similarity-neighbor {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.4rem;
+  border: 1px solid var(--line, #dce3ec);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  text-align: left;
+  cursor: pointer;
+}
+
+.class-similarity-neighbor img {
+  width: 44px;
+  height: 44px;
+  border-radius: 5px;
+  object-fit: cover;
+}
+
+.class-similarity-neighbor span {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.class-similarity-neighbor small,
+.class-similarity-empty {
+  color: var(--muted, #64748b);
+}
+
+.class-similarity-error {
+  padding: 0.8rem 1rem;
+  border: 1px solid #e9a8a8;
+  border-radius: 8px;
+  color: #8c2020;
+  background: #fff2f2;
+}
+
+.class-similarity-progress {
+  padding: 0.8rem 1rem;
+  border-radius: 8px;
+  color: #173c79;
+  background: #eff5ff;
+}
+
+@media (max-width: 900px) {
+  .class-similarity-workspace { padding: 1rem; }
+  .class-similarity-results-grid { grid-template-columns: 1fr; }
+  .class-similarity-evidence { position: static; }
+}

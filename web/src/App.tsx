@@ -31,6 +31,7 @@ import {
   type VisualizeUnit,
   type VisualizationRun,
 } from "./api";
+import ClassSimilarityWorkspace from "./ClassSimilarityWorkspace";
 import CompareDistributions from "./CompareDistributions";
 import CurationWorkspace from "./CurationWorkspace";
 import EvaluationWorkspace from "./EvaluationWorkspace";
@@ -282,7 +283,7 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "evaluation" | "anomaly" | "fewshot">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "class_similarity" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "evaluation" | "anomaly" | "fewshot">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -1142,6 +1143,7 @@ export default function App() {
         </div>
         <nav className="tool-nav" aria-label="LV tools">
           <button type="button" className={activeTool === "visualize" ? "active" : ""} aria-current={activeTool === "visualize" ? "page" : undefined} onClick={() => setActiveTool("visualize")}>Visualize</button>
+          {run && currentRunId && <button type="button" data-testid="open-class-similarity" className={activeTool === "class_similarity" ? "active" : ""} aria-current={activeTool === "class_similarity" ? "page" : undefined} onClick={() => setActiveTool("class_similarity")}>類別相似度</button>}
           {diagnosticReference && <button type="button" data-testid="open-diagnostics" className={activeTool === "diagnostics" ? "active" : ""} aria-current={activeTool === "diagnostics" ? "page" : undefined} onClick={() => setActiveTool("diagnostics")}>Diagnostics</button>}
           <button type="button" className={activeTool === "compare" ? "active" : ""} aria-current={activeTool === "compare" ? "page" : undefined} onClick={() => setActiveTool("compare")}>Compare</button>
           <button type="button" className={activeTool === "coverage" ? "active" : ""} aria-current={activeTool === "coverage" ? "page" : undefined} onClick={() => { setCoverageMounted(true); setActiveTool("coverage"); }}>Coverage</button>
@@ -1409,6 +1411,20 @@ export default function App() {
         </main>
       ) : activeTool === "false_positive" ? (
         <FalsePositiveCaseWorkspace />
+      ) : activeTool === "class_similarity" && run && currentRunId ? (
+        <ClassSimilarityWorkspace
+          key={`${currentRunId}-${activeModelId}`}
+          runId={currentRunId}
+          modelId={activeModelId}
+          unit={run.unit}
+          records={run.records}
+          onReturn={() => setActiveTool("visualize")}
+          onOpenRecord={(index) => {
+            setActiveTool("visualize");
+            setSelectedIndex(index);
+            setSelectedIndices((current) => current.includes(index) ? current : [...current, index]);
+          }}
+        />
       ) : activeTool === "evaluation" ? (
         <EvaluationWorkspace />
       ) : activeTool === "fewshot" ? (

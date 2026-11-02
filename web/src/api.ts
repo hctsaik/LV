@@ -430,6 +430,81 @@ export type VisualizationRun = {
   warnings: string[];
 };
 
+export type ClassSimilarityMetric = "margin" | "same" | "other";
+
+export type ClassSimilarityNeighbor = {
+  index: number;
+  filename: string;
+  label: string | null;
+  cosine: number;
+};
+
+export type ClassSimilarityItem = {
+  record_id: string;
+  index: number;
+  filename: string;
+  label: string | null;
+  split: string;
+  bbox: [number, number, number, number] | null;
+  obj_index: number | null;
+  same: number | null;
+  other: number | null;
+  margin: number | null;
+  rival_class: string | null;
+  same_k: number;
+  rival_k: number;
+  status: string;
+  reasons: string[];
+  same_neighbors: ClassSimilarityNeighbor[];
+  rival_neighbors: ClassSimilarityNeighbor[];
+  tied_rival_count: number;
+  tied_rival_classes: string[];
+};
+
+export type ClassSimilarityBoxSummary = {
+  label: string;
+  n_total: number;
+  n_scored: number;
+  n_unscored: number;
+  metric: ClassSimilarityMetric;
+  q1?: number;
+  median?: number;
+  q3?: number;
+  iqr?: number;
+  whisker_low?: number;
+  whisker_high?: number;
+};
+
+export type ClassSimilarityResult = {
+  analysis_key: string;
+  run_id: string;
+  model_id: string;
+  unit: VisualizeUnit;
+  k: number;
+  analysis_split: string;
+  source_status: string;
+  summary: {
+    input_count: number;
+    valid_count: number;
+    excluded_count: number;
+    per_class_counts: Record<string, number>;
+  };
+  summaries: Record<ClassSimilarityMetric, ClassSimilarityBoxSummary[]>;
+  items: ClassSimilarityItem[];
+};
+
+export type ClassSimilarityJob = {
+  job_id: string;
+  run_id: string;
+  state: JobStatus["state"];
+  done: number;
+  total: number;
+  percent: number;
+  result: ClassSimilarityResult | null;
+  error: JobStatus["error"];
+  can_cancel: boolean;
+};
+
 export type CoverageRun = {
   run_id: string;
   model_id: string;
@@ -1185,6 +1260,17 @@ async function uploadFile<T>(path: string, file: File): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean; api_version: string; models_available: number }>("/api/v1/health"),
   models: () => request<{ items: ModelOption[] }>("/api/v1/models"),
+  createClassSimilarityJob: (runId: string, input: { model_id: string; k: number; analysis_split: string }) =>
+    request<{ job_id: string; run_id: string; state: string }>(
+      "/api/v1/runs/" + encodeURIComponent(runId) + "/class-similarity/jobs",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
+  classSimilarityJob: (jobId: string) => request<ClassSimilarityJob>(
+    "/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId),
+  ),
+  cancelClassSimilarityJob: (jobId: string) => request<{ job_id: string; state: string }>(
+    "/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId), { method: "DELETE" },
+  ),
   createAnomalyModelJob: (input: {
     train_folders: string[];
     model_id: string;

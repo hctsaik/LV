@@ -91,6 +91,10 @@ from react_evaluation import (
     run_detection_evaluation,
     run_detection_evaluation_demo,
 )
+from class_similarity import analyze as analyze_class_similarity
+from class_similarity import build_box_summary, ClassSimilarityError
+from class_similarity_records import canonical_path as canonical_class_similarity_path
+from class_similarity_records import prepare_records as prepare_class_similarity_records
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 from safe_io import safe_open_image
 
@@ -130,6 +134,12 @@ class CreateVisualizationJob(BaseModel):
     methods: list[str] = Field(default_factory=list, max_length=5)
     umap_reference: bool = False
     umap_rebuild: bool = False
+
+
+class CreateClassSimilarityJob(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    k: int = Field(default=5, ge=1, le=20)
+    analysis_split: str = Field(default="all", max_length=128)
 
 
 class CreateDetectionEvaluationRequest(BaseModel):
@@ -725,6 +735,19 @@ class _Job:
 
 
 @dataclass
+class _ClassSimilarityJob:
+    job_id: str
+    run_id: str
+    request: CreateClassSimilarityJob
+    state: str = "queued"
+    done: int = 0
+    total: int = 0
+    result: dict | None = None
+    error: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
 class _ComparisonJob:
     job_id: str
     request: CreateComparisonJob
@@ -939,6 +962,7 @@ def create_app(
         object_loader = lambda model_id, **_kwargs: loader(model_id)
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
+    app.state.class_similarity_jobs = {}
     app.state.runs = {}
     app.state.current_run_id = None
     app.state.diagnostic_references = {}
@@ -986,6 +1010,7 @@ def create_app(
     def has_active_job() -> bool:
         jobs = (
             list(app.state.jobs.values())
+            + list(app.state.class_similarity_jobs.values())
             + list(app.state.comparison_jobs.values())
             + list(app.state.coverage_jobs.values())
             + list(app.state.groupdiff_jobs.values())
@@ -4861,6 +4886,225 @@ def create_app(
                 key: value for key, value in run.items()
                 if key not in {"image_paths", "_raw_embeddings", "_phashes", "_source_sha256"}
             }
+
+    def class_similarity_job_view(job: _ClassSimilarityJob) -> dict:
+        percent = int(job.done * 100 / job.total) if job.total else (100 if job.state == "completed" else 0)
+        return {
+            "job_id": job.job_id,
+            "run_id": job.run_id,
+            "state": job.state,
+            "done": job.done,
+            "total": job.total,
+            "percent": max(0, min(100, percent)),
+            "result": job.result,
+            "error": job.error,
+            "can_cancel": job.state in {"queued", "running"},
+        }
+
+    def execute_class_similarity_job(
+        job: _ClassSimilarityJob,
+        run: dict,
+        raw_embeddings: np.ndarray,
+    ) -> None:
+        try:
+            with app.state.lock:
+                job.state = "running"
+                job.total = max(1, len(run.get("records", [])))
+
+            unit = str(run.get("unit") or "image")
+            mode = str(run.get("mode") or "classifier")
+            records = [dict(record) for record in run.get("records", [])]
+            image_paths = [Path(path).resolve() for path in run.get("image_paths", [])]
+            source_hashes = list(run.get("_source_sha256") or [])
+            if len(records) != len(image_paths) or len(records) != len(source_hashes):
+                raise ClassSimilarityError("The Visualize source identity is incomplete.")
+
+            generation_hashes = {}
+            for index, (record, path, expected_hash) in enumerate(zip(records, image_paths, source_hashes)):
+                if not path.is_file() or _sha256_file(path) != expected_hash:
+                    raise ClassSimilarityError("A source image changed after this Visualize run.")
+                generation_hashes[canonical_class_similarity_path(path)] = str(expected_hash)
+                if unit == "object":
+                    record["image_path"] = str(path)
+                else:
+                    record["path"] = str(path)
+
+            context = {
+                "level": unit,
+                "data_token": f"{job.run_id}:{job.request.model_id}",
+                "viz_mode": "Object Detector" if mode == "detector" else "Image Classifier",
+                "analysis_split": job.request.analysis_split,
+                "k": job.request.k,
+                "model": job.request.model_id,
+                "model_weights_id": job.request.model_id,
+                "embedding_recipe": {
+                    "model_id": job.request.model_id,
+                    "object_policy": run.get("object_policy"),
+                },
+                "generation": {
+                    "source_hashes": generation_hashes,
+                    "recipe": {"run_id": job.run_id, "model_id": job.request.model_id},
+                },
+            }
+            prepared = prepare_class_similarity_records(records, raw_embeddings, context)
+            if not prepared.source_verified:
+                raise ClassSimilarityError("The Visualize source could not be verified.")
+
+            def update_progress(done: int, total: int) -> None:
+                if job.cancel_event.is_set():
+                    raise JobCancelled()
+                with app.state.lock:
+                    job.done = max(0, min(int(done), int(total)))
+                    job.total = max(1, int(total))
+
+            analysis = analyze_class_similarity(
+                prepared.embeddings,
+                prepared.labels,
+                prepared.record_ids,
+                eligibility=prepared.eligibility,
+                invalid_reasons=prepared.invalid_reasons,
+                k=job.request.k,
+                progress=update_progress,
+            )
+            if job.cancel_event.is_set():
+                raise JobCancelled()
+
+            def public_neighbor(neighbor) -> dict:
+                index = int(neighbor.input_index)
+                record = prepared.records[index]
+                return {
+                    "index": int(prepared.original_index[index]),
+                    "filename": str(record.get("filename") or ""),
+                    "label": record.get("label"),
+                    "cosine": float(neighbor.cosine),
+                }
+
+            items = []
+            for item in analysis.items:
+                index = int(item.input_index)
+                record = prepared.records[index]
+                items.append({
+                    "record_id": item.record_id,
+                    "index": int(prepared.original_index[index]),
+                    "filename": str(record.get("filename") or ""),
+                    "label": item.label,
+                    "split": str(record.get("split") or ""),
+                    "bbox": record.get("bbox"),
+                    "obj_index": record.get("obj_index"),
+                    "same": item.same,
+                    "other": item.other,
+                    "margin": item.margin,
+                    "rival_class": item.rival_class,
+                    "same_k": item.same_k,
+                    "rival_k": item.rival_k,
+                    "status": item.status,
+                    "reasons": item.reasons,
+                    "same_neighbors": [public_neighbor(value) for value in item.same_neighbors],
+                    "rival_neighbors": [public_neighbor(value) for value in item.rival_neighbors],
+                    "tied_rival_count": item.tied_rival_count,
+                    "tied_rival_classes": item.tied_rival_classes,
+                })
+
+            summaries = {
+                metric: build_box_summary(analysis.items, metric)
+                for metric in ("margin", "same", "other")
+            }
+            result = {
+                "analysis_key": prepared.analysis_key,
+                "run_id": job.run_id,
+                "model_id": job.request.model_id,
+                "unit": unit,
+                "k": job.request.k,
+                "analysis_split": prepared.analysis_split,
+                "source_status": prepared.source_status,
+                "summary": {
+                    "input_count": analysis.input_count,
+                    "valid_count": analysis.valid_count,
+                    "excluded_count": analysis.excluded_count,
+                    "per_class_counts": analysis.per_class_counts,
+                },
+                "summaries": summaries,
+                "items": items,
+            }
+            with app.state.lock:
+                if app.state.current_run_id != job.run_id:
+                    raise ClassSimilarityError("The Visualize run changed during class-similarity analysis.")
+                job.result = result
+                job.done = job.total = len(items)
+                job.state = "completed"
+        except JobCancelled:
+            with app.state.lock:
+                job.state = "cancelled"
+        except ClassSimilarityError:
+            with app.state.lock:
+                job.state = "failed"
+                job.error = {
+                    "code": "CLASS_SIMILARITY_INVALID",
+                    "message": "The selected records or source snapshot are invalid. Create a new Visualize run and retry.",
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV class-similarity analysis failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state = "failed"
+                job.error = {
+                    "code": "CLASS_SIMILARITY_FAILED",
+                    "message": "Class-similarity analysis failed. Check the local worker log and retry.",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/runs/{run_id}/class-similarity/jobs", status_code=202)
+    def create_class_similarity_job(run_id: str, request: CreateClassSimilarityJob) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            raw_by_model = app.state.raw_embeddings.get(run_id, {})
+            raw = raw_by_model.get(request.model_id)
+            if run is None or app.state.current_run_id != run_id or raw is None:
+                raise HTTPException(status_code=409, detail={
+                    "code": "CLASS_SIMILARITY_RUN_UNAVAILABLE",
+                    "message": "Create a current Visualize run with the selected model before calculating class similarity.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if request.model_id not in set(run.get("models", [])):
+                raise HTTPException(status_code=422, detail="The selected model is not part of this Visualize run.")
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "Wait for the active local analysis to finish before calculating class similarity.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            run_snapshot = copy.deepcopy(run)
+            raw_snapshot = np.array(raw, copy=True)
+            job_id = uuid.uuid4().hex
+            job = _ClassSimilarityJob(job_id=job_id, run_id=run_id, request=request)
+            app.state.class_similarity_jobs[job_id] = job
+        threading.Thread(
+            target=execute_class_similarity_job,
+            args=(job, run_snapshot, raw_snapshot),
+            daemon=True,
+            name=f"lv-class-similarity-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state, "run_id": run_id}
+
+    @app.get("/api/v1/class-similarity/jobs/{job_id}")
+    def get_class_similarity_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.class_similarity_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Class-similarity job not found")
+            return class_similarity_job_view(job)
+
+    @app.delete("/api/v1/class-similarity/jobs/{job_id}", status_code=202)
+    def cancel_class_similarity_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.class_similarity_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Class-similarity job not found")
+            if job.state not in {"queued", "running"}:
+                raise HTTPException(status_code=409, detail="Class-similarity job is already finished")
+            job.cancel_event.set()
+            job.state = "cancelling"
+            return {"job_id": job_id, "state": job.state}
 
     def public_diagnostic_reference(
         context: dict,

@@ -610,6 +610,81 @@ def test_lv_web_01_ic_01_nativeapp_folder_grant_visible_react_journey(
     }
 
 
+def test_lv_web_01_cs_01_visible_class_similarity_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible React flow ranks same/rival evidence and reads the selected source image."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "class-similarity-fixture")
+    source_hashes = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda model_id: _worker_fixture_model(model_id),
+    )
+    server = None
+    server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1000})
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-fixture-model").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=30_000)
+
+            page.get_by_test_id("open-class-similarity").click()
+            expect(page.get_by_test_id("class-similarity-workspace")).to_be_visible()
+            page.get_by_role("button", name="Calculate class similarity").click()
+            expect(page.get_by_test_id("class-similarity-summary")).to_contain_text("eligible", timeout=15_000)
+            expect(page.get_by_test_id("class-similarity-row")).to_have_count(4)
+            candidate_count = page.get_by_test_id("class-similarity-candidate-count")
+            page.get_by_label("Class similarity threshold", exact=True).fill("-2")
+            expect(candidate_count).to_contain_text("0 candidates")
+            page.get_by_label("Class similarity threshold", exact=True).fill("2")
+            expect(candidate_count).to_contain_text("4 candidates")
+            page.get_by_role("button", name="Select current candidates (4)").click()
+            page.get_by_role("button", name="Add selected to Curation").click()
+            expect(page.get_by_role("status").filter(has_text="Added 4; skipped 0")).to_be_visible(timeout=15_000)
+            page.get_by_test_id("class-similarity-row").first.get_by_role("button").click()
+            preview = page.get_by_test_id("class-similarity-preview")
+            expect(preview).to_be_visible()
+            expect(preview).to_have_js_property("naturalWidth", 64)
+            expect(page.get_by_role("heading", name="Same-class neighbors")).to_be_visible()
+            expect(page.get_by_role("heading", name="Rival-class neighbors")).to_be_visible()
+            selected_name = page.get_by_test_id("class-similarity-row").first.locator("button").inner_text()
+            page.get_by_role("button", name="Open record in Visualize").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(selected_name)
+            page.get_by_test_id("open-curation").click()
+            expect(page.get_by_test_id("curation-item")).to_have_count(4)
+            expect(page.get_by_test_id("curation-item").first).to_contain_text("類別相似度")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+
+
 def test_lv_web_01_ic_02_multi_model_projections_visible_journey(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
