@@ -2145,6 +2145,85 @@ def test_case_lv_web_01_ic_02_multi_model_projection_views(
     assert run["method"] == "pca"
 
 
+def test_case_lv_web_01_ic_02_real_models_match_streamlit_projection_values(
+    classifier_fixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Opt-in real-weight run compares every React projection with the legacy calculation."""
+    model_dir_value = os.environ.get("LV_TEST_MODELS_DIR")
+    if not model_dir_value:
+        pytest.skip("set LV_TEST_MODELS_DIR to a local LV models/ directory for real-weight parity")
+
+    model_dir = Path(model_dir_value).expanduser().resolve()
+    models = ["dinov2_vits14", "dinov2_vitb14"]
+    for model_id in models:
+        weight = model_dir / model_id / f"{model_id}.pth"
+        assert weight.is_file(), f"missing local real-model weight: {weight}"
+
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+    from _utils import load_model
+    import app as streamlit_app
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "react-cache"))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "case-cache"))
+    methods = ["pca", "tsne", "umap", "lda", "sumap"]
+    application = create_app(
+        model_catalog=lambda: models,
+        model_loader=lambda model_id: load_model(model_id, models_dir=model_dir),
+    )
+    with TestClient(application) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in classifier_fixture["folders"]],
+            "model_ids": models,
+            "methods": methods,
+        })
+        assert job["state"] == "completed", job
+        run = client.get(f"/api/v1/runs/{job['run_id']}").json()
+        raw_by_model = application.state.raw_embeddings[job["run_id"]]
+
+    assert run["models"] == models
+    assert run["embedding_shapes"] == {
+        "dinov2_vits14": [4, 384],
+        "dinov2_vitb14": [4, 768],
+    }
+    views = {(view["model_id"], view["method"]): view for view in run["views"]}
+    assert set(views) == {(model_id, method) for model_id in models for method in methods}
+
+    labels = [record["label"] for record in run["records"]]
+    sample_count = len(run["records"])
+    components = min(3, max(1, sample_count - 2))
+    for model_id in models:
+        embeddings = raw_by_model[model_id]
+        expected = {
+            "pca": PCA(n_components=components, random_state=42).fit_transform(embeddings),
+            "tsne": TSNE(
+                n_components=components,
+                random_state=42,
+                perplexity=min(30, max(1, sample_count - 1)),
+            ).fit_transform(embeddings),
+            "umap": streamlit_app._umap().UMAP(
+                n_components=components,
+                n_neighbors=min(15, max(2, sample_count - 1)),
+                random_state=42,
+            ).fit_transform(embeddings),
+            "lda": streamlit_app._supervised_projection(
+                embeddings, labels, "lda", components,
+            ),
+            "sumap": streamlit_app._supervised_projection(
+                embeddings, labels, "sumap", components,
+            ),
+        }
+        for method, coordinates in expected.items():
+            view = views[(model_id, method)]
+            actual = np.asarray([[point["x"], point["y"]] for point in view["points"]])
+            if coordinates.shape[1] == 1:
+                coordinates = np.hstack((coordinates, np.zeros((len(coordinates), 1))))
+            np.testing.assert_allclose(actual, coordinates[:, :2], rtol=2e-4, atol=2e-4)
+
+    for path, expected_hash in classifier_fixture["hashes"].items():
+        assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == expected_hash
+
+
 def test_case_lv_web_01_ic_03_fixed_umap_reference_frame(
     classifier_fixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
