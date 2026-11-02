@@ -1335,6 +1335,26 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
   background: #eff5ff;
 }
 
+.class-similarity-evaluation { display: grid; gap: 1rem; margin: 1.4rem 0; padding: 1.2rem; border: 1px solid var(--line, #dce3ec); border-radius: 14px; background: var(--surface, #fff); }
+.class-similarity-evaluation > p { max-width: 78ch; margin: 0; color: var(--muted, #64748b); }
+.class-similarity-evaluation-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 0.75rem; }
+.class-similarity-evaluation-controls > label { display: grid; gap: 0.35rem; color: var(--muted, #64748b); font-size: 0.82rem; }
+.class-similarity-evaluation-controls select, .class-similarity-file-input input { max-width: 100%; padding: 0.45rem; border: 1px solid var(--line, #dce3ec); border-radius: 7px; background: var(--surface, #fff); color: var(--text, #172033); }
+.class-similarity-evaluation-results { display: grid; gap: 0.6rem; padding: 1rem; border-radius: 10px; background: var(--surface-muted, #f5f7fa); }
+.class-similarity-evaluation-results > p { margin: 0; }
+.class-similarity-evaluation-metrics { display: flex; flex-wrap: wrap; gap: 0.6rem 1.2rem; }
+.class-similarity-evaluation-metrics span { color: var(--muted, #64748b); }
+.class-similarity-evaluation-metrics strong { color: var(--text, #172033); }
+.class-similarity-pr-plot { width: min(100%, 340px); overflow: visible; }
+.class-similarity-pr-axis { stroke: var(--line-strong, #94a3b8); stroke-width: 1; }
+.class-similarity-pr-line { fill: none; stroke: var(--accent, #2459a6); stroke-width: 2.5; }
+.class-similarity-pr-point { fill: var(--accent, #2459a6); }
+.class-similarity-pr-label { fill: var(--muted, #64748b); font-size: 10px; }
+.class-similarity-export-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 0.7rem 1.2rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+.class-similarity-export-controls > span { color: var(--muted, #64748b); }
+.class-similarity-export-controls > div { display: inline-flex; align-items: center; gap: 0.4rem; }
+.class-similarity-export-controls strong { margin-right: 0.15rem; font-size: 0.83rem; }
+
 @media (max-width: 900px) {
   .class-similarity-workspace { padding: 1rem; }
   .class-similarity-results-grid { grid-template-columns: 1fr; }

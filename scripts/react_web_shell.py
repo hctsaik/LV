@@ -93,8 +93,20 @@ from react_evaluation import (
 )
 from class_similarity import analyze as analyze_class_similarity
 from class_similarity import build_box_summary, ClassSimilarityError
+from class_similarity_export import evaluation_template as class_similarity_evaluation_template
+from class_similarity_export import export_report as export_class_similarity_report
 from class_similarity_records import canonical_path as canonical_class_similarity_path
 from class_similarity_records import prepare_records as prepare_class_similarity_records
+from class_similarity_threshold import (
+    candidate_mask as class_similarity_candidate_mask,
+    evaluate_threshold as evaluate_class_similarity_threshold,
+    parse_policy as parse_class_similarity_policy,
+    precision_recall_curve as class_similarity_precision_recall_curve,
+    preview_key as class_similarity_preview_key,
+    summarize_candidates as summarize_class_similarity_candidates,
+    validate_evaluation_manifest as validate_class_similarity_manifest,
+    workload_curve as class_similarity_workload_curve,
+)
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
 from safe_io import safe_open_image
 
@@ -140,6 +152,27 @@ class CreateClassSimilarityJob(BaseModel):
     model_id: str = Field(min_length=1, max_length=128)
     k: int = Field(default=5, ge=1, le=20)
     analysis_split: str = Field(default="all", max_length=128)
+
+
+class ClassSimilarityEvaluationTemplateRequest(BaseModel):
+    scope: Literal["all", "selected"] = "all"
+    selected_ids: list[str] = Field(default_factory=list, max_length=10000)
+
+
+class ClassSimilarityEvaluationRequest(BaseModel):
+    manifest: dict
+    policy: dict = Field(default_factory=lambda: {"mode": "threshold", "threshold": 0.0})
+
+
+class ClassSimilarityEvaluationPreviewRequest(BaseModel):
+    policy: dict = Field(default_factory=lambda: {"mode": "threshold", "threshold": 0.0})
+
+
+class ClassSimilarityReportRequest(BaseModel):
+    scope: Literal["all", "candidates", "selected"] = "all"
+    selected_ids: list[str] = Field(default_factory=list, max_length=10000)
+    policy: dict = Field(default_factory=lambda: {"mode": "threshold", "threshold": 0.0})
+    format: Literal["csv", "json"]
 
 
 class CreateDetectionEvaluationRequest(BaseModel):
@@ -744,6 +777,10 @@ class _ClassSimilarityJob:
     total: int = 0
     result: dict | None = None
     error: dict | None = None
+    prepared: object | None = None
+    analysis: object | None = None
+    source_hashes: dict[str, str] = field(default_factory=dict)
+    evaluation: dict | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -5029,6 +5066,9 @@ def create_app(
             with app.state.lock:
                 if app.state.current_run_id != job.run_id:
                     raise ClassSimilarityError("The Visualize run changed during class-similarity analysis.")
+                job.prepared = prepared
+                job.analysis = analysis
+                job.source_hashes = generation_hashes
                 job.result = result
                 job.done = job.total = len(items)
                 job.state = "completed"
@@ -5105,6 +5145,184 @@ def create_app(
             job.cancel_event.set()
             job.state = "cancelling"
             return {"job_id": job_id, "state": job.state}
+
+    def current_class_similarity_job(job_id: str, *, verify_sources: bool = False) -> _ClassSimilarityJob:
+        with app.state.lock:
+            job = app.state.class_similarity_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Class-similarity job not found")
+            if job.state != "completed" or job.prepared is None or job.analysis is None:
+                raise HTTPException(status_code=409, detail="Class-similarity analysis is not ready")
+            if app.state.current_run_id != job.run_id:
+                raise HTTPException(status_code=409, detail="The Visualize run changed; recalculate class similarity.")
+        if verify_sources:
+            for source_path, expected_hash in job.source_hashes.items():
+                path = Path(source_path)
+                try:
+                    if not path.is_file() or _sha256_file(path) != expected_hash:
+                        raise HTTPException(status_code=409, detail="A Visualize source changed after analysis.")
+                except OSError as exc:
+                    raise HTTPException(status_code=409, detail="A Visualize source is no longer available.") from exc
+        return job
+
+    def class_similarity_evaluation_payload(job: _ClassSimilarityJob, policy: dict) -> dict:
+        prepared = job.prepared
+        analysis = job.analysis
+        parsed = parse_class_similarity_policy(policy)
+        mask = class_similarity_candidate_mask(analysis.items, parsed)
+        summary = summarize_class_similarity_candidates(analysis.items, mask)
+        evaluation = job.evaluation
+        counts = evaluate_class_similarity_threshold(
+            analysis.items, mask, evaluation, source_verified=prepared.source_verified,
+        ) if evaluation else None
+        precision_recall = []
+        if evaluation and evaluation.get("purpose") != "heldout" and prepared.source_verified:
+            for point in class_similarity_precision_recall_curve(
+                analysis.items, evaluation, source_verified=prepared.source_verified,
+            ):
+                point_policy = point.get("policy") or {}
+                precision_recall.append({
+                    "threshold": point_policy.get("threshold")
+                    if point_policy.get("mode") == "threshold" else None,
+                    "precision": point["precision"],
+                    "recall": point["recall"],
+                    "tp": point["tp"], "fp": point["fp"], "fn": point["fn"],
+                })
+        return {
+            "policy": {"mode": parsed.mode, "threshold": parsed.threshold,
+                       "comparator": parsed.comparator, "score": parsed.score},
+            "summary": {
+                "eligible_n": summary.eligible_n,
+                "candidate_n": summary.candidate_n,
+                "unscorable_n": summary.unscorable_n,
+                "ratio": summary.ratio,
+                "per_class": summary.per_class,
+                "input_count": summary.input_count,
+            },
+            "evaluation": ({
+                "evaluation_id": evaluation.get("evaluation_id"),
+                "evaluation_version": evaluation.get("evaluation_version"),
+                "purpose": evaluation.get("purpose"),
+                "truth_digest": evaluation.get("truth_digest"),
+                "frozen_ids": evaluation.get("frozen_ids") or [],
+                "pending_n": sum(1 for review in evaluation.get("reviews") or []
+                                 if review.get("verdict") == "unreviewed"),
+            } if evaluation else None),
+            "counts": ({
+                "status": counts.status,
+                "unavailable_reason": counts.unavailable_reason,
+                "coverage": counts.coverage,
+                "e0_n": counts.e0_n,
+                "e_n": counts.e_n,
+                "known_incorrect_n": counts.known_incorrect_n,
+                "unknown_n": counts.unknown_n,
+                "unscorable_in_e0": counts.unscorable_in_e0,
+                "tp": counts.tp,
+                "fp": counts.fp,
+                "fn": counts.fn,
+                "tn": counts.tn,
+                "precision": counts.precision,
+                "recall": counts.recall,
+                "confusion_ids": counts.confusion_ids,
+            } if counts else None),
+            "workload_curve": class_similarity_workload_curve(analysis.items),
+            "precision_recall_curve": precision_recall,
+        }
+
+    @app.post("/api/v1/class-similarity/jobs/{job_id}/evaluation/template")
+    def download_class_similarity_evaluation_template(
+        job_id: str, request: ClassSimilarityEvaluationTemplateRequest,
+    ) -> Response:
+        job = current_class_similarity_job(job_id, verify_sources=True)
+        prepared = job.prepared
+        if request.scope == "selected":
+            selected = set(request.selected_ids)
+            ids = [record_id for record_id in prepared.record_ids
+                   if record_id in selected and not record_id.startswith("invalid:")]
+            if len(ids) != len(selected):
+                raise HTTPException(status_code=422, detail="Selection contains unavailable records.")
+            method = "React panel selection (manual sample; not random or population-wide)"
+        else:
+            ids = [record_id for record_id, eligible in zip(prepared.record_ids, prepared.eligibility)
+                   if eligible and not record_id.startswith("invalid:")]
+            method = "Full eligible Visualize population"
+        payload = class_similarity_evaluation_template(
+            frozen_ids=ids, records=prepared.records, record_ids=prepared.record_ids,
+            labels=prepared.effective_label, snapshot_key=prepared.source_snapshot_key,
+            selection_method=method, evaluation_id=f"eval-{prepared.analysis_key[:8]}",
+            level=str(job.result.get("unit") or "image"),
+        )
+        return Response(
+            content=payload, media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="class_similarity_evaluation.json"'},
+        )
+
+    @app.put("/api/v1/class-similarity/jobs/{job_id}/evaluation")
+    def import_class_similarity_evaluation(
+        job_id: str, request: ClassSimilarityEvaluationRequest,
+    ) -> dict:
+        job = current_class_similarity_job(job_id, verify_sources=True)
+        prepared = job.prepared
+        snapshot = {
+            "snapshot_key": prepared.source_snapshot_key,
+            "original_labels": {record_id: label for record_id, label in
+                                 zip(prepared.record_ids, prepared.effective_label)},
+        }
+        try:
+            evaluation = validate_class_similarity_manifest(
+                request.manifest, snapshot, job.analysis.items,
+            )
+            parse_class_similarity_policy(request.policy)
+        except ClassSimilarityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        with app.state.lock:
+            job.evaluation = evaluation
+        return class_similarity_evaluation_payload(job, request.policy)
+
+    @app.post("/api/v1/class-similarity/jobs/{job_id}/evaluation/preview")
+    def preview_class_similarity_evaluation(
+        job_id: str, request: ClassSimilarityEvaluationPreviewRequest,
+    ) -> dict:
+        job = current_class_similarity_job(job_id)
+        try:
+            return class_similarity_evaluation_payload(job, request.policy)
+        except ClassSimilarityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/class-similarity/jobs/{job_id}/report")
+    def download_class_similarity_report(job_id: str, request: ClassSimilarityReportRequest) -> Response:
+        job = current_class_similarity_job(job_id, verify_sources=True)
+        prepared = job.prepared
+        analysis = job.analysis
+        try:
+            policy = parse_class_similarity_policy(request.policy)
+            mask = class_similarity_candidate_mask(analysis.items, policy)
+            counts = evaluate_class_similarity_threshold(
+                analysis.items, mask, job.evaluation,
+                source_verified=prepared.source_verified,
+            ) if job.evaluation else None
+            preview = class_similarity_preview_key(
+                prepared.analysis_key, policy,
+                job.evaluation.get("evaluation_key") if job.evaluation else None,
+            )
+            csv_bytes, json_bytes = export_class_similarity_report(
+                analysis, prepared.records, scope=request.scope,
+                local_selected_ids=request.selected_ids,
+                committed_preview=policy, evaluation=job.evaluation,
+                evaluation_counts=counts, prepared=prepared,
+                level=str(job.result.get("unit") or "image"),
+                analysis_key=prepared.analysis_key, preview_key=preview,
+                label_status=prepared.label_status,
+            )
+        except ClassSimilarityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        content, media_type, filename = (
+            (csv_bytes, "text/csv; charset=utf-8", "class_similarity.csv")
+            if request.format == "csv" else
+            (json_bytes, "application/json", "class_similarity.json")
+        )
+        return Response(content=content, media_type=media_type,
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     def public_diagnostic_reference(
         context: dict,

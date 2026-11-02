@@ -505,6 +505,20 @@ export type ClassSimilarityJob = {
   can_cancel: boolean;
 };
 
+export type ClassSimilarityEvaluationPreview = {
+  policy: { mode: "threshold" | "none" | "all_eligible"; threshold: number | null; comparator: "lt"; score: "margin" };
+  summary: { eligible_n: number; candidate_n: number; unscorable_n: number; ratio: number | null; per_class: Array<Record<string, unknown>>; input_count: number };
+  evaluation: { evaluation_id: string; evaluation_version: number; purpose: "tuning" | "heldout"; truth_digest: string; frozen_ids: string[]; pending_n: number } | null;
+  counts: {
+    status: string; unavailable_reason: string | null; coverage: number | null;
+    e0_n: number; e_n: number; known_incorrect_n: number; unknown_n: number; unscorable_in_e0: number;
+    tp: number | null; fp: number | null; fn: number | null; tn: number | null;
+    precision: number | null; recall: number | null; confusion_ids: Record<string, string[]>;
+  } | null;
+  workload_curve: Array<{ t: number | null; mode: string; candidate_n: number; label?: string | null }>;
+  precision_recall_curve: Array<{ threshold: number | null; precision: number; recall: number; tp: number; fp: number; fn: number }>;
+};
+
 export type CoverageRun = {
   run_id: string;
   model_id: string;
@@ -1271,6 +1285,18 @@ export const api = {
   cancelClassSimilarityJob: (jobId: string) => request<{ job_id: string; state: string }>(
     "/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId), { method: "DELETE" },
   ),
+  classSimilarityEvaluationTemplate: (jobId: string, input: { scope: "all" | "selected"; selected_ids: string[] }) =>
+    requestBlob("/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId) + "/evaluation/template", input),
+  importClassSimilarityEvaluation: (jobId: string, manifest: Record<string, unknown>, policy: ClassSimilarityEvaluationPreview["policy"]) =>
+    request<ClassSimilarityEvaluationPreview>("/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId) + "/evaluation", {
+      method: "PUT", body: JSON.stringify({ manifest, policy }),
+    }),
+  previewClassSimilarityEvaluation: (jobId: string, policy: ClassSimilarityEvaluationPreview["policy"]) =>
+    request<ClassSimilarityEvaluationPreview>("/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId) + "/evaluation/preview", {
+      method: "POST", body: JSON.stringify({ policy }),
+    }),
+  classSimilarityReport: (jobId: string, input: { scope: "all" | "candidates" | "selected"; selected_ids: string[]; policy: ClassSimilarityEvaluationPreview["policy"]; format: "csv" | "json" }) =>
+    requestBlob("/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId) + "/report", input),
   createAnomalyModelJob: (input: {
     train_folders: string[];
     model_id: string;

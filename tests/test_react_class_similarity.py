@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import csv
+import io
+import json
 import time
 from pathlib import Path
 
@@ -133,6 +136,96 @@ def test_class_similarity_api_uses_current_raw_embeddings_and_keeps_paths_privat
         assert all(item["rival_neighbors"] for item in result["items"])
         assert str(tmp_path) not in analysis.__repr__()
         assert {path: hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in source_hashes} == source_hashes
+
+
+def test_class_similarity_evaluation_template_review_and_scoped_exports(tmp_path: Path, monkeypatch):
+    folders, source_hashes = _fixture(tmp_path / "evaluation-dataset")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
+    app = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: _embedder,
+    )
+    with TestClient(app) as client:
+        created = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(folder) for folder in folders],
+            "model_id": "fixture-model", "method": "pca",
+        })
+        run_job = _wait_for_job(client, "/api/v1/jobs/{job_id}", created.json()["job_id"])
+        assert run_job["state"] == "completed", run_job
+        run_id = run_job["run_id"]
+        started = client.post(f"/api/v1/runs/{run_id}/class-similarity/jobs", json={
+            "model_id": "fixture-model", "k": 1,
+        })
+        analysis = _wait_for_job(
+            client, "/api/v1/class-similarity/jobs/{job_id}", started.json()["job_id"],
+        )
+        assert analysis["state"] == "completed", analysis
+        job_id = started.json()["job_id"]
+
+        template_response = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation/template",
+            json={"scope": "all", "selected_ids": []},
+        )
+        assert template_response.status_code == 200, template_response.text
+        template = json.loads(template_response.content)
+        assert len(template["frozen_ids"]) == 4
+        assert all(review["verdict"] == "unreviewed" for review in template["reviews"])
+        for index, review in enumerate(template["reviews"]):
+            review["verdict"] = "incorrect" if index == 0 else "correct"
+
+        policy = {"mode": "threshold", "threshold": 2.0}
+        imported = client.put(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation",
+            json={"manifest": template, "policy": policy},
+        )
+        assert imported.status_code == 200, imported.text
+        payload = imported.json()
+        assert payload["evaluation"]["pending_n"] == 0
+        assert payload["counts"]["status"] == "ready"
+        assert payload["counts"]["coverage"] == 1.0
+        assert payload["counts"]["precision"] is not None
+        assert payload["counts"]["recall"] is not None
+        assert payload["precision_recall_curve"]
+
+        preview = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation/preview",
+            json={"policy": {"mode": "none"}},
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["summary"]["candidate_n"] == 0
+        assert preview.json()["counts"]["status"] == "ready"
+
+        csv_response = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/report",
+            json={"scope": "candidates", "selected_ids": [], "policy": policy, "format": "csv"},
+        )
+        assert csv_response.status_code == 200, csv_response.text
+        csv_rows = list(csv.DictReader(io.StringIO(csv_response.content.decode("utf-8-sig"))))
+        assert len(csv_rows) == 4
+        assert all(row["is_candidate"] == "1" for row in csv_rows)
+
+        json_response = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/report",
+            json={"scope": "selected", "selected_ids": [template["frozen_ids"][0]], "policy": policy, "format": "json"},
+        )
+        assert json_response.status_code == 200, json_response.text
+        report = json.loads(json_response.content)
+        assert report["scope"] == "selected"
+        assert report["evaluation"]["status"] == "ready"
+        assert len(report["items"]) == 1
+
+        source = folders[0] / "apple" / "a1.png"
+        Image.new("RGB", (32, 32), (1, 2, 3)).save(source)
+        stale_export = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/report",
+            json={"scope": "all", "selected_ids": [], "policy": policy, "format": "json"},
+        )
+        assert stale_export.status_code == 409
+        assert "source changed" in stale_export.json()["message"]
+
+    assert any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
+               for path, digest in source_hashes.items())
 
 
 def test_class_similarity_rejects_a_run_after_its_source_changes(tmp_path: Path, monkeypatch):

@@ -5,6 +5,7 @@ import {
   type ClassSimilarityItem,
   type ClassSimilarityMetric,
   type ClassSimilarityResult,
+  type ClassSimilarityEvaluationPreview,
   type VisualizeUnit,
   type RunRecord,
 } from "./api";
@@ -22,6 +23,28 @@ const terminalStates = new Set(["completed", "failed", "cancelled"]);
 
 function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function PrecisionRecallPlot({ points }: { points: ClassSimilarityEvaluationPreview["precision_recall_curve"] }) {
+  if (points.length < 2) return <p className="class-similarity-empty">A tuning review set with at least one reviewed incorrect and one reviewed correct item is needed for a PR curve.</p>;
+  const xy = points.map((point) => `${32 + point.recall * 260},${180 - point.precision * 150}`).join(" ");
+  return <svg className="class-similarity-pr-plot" viewBox="0 0 320 210" role="img" aria-label="Precision recall curve">
+    <line x1="32" y1="30" x2="32" y2="180" className="class-similarity-pr-axis" />
+    <line x1="32" y1="180" x2="292" y2="180" className="class-similarity-pr-axis" />
+    <polyline points={xy} className="class-similarity-pr-line" />
+    {points.map((point, index) => <circle key={`${point.threshold}-${index}`} cx={32 + point.recall * 260} cy={180 - point.precision * 150} r="3" className="class-similarity-pr-point" />)}
+    <text x="150" y="204" className="class-similarity-pr-label">Recall</text>
+    <text x="4" y="22" className="class-similarity-pr-label">Precision</text>
+  </svg>;
 }
 
 function BoxPlot({ rows, threshold = null }: { rows: ClassSimilarityBoxSummary[]; threshold?: number | null }) {
@@ -84,6 +107,11 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [cartBusy, setCartBusy] = useState(false);
   const [cartMessage, setCartMessage] = useState("");
+  const [evaluationScope, setEvaluationScope] = useState<"all" | "selected">("all");
+  const [evaluationPreview, setEvaluationPreview] = useState<ClassSimilarityEvaluationPreview | null>(null);
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
+  const [evaluationMessage, setEvaluationMessage] = useState("");
+  const [reportBusy, setReportBusy] = useState(false);
 
   const splits = useMemo(() => [...new Set(records.map((record) => record.split).filter(Boolean))].sort(), [records]);
   const rows = useMemo(() => {
@@ -105,6 +133,15 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
     )).map((item) => item.record_id);
   }, [result, candidateMode, threshold]);
 
+  const currentPolicy: ClassSimilarityEvaluationPreview["policy"] = {
+    mode: candidateMode,
+    threshold: candidateMode === "threshold" ? threshold : null,
+    comparator: "lt",
+    score: "margin",
+  };
+  const evaluationPreviewIsCurrent = evaluationPreview?.policy.mode === currentPolicy.mode
+    && evaluationPreview.policy.threshold === currentPolicy.threshold;
+
   async function calculate() {
     if (busy) return;
     setBusy(true);
@@ -113,6 +150,8 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
     setSelected(null);
     setSelectedIds([]);
     setCartMessage("");
+    setEvaluationPreview(null);
+    setEvaluationMessage("");
     setVisibleRows(40);
     try {
       const created = await api.createClassSimilarityJob(runId, { model_id: modelId, k, analysis_split: analysisSplit });
@@ -162,6 +201,73 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
       setCartMessage(reason instanceof Error ? reason.message : "Could not add the selected records to Curation.");
     } finally {
       setCartBusy(false);
+    }
+  }
+
+  async function downloadEvaluationTemplate() {
+    if (!jobId || evaluationBusy) return;
+    setEvaluationBusy(true);
+    setEvaluationMessage("");
+    try {
+      const blob = await api.classSimilarityEvaluationTemplate(jobId, {
+        scope: evaluationScope,
+        selected_ids: evaluationScope === "selected" ? selectedIds : [],
+      });
+      saveBlob(blob, "class_similarity_evaluation.json");
+      setEvaluationMessage("Template downloaded. Review verdicts in the JSON, then upload it here.");
+    } catch (reason) {
+      setEvaluationMessage(reason instanceof Error ? reason.message : "Could not create the review template.");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  }
+
+  async function importEvaluationFile(file: File | undefined) {
+    if (!file || !jobId || evaluationBusy) return;
+    setEvaluationBusy(true);
+    setEvaluationMessage("");
+    try {
+      const manifest = JSON.parse(await file.text()) as Record<string, unknown>;
+      const preview = await api.importClassSimilarityEvaluation(jobId, manifest, currentPolicy);
+      setEvaluationPreview(preview);
+      setEvaluationMessage("Review set validated against this Visualize source snapshot.");
+    } catch (reason) {
+      setEvaluationPreview(null);
+      setEvaluationMessage(reason instanceof Error ? reason.message : "Could not validate this review JSON.");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  }
+
+  async function previewEvaluation() {
+    if (!jobId || !evaluationPreview?.evaluation || evaluationBusy) return;
+    setEvaluationBusy(true);
+    setEvaluationMessage("");
+    try {
+      setEvaluationPreview(await api.previewClassSimilarityEvaluation(jobId, currentPolicy));
+    } catch (reason) {
+      setEvaluationMessage(reason instanceof Error ? reason.message : "Could not score the current threshold.");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  }
+
+  async function exportReport(scope: "all" | "candidates" | "selected", format: "csv" | "json") {
+    if (!jobId || reportBusy || (scope === "selected" && !selectedIds.length)) return;
+    setReportBusy(true);
+    setEvaluationMessage("");
+    try {
+      const blob = await api.classSimilarityReport(jobId, {
+        scope,
+        selected_ids: scope === "selected" ? selectedIds : [],
+        policy: currentPolicy,
+        format,
+      });
+      saveBlob(blob, `class_similarity_${scope}.${format}`);
+    } catch (reason) {
+      setEvaluationMessage(reason instanceof Error ? reason.message : "Could not export class-similarity evidence.");
+    } finally {
+      setReportBusy(false);
     }
   }
 
@@ -240,6 +346,43 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
               <button type="button" className="primary-action" onClick={() => void addSelectedToCuration()} disabled={!selectedIds.length || cartBusy}>{cartBusy ? "Adding…" : "Add selected to Curation"}</button>
             </div>
             {cartMessage && <div className="class-similarity-progress" role="status">{cartMessage}</div>}
+          </section>
+
+          <section className="class-similarity-evaluation" aria-labelledby="class-similarity-evaluation-title">
+            <div className="class-similarity-panel-heading">
+              <div><div className="eyebrow">VERIFIED HUMAN REVIEW</div><h2 id="class-similarity-evaluation-title">Evaluation and evidence export</h2></div>
+              <span>Review verdicts stay attached to this source snapshot.</span>
+            </div>
+            <p>Download a frozen JSON template, label each item as incorrect, correct, unresolved, or unreviewed, then upload it to measure review coverage and threshold Precision / Recall.</p>
+            <div className="class-similarity-evaluation-controls">
+              <label><span>Template population</span><select aria-label="Evaluation template scope" value={evaluationScope} onChange={(event) => setEvaluationScope(event.target.value as "all" | "selected")}>
+                <option value="all">All eligible records</option><option value="selected">Selected records ({selectedIds.length})</option>
+              </select></label>
+              <button type="button" className="secondary-action" onClick={() => void downloadEvaluationTemplate()} disabled={evaluationBusy || (evaluationScope === "selected" && !selectedIds.length)}>Download evaluation template</button>
+              <label className="class-similarity-file-input"><span>Upload reviewed JSON</span><input aria-label="Upload class similarity evaluation JSON" type="file" accept="application/json,.json" disabled={evaluationBusy} onChange={(event) => { void importEvaluationFile(event.target.files?.[0]); event.currentTarget.value = ""; }} /></label>
+              {evaluationPreview?.evaluation && <button type="button" className="secondary-action" onClick={() => void previewEvaluation()} disabled={evaluationBusy}>{evaluationBusy ? "Calculating…" : "Evaluate current threshold"}</button>}
+            </div>
+            {evaluationMessage && <div className="class-similarity-progress" role="status">{evaluationMessage}</div>}
+            {evaluationPreview?.evaluation && <div className="class-similarity-evaluation-results" data-testid="class-similarity-evaluation-results">
+              <div className="class-similarity-evaluation-metrics">
+                <span><strong>{evaluationPreview.evaluation.pending_n}</strong> pending / {evaluationPreview.evaluation.frozen_ids.length} frozen</span>
+                <span><strong>{evaluationPreview.summary.candidate_n}</strong> candidates / {evaluationPreview.summary.eligible_n} scored</span>
+                <span><strong>{evaluationPreview.counts?.coverage === null || evaluationPreview.counts?.coverage === undefined ? "—" : `${(evaluationPreview.counts.coverage * 100).toFixed(1)}%`}</strong> review coverage</span>
+                <span><strong>{evaluationPreview.counts?.precision === null || evaluationPreview.counts?.precision === undefined ? "—" : evaluationPreview.counts.precision.toFixed(3)}</strong> precision</span>
+                <span><strong>{evaluationPreview.counts?.recall === null || evaluationPreview.counts?.recall === undefined ? "—" : evaluationPreview.counts.recall.toFixed(3)}</strong> recall</span>
+              </div>
+              {evaluationPreview.counts?.status === "ready" ? <p>TP {evaluationPreview.counts.tp} · FP {evaluationPreview.counts.fp} · FN {evaluationPreview.counts.fn} · TN {evaluationPreview.counts.tn} · {evaluationPreview.evaluation.purpose}</p> : <p className="class-similarity-empty">Precision / Recall unavailable: {evaluationPreview.counts?.unavailable_reason || "review enough frozen items first"}.</p>}
+              {evaluationPreview.evaluation.purpose === "tuning" && <PrecisionRecallPlot points={evaluationPreview.precision_recall_curve} />}
+              {!evaluationPreviewIsCurrent && <p className="class-similarity-empty">The threshold changed. Evaluate again to update these metrics.</p>}
+            </div>}
+            <div className="class-similarity-export-controls" aria-label="Export class similarity evidence">
+              <span>Export current analysis</span>
+              {(["all", "candidates", "selected"] as const).map((scope) => <div key={scope}>
+                <strong>{scope === "all" ? "All" : scope === "candidates" ? `Candidates (${candidateIds.length})` : `Selected (${selectedIds.length})`}</strong>
+                <button type="button" className="secondary-action" onClick={() => void exportReport(scope, "csv")} disabled={reportBusy || (scope === "selected" && !selectedIds.length)}>CSV</button>
+                <button type="button" className="secondary-action" onClick={() => void exportReport(scope, "json")} disabled={reportBusy || (scope === "selected" && !selectedIds.length)}>JSON</button>
+              </div>)}
+            </div>
           </section>
 
           <div className="class-similarity-results-grid">

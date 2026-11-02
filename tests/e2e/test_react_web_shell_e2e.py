@@ -660,6 +660,27 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
             page.get_by_role("button", name="Select current candidates (4)").click()
             page.get_by_role("button", name="Add selected to Curation").click()
             expect(page.get_by_role("status").filter(has_text="Added 4; skipped 0")).to_be_visible(timeout=15_000)
+
+            with page.expect_download() as download_info:
+                page.get_by_role("button", name="Download evaluation template").click()
+            template_download = download_info.value
+            edited_template_path = tmp_path / "class_similarity_review.json"
+            template = json.loads(Path(template_download.path()).read_text(encoding="utf-8"))
+            for index, review in enumerate(template["reviews"]):
+                review["verdict"] = "incorrect" if index == 0 else "correct"
+            edited_template_path.write_text(json.dumps(template), encoding="utf-8")
+            page.get_by_label("Upload class similarity evaluation JSON").set_input_files(str(edited_template_path))
+            expect(page.get_by_test_id("class-similarity-evaluation-results")).to_be_visible(timeout=15_000)
+            expect(page.get_by_test_id("class-similarity-evaluation-results")).to_contain_text("TP")
+            expect(page.get_by_test_id("class-similarity-evaluation-results")).to_contain_text("precision")
+            expect(page.get_by_role("img", name="Precision recall curve")).to_be_visible()
+            with page.expect_download() as report_download_info:
+                page.get_by_role("button", name="CSV", exact=True).first.click()
+            report_download = report_download_info.value
+            exported_rows = list(csv.DictReader(Path(report_download.path()).open(encoding="utf-8-sig")))
+            assert len(exported_rows) == 4
+            assert all(row["is_candidate"] == "1" for row in exported_rows)
+
             page.get_by_test_id("class-similarity-row").first.get_by_role("button").click()
             preview = page.get_by_test_id("class-similarity-preview")
             expect(preview).to_be_visible()
