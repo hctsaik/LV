@@ -34,6 +34,7 @@ import CurationWorkspace from "./CurationWorkspace";
 import FalsePositiveCaseWorkspace from "./FalsePositiveCaseWorkspace";
 const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
+const LazyGroupDiffWorkspace = lazy(() => import("./GroupDiffWorkspace"));
 const LazyCoverageWorkspace = lazy(() => import("./CoverageWorkspace"));
 const LazyAnomalyBankWorkspace = lazy(() => import("./AnomalyBankWorkspace"));
 const LazyFewshotSampleBankWorkspace = lazy(() => import("./FewshotSampleBankWorkspace"));
@@ -278,7 +279,7 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "curation" | "coverage" | "false_positive" | "anomaly" | "fewshot">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "anomaly" | "fewshot">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -1071,6 +1072,7 @@ export default function App() {
           <button type="button" className={activeTool === "coverage" ? "active" : ""} aria-current={activeTool === "coverage" ? "page" : undefined} onClick={() => { setCoverageMounted(true); setActiveTool("coverage"); }}>Coverage</button>
           <button type="button" data-testid="open-fewshot-samples" className={activeTool === "fewshot" ? "active" : ""} aria-current={activeTool === "fewshot" ? "page" : undefined} onClick={() => setActiveTool("fewshot")}>以樣搜樣</button>
           <button type="button" data-testid="open-anomaly-bank" className={activeTool === "anomaly" ? "active" : ""} aria-current={activeTool === "anomaly" ? "page" : undefined} onClick={() => setActiveTool("anomaly")}>瑕疵偵測</button>
+          <button type="button" data-testid="open-groupdiff" className={activeTool === "groupdiff" ? "active" : ""} aria-current={activeTool === "groupdiff" ? "page" : undefined} onClick={() => setActiveTool("groupdiff")}>差異探索</button>
           <button type="button" data-testid="open-curation" className={activeTool === "curation" ? "active" : ""} aria-current={activeTool === "curation" ? "page" : undefined} onClick={() => setActiveTool("curation")}>Curation{curationCount === null ? "" : ` (${curationCount})`}</button>
           <button type="button" data-testid="open-fp-cases" className={activeTool === "false_positive" ? "active" : ""} aria-current={activeTool === "false_positive" ? "page" : undefined} onClick={() => setActiveTool("false_positive")}>誤逮案件</button>
         </nav>
@@ -1343,6 +1345,10 @@ export default function App() {
         <CurationWorkspace onCountChange={setCurationCount} />
       ) : activeTool === "compare" ? (
         <CompareDistributions models={models} loadingModels={loadingModels} connected={connected} onCurationCountChange={setCurationCount} />
+      ) : activeTool === "groupdiff" ? (
+        <Suspense fallback={<div className="coverage-loading" role="status">載入 Good／Bad 差異工作區…</div>}>
+          <LazyGroupDiffWorkspace models={models} loadingModels={loadingModels} connected={connected} />
+        </Suspense>
       ) : activeTool === "coverage" ? null : <div className="workspace">
         <aside className="control-panel">
           <div className="eyebrow">VISUALIZE EMBEDDINGS</div>

@@ -490,6 +490,42 @@ export type CoverageProjectionResult = {
   warnings: string[];
 };
 
+export type GroupDiffRegion = {
+  rank: number;
+  peak_z: number;
+  mean_z: number;
+  stability: number;
+  pct: number;
+  text: string;
+  bbox_px: [number, number, number, number];
+  good_count: number;
+  bad_count: number;
+};
+
+export type GroupDiffRun = {
+  run_id: string;
+  grid: [number, number];
+  score_map: number[][];
+  z_map: number[][];
+  stability_map: number[][];
+  verdict: boolean;
+  p_global: number;
+  threshold_z: number;
+  regions: GroupDiffRegion[];
+  n_good: number;
+  n_bad: number;
+  skipped: { unreadable: number; grid: number };
+  alignment_warning: boolean;
+  warn_msgs: string[];
+  meta: { model: string; target_res: number; n_perm: number; alpha: number; stab_q: number; seed: number; top_k: number };
+  bases_good: string[];
+  bases_bad: string[];
+  base_good_index: number;
+  base_bad_index: number;
+};
+
+export type GroupDiffPca = { xy_good: number[][]; xy_bad: number[][]; evr: number[] };
+
 export type CoverageSparsityResult = {
   k: number;
   scores: number[];
@@ -1209,6 +1245,33 @@ export const api = {
   coverageSparsity: (runId: string, k: number) => request<CoverageSparsityResult>(
     "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/sparsity",
     { method: "POST", body: JSON.stringify({ k }) },
+  ),
+  createGroupDiffJob: (input: {
+    good_dirs: string[]; bad_dirs: string[]; model_id: string;
+    n_perm: 100 | 200 | 500; alpha: 0.01 | 0.05 | 0.1; top_k: number; seed: number;
+  }) => request<{ job_id: string; state: string }>("/api/v1/groupdiff/jobs", {
+    method: "POST", body: JSON.stringify(input),
+  }),
+  groupDiffJob: (jobId: string) => request<JobStatus>(
+    "/api/v1/groupdiff/jobs/" + encodeURIComponent(jobId),
+  ),
+  groupDiffRun: (runId: string) => request<GroupDiffRun>(
+    "/api/v1/groupdiff/runs/" + encodeURIComponent(runId),
+  ),
+  groupDiffBaseUrl: (runId: string, side: "good" | "bad", index: number, overlay: boolean, alpha: number) => {
+    const query = new URLSearchParams({ overlay: String(overlay), alpha: String(alpha) });
+    return (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/groupdiff/runs/"
+      + encodeURIComponent(runId) + "/bases/" + side + "/" + index + "?" + query.toString();
+  },
+  groupDiffRegionImageUrl: (runId: string, rank: number, side: "good" | "bad", index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/groupdiff/runs/" + encodeURIComponent(runId)
+      + "/regions/" + rank + "/images/" + side + "/" + index + ".jpg",
+  groupDiffPca: (runId: string) => request<GroupDiffPca>(
+    "/api/v1/groupdiff/runs/" + encodeURIComponent(runId) + "/pca",
+  ),
+  exportGroupDiff: (runId: string, outputDir: string) => request<{ count: number; files: string[] }>(
+    "/api/v1/groupdiff/runs/" + encodeURIComponent(runId) + "/exports",
+    { method: "POST", body: JSON.stringify({ output_dir: outputDir }) },
   ),
   coverageCompleteness: (runId: string, input: CoverageCompletenessInput) =>
     request<CoverageCompletenessResult>(

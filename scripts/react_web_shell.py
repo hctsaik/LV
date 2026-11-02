@@ -337,6 +337,20 @@ class CreateCoverageJob(BaseModel):
     k: int = Field(default=10, ge=1, le=1000)
 
 
+class CreateGroupDiffJob(BaseModel):
+    good_dirs: list[str] = Field(min_length=1, max_length=32)
+    bad_dirs: list[str] = Field(min_length=1, max_length=32)
+    model_id: str = Field(min_length=1, max_length=128)
+    n_perm: Literal[100, 200, 500] = 200
+    alpha: Literal[0.01, 0.05, 0.1] = 0.05
+    top_k: int = Field(default=5, ge=1, le=10)
+    seed: int = Field(default=0, ge=0, le=9999)
+
+
+class GroupDiffExportRequest(BaseModel):
+    output_dir: str = Field(min_length=1, max_length=4096)
+
+
 class CoverageProjectionRequest(BaseModel):
     method: Literal["pca", "tsne", "umap", "lda", "sumap"]
     dimension: Literal[2, 3] = 2
@@ -513,6 +527,19 @@ class _CoverageJob:
 
 
 @dataclass
+class _GroupDiffJob:
+    job_id: str
+    request: CreateGroupDiffJob
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 100
+    message: str = "Waiting to start"
+    run_id: str | None = None
+    error: dict | None = None
+
+
+@dataclass
 class _CoverageCandidateJob:
     job_id: str
     run_id: str
@@ -595,7 +622,7 @@ class _AnomalyScoreJob:
     error: dict | None = None
 
 
-def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob) -> dict:
+def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob | _GroupDiffJob) -> dict:
     return {
         "job_id": job.job_id,
         "state": job.state,
@@ -606,7 +633,7 @@ def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob)
         "message": job.message,
         "run_id": job.run_id,
         "error": job.error,
-        "can_cancel": job.state in {"queued", "running", "cancelling"},
+        "can_cancel": job.state in {"queued", "running", "cancelling"} and not isinstance(job, _GroupDiffJob),
     }
 
 
@@ -666,6 +693,7 @@ def create_app(
     text_model_loader: Callable[[str], Callable[[str], np.ndarray]] | None = None,
     object_model_loader: Callable | None = None,
     diagnostic_model_loader: Callable[[str, int, bool, str], Callable] | None = None,
+    groupdiff_extractor: Callable | None = None,
     case_search_model_provider: Callable[[], tuple[dict, Callable]] | None = None,
     anomaly_model_builder: Callable | None = None,
     anomaly_scorer: Callable | None = None,
@@ -705,6 +733,8 @@ def create_app(
     app.state.coverage_completeness_candidates = {}
     app.state.coverage_candidate_jobs = {}
     app.state.coverage_candidates = {}
+    app.state.groupdiff_jobs = {}
+    app.state.groupdiff_runs = {}
     app.state.anomaly_jobs = {}
     app.state.anomaly_score_jobs = {}
     app.state.fewshot_sample_bank_jobs = {}
@@ -731,6 +761,7 @@ def create_app(
             list(app.state.jobs.values())
             + list(app.state.comparison_jobs.values())
             + list(app.state.coverage_jobs.values())
+            + list(app.state.groupdiff_jobs.values())
             + list(app.state.coverage_candidate_jobs.values())
             + list(app.state.anomaly_jobs.values())
             + list(app.state.anomaly_score_jobs.values())
@@ -3811,6 +3842,251 @@ def create_app(
             name=f"lv-compare-{job_id[:8]}",
         ).start()
         return {"job_id": job_id, "state": job.state}
+
+    def groupdiff_result(run_id: str) -> dict:
+        with app.state.lock:
+            result = app.state.groupdiff_runs.get(run_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="差異分析結果不存在或已過期")
+        return result
+
+    def groupdiff_run_view(run_id: str, result: dict) -> dict:
+        regions = []
+        for region in result["regions"]:
+            regions.append({
+                key: region[key]
+                for key in ("rank", "peak_z", "mean_z", "stability", "pct", "text", "bbox_px")
+            } | {
+                "good_count": len(region.get("good_paths", [])),
+                "bad_count": len(region.get("bad_paths", [])),
+            })
+        return {
+            "run_id": run_id,
+            "grid": [int(value) for value in result["grid"]],
+            "score_map": np.asarray(result["score_map"], dtype=float).tolist(),
+            "z_map": np.asarray(result["z_map"], dtype=float).tolist(),
+            "stability_map": np.asarray(result["stability_map"], dtype=float).tolist(),
+            "verdict": bool(result["verdict"]),
+            "p_global": float(result["p_global"]),
+            "threshold_z": float(result["threshold_z"]),
+            "regions": regions,
+            "n_good": int(result["n_good"]),
+            "n_bad": int(result["n_bad"]),
+            "skipped": dict(result["skipped"]),
+            "alignment_warning": bool(result["alignment_warning"]),
+            "warn_msgs": list(result["warn_msgs"]),
+            "meta": dict(result["meta"]),
+            "bases_good": [Path(path).name for path in result["good_paths"]],
+            "bases_bad": [Path(path).name for path in result["bad_paths"]],
+            "base_good_index": result["good_paths"].index(result["base_good"]),
+            "base_bad_index": result["bad_paths"].index(result["base_bad"]),
+        }
+
+    def safe_groupdiff_error(message: str, request: CreateGroupDiffJob) -> str:
+        safe = message
+        for folder in (*request.good_dirs, *request.bad_dirs):
+            try:
+                safe = safe.replace(str(Path(folder).expanduser().resolve()), "selected folder")
+            except (OSError, RuntimeError):
+                safe = safe.replace(folder, "selected folder")
+        return safe
+
+    def execute_groupdiff(job: _GroupDiffJob) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase, job.message = "running", "discovery", "正在掃描 Good／Bad 影像"
+            from groupdiff_pipeline import run_groupdiff
+
+            def update_progress(frac: float, message: str) -> None:
+                with app.state.lock:
+                    job.phase = "analysis"
+                    job.done = max(job.done, min(100, int(float(frac) * 100)))
+                    job.message = str(message)
+
+            result = run_groupdiff(
+                job.request.good_dirs,
+                job.request.bad_dirs,
+                model=job.request.model_id,
+                n_perm=job.request.n_perm,
+                alpha=job.request.alpha,
+                top_k=job.request.top_k,
+                seed=job.request.seed,
+                extractor=groupdiff_extractor,
+                progress=update_progress,
+            )
+            run_id = uuid.uuid4().hex
+            with app.state.lock:
+                app.state.groupdiff_runs[run_id] = result
+                while len(app.state.groupdiff_runs) > 8:
+                    app.state.groupdiff_runs.pop(next(iter(app.state.groupdiff_runs)))
+                job.run_id = run_id
+                job.state, job.phase = "completed", "completed"
+                job.done = job.total = 100
+                job.message = "分析完成"
+        except FileNotFoundError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "MODEL_UNAVAILABLE"
+                job.error = {
+                    "code": "MODEL_UNAVAILABLE",
+                    "message": "所選 DINOv2 模型權重無法載入。",
+                    "request_id": job.job_id,
+                }
+        except ValueError as exc:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "INVALID_GROUPDIFF_INPUT"
+                job.error = {
+                    "code": "INVALID_GROUPDIFF_INPUT",
+                    "message": safe_groupdiff_error(str(exc), job.request),
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV web group difference analysis failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "GROUPDIFF_FAILED"
+                job.error = {
+                    "code": "GROUPDIFF_FAILED",
+                    "message": "群組差異分析失敗。請檢查本機模型權重、影像資料與 worker 記錄。",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/groupdiff/jobs", status_code=202)
+    def create_groupdiff_job(request: CreateGroupDiffJob) -> dict:
+        try:
+            available = set(catalog())
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="無法讀取本機模型清單") from exc
+        if request.model_id not in available:
+            raise HTTPException(status_code=422, detail="所選 DINOv2 模型不存在或尚未安裝")
+        if groupdiff_extractor is None and not request.model_id.startswith("dinov2_vit"):
+            raise HTTPException(status_code=422, detail="群組 patch 差異分析目前只支援 DINOv2 模型")
+
+        def normalize_folders(values: list[str]) -> list[str]:
+            normalized: list[str] = []
+            seen: set[str] = set()
+            for value in values:
+                try:
+                    folder = Path(value).expanduser().resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise HTTPException(status_code=422, detail="Good／Bad 資料夾不存在或無法讀取") from exc
+                if not folder.is_dir():
+                    raise HTTPException(status_code=422, detail="Good／Bad 資料夾不存在或無法讀取")
+                key = os.path.normcase(str(folder))
+                if key not in seen:
+                    seen.add(key)
+                    normalized.append(str(folder))
+            return normalized
+
+        normalized = request.model_copy(update={
+            "good_dirs": normalize_folders(request.good_dirs),
+            "bad_dirs": normalize_folders(request.bad_dirs),
+        })
+        job_id = uuid.uuid4().hex
+        job = _GroupDiffJob(job_id=job_id, request=normalized)
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "請等目前分析完成後再開始 Good／Bad 差異分析。",
+                    "request_id": job_id,
+                })
+            app.state.groupdiff_jobs[job_id] = job
+        threading.Thread(
+            target=execute_groupdiff,
+            args=(job,),
+            daemon=True,
+            name=f"lv-groupdiff-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/groupdiff/jobs/{job_id}")
+    def get_groupdiff_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.groupdiff_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="找不到差異分析工作")
+            return _job_view(job)
+
+    @app.get("/api/v1/groupdiff/runs/{run_id}")
+    def get_groupdiff_run(run_id: str) -> dict:
+        return groupdiff_run_view(run_id, groupdiff_result(run_id))
+
+    @app.get("/api/v1/groupdiff/runs/{run_id}/bases/{side}/{index}")
+    def get_groupdiff_base(run_id: str, side: str, index: int,
+                           overlay: bool = False, alpha: float = 0.55) -> Response:
+        result = groupdiff_result(run_id)
+        if side not in {"good", "bad"} or not 0.0 <= alpha <= 1.0:
+            raise HTTPException(status_code=422, detail="底圖選項無效")
+        paths = result["good_paths"] if side == "good" else result["bad_paths"]
+        if index < 0 or index >= len(paths):
+            raise HTTPException(status_code=404, detail="找不到差異分析底圖")
+        from safe_io import safe_open_image
+        image = safe_open_image(paths[index])
+        if image is None:
+            raise HTTPException(status_code=404, detail="差異分析底圖已無法讀取")
+        image = image.convert("RGB")
+        if overlay:
+            from anomaly_heatmap import render_heatmap
+            vmax = float(max(float(np.max(result["z_map"])), result["threshold_z"], 1e-9))
+            image = render_heatmap(result["z_map"], image, alpha=alpha, vmin=0.0, vmax=vmax)
+        image.thumbnail((1400, 1400))
+        output = BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        return Response(output.getvalue(), media_type="image/png", headers={
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.get("/api/v1/groupdiff/runs/{run_id}/regions/{rank}/images/{side}/{index}.jpg")
+    def get_groupdiff_region_image(run_id: str, rank: int, side: str, index: int) -> Response:
+        result = groupdiff_result(run_id)
+        if side not in {"good", "bad"}:
+            raise HTTPException(status_code=422, detail="群組選項無效")
+        region = next((item for item in result["regions"] if item["rank"] == rank), None)
+        if region is None or index < 0 or index >= len(region.get(f"{side}_paths", [])):
+            raise HTTPException(status_code=404, detail="找不到此差異區域代表圖")
+        from groupdiff_pipeline import region_compare_images
+        selected_region = dict(region)
+        selected_region["good_paths"] = [region["good_paths"][index]] if side == "good" else []
+        selected_region["bad_paths"] = [region["bad_paths"][index]] if side == "bad" else []
+        images = region_compare_images(result, selected_region, n_each=1)
+        if not images[side]:
+            raise HTTPException(status_code=404, detail="差異區域代表圖已無法讀取")
+        image = images[side][0]
+        image.thumbnail((900, 900))
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=88, optimize=True)
+        return Response(output.getvalue(), media_type="image/jpeg", headers={
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.get("/api/v1/groupdiff/runs/{run_id}/pca")
+    def get_groupdiff_pca(run_id: str) -> dict:
+        result = groupdiff_result(run_id)
+        from groupdiff_pipeline import pca2d
+        try:
+            projected = pca2d(result["gmean_good"], result["gmean_bad"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "xy_good": np.asarray(projected["xy_good"], dtype=float).tolist(),
+            "xy_bad": np.asarray(projected["xy_bad"], dtype=float).tolist(),
+            "evr": np.asarray(projected["evr"], dtype=float).tolist(),
+        }
+
+    @app.post("/api/v1/groupdiff/runs/{run_id}/exports")
+    def export_groupdiff_run(run_id: str, request: GroupDiffExportRequest) -> dict:
+        result = groupdiff_result(run_id)
+        output_dir = request.output_dir.strip()
+        if not output_dir:
+            raise HTTPException(status_code=422, detail="請選擇差異分析報告的輸出資料夾")
+        try:
+            from groupdiff_pipeline import export_report
+            report = export_report(result, output_dir.strip())
+        except (ValueError, OSError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="匯出失敗。請確認輸出資料夾位於 Good／Bad 來源之外且有寫入權限。",
+            ) from exc
+        return {"count": len(report["files"]), "files": [Path(path).name for path in report["files"]]}
 
     @app.get("/api/v1/compare/jobs/{job_id}")
     def get_comparison_job(job_id: str) -> dict:
