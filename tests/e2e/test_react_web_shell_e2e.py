@@ -95,6 +95,67 @@ def _worker_fixture_model(_model_id: str):
     return embed
 
 
+def _fixture_anomaly_model_builder(request: dict, *, progress=None) -> dict:
+    """Stable artifact fixture for visible React persistence and restart coverage."""
+    if progress:
+        progress(100, 100, "Fixture Normal Bank ready")
+    return {
+        "meta": {
+            "model": request["model_id"], "target_res": 224, "score_mode": "patch",
+            "object_source": "yolo", "patch_dim": 3, "obj_dim": 2, "n_objects": 5,
+            "label_semantic": "object",
+            "embedding_recipe": {"model_id": request["model_id"], "checkpoint_id": "fixture-sha"},
+        },
+        "bank_vectors": np.asarray([[1, 0, 0], [0, 1, 0]], dtype=np.float32),
+        "projection": {
+            "mean": np.asarray([0, 0], dtype=np.float32),
+            "components": np.asarray([[1, 0], [0, 1]], dtype=np.float32),
+            "ref_coords": np.asarray([[0, 0], [1, 0], [0, 1]], dtype=np.float32),
+            "good_obj_emb": np.asarray([[1, 0], [0, 1]], dtype=np.float32),
+            "tau": 0.25,
+            "l2norm": False,
+        },
+        "fewshot": [], "head": None, "built_at": 1_798_000_000.0,
+        "summary": {
+            "n_images": 5, "n_objects": 5, "has_normal_bank": True,
+            "has_head": False, "head_status": "只做異常偵測(不分種類)", "eligible_classes": [],
+        },
+    }
+
+
+def _serve_anomaly_worker(port: int, cache_root: str) -> None:
+    os.environ["LV_CACHE_DIR"] = cache_root
+    os.environ["LV_CASES_DIR"] = str(Path(cache_root) / "cases")
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: _worker_fixture_model,
+        anomaly_model_builder=_fixture_anomaly_model_builder,
+    )
+    uvicorn.run(application, host="127.0.0.1", port=port, log_level="error", access_log=False)
+
+
+def _start_anomaly_worker(cache_root: Path):
+    port = _free_port()
+    process = multiprocessing.get_context("spawn").Process(
+        target=_serve_anomaly_worker,
+        args=(port, str(cache_root)),
+        daemon=True,
+    )
+    process.start()
+    base_url = f"http://127.0.0.1:{port}"
+    _wait_http(f"{base_url}/api/v1/health", process)
+    return process, base_url
+
+
+def _stop_worker(process) -> None:
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=10)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=5)
+
+
 def _serve_curation_worker(port: int, cache_root: str) -> None:
     os.environ["LV_CACHE_DIR"] = cache_root
     application = create_app(
@@ -3160,6 +3221,160 @@ def test_lv_web_05_al_01_visible_review_batch_zip_partial_return_and_manual_revi
             }
             assert persisted["items"] == []
             assert persisted["improvement_status"] == "not_evaluated"
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+
+
+def test_lv_web_06_bank_01_visible_build_save_worker_restart_and_load(
+    tmp_path: Path,
+):
+    """Visible bank journey persists the package and reloads it in a fresh worker PID."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+
+    cache_root = tmp_path / "persistent-cache"
+    train_folder = tmp_path / "training-data"
+    train_folder.mkdir()
+    first_worker, first_url = _start_anomaly_worker(cache_root)
+    first_pid = first_worker.pid
+    model_id = ""
+    api_bodies: list[str] = []
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page.set_default_timeout(15000)
+            page.on("response", lambda response: api_bodies.append(response.text())
+                    if "/api/v1/anomaly/" in response.url and response.ok else None)
+            page.goto(first_url, wait_until="networkidle")
+            page.get_by_test_id("open-anomaly-bank").click()
+            expect(page.get_by_test_id("anomaly-model")).to_be_visible()
+            page.get_by_test_id("anomaly-train-folders").fill(str(train_folder))
+            page.get_by_test_id("anomaly-model").select_option("fixture-model")
+            page.get_by_test_id("anomaly-build").click()
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("模型已建立", timeout=15000)
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("5 個物件")
+            model_id = page.get_by_test_id("anomaly-model-status").inner_text().split("模型 ID ")[-1].strip()
+            page.get_by_test_id("anomaly-save").click()
+            expect(page.get_by_test_id("anomaly-notice")).to_contain_text("已保存至 LV_CACHE_DIR")
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("模型已保存")
+            model_dir = cache_root / "react_anomaly_models" / model_id
+            assert {"bank.npz", "projection.npz", "fewshot.json", "meta.json", "manifest.json"} <= {
+                path.name for path in model_dir.iterdir()
+            }
+            page.close()
+            browser.close()
+    finally:
+        _stop_worker(first_worker)
+
+    second_worker, second_url = _start_anomaly_worker(cache_root)
+    try:
+        assert second_worker.pid != first_pid
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page.set_default_timeout(15000)
+            page.on("response", lambda response: api_bodies.append(response.text())
+                    if "/api/v1/anomaly/" in response.url and response.ok else None)
+            page.goto(second_url, wait_until="networkidle")
+            page.get_by_test_id("open-anomaly-bank").click()
+            page.get_by_test_id("anomaly-saved-model").select_option(model_id)
+            page.get_by_test_id("anomaly-load").click()
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("模型已載入")
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text(model_id)
+            assert all(str(tmp_path) not in body for body in api_bodies)
+            browser.close()
+    finally:
+        _stop_worker(second_worker)
+
+
+def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Run the default React worker builder against the pinned real DINOv2 weights."""
+    models_dir = Path(os.environ.get("LV_MODELS_DIR", ROOT / "models")).resolve()
+    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
+    if not weights.is_file():
+        pytest.skip(f"real DINOv2-small weights are unavailable: {weights}")
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
+        "the local model weights differ from the LV-WEB-06-BANK-01 baseline"
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+
+    monkeypatch.setenv("LV_MODELS_DIR", str(models_dir))
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
+    root = tmp_path / "real-dino-yolo"
+    (root / "images").mkdir(parents=True)
+    (root / "labels").mkdir()
+    (root / "classes.txt").write_text("good\nbad\n", encoding="utf-8")
+    for index, class_id in enumerate((0, 0, 1, 1)):
+        image = Image.new("RGB", (96, 96), (24, 150, 40) if class_id == 0 else (190, 45, 30))
+        if class_id:
+            for x in range(18, 54):
+                for y in range(18, 54):
+                    image.putpixel((x, y), (240, 120, 10))
+        image.save(root / "images" / f"{index}.png")
+        (root / "labels" / f"{index}.txt").write_text(
+            f"{class_id} 0.5 0.5 0.8 0.8\n", encoding="utf-8",
+        )
+    source_hashes = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*") if path.is_file()
+    }
+    application = create_app(
+        model_catalog=lambda: available_models(models_dir),
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+    )
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page.set_default_timeout(300000)
+            job_payloads: list[dict] = []
+
+            def capture_job(response):
+                if response.request.method == "GET" and "/api/v1/anomaly/jobs/" in response.url and response.ok:
+                    job_payloads.append(response.json())
+
+            page.on("response", capture_job)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-anomaly-bank").click()
+            page.get_by_test_id("anomaly-train-folders").fill(str(root))
+            page.get_by_test_id("anomaly-model").select_option("dinov2_vits14")
+            page.get_by_test_id("anomaly-build").click()
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("模型已建立", timeout=300000)
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("4 個物件")
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("embedding D=384")
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("只做異常偵測")
+            assert any(
+                payload.get("state") == "completed"
+                and payload.get("result", {}).get("meta", {}).get("patch_dim") == 384
+                and payload.get("result", {}).get("summary", {}).get("has_head") is False
+                for payload in job_payloads
+            )
+            page.get_by_test_id("anomaly-label-semantic").select_option("defect")
+            page.get_by_label("分類頭最小樣本數").fill("2")
+            page.get_by_test_id("anomaly-build").click()
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("能分辨瑕疵種類", timeout=300000)
+            assert any(
+                payload.get("state") == "completed"
+                and payload.get("result", {}).get("summary", {}).get("has_head") is True
+                and payload.get("result", {}).get("summary", {}).get("eligible_classes") == ["bad", "good"]
+                for payload in job_payloads
+            )
+            after_hashes = {
+                path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in root.rglob("*") if path.is_file()
+            }
+            assert after_hashes == source_hashes, "anomaly model build must leave the selected dataset unchanged"
             browser.close()
     finally:
         server.should_exit = True

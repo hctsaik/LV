@@ -25,6 +25,48 @@ export type JobStatus = {
   can_cancel: boolean;
 };
 
+export type AnomalyModel = {
+  model_id: string;
+  source: "built" | "saved" | "loaded";
+  saved: boolean;
+  active?: boolean;
+  saved_at: number | null;
+  built_at: number | null;
+  meta: {
+    model: string;
+    target_res: number;
+    score_mode: "patch" | "object";
+    object_source: "yolo" | "whole_image";
+    patch_dim: number | null;
+    obj_dim: number | null;
+    n_objects: number;
+    label_semantic: "object" | "defect";
+    embedding_recipe: Record<string, unknown>;
+  };
+  summary: {
+    n_images: number;
+    n_objects: number;
+    has_normal_bank: boolean;
+    has_head: boolean;
+    head_status: string;
+    eligible_classes: string[];
+  };
+};
+
+export type AnomalyModelJob = {
+  job_id: string;
+  state: JobStatus["state"];
+  phase: string;
+  done: number;
+  total: number;
+  percent: number;
+  message: string;
+  model_id: string | null;
+  result: AnomalyModel | null;
+  error: JobStatus["error"];
+  can_cancel: boolean;
+};
+
 export type RunRecord = {
   index: number;
   filename: string;
@@ -728,6 +770,32 @@ async function uploadFile<T>(path: string, file: File): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean; api_version: string; models_available: number }>("/api/v1/health"),
   models: () => request<{ items: ModelOption[] }>("/api/v1/models"),
+  createAnomalyModelJob: (input: {
+    train_folders: string[];
+    model_id: string;
+    score_mode: "patch" | "object";
+    target_res: number;
+    sample_n: number;
+    label_semantic: "object" | "defect";
+    n_min: number;
+    object_source: "yolo" | "whole_image";
+    class_names?: string[];
+  }) => request<{ job_id: string; state: string }>("/api/v1/anomaly/models/jobs", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  anomalyJob: (jobId: string) => request<AnomalyModelJob>(
+    "/api/v1/anomaly/jobs/" + encodeURIComponent(jobId),
+  ),
+  anomalyModels: () => request<{ items: AnomalyModel[] }>("/api/v1/anomaly/models"),
+  saveAnomalyModel: (modelId: string) => request<{ model: AnomalyModel }>(
+    "/api/v1/anomaly/models/" + encodeURIComponent(modelId) + "/save",
+    { method: "POST" },
+  ),
+  loadAnomalyModel: (modelId: string) => request<{ model: AnomalyModel }>(
+    "/api/v1/anomaly/models/load",
+    { method: "POST", body: JSON.stringify({ model_id: modelId }) },
+  ),
   createJob: (
     folders: string[],
     modelIds: string[],

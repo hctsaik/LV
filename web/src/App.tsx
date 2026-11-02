@@ -35,6 +35,7 @@ import FalsePositiveCaseWorkspace from "./FalsePositiveCaseWorkspace";
 const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
 const LazyCoverageWorkspace = lazy(() => import("./CoverageWorkspace"));
+const LazyAnomalyBankWorkspace = lazy(() => import("./AnomalyBankWorkspace"));
 
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
 const projectionOptions: { value: ProjectionMethod; label: string }[] = [
@@ -276,7 +277,7 @@ export default function App() {
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "curation" | "coverage" | "false_positive">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "compare" | "curation" | "coverage" | "false_positive" | "anomaly">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -1067,6 +1068,7 @@ export default function App() {
           {diagnosticReference && <button type="button" data-testid="open-diagnostics" className={activeTool === "diagnostics" ? "active" : ""} aria-current={activeTool === "diagnostics" ? "page" : undefined} onClick={() => setActiveTool("diagnostics")}>Diagnostics</button>}
           <button type="button" className={activeTool === "compare" ? "active" : ""} aria-current={activeTool === "compare" ? "page" : undefined} onClick={() => setActiveTool("compare")}>Compare</button>
           <button type="button" className={activeTool === "coverage" ? "active" : ""} aria-current={activeTool === "coverage" ? "page" : undefined} onClick={() => { setCoverageMounted(true); setActiveTool("coverage"); }}>Coverage</button>
+          <button type="button" data-testid="open-anomaly-bank" className={activeTool === "anomaly" ? "active" : ""} aria-current={activeTool === "anomaly" ? "page" : undefined} onClick={() => setActiveTool("anomaly")}>瑕疵偵測</button>
           <button type="button" data-testid="open-curation" className={activeTool === "curation" ? "active" : ""} aria-current={activeTool === "curation" ? "page" : undefined} onClick={() => setActiveTool("curation")}>Curation{curationCount === null ? "" : ` (${curationCount})`}</button>
           <button type="button" data-testid="open-fp-cases" className={activeTool === "false_positive" ? "active" : ""} aria-current={activeTool === "false_positive" ? "page" : undefined} onClick={() => setActiveTool("false_positive")}>誤逮案件</button>
         </nav>
@@ -1327,6 +1329,10 @@ export default function App() {
         </main>
       ) : activeTool === "false_positive" ? (
         <FalsePositiveCaseWorkspace />
+      ) : activeTool === "anomaly" ? (
+        <Suspense fallback={<div className="coverage-loading" role="status">Loading anomaly workspace…</div>}>
+          <LazyAnomalyBankWorkspace models={models} connected={connected} />
+        </Suspense>
       ) : activeTool === "curation" ? (
         <CurationWorkspace onCountChange={setCurationCount} />
       ) : activeTool === "compare" ? (

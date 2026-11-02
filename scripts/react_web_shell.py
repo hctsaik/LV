@@ -224,6 +224,23 @@ class CreateExternalModelProfileRequest(BaseModel):
     config: dict
 
 
+class CreateAnomalyModelJobRequest(BaseModel):
+    train_folders: list[str] = Field(min_length=1, max_length=32)
+    model_id: str = Field(min_length=1, max_length=128)
+    score_mode: Literal["patch", "object"] = "patch"
+    target_res: Literal[224, 336, 448] = 224
+    sample_n: int = Field(default=64, ge=1, le=10000)
+    label_semantic: Literal["object", "defect"] = "object"
+    n_min: int = Field(default=8, ge=2, le=10000)
+    object_source: Literal["yolo", "whole_image"] = "yolo"
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+    confirmed: dict[str, Literal["good", "bad"]] = Field(default_factory=dict)
+
+
+class LoadAnomalyModelRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=64)
+
+
 class ReviseExternalModelProfileRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     name: str | None = Field(default=None, max_length=240)
@@ -443,6 +460,21 @@ class _CoverageCandidateJob:
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
+@dataclass
+class _AnomalyModelJob:
+    job_id: str
+    request: CreateAnomalyModelJobRequest
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    model_id: str | None = None
+    result: dict | None = None
+    error: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
 def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob) -> dict:
     return {
         "job_id": job.job_id,
@@ -458,6 +490,22 @@ def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob)
     }
 
 
+def _anomaly_job_view(job: _AnomalyModelJob) -> dict:
+    return {
+        "job_id": job.job_id,
+        "state": job.state,
+        "phase": job.phase,
+        "done": job.done,
+        "total": job.total,
+        "percent": (job.done / job.total * 100.0) if job.total else 0.0,
+        "message": job.message,
+        "model_id": job.model_id,
+        "result": job.result,
+        "error": job.error,
+        "can_cancel": False,
+    }
+
+
 def create_app(
     *,
     model_catalog: Callable[[], list[str]] | None = None,
@@ -466,6 +514,7 @@ def create_app(
     object_model_loader: Callable | None = None,
     diagnostic_model_loader: Callable[[str, int, bool, str], Callable] | None = None,
     case_search_model_provider: Callable[[], tuple[dict, Callable]] | None = None,
+    anomaly_model_builder: Callable | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
     has_custom_model_loader = model_loader is not None
@@ -501,6 +550,10 @@ def create_app(
     app.state.coverage_completeness_candidates = {}
     app.state.coverage_candidate_jobs = {}
     app.state.coverage_candidates = {}
+    app.state.anomaly_jobs = {}
+    app.state.anomaly_models = {}
+    app.state.current_anomaly_model_id = None
+    app.state.anomaly_model_builder = anomaly_model_builder
     app.state.curation_store = CurationStore()
     app.state.fp_case_store = FalsePositiveCaseStore()
     app.state.external_model_registry = ExternalModelRegistry(app.state.fp_case_store.root)
@@ -514,6 +567,7 @@ def create_app(
             + list(app.state.comparison_jobs.values())
             + list(app.state.coverage_jobs.values())
             + list(app.state.coverage_candidate_jobs.values())
+            + list(app.state.anomaly_jobs.values())
         )
         return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
@@ -1262,6 +1316,146 @@ def create_app(
             app.state.diagnostic_heads.clear()
         threading.Thread(target=execute, args=(job,), daemon=True, name=f"lv-web-{job_id[:8]}").start()
         return {"job_id": job_id, "state": job.state}
+
+    def execute_anomaly_model_job(job: _AnomalyModelJob) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase, job.message = "running", "building", "Preparing anomaly model"
+                job.total = 100
+
+            def update_progress(done: int, total: int, message: str) -> None:
+                with app.state.lock:
+                    job.phase = "building"
+                    job.done = max(0, min(int(done), int(total)))
+                    job.total = max(1, int(total))
+                    job.message = str(message)[:240]
+
+            if app.state.anomaly_model_builder is not None:
+                bundle = app.state.anomaly_model_builder(job.request.model_dump(), progress=update_progress)
+            else:
+                from react_anomaly import build_model
+                bundle = build_model(job.request.model_dump(), progress=update_progress)
+            if job.cancel_event.is_set():
+                raise JobCancelled()
+            model_id = "am_" + uuid.uuid4().hex[:16]
+            bundle["_selected_folders"] = list(job.request.train_folders)
+            from react_anomaly import _view
+            result = _view(model_id, bundle, source="built")
+            with app.state.lock:
+                # Streamlit owns one active anomaly model slot. Drop prior
+                # in-memory banks instead of pinning potentially large arrays.
+                app.state.anomaly_models.clear()
+                app.state.anomaly_models[model_id] = bundle
+                app.state.current_anomaly_model_id = model_id
+                job.model_id = model_id
+                job.result = result
+                job.done = job.total = 100
+                job.state, job.phase, job.message = "completed", "completed", "模型已建立"
+        except JobCancelled:
+            with app.state.lock:
+                job.state, job.phase, job.message = "cancelled", "cancelled", "已取消"
+        except (ValueError, FileNotFoundError) as exc:
+            logger.info("LV anomaly model input rejected (job=%s): %s", job.job_id, exc)
+            message = str(exc)
+            for selected in job.request.train_folders:
+                for candidate in {selected, os.path.abspath(os.path.expanduser(selected))}:
+                    if candidate:
+                        message = message.replace(candidate, "選取資料夾")
+            if isinstance(exc, FileNotFoundError):
+                message = "訓練資料夾不存在，請重新選擇。"
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "模型建立失敗"
+                job.error = {
+                    "code": "ANOMALY_MODEL_INVALID",
+                    "message": message[:500],
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV anomaly model build failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "模型建立失敗"
+                job.error = {
+                    "code": "ANOMALY_MODEL_FAILED",
+                    "message": "建立 Normal Bank 失敗；請檢查本機模型權重、資料集標註及 worker 記錄後重試。",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/anomaly/models/jobs", status_code=202)
+    def create_anomaly_model_job(request: CreateAnomalyModelJobRequest) -> dict:
+        if request.model_id not in set(catalog()):
+            raise HTTPException(status_code=422, detail="選取的模型未安裝")
+        job_id = uuid.uuid4().hex
+        job = _AnomalyModelJob(job_id=job_id, request=request)
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "請等目前分析完成後再建立瑕疵偵測模型。",
+                    "request_id": job_id,
+                })
+            app.state.anomaly_jobs[job_id] = job
+        threading.Thread(
+            target=execute_anomaly_model_job,
+            args=(job,),
+            daemon=True,
+            name=f"lv-anomaly-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/anomaly/jobs/{job_id}")
+    def get_anomaly_model_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.anomaly_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="找不到瑕疵偵測建模工作")
+            return _anomaly_job_view(job)
+
+    @app.get("/api/v1/anomaly/models")
+    def list_anomaly_models() -> dict:
+        from react_anomaly import list_saved
+        items = list_saved()
+        known = {row["model_id"] for row in items}
+        with app.state.lock:
+            current_id = app.state.current_anomaly_model_id
+            current = app.state.anomaly_models.get(current_id) if current_id else None
+            if current_id and current and current_id not in known:
+                from react_anomaly import _view
+                items.insert(0, _view(current_id, current, source="built"))
+        for item in items:
+            item["active"] = item["model_id"] == current_id
+        return {"items": items}
+
+    @app.post("/api/v1/anomaly/models/{model_id}/save")
+    def save_anomaly_model(model_id: str) -> dict:
+        from react_anomaly import save_bundle
+        with app.state.lock:
+            bundle = app.state.anomaly_models.get(model_id)
+            if bundle is None:
+                raise HTTPException(status_code=404, detail="目前 worker 沒有此模型；請重新載入已保存模型")
+            selected_folders = bundle.get("_selected_folders", [])
+        try:
+            saved = save_bundle(model_id, bundle, selected_folders)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("LV anomaly model save failed (model=%s)", model_id)
+            raise HTTPException(status_code=500, detail="模型保存失敗；請檢查 LV_CACHE_DIR 可用空間與權限") from exc
+        return {"model": saved}
+
+    @app.post("/api/v1/anomaly/models/load")
+    def load_anomaly_model(request: LoadAnomalyModelRequest) -> dict:
+        from react_anomaly import load_bundle
+        try:
+            bundle, view = load_bundle(request.model_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="找不到完整的已保存模型") from exc
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="模型檔案不完整、損毀或不相容，請重新選擇有效模型") from exc
+        with app.state.lock:
+            app.state.anomaly_models.clear()
+            app.state.anomaly_models[request.model_id] = bundle
+            app.state.current_anomaly_model_id = request.model_id
+        return {"model": view}
 
     def coverage_points(records: list[dict], coordinates: np.ndarray) -> list[dict]:
         return [

@@ -805,3 +805,25 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .fp-candidate-review-body > small { overflow-wrap: anywhere; color: #7d8a9c; font-size: 10px; }
 .fp-candidate-review-body textarea { resize: vertical; }
 @media (max-width: 700px) { .fp-batch-return { align-items: stretch; }.fp-batch-return > button { width: 100%; }.fp-candidate-review { grid-template-columns: 90px minmax(0, 1fr); gap: 9px; padding: 9px; }.fp-candidate-image-frame { max-height: 120px; }.fp-batch-card .fp-card-heading { align-items: flex-start; flex-direction: column; }.fp-batch-card .fp-card-heading > span { text-align: left; } }
+
+.anomaly-workspace { display: grid; gap: 16px; width: min(1160px, calc(100% - 40px)); margin: 28px auto 56px; }
+.anomaly-card { display: grid; gap: 13px; padding: 22px; border: 1px solid #e3e9f1; border-radius: 10px; background: #fff; box-shadow: 0 5px 20px rgba(33, 52, 80, .04); }
+.anomaly-card h1, .anomaly-card h2 { margin: 0; color: #2d3f59; font-size: 20px; }
+.anomaly-card h2 { font-size: 16px; }
+.anomaly-card > p { margin: 0; color: #738197; font-size: 11px; line-height: 1.6; }
+.anomaly-card code { color: #385d91; }
+.anomaly-build-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: end; }
+.anomaly-build-form label, .anomaly-persist-controls label { display: grid; gap: 6px; min-width: 0; color: #53637b; font-size: 11px; font-weight: 650; }
+.anomaly-build-form input, .anomaly-build-form select, .anomaly-build-form textarea, .anomaly-persist-controls select { width: 100%; min-width: 0; padding: 9px 10px; border: 1px solid #d7deea; border-radius: 6px; background: #fff; color: #293a55; font: 11px "Segoe UI", sans-serif; }
+.anomaly-build-form textarea { resize: vertical; }
+.anomaly-build-form small { color: #8491a3; font-size: 9px; font-weight: 400; line-height: 1.5; }
+.anomaly-wide { grid-column: 1 / -1; }
+.anomaly-progress { padding: 10px 12px; border: 1px solid #d7e4f3; border-radius: 6px; background: #f6f9fd; color: #466285; font-size: 11px; }
+.anomaly-persist-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: end; }
+.anomaly-persist-controls .secondary-action, .anomaly-persist-controls .run-button { min-height: 36px; }
+.anomaly-model-status { display: grid; gap: 5px; padding: 12px; border: 1px solid #d9e6f3; border-radius: 7px; background: #f7fafd; color: #586a83; font-size: 10px; }
+.anomaly-model-status strong { color: #2e5a81; font-size: 12px; }
+.anomaly-model-status small { color: #8c98a9; overflow-wrap: anywhere; }
+.anomaly-boundary { margin: 0; padding: 10px 12px; border-left: 3px solid #d8c39b; background: #fffaf1; color: #88755e; font-size: 10px; line-height: 1.6; }
+@media (max-width: 780px) { .anomaly-build-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-persist-controls { grid-template-columns: 1fr 1fr; }.anomaly-persist-controls label { grid-column: 1 / -1; } }
+@media (max-width: 560px) { .anomaly-workspace { width: calc(100% - 22px); margin-top: 14px; }.anomaly-card { padding: 15px; }.anomaly-build-form, .anomaly-persist-controls { grid-template-columns: 1fr; }.anomaly-build-form .anomaly-wide, .anomaly-persist-controls label { grid-column: auto; } }

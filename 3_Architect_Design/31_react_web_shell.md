@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的本機 React UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions、LV-WEB-03 image/object/attribute coverage、LV-WEB-05 CASE/RETRIEVE/REPORT/AL 及 EXT-01 外部 ONNX 推論／歷史比對的局部流程；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
+> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions、LV-WEB-03 image/object/attribute coverage、LV-WEB-05 CASE/RETRIEVE/REPORT/AL 及 EXT-01 外部 ONNX 推論／歷史比對的局部流程，以及 LV-WEB-06-BANK-01 Normal Bank 建模／保存／載入；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
 
 ## 1. 邊界
 
@@ -20,6 +20,11 @@
 | `GET /api/v1/health` | worker readiness | API 版本、模型目錄狀態、可用模型數 |
 | `GET /api/v1/models` | 讀取模型清單 | model ID、名稱、可用狀態；不載入所有權重 |
 | `POST /api/v1/visualize/jobs` | 建立 Image Classifier 整圖或 Object Detector 整圖／物件級 run | job ID、queued 狀態 |
+| `POST /api/v1/anomaly/models/jobs` | 建立瑕疵偵測 Normal Bank | 訓練資料夾、模型、patch/object score、解析度、標籤語義、物件來源；使用既有 anomaly pipeline |
+| `GET /api/v1/anomaly/jobs/{job_id}` | 讀取 Normal Bank 建模狀態 | phase、進度、模型摘要或可恢復錯誤；不回傳資料夾路徑 |
+| `GET /api/v1/anomaly/models` | 列出目前與已保存瑕疵偵測模型 | 模型／特徵 metadata、是否 active；不回傳快取位置 |
+| `POST /api/v1/anomaly/models/{model_id}/save` | 保存 Normal Bank 套件 | 原子保存 bank、projector、few-shot、可選 head 與 manifest 至 `LV_CACHE_DIR` |
+| `POST /api/v1/anomaly/models/load` | 從 `LV_CACHE_DIR` 載入模型套件 | 載入前驗證 meta 與 patch 維度，回傳已鎖定模型身分 |
 | `POST /api/v1/coverage/jobs` | 獨立建立 image-level 或 YOLO object-level embedding coverage run | folders、model、unit、初始投影／維度／k、job ID |
 | `GET /api/v1/coverage/jobs/{job_id}` / `DELETE ...` | 讀取或取消 coverage job | 共用單一 active-job gate、進度及結果 ID |
 | `GET /api/v1/coverage/runs/{run_id}` | 讀取 coverage 結果 | records、投影點、稀疏分數與 percentile 門檻；物件粒度附 class、confidence、bbox、short edge；不回傳路徑或 raw embedding |
@@ -56,6 +61,8 @@
 | `GET /api/v1/fp-cases/{case_id}/external-runs/{run_id}/input-preview.png` / `evidence.json` / `evidence.zip` | 讀回模型輸入預覽或匯出推論證據 | 僅依已保存的 run ID 查找；JSON／ZIP 移除本機路徑，ZIP 含 source、model input 與 NPZ tensors |
 
 外部模型 asset 只能由 worker 從串流匯入，runtime config 不能指定任意本機模型路徑。推論只有在使用者明確操作後才執行；profile revision 保存契約但不執行模型。歷史 parity 需原圖 SHA-256、deployment origin、記錄時間、contract ID 及完整分類分數或 detection 框／分數／警報一致。此 React slice 尚未移植對照實驗、paired holdout、訓練資料 ZIP；Windows ARM64 worker 與 NativeApp 發布包仍待實機驗證。
+
+瑕疵偵測 BANK-01 使用原 `anomaly_tool.run_pipeline` 建立 Normal Bank 與固定 object projector；新模型套件先寫入 cache 內暫存目錄，再以目錄 rename 發布，避免未完成套件出現在清單。載入會檢查 bank 維度與必需 metadata；只有同一 `LV_CACHE_DIR` 可見時才能跨 worker 重開。visible Chromium 已以固定 DINOv2-small 權重在 4 個 YOLO 物件跑過建模，驗證 object 語義不訓分類頭、defect 語義且兩類均達設定門檻時建立分類頭，並確認來源資料不變；獨立保存／重開旅程用 deterministic artifact fixture 驗證不同 worker PID。尚未與 Streamlit 做數值逐項比較；NativeApp folder grant 和 BANK 之後的套用／排序流程尚未接線。
 
 Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`，預設 `classifier`）、`unit`（`image` 或 `object`，預設 `image`）、可選的逗號類別名稱 fallback、`model_ids`（最多 8 個）、`methods`（最多 5 個）和可選 `object_policy`（pad、target resolution、head）。Classifier 只接受整圖；Detector 讀取 YOLO `images/` 與 `labels/`，整圖時一張影像一筆，物件級時一個支援的 bbox 一筆。資料集旁 `classes.txt` 優先於手動 fallback，選取的類別表不一致時明確失敗。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、無 bbox、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
 
