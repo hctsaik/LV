@@ -1424,6 +1424,7 @@ export default function App() {
             setSelectedIndex(index);
             setSelectedIndices((current) => current.includes(index) ? current : [...current, index]);
           }}
+          onAddSelection={addSelection}
         />
       ) : activeTool === "evaluation" ? (
         <EvaluationWorkspace />

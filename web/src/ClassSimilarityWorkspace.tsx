@@ -18,6 +18,7 @@ type Props = {
   records: RunRecord[];
   onReturn: () => void;
   onOpenRecord: (index: number) => void;
+  onAddSelection: (indices: number[]) => void;
 };
 
 const terminalStates = new Set(["completed", "failed", "cancelled"]);
@@ -182,7 +183,7 @@ function WorkloadCurve({ points }: { points: Array<{ candidate_n: number; mode: 
   </svg>;
 }
 
-export default function ClassSimilarityWorkspace({ runId, modelId, unit, records, onReturn, onOpenRecord }: Props) {
+export default function ClassSimilarityWorkspace({ runId, modelId, unit, records, onReturn, onOpenRecord, onAddSelection }: Props) {
   const [k, setK] = useState(5);
   const [analysisSplit, setAnalysisSplit] = useState("all");
   const [metric, setMetric] = useState<ClassSimilarityMetric>("margin");
@@ -204,6 +205,7 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [cartBusy, setCartBusy] = useState(false);
   const [cartMessage, setCartMessage] = useState("");
+  const [selectionMessage, setSelectionMessage] = useState("");
   const [evaluationScope, setEvaluationScope] = useState<"all" | "selected">("all");
   const [evaluationPurpose, setEvaluationPurpose] = useState<"tuning" | "heldout">("tuning");
   const [evaluationPreview, setEvaluationPreview] = useState<ClassSimilarityEvaluationPreview | null>(null);
@@ -344,6 +346,28 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
     } finally {
       setCartBusy(false);
     }
+  }
+
+  function syncSelectedToVisualize() {
+    if (!result || !selectedIds.length) return;
+    const selected = new Set(selectedIds);
+    const indices = result.items.filter((item) => selected.has(item.record_id)).map((item) => item.index);
+    onAddSelection(indices);
+    setSelectionMessage(`Added ${indices.length} selected item(s) to the Visualize selection.`);
+  }
+
+  function addCandidatesToVisualize() {
+    if (!result || !candidateIds.length) return;
+    const candidates = new Set(candidateIds);
+    const indices = result.items.filter((item) => candidates.has(item.record_id)).map((item) => item.index);
+    onAddSelection(indices);
+    setSelectionMessage(`Added ${indices.length} current candidate(s) across all classes to the Visualize selection.`);
+  }
+
+  function clearPanelSelection() {
+    setSelectedIds([]);
+    setSelected(null);
+    setSelectionMessage("Cleared the class-similarity panel selection.");
   }
 
   async function downloadEvaluationTemplate() {
@@ -557,6 +581,12 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
               <button type="button" className="primary-action" onClick={() => void addSelectedToCuration()} disabled={!selectedIds.length || cartBusy}>{cartBusy ? "Adding…" : "Add selected to Curation"}</button>
             </div>
             {cartMessage && <div className="class-similarity-progress" role="status">{cartMessage}</div>}
+            <div className="class-similarity-selection-actions">
+              <button type="button" className="secondary-action" onClick={syncSelectedToVisualize} disabled={!selectedIds.length}>Sync selected to Visualize ({selectedIds.length})</button>
+              <button type="button" className="secondary-action" onClick={addCandidatesToVisualize} disabled={!candidateIds.length}>Add all candidates to Visualize selection ({candidateIds.length})</button>
+              <button type="button" className="secondary-action" onClick={clearPanelSelection} disabled={!selectedIds.length && !selected}>Clear panel selection</button>
+            </div>
+            {selectionMessage && <div className="class-similarity-progress" role="status">{selectionMessage}</div>}
           </section>
 
           <section className="class-similarity-workload-panel" aria-labelledby="class-similarity-workload-title">

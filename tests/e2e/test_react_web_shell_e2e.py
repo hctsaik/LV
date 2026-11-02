@@ -668,6 +668,10 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
             expect(page.get_by_test_id("class-similarity-row")).to_have_count(4)
             page.get_by_label("Class similarity threshold", exact=True).fill("2")
             expect(candidate_count).to_contain_text("4 candidates")
+            page.get_by_label("Visible classes").select_option(label=["apple"])
+            page.get_by_role("button", name="Add all candidates to Visualize selection (4)").click()
+            expect(page.get_by_role("status").filter(has_text="Added 4 current candidate(s) across all classes")).to_be_visible()
+            page.get_by_label("Visible classes").select_option(label=["apple", "banana"])
             page.get_by_label("Only margin < 0").check()
             assert page.get_by_test_id("class-similarity-row").count() <= 4
             page.get_by_label("Only margin < 0").uncheck()
@@ -757,6 +761,7 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
             selected_name = page.get_by_test_id("class-similarity-row").first.locator("button").inner_text()
             page.get_by_role("button", name="Open record in Visualize").click()
             expect(page.get_by_test_id("selected-image-name")).to_have_text(selected_name)
+            expect(page.get_by_test_id("selection-count")).to_have_text("4 selected")
             page.get_by_test_id("open-curation").click()
             expect(page.get_by_test_id("curation-item")).to_have_count(4)
             expect(page.get_by_test_id("curation-item").first).to_contain_text("類別相似度")
