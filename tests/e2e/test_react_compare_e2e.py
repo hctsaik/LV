@@ -260,6 +260,201 @@ def test_lv_web_02_img_01_real_dinov2_visible_streamlit_parity(tmp_path: Path, m
         thread.join(timeout=10)
 
 
+def test_lv_web_02_obj_01_real_dinov2_visible_streamlit_parity(tmp_path: Path, monkeypatch):
+    """Match real DINOv2 object drift and PCA with the legacy Streamlit calculation."""
+    import json
+
+    import numpy as np
+    import pytest
+    from sklearn.decomposition import PCA
+
+    from _utils import load_model
+
+    repository_root = Path(__file__).resolve().parents[2]
+    configured_models = Path(
+        os.environ.get("LV_TEST_MODELS_DIR") or os.environ.get("LV_MODELS_DIR") or repository_root / "models"
+    ).expanduser().resolve()
+    configured_weights = (
+        configured_models / "dinov2_vits14" / "dinov2_vits14.pth",
+        configured_models / "dinov2_vits14.pth",
+    )
+    cache_weights = Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "dinov2_vits14_pretrain.pth"
+    source_weights = next((path for path in configured_weights if path.is_file()), None)
+    if source_weights is None and cache_weights.is_file():
+        source_weights = cache_weights
+    if source_weights is None:
+        pytest.skip("pinned real DINOv2-small weights are unavailable in LV models or the local torch cache")
+    expected_sha256 = "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9"
+    assert hashlib.sha256(source_weights.read_bytes()).hexdigest() == expected_sha256, \
+        "the local model weights differ from the LV-WEB-01/06 baseline"
+
+    models_dir = tmp_path / "models"
+    model_dir = models_dir / "dinov2_vits14"
+    model_dir.mkdir(parents=True)
+    weights = model_dir / "dinov2_vits14.pth"
+    try:
+        os.link(source_weights, weights)
+    except OSError:
+        shutil.copyfile(source_weights, weights)
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == expected_sha256
+
+    roots = [tmp_path / "objects-a", tmp_path / "objects-b"]
+    source_files = []
+    for side, root_dir, color in (("a", roots[0], (210, 42, 34)), ("b", roots[1], (36, 54, 211))):
+        (root_dir / "images").mkdir(parents=True)
+        (root_dir / "labels").mkdir()
+        (root_dir / "classes.txt").write_text("widget\n", encoding="utf-8")
+        for index in range(2):
+            image = Image.new("RGB", (96, 80), (color[0], min(255, color[1] + index * 13), color[2]))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((12 + index * 5, 13, 57 + index * 3, 61 - index * 4), fill=(239, 193, 41))
+            draw.line((7, 70 - index * 3, 89, 9 + index * 2), fill=(32, 210, 126), width=3)
+            path = root_dir / "images" / f"{side}-{index}.png"
+            image.save(path)
+            (root_dir / "labels" / f"{side}-{index}.txt").write_text(
+                f"0 {0.45 + index * 0.1:.2f} 0.50 0.62 0.58\n", encoding="utf-8",
+            )
+            source_files.extend((path, root_dir / "labels" / f"{side}-{index}.txt"))
+        source_files.append(root_dir / "classes.txt")
+    source_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+    monkeypatch.setenv("LV_MODELS_DIR", str(models_dir))
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    policy = {"pad": 0.2, "target_res": 280, "head": "meanpool"}
+    embed_object = load_model("dinov2_vits14", models_dir=models_dir, keep_aspect=True,
+                              target_res=policy["target_res"], head=policy["head"])
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+        object_model_loader=lambda model_id, **kwargs: load_model(model_id, models_dir=models_dir, **kwargs),
+    )
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(
+        application, host="127.0.0.1", port=port, log_level="error", lifespan="off",
+    ))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                import urllib.request
+
+                with urllib.request.urlopen(base_url + "/api/v1/health", timeout=1) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("local worker did not start")
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1050})
+            page.set_default_timeout(300_000)
+            comparison_results: list[dict] = []
+            projection_results: list[dict] = []
+            comparison_requests: list[dict] = []
+            visible_image_bodies: dict[str, bytes] = {}
+
+            def capture_response(response):
+                if not response.ok:
+                    return
+                path = response.url.split("?", 1)[0]
+                if response.request.method == "GET" and "/api/v1/comparisons/" in path \
+                        and not path.endswith("/projections") and "/images/" not in path:
+                    comparison_results.append(response.json())
+                elif response.request.method == "POST" and path.endswith("/projections"):
+                    projection_results.append(response.json())
+                elif "/api/v1/comparisons/" in path and "/images/" in path:
+                    image_parts = path.rsplit("/", 2)
+                    visible_image_bodies[f"{image_parts[-2]}/{image_parts[-1]}"] = response.body()
+
+            page.on("response", capture_response)
+            page.on("request", lambda request: comparison_requests.append(json.loads(request.post_data or "{}"))
+                    if request.method == "POST"
+                    and request.url.rstrip("/").endswith("/api/v1/compare/jobs") else None)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Compare").click()
+            page.get_by_label("Image folder", exact=True).nth(0).fill(str(roots[0]))
+            page.get_by_role("button", name="Add Folder A").click()
+            page.get_by_label("Image folder", exact=True).nth(1).fill(str(roots[1]))
+            page.get_by_role("button", name="Add Folder B").click()
+            page.get_by_label("Feature model").select_option("dinov2_vits14")
+            page.get_by_label("Object padding").fill("0.2")
+            page.get_by_label("Object resolution").select_option("280")
+            page.get_by_label("Object embedding head").select_option("meanpool")
+            page.get_by_role("button", name="Apply manual settings").click()
+            expect(page.get_by_text("Manual policy active: pad 0.2 · 280 · meanpool.")).to_be_visible()
+            page.get_by_role("button", name="Run comparison").click()
+            expect(page.get_by_test_id("compare-job-status")).to_contain_text("Completed", timeout=300_000)
+            expect(page.get_by_role("heading", name="Drift by shared class")).to_be_visible()
+            expect(page.get_by_test_id("compare-policy")).to_contain_text(
+                "Manual object policy: pad 0.2 · resolution 280 · meanpool head",
+            )
+            expect(page.get_by_test_id("comparison-point")).to_have_count(4, timeout=300_000)
+            page.get_by_label("Comparison projection", exact=True).select_option("pca")
+            expect(page.get_by_test_id("comparison-point")).to_have_count(4, timeout=300_000)
+            page.get_by_test_id("comparison-point").nth(0).click()
+            expect(page.get_by_test_id("comparison-focused-record")).to_contain_text("Group A")
+
+            assert comparison_results and projection_results and comparison_requests
+            result = comparison_results[-1]
+            projection = projection_results[-1]
+            assert result["unit"] == "object" and result["model"] == "dinov2_vits14"
+            assert result["policy"] == policy and result["policy_source"] == "manual"
+            assert comparison_requests[-1]["object_policy"] == policy
+
+            from interaction import crop_bbox, discover_yolo_objects
+            from object_eval import _adaptive_pad_px
+
+            def legacy_embeddings(root_dir: Path) -> np.ndarray:
+                image_paths = sorted((root_dir / "images").glob("*.png"))
+                metadata = discover_yolo_objects(image_paths, ["widget"])
+                vectors = []
+                for item in metadata:
+                    with Image.open(item["image_path"]) as source:
+                        original = source.convert("RGB")
+                    bbox = item["bbox"]
+                    pad_px = _adaptive_pad_px(bbox, original.width, original.height, policy["pad"])
+                    crop = crop_bbox(original, *bbox, pad_px=pad_px)
+                    vectors.append(embed_object(crop))
+                return np.stack(vectors)
+
+            embeddings_a = legacy_embeddings(roots[0])
+            embeddings_b = legacy_embeddings(roots[1])
+            assert embeddings_a.shape == embeddings_b.shape == (2, 384)
+            assert np.isfinite(embeddings_a).all() and np.isfinite(embeddings_b).all()
+            mean_a = embeddings_a.mean(axis=0)
+            mean_a /= np.linalg.norm(mean_a) + 1e-9
+            mean_b = embeddings_b.mean(axis=0)
+            mean_b /= np.linalg.norm(mean_b) + 1e-9
+            expected_drift = round(max(0.0, 1.0 - float(mean_a @ mean_b)), 4)
+            assert result["rows"] == [{
+                "label": "widget", "a_count": 2, "b_count": 2, "drift": expected_drift,
+            }]
+            expect(page.get_by_text(f"{expected_drift:.4f}", exact=True)).to_be_visible()
+            expected_pca = PCA(n_components=2, random_state=42).fit_transform(
+                np.vstack([embeddings_a, embeddings_b])
+            )
+            actual_pca = np.asarray([[point["x"], point["y"]] for point in projection["points"]])
+            assert projection["requested_method"] == "pca"
+            assert np.allclose(actual_pca, expected_pca, rtol=1e-5, atol=1e-5)
+            assert len(result["records_a"]) == len(result["records_b"]) == 2
+            assert all(record["bbox"] == [0.45 + index * 0.1, 0.5, 0.62, 0.58]
+                       for index, record in enumerate(result["records_a"]))
+            public_payload = json.dumps({"comparison": result, "projection": projection})
+            assert str(tmp_path) not in public_payload
+            assert "a/0" in visible_image_bodies
+            assert visible_image_bodies["a/0"] == sorted((roots[0] / "images").glob("*.png"))[0].read_bytes()
+            assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files} == source_hashes
+            browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
 def test_lv_web_02_obj_01_react_object_compare_flow_with_local_worker(tmp_path: Path, monkeypatch):
     roots = [tmp_path / "det-a", tmp_path / "det-b"]
     colors = [(210, 40, 35), (35, 50, 210)]
