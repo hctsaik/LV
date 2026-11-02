@@ -2019,7 +2019,7 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
         )
         annotation_page.goto(annotation_url, wait_until="networkidle")
         workflow = annotation_page.get_by_role("navigation", name="工作流程")
-        workflow.get_by_role("button", name="資料集").click()
+        workflow.get_by_role("button", name=re.compile("資料集")).click()
         annotation_page.get_by_label("資料夾路徑").fill(str(images_dir))
         annotation_page.get_by_label("資料集名稱").fill("LV React handoff browser journey")
         annotation_page.get_by_role("button", name=re.compile("建立資料集並開始標注")).click()
@@ -2032,7 +2032,7 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
             expect(pair_row).to_contain_text("image-04.png")
             expect(annotation_page.get_by_test_id("handoff-review-classification-guidance")).to_be_visible()
 
-        workflow.get_by_role("button", name="資料集").click()
+        workflow.get_by_role("button", name=re.compile("資料集")).click()
         annotation_page.get_by_role("button", name="標籤管理").click()
         if handoff_flow == "curation-item":
             annotation_page.get_by_label("框選標籤").fill("reviewed-label")
