@@ -208,6 +208,68 @@ def test_duplicate_pairs_handoff_preserves_pair_metadata_and_guards_handled_imag
         assert changed.json()["code"] == "DUPLICATE_SOURCE_CHANGED"
 
 
+def test_duplicate_pair_answers_csv_counts_and_reads_keep_drop_by_sha256(
+    monkeypatch, tmp_path: Path,
+):
+    output_dir = tmp_path / "output"
+    inbox_dir = tmp_path / "labeling-inbox"
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setenv("CIM_LOG_DIR", str(inbox_dir))
+
+    train = tmp_path / "dataset" / "train" / "apple" / "train.png"
+    test = tmp_path / "dataset" / "test" / "apple" / "test.png"
+    train.parent.mkdir(parents=True)
+    test.parent.mkdir(parents=True)
+    Image.new("RGB", (24, 18), (120, 30, 80)).save(train)
+    Image.new("RGB", (24, 18), (80, 120, 30)).save(test)
+    paths = [train, test]
+    source_shas = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    run_id = "duplicate-answer-readback"
+    application.state.runs[run_id] = {
+        "mode": "classifier",
+        "unit": "image",
+        "records": [
+            {"index": 0, "filename": train.name, "label": "apple", "split": "train"},
+            {"index": 1, "filename": test.name, "label": "apple", "split": "test"},
+        ],
+        "image_paths": paths,
+        "_source_sha256": source_shas,
+        "_phashes": ["0000000000000000", "0000000000000000"],
+    }
+    application.state.current_run_id = run_id
+
+    with TestClient(application) as client:
+        sent = client.post(f"/api/v1/runs/{run_id}/duplicates/labeling-handoff", json={
+            "method": "phash", "max_hamming": 0, "cross_split_only": True,
+        })
+        assert sent.status_code == 201, sent.text
+        handoff_id = sent.json()["handoff_id"]
+        handoff_dir = inbox_dir / "lv_labeling_handoff" / handoff_id
+        (handoff_dir / "answers.csv").write_text(
+            "sha256,label\n" + f"{source_shas[0]},keep\n{source_shas[1]},drop\n",
+            encoding="utf-8",
+        )
+
+        pending = client.get("/api/v1/labeling/handoffs").json()["items"]
+        row = next(item for item in pending if item["handoff_id"] == handoff_id)
+        assert row["n_annotated"] == 2
+
+        readback = client.post(
+            f"/api/v1/labeling/handoffs/{handoff_id}/readback", json={"run_id": run_id},
+        )
+        assert readback.status_code == 200, readback.text
+        result = readback.json()
+        assert result["n_labeled"] == 2
+        assert result["n_changed"] == 2
+        assert result["complete"] is True
+        assert [record["label"] for record in application.state.runs[run_id]["records"]] == ["keep", "drop"]
+        assert [change["new_label"] for change in result["changes"]] == ["keep", "drop"]
+        assert str(tmp_path) not in readback.text
+
+
 def test_react_labeling_readback_updates_run_overlay_pool_round_and_audit(
     monkeypatch, tmp_path: Path,
 ):

@@ -254,7 +254,7 @@ def send_to_labeling(
                 if img is None:  # 壞檔 → 不複製此圖,讓它落入下方「未產出 image」過濾
                     continue
                 skin_fn(img, it["skin"]).save(dst, quality=92)
-            elif ext in (".jpg", ".jpeg"):
+            elif ext in (".jpg", ".jpeg", ".png"):
                 shutil.copyfile(src, dst)
             else:
                 img = safe_open_image(src)
@@ -383,15 +383,11 @@ def _count_annotated(handoff_dir: Path) -> int:
         spec = json.loads((handoff_dir / HANDOFF_SPEC_NAME).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return 0
-    img_dir = handoff_dir / "images"
-    n = 0
-    for it in spec.get("items", []):
-        ann = (img_dir / Path(it["image"]).name).with_suffix(".json")
-        if ann.exists() and not _is_untouched_seed(it, ann):
-            lbl, _ = _label_from_sidecar(ann)
-            if lbl:
-                n += 1
-    return n
+    try:
+        results = read_labeling_results(handoff_dir)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return 0
+    return sum(1 for item in spec.get("items", []) if results.get(item.get("sha256"), {}).get("label"))
 
 
 def read_labeling_results(handoff_dir: str | os.PathLike) -> dict[str, dict]:

@@ -1897,10 +1897,11 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         }
 
 
+@pytest.mark.parametrize("handoff_flow", ["curation-item", "duplicate-pair"])
 def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
-    tmp_path: Path,
+    tmp_path: Path, handoff_flow: str,
 ):
-    """Send a React curation item through ANnoTation React and read it back after restarts."""
+    """Round-trip relabel and duplicate-pair decisions through both React apps."""
     annotation_root_value = os.environ.get("ANNOTATION_REPO_ROOT")
     if not annotation_root_value:
         pytest.skip("set ANNOTATION_REPO_ROOT to a built ANnoTation checkout for cross-repo E2E")
@@ -1915,6 +1916,17 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
         )
 
     dataset = _fixture(tmp_path / "cross-repo-source")
+    if handoff_flow == "duplicate-pair":
+        from PIL.PngImagePlugin import PngInfo
+
+        left_image = dataset / "train" / "apple" / "image-01.png"
+        right_image = dataset / "test" / "banana" / "image-04.png"
+        duplicate_info = PngInfo()
+        duplicate_info.add_text("fixture_copy", "second file identity")
+        with Image.open(left_image) as source:
+            source.convert("RGB").save(right_image, pnginfo=duplicate_info)
+        assert left_image.read_bytes() != right_image.read_bytes()
+        assert np.array_equal(np.asarray(Image.open(left_image)), np.asarray(Image.open(right_image)))
     source_before = {
         path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in dataset.rglob("*") if path.is_file()
@@ -1948,31 +1960,58 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
         lv_page.get_by_role("button", name="Run analysis").click()
         expect(lv_page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
         expect(lv_page.get_by_test_id("embedding-point")).to_have_count(4)
-        lv_page.get_by_test_id("embedding-point").first.click()
-        expect(lv_page.get_by_test_id("selection-count")).to_have_text("1 selected")
-        lv_page.get_by_test_id("add-selection-to-curation").click()
-        expect(lv_page.locator(".alert-info")).to_contain_text("Added 1 item(s) to curation")
-        lv_page.get_by_test_id("open-curation").click()
-        expect(lv_page.get_by_test_id("curation-item")).to_have_count(1)
-        expect(lv_page.get_by_test_id("curation-labeling-preview")).to_contain_text(
-            "1 sendable · 1 new · 0 already handled"
-        )
-        lv_page.get_by_test_id("curation-send-labeling").click()
-        expect(lv_page.locator(".alert-info")).to_contain_text(
-            "Saved 1 image(s) to the local Labeling inbox"
-        )
+        if handoff_flow == "curation-item":
+            lv_page.get_by_test_id("embedding-point").first.click()
+            expect(lv_page.get_by_test_id("selection-count")).to_have_text("1 selected")
+            lv_page.get_by_test_id("add-selection-to-curation").click()
+            expect(lv_page.locator(".alert-info")).to_contain_text("Added 1 item(s) to curation")
+            lv_page.get_by_test_id("open-curation").click()
+            expect(lv_page.get_by_test_id("curation-item")).to_have_count(1)
+            expect(lv_page.get_by_test_id("curation-labeling-preview")).to_contain_text(
+                "1 sendable · 1 new · 0 already handled"
+            )
+            lv_page.get_by_test_id("curation-send-labeling").click()
+            expect(lv_page.locator(".alert-info")).to_contain_text(
+                "Saved 1 image(s) to the local Labeling inbox"
+            )
+        else:
+            lv_page.get_by_label("Duplicate method").select_option("embedding")
+            lv_page.get_by_label("Only cross-split pairs").check()
+            lv_page.get_by_role("button", name="Scan candidates").click()
+            expect(lv_page.get_by_test_id("duplicate-result")).to_have_count(1)
+            assert lv_page.get_by_test_id("duplicate-result").first.get_attribute("data-pair") == "0-3"
+            lv_page.get_by_test_id("duplicate-labeling-handoff").click()
+            expect(lv_page.get_by_test_id("duplicate-handoff-status")).to_contain_text(
+                "Saved 1 pair(s) with 2 unique image(s) to the Labeling inbox"
+            )
 
         handoff_specs = list((cache_root / "labeling-inbox" / "lv_labeling_handoff").glob("*/_handoff.json"))
         assert len(handoff_specs) == 1
         handoff_spec_path = handoff_specs[0]
         handoff_spec = json.loads(handoff_spec_path.read_text(encoding="utf-8"))
-        assert handoff_spec["task"] == "re-label"
-        assert len(handoff_spec["items"]) == 1
         handoff_id = handoff_spec["handoff_id"]
-        item = handoff_spec["items"][0]
-        image_path = handoff_spec_path.parent / "images" / Path(item["image"]).name
-        assert image_path.is_file()
-        assert hashlib.sha256(image_path.read_bytes()).hexdigest() == item["sha256"]
+        images_dir = handoff_spec_path.parent / "images"
+        if handoff_flow == "curation-item":
+            assert handoff_spec["task"] == "re-label"
+            assert len(handoff_spec["items"]) == 1
+            item = handoff_spec["items"][0]
+            image_path = images_dir / Path(item["image"]).name
+            assert image_path.is_file()
+            assert hashlib.sha256(image_path.read_bytes()).hexdigest() == item["sha256"]
+        else:
+            assert handoff_spec["task"] == "verify"
+            assert handoff_spec["source"] == "duplicate"
+            assert handoff_spec["payload"]["kind"] == "duplicate_pair_review"
+            assert len(handoff_spec["payload"]["pairs"]) == 1
+            pair = handoff_spec["payload"]["pairs"][0]
+            assert pair["left_filename"] == "image-01.png"
+            assert pair["right_filename"] == "image-04.png"
+            assert pair["left_sha256"] != pair["right_sha256"]
+            assert len(handoff_spec["items"]) == 2
+            for item in handoff_spec["items"]:
+                image_path = images_dir / Path(item["image"]).name
+                assert image_path.is_file()
+                assert hashlib.sha256(image_path.read_bytes()).hexdigest() == item["sha256"]
 
         annotation_process, annotation_url = _start_annotation_react_server(
             annotation_root, annotation_data, annotation_port, annotation_log
@@ -1980,36 +2019,60 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
         annotation_page.goto(annotation_url, wait_until="networkidle")
         workflow = annotation_page.get_by_role("navigation", name="工作流程")
         workflow.get_by_role("button", name="資料集").click()
-        annotation_page.get_by_label("資料夾路徑").fill(str(image_path.parent))
+        annotation_page.get_by_label("資料夾路徑").fill(str(images_dir))
         annotation_page.get_by_label("資料集名稱").fill("LV React handoff browser journey")
         annotation_page.get_by_role("button", name=re.compile("建立資料集並開始標注")).click()
         expect(annotation_page.get_by_role("heading", name="標注工作台")).to_be_visible()
-        expect(annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name)))).to_be_visible()
+        if handoff_flow == "curation-item":
+            expect(annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name)))).to_be_visible()
+        else:
+            pair_row = annotation_page.get_by_test_id("handoff-review-pair")
+            expect(pair_row).to_contain_text("image-01.png")
+            expect(pair_row).to_contain_text("image-04.png")
+            expect(annotation_page.get_by_test_id("handoff-review-classification-guidance")).to_be_visible()
 
         workflow.get_by_role("button", name="資料集").click()
         annotation_page.get_by_role("button", name="標籤管理").click()
-        annotation_page.get_by_label("框選標籤").fill("reviewed-label")
-        annotation_page.get_by_label("整張圖片分類").fill("OK\nNG")
+        if handoff_flow == "curation-item":
+            annotation_page.get_by_label("框選標籤").fill("reviewed-label")
+            annotation_page.get_by_label("整張圖片分類").fill("OK\nNG")
+        else:
+            annotation_page.get_by_label("框選標籤").fill("keep\ndrop")
+            annotation_page.get_by_label("整張圖片分類").fill("keep\ndrop")
         annotation_page.get_by_label("外部標注工具").select_option("labelme")
         annotation_page.get_by_role("button", name=re.compile("保存工作區設定")).click()
         expect(annotation_page.get_by_text("工作區設定已保存")).to_be_visible()
         workflow.get_by_role("button", name="標注工作台").click()
-        annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name))).click()
-        canvas = annotation_page.get_by_label("圖片與標注框")
-        expect(canvas).to_be_visible()
-        bounds = canvas.bounding_box()
-        assert bounds is not None
-        annotation_page.mouse.move(bounds["x"] + bounds["width"] * 0.2, bounds["y"] + bounds["height"] * 0.2)
-        annotation_page.mouse.down()
-        annotation_page.mouse.move(bounds["x"] + bounds["width"] * 0.8, bounds["y"] + bounds["height"] * 0.8)
-        annotation_page.mouse.up()
-        expect(annotation_page.get_by_label("第 1 個框選類別")).to_have_value("reviewed-label")
-        annotation_page.get_by_role("button", name=re.compile("保存標注")).click()
-        expect(annotation_page.get_by_text("已同步")).to_be_visible()
-        sidecar_path = image_path.with_suffix(".json")
-        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-        assert [shape["label"] for shape in sidecar["shapes"]] == ["reviewed-label"]
-        assert hashlib.sha256(image_path.read_bytes()).hexdigest() == item["sha256"]
+        if handoff_flow == "curation-item":
+            annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name))).click()
+            canvas = annotation_page.get_by_label("圖片與標注框")
+            expect(canvas).to_be_visible()
+            bounds = canvas.bounding_box()
+            assert bounds is not None
+            annotation_page.mouse.move(bounds["x"] + bounds["width"] * 0.2, bounds["y"] + bounds["height"] * 0.2)
+            annotation_page.mouse.down()
+            annotation_page.mouse.move(bounds["x"] + bounds["width"] * 0.8, bounds["y"] + bounds["height"] * 0.8)
+            annotation_page.mouse.up()
+            expect(annotation_page.get_by_label("第 1 個框選類別")).to_have_value("reviewed-label")
+            annotation_page.get_by_role("button", name=re.compile("保存標注")).click()
+            expect(annotation_page.get_by_text("已同步")).to_be_visible()
+            sidecar_path = image_path.with_suffix(".json")
+            sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            assert [shape["label"] for shape in sidecar["shapes"]] == ["reviewed-label"]
+            assert hashlib.sha256(image_path.read_bytes()).hexdigest() == item["sha256"]
+        else:
+            pair_row = annotation_page.get_by_test_id("handoff-review-pair")
+            pair_row.get_by_test_id("handoff-pair-left").click()
+            with annotation_page.expect_response(lambda response: "/classification" in response.url):
+                annotation_page.get_by_label("分類結果").select_option(label="keep")
+            pair_row.get_by_test_id("handoff-pair-right").click()
+            with annotation_page.expect_response(lambda response: "/classification" in response.url):
+                annotation_page.get_by_label("分類結果").select_option(label="drop")
+            with (handoff_spec_path.parent / "answers.csv").open(encoding="utf-8", newline="") as handle:
+                answers = {row["sha256"]: row["label"] for row in csv.DictReader(handle)}
+            assert answers == {
+                pair["left_sha256"]: "keep", pair["right_sha256"]: "drop",
+            }
 
         _stop_annotation_react_server(annotation_process)
         annotation_process, restarted_annotation_url = _start_annotation_react_server(
@@ -2017,9 +2080,16 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
         )
         annotation_page.goto(restarted_annotation_url, wait_until="networkidle")
         expect(annotation_page.get_by_role("heading", name="標注工作台")).to_be_visible()
-        annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name))).click()
-        expect(annotation_page.get_by_label("第 1 個框選類別")).to_have_value("reviewed-label")
-        expect(annotation_page.get_by_text("已同步")).to_be_visible()
+        if handoff_flow == "curation-item":
+            annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name))).click()
+            expect(annotation_page.get_by_label("第 1 個框選類別")).to_have_value("reviewed-label")
+            expect(annotation_page.get_by_text("已同步")).to_be_visible()
+        else:
+            pair_row = annotation_page.get_by_test_id("handoff-review-pair")
+            pair_row.get_by_test_id("handoff-pair-left").click()
+            expect(annotation_page.get_by_label("分類結果")).to_have_value("keep")
+            pair_row.get_by_test_id("handoff-pair-right").click()
+            expect(annotation_page.get_by_label("分類結果")).to_have_value("drop")
 
         _stop_worker(worker)
         worker = None
@@ -2035,11 +2105,16 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
         expect(lv_page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
         lv_page.get_by_test_id("open-curation").click()
         lv_page.get_by_test_id("refresh-labeling-inbox").click()
-        expect(lv_page.get_by_test_id("labeling-handoff-row")).to_contain_text("1/1 labeled")
+        expected_labeled = 1 if handoff_flow == "curation-item" else 2
+        expect(lv_page.get_by_test_id("labeling-handoff-row")).to_contain_text(
+            f"{expected_labeled}/{expected_labeled} labeled"
+        )
         lv_page.get_by_test_id(f"labeling-readback-{handoff_id}").click()
-        expect(lv_page.locator(".alert-info")).to_contain_text("Applied 1 labeled image(s)")
+        expect(lv_page.locator(".alert-info")).to_contain_text(
+            f"Applied {expected_labeled} labeled image(s)"
+        )
         expect(lv_page.get_by_test_id("labeling-readback-audit")).to_contain_text(
-            "1 corrected image(s) · 1 audit event(s)"
+            f"{expected_labeled} corrected image(s) · {expected_labeled} audit event(s)"
         )
         lv_page.get_by_role("button", name="Visualize").click()
         lv_page.get_by_role("button", name="Run analysis").click()
@@ -2048,7 +2123,23 @@ def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
             point.get_attribute("aria-label") or ""
             for point in lv_page.get_by_test_id("embedding-point").all()
         ]
-        assert sum("reviewed-label" in label for label in point_labels) == 1
+        if handoff_flow == "curation-item":
+            assert sum("reviewed-label" in label for label in point_labels) == 1
+        else:
+            assert any("image-01.png, keep, train" in label for label in point_labels)
+            assert any("image-04.png, drop, test" in label for label in point_labels)
+            ledger = [
+                json.loads(line)
+                for line in (cache_root / "output" / "rounds.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            duplicate_readbacks = [
+                event for event in ledger
+                if event.get("kind") == "readback" and event.get("batch_id") == handoff_id
+            ]
+            assert len(duplicate_readbacks) == 1
+            assert duplicate_readbacks[0]["n_labeled"] == 2
+            assert duplicate_readbacks[0]["n_changed"] == 2
         assert source_before == {
             path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in dataset.rglob("*") if path.is_file()
