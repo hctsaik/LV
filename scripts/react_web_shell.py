@@ -212,19 +212,19 @@ def _folder_permission_error(status_code: int, code: str, message: str) -> HTTPE
     )
 
 
-def _resolve_request_folders(
-    request: CreateVisualizationJob | CreateDetectionEvaluationRequest,
+def _resolve_nativeapp_folder_list(
+    folders: list[str], folder_grant_ids: list[str | None],
 ) -> list[str]:
     app_id = os.environ.get("NATIVEAPP_APP_ID", "").strip()
     if not app_id:
-        if any(request.folder_grant_ids):
+        if any(folder_grant_ids):
             raise _folder_permission_error(
                 403,
                 "FOLDER_GRANT_REJECTED",
                 "A NativeApp folder permission cannot be used outside its managed app session.",
             )
-        return request.folders
-    if len(request.folder_grant_ids) != len(request.folders):
+        return folders
+    if len(folder_grant_ids) != len(folders):
         raise _folder_permission_error(
             403,
             "FOLDER_GRANT_REQUIRED",
@@ -232,7 +232,7 @@ def _resolve_request_folders(
         )
 
     resolved: list[str] = []
-    for submitted_path, grant_id in zip(request.folders, request.folder_grant_ids):
+    for submitted_path, grant_id in zip(folders, folder_grant_ids):
         if not grant_id:
             raise _folder_permission_error(
                 403,
@@ -260,6 +260,19 @@ def _resolve_request_folders(
             )
         resolved.append(str(granted_path))
     return resolved
+
+
+def _resolve_request_folders(
+    request: CreateVisualizationJob | CreateDetectionEvaluationRequest,
+) -> list[str]:
+    return _resolve_nativeapp_folder_list(request.folders, request.folder_grant_ids)
+
+
+def _resolve_comparison_folders(request: CreateComparisonJob) -> tuple[list[str], list[str]]:
+    return (
+        _resolve_nativeapp_folder_list(request.folders_a, request.folder_grant_ids_a),
+        _resolve_nativeapp_folder_list(request.folders_b, request.folder_grant_ids_b),
+    )
 
 
 class CreateDiagnosticReferenceRequest(BaseModel):
@@ -486,7 +499,9 @@ class RunExternalModelRequest(BaseModel):
 
 class CreateComparisonJob(BaseModel):
     folders_a: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids_a: list[str | None] = Field(default_factory=list, max_length=32)
     folders_b: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids_b: list[str | None] = Field(default_factory=list, max_length=32)
     model_id: str = Field(min_length=1, max_length=128)
     unit: Literal["whole", "object"] = "object"
     class_names: list[str] = Field(default_factory=list, max_length=256)
@@ -4349,6 +4364,13 @@ def create_app(
 
     @app.post("/api/v1/compare/jobs", status_code=202)
     def create_comparison_job(request: CreateComparisonJob) -> dict:
+        folders_a, folders_b = _resolve_comparison_folders(request)
+        request = request.model_copy(update={
+            "folders_a": folders_a,
+            "folder_grant_ids_a": [],
+            "folders_b": folders_b,
+            "folder_grant_ids_b": [],
+        })
         job_id = uuid.uuid4().hex
         job = _ComparisonJob(job_id=job_id, request=request)
         with app.state.lock:

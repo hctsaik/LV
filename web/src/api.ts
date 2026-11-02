@@ -806,7 +806,9 @@ export type ComparisonProjection = {
 
 export type ComparisonJobInput = {
   folders_a: string[];
+  folder_grant_ids_a?: Array<string | null>;
   folders_b: string[];
+  folder_grant_ids_b?: Array<string | null>;
   model_id: string;
   unit: CompareUnit;
   class_names?: string[];

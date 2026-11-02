@@ -437,6 +437,10 @@ export default function CompareDistributions({
       if (result.canceled) return;
       const chosen = result.paths?.length ? result.paths : result.path ? [result.path] : [];
       if (!chosen.length) throw new Error("The host did not return a folder path.");
+      if (result.grant_id && chosen.length !== 1) {
+        throw new Error("The NativeApp picker returned one folder permission for multiple folders. Choose one folder at a time.");
+      }
+      if (result.grant_id) api.rememberFolderGrant(chosen[0], result.grant_id);
       chosen.forEach((path) => addChosenFolder(side, path));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The folder picker failed.");
@@ -468,7 +472,9 @@ export default function CompareDistributions({
     try {
       const created = await api.createComparisonJob({
         folders_a: selectedA,
+        folder_grant_ids_a: api.folderGrantIds(selectedA),
         folders_b: selectedB,
+        folder_grant_ids_b: api.folderGrantIds(selectedB),
         model_id: modelId,
         unit,
         class_names: classNamesText.split(/[\n,，]/).map((name) => name.trim()).filter(Boolean),

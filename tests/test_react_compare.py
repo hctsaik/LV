@@ -284,6 +284,87 @@ def test_case_lv_web_02_rejects_missing_groups_and_invalid_projection(tmp_path, 
     assert "C:\\" not in job["error"]["message"]
 
 
+def test_case_lv_web_02_img_01_managed_comparison_requires_and_binds_both_folder_grants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    import react_web_shell
+
+    folder_a = tmp_path / "group-a"
+    folder_b = tmp_path / "group-b"
+    _image(folder_a, "a.png", (220, 30, 40))
+    _image(folder_b, "b.png", (30, 50, 220))
+    monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    grants = {"grant-a": folder_a.resolve(), "grant-b": folder_b.resolve()}
+    resolved: list[tuple[str, str]] = []
+
+    def resolve(grant_id: str, app_id: str) -> Path:
+        resolved.append((grant_id, app_id))
+        return grants[grant_id]
+
+    monkeypatch.setattr(react_web_shell, "_resolve_nativeapp_folder_grant", resolve)
+    client = TestClient(create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: _whole_embedder,
+    ))
+    payload = {
+        "folders_a": [str(folder_a)],
+        "folder_grant_ids_a": [None],
+        "folders_b": [str(folder_b)],
+        "folder_grant_ids_b": ["grant-b"],
+        "model_id": "fixture-model",
+        "unit": "whole",
+    }
+
+    missing = client.post("/api/v1/compare/jobs", json=payload)
+    assert missing.status_code == 403
+    assert missing.json()["code"] == "FOLDER_GRANT_REQUIRED"
+    assert resolved == []
+
+    missing_b = client.post("/api/v1/compare/jobs", json={
+        **payload,
+        "folder_grant_ids_a": ["grant-a"],
+        "folder_grant_ids_b": [None],
+    })
+    assert missing_b.status_code == 403
+    assert missing_b.json()["code"] == "FOLDER_GRANT_REQUIRED"
+
+    mismatch = client.post("/api/v1/compare/jobs", json={
+        **payload,
+        "folder_grant_ids_a": ["grant-a"],
+        "folder_grant_ids_b": ["grant-a"],
+    })
+    assert mismatch.status_code == 403
+    assert mismatch.json()["code"] == "FOLDER_GRANT_MISMATCH"
+    assert str(tmp_path) not in mismatch.text
+    assert "grant-a" not in mismatch.text
+
+    result = client.post("/api/v1/compare/jobs", json={
+        **payload,
+        "folder_grant_ids_a": ["grant-a"],
+    })
+    assert result.status_code == 202, result.text
+    assert str(tmp_path) not in result.text
+    job_id = result.json()["job_id"]
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        job = client.get(f"/api/v1/compare/jobs/{job_id}").json()
+        if job["state"] in {"failed", "completed", "cancelled"}:
+            break
+        time.sleep(0.02)
+    assert job["state"] == "completed", job
+    summary = client.get(f"/api/v1/comparisons/{job['run_id']}")
+    assert summary.status_code == 200, summary.text
+    assert str(tmp_path) not in summary.text
+    assert "grant-a" not in summary.text and "grant-b" not in summary.text
+    assert resolved == [
+        ("grant-a", "visuallatent"),
+        ("grant-a", "visuallatent"),
+        ("grant-a", "visuallatent"), ("grant-a", "visuallatent"),
+        ("grant-b", "visuallatent"),
+    ]
+
+
 def test_case_lv_web_02_obj_01_no_shared_classes_is_explicit_and_path_safe(tmp_path, monkeypatch):
     roots = [tmp_path / "det-a", tmp_path / "det-b"]
     for root, label in zip(roots, ("alpha", "beta")):

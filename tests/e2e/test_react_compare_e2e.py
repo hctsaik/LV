@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import socket
 import threading
 import time
+import urllib.request
+from io import BytesIO
 from pathlib import Path
 
 import uvicorn
@@ -86,11 +89,13 @@ def test_lv_web_02_img_01_react_compare_flow_with_local_worker(tmp_path: Path, m
             expect(page.get_by_test_id("compare-job-status")).to_contain_text("Completed", timeout=60_000)
             expect(page.get_by_role("heading", name="Overall image drift")).to_be_visible()
             expect(page.get_by_role("button", name="(全部影像)", exact=True)).to_be_visible()
+            page.get_by_label("Comparison projection", exact=True).select_option("pca")
             expect(page.get_by_test_id("comparison-point")).to_have_count(8, timeout=60_000)
-            page.get_by_test_id("comparison-point").nth(0).click()
+            first_point = page.get_by_test_id("comparison-point").nth(0)
+            first_point.focus()
+            first_point.press("Enter")
             expect(page.get_by_test_id("comparison-focused-record")).to_contain_text("Group A")
             expect(page.get_by_test_id("comparison-focused-record")).to_be_visible()
-            page.get_by_label("Comparison projection", exact=True).select_option("pca")
             expect(page.get_by_test_id("comparison-point")).to_have_count(8, timeout=60_000)
             expect(page.locator(".compare-gallery-grid img").first).to_be_visible()
             page.get_by_label("Comparison unit").select_option("object")
@@ -100,6 +105,119 @@ def test_lv_web_02_img_01_react_compare_flow_with_local_worker(tmp_path: Path, m
     finally:
         server.should_exit = True
         thread.join(timeout=10)
+
+
+def test_lv_web_02_img_01_nativeapp_folder_grants_visible_react_journey(tmp_path: Path, monkeypatch):
+    roots = [tmp_path / "group-a", tmp_path / "group-b"]
+    for side, root, color in (("a", roots[0], (220, 30, 40)), ("b", roots[1], (30, 50, 220))):
+        root.mkdir()
+        for index in range(4):
+            Image.new("RGB", (48, 48), (color[0], min(255, color[1] + index), color[2])).save(
+                root / f"{side}-{index}.png",
+            )
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for root in roots for path in root.iterdir()
+    }
+    monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+    monkeypatch.setenv("NATIVEAPP_API", "http://127.0.0.1:8765")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    granted_paths = {f"hostgrant-{index}": root.resolve() for index, root in enumerate(roots)}
+    host_calls: list[dict] = []
+    real_urlopen = urllib.request.urlopen
+
+    def resolve_grant(request, timeout):
+        if request.full_url != "http://127.0.0.1:8765/host/grants/resolve":
+            return real_urlopen(request, timeout=timeout)
+        assert request.get_method() == "POST"
+        assert request.get_header("Origin") is None
+        assert timeout == 10
+        body = json.loads(request.data)
+        host_calls.append(body)
+        path = granted_paths[body["grant_id"]]
+        return BytesIO(json.dumps({
+            "app_id": "visuallatent",
+            "grant_id": body["grant_id"],
+            "path": str(path),
+            "display_name": path.name,
+        }).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", resolve_grant)
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: _embed,
+    )
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(
+        application, host="127.0.0.1", port=port, log_level="error", lifespan="off",
+    ))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                with real_urlopen(base_url + "/api/v1/health", timeout=1) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("local worker did not start")
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_default_timeout(15_000)
+            selections = [
+                {"path": str(root), "grant_id": f"hostgrant-{index}", "display_name": root.name}
+                for index, root in enumerate(roots)
+            ]
+            page.add_init_script(
+                "const choices = " + json.dumps(selections)
+                + "; let nextChoice = 0; window.cimHost = { chooseFile: async () => choices[nextChoice++] };"
+            )
+            comparison_requests: list[dict] = []
+            page.on(
+                "request",
+                lambda request: comparison_requests.append(json.loads(request.post_data or "{}"))
+                if request.method == "POST" and request.url.rstrip("/").endswith("/api/v1/compare/jobs")
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Compare").click()
+            page.get_by_role("button", name="Choose Folder A from device").click()
+            page.get_by_role("button", name="Choose Folder B from device").click()
+            expect(page.get_by_role("list", name="Folder A folders")).to_contain_text("group-a")
+            expect(page.get_by_role("list", name="Folder B folders")).to_contain_text("group-b")
+            page.get_by_label("Comparison unit").select_option("whole")
+            page.get_by_label("Feature model").select_option("fixture-model")
+            page.get_by_role("button", name="Run comparison").click()
+            expect(page.get_by_test_id("compare-job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("comparison-point")).to_have_count(8, timeout=60_000)
+            assert comparison_requests == [{
+                "folders_a": [str(roots[0])],
+                "folder_grant_ids_a": ["hostgrant-0"],
+                "folders_b": [str(roots[1])],
+                "folder_grant_ids_b": ["hostgrant-1"],
+                "model_id": "fixture-model",
+                "unit": "whole",
+                "class_names": [],
+            }]
+            assert host_calls == [
+                {"app_id": "visuallatent", "grant_id": "hostgrant-0"},
+                {"app_id": "visuallatent", "grant_id": "hostgrant-1"},
+            ]
+            browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for root in roots for path in root.iterdir()
+    }
 
 
 def test_lv_web_02_img_01_real_dinov2_visible_streamlit_parity(tmp_path: Path, monkeypatch):
