@@ -21,6 +21,8 @@ AC2、AC3、AC6 須以真實權重和可見 UI 通過；AC1、AC4、AC5 可先�
 
 Legacy 測試只作為 Streamlit 行為錨點，不算 React 通過證據。React case 必須用固定輸入、固定模型、可見 UI 操作重跑；檢查顯示結果、領域數值、檔案輸出、跨工具 handoff、資料夾副作用及重開後狀態。LV-WEB-01-IC-01 有 AC1–AC5 本機證據、app-side grant contract，以及 NativeApp managed package 真 DINOv2/test-grant journey 的局部證據；NativeApp desktop window、OS picker 與完整可見 UI 驗收仍待驗。IC-02 有 deterministic API/core 覆蓋，仍須真實多模型與完整 UI parity。LV-WEB-02 的整圖與物件比較已有 fixture API／UI 局部證據，真實模型與 Streamlit 數值 parity 未驗。標成「本機來源」的文件／測試存在於原 LV 使用者工作樹，但尚未併入此隔離分支，不得當成此分支的 CI 證據。
 
+**Cross-repository React journey follow-up (2026-11-02):** Against current pushed heads LV `42320ea` and ANnoTation `d4517cd`, `test_lv_web_10_send_readback_cross_repo_react_browser_journey` passed again (`1 passed`, 42.24 s) on the Windows ARM64 host using AMD64 CPython 3.11.9. The deterministic browser journey sends one LV curation item to the ANnoTation React app, creates a dataset, saves a rectangle sidecar, restarts ANnoTation and reads it back, then restarts LV and applies the returned label. The fixture source remained unchanged. This does not verify real-model parity or NativeApp packaging. The separate native ARM64 CPython 3.14.3 reruns remain 2/3; the unexplained worker startup exit is still unresolved.
+
 | Case ID | 原有操作旅程與 parity contract | Streamlit 行為錨點 | React 狀態 |
 |---|---|---|---|
 | LV-WEB-01-IC-01 | Image Classifier 整圖：選來源、DINOv2-small、PCA、執行、選點讀回原圖與類別／split | scripts/app.py::_visualize_embeddings_ui；scripts/visualize_embeddings.py | 本機 AC1–AC5 通過；固定模型的 Windows ARM64 visible React 流程通過；NativeApp `0.2.1-dev` package + test-grant/headless Chromium 真 DINOv2 journey 局部通過（3×384、3 點、原圖讀回、fixture 不變、stop 成功）；NativeApp desktop window、OS picker、React save/reopen、原生 ARM64 與完整 case parity 待驗 |
