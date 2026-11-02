@@ -622,7 +622,8 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
         path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in dataset.rglob("*") if path.is_file()
     }
-    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
     monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
     application = create_app(
         model_catalog=lambda: ["fixture-model"],
@@ -630,6 +631,7 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
     )
     server = None
     server_thread = None
+    restarted_worker = None
     try:
         server, server_thread, base_url = _start_api(application)
         from playwright.sync_api import expect, sync_playwright
@@ -765,8 +767,22 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
             page.get_by_test_id("open-curation").click()
             expect(page.get_by_test_id("curation-item")).to_have_count(4)
             expect(page.get_by_test_id("curation-item").first).to_contain_text("類別相似度")
+
+            server.should_exit = True
+            server_thread.join(timeout=10)
+            assert not server_thread.is_alive()
+            server = None
+            server_thread = None
+            restarted_worker, restarted_url = _start_curation_worker(cache_root)
+            assert restarted_worker.pid != os.getpid()
+            page.goto(restarted_url, wait_until="networkidle")
+            page.get_by_test_id("open-curation").click()
+            expect(page.get_by_test_id("curation-item")).to_have_count(4)
+            expect(page.get_by_test_id("curation-item").first).to_contain_text("類別相似度")
             browser.close()
     finally:
+        if restarted_worker is not None:
+            _stop_worker(restarted_worker)
         if server is not None:
             server.should_exit = True
         if server_thread is not None:
