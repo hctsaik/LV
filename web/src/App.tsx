@@ -820,6 +820,10 @@ export default function App() {
       if (result.canceled) return;
       const chosen = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
       if (!chosen.length) throw new Error("The host did not return a folder path.");
+      if (result.grant_id && chosen.length !== 1) {
+        throw new Error("Choose one folder at a time so NativeApp can scope its permission.");
+      }
+      if (result.grant_id) api.rememberFolderGrant(chosen[0], result.grant_id);
       chosen.forEach((path) => addFolder(path));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The folder picker failed.");
@@ -898,6 +902,7 @@ export default function App() {
         classNames,
         umapReference: umapReferenceEnabled,
         umapRebuild: umapReferenceEnabled && umapRebuildRequested,
+        folderGrantIds: api.folderGrantIds(selectedFolders),
         ...(analysisUnit === "object" ? { objectPolicy } : {}),
       });
       setJob({

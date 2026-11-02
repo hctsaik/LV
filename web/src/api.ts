@@ -25,6 +25,8 @@ export type JobStatus = {
   can_cancel: boolean;
 };
 
+const nativeFolderGrants = new Map<string, string>();
+
 export type AnomalyModel = {
   model_id: string;
   source: "built" | "saved" | "loaded";
@@ -1300,12 +1302,14 @@ export const api = {
       objectPolicy?: ComparisonObjectPolicy;
       umapReference?: boolean;
       umapRebuild?: boolean;
+      folderGrantIds?: Array<string | null>;
     } = {},
   ) =>
     request<{ job_id: string; state: string }>("/api/v1/visualize/jobs", {
       method: "POST",
       body: JSON.stringify({
         folders,
+        folder_grant_ids: options.folderGrantIds,
         model_ids: modelIds,
         methods,
         mode: options.mode || "classifier",
@@ -1316,6 +1320,10 @@ export const api = {
         umap_rebuild: options.umapRebuild || false,
       }),
     }),
+  rememberFolderGrant: (path: string, grantId: string) => {
+    nativeFolderGrants.set(path, grantId);
+  },
+  folderGrantIds: (paths: string[]) => paths.map((path) => nativeFolderGrants.get(path) || null),
   job: (jobId: string) => request<JobStatus>("/api/v1/jobs/" + encodeURIComponent(jobId)),
   cancel: (jobId: string) => request<{ job_id: string; state: string }>(
     "/api/v1/jobs/" + encodeURIComponent(jobId),

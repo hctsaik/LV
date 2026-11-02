@@ -11,6 +11,7 @@ import os
 import sys
 import time
 import types
+import urllib.request
 from pathlib import Path
 from threading import Event
 from zipfile import ZipFile
@@ -20,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
+import react_web_shell
 from react_web_shell import create_app
 from interaction import compute_label_disagreement, compute_outlier_scores
 from visualize_embeddings import discover_images_classifier
@@ -1339,6 +1341,101 @@ def test_case_lv_web_01_ic_01_discovery(classifier_fixture, monkeypatch, tmp_pat
     assert run["embedding_nonzero"] is True
     assert len(run["points"]) == 4
     assert all(np.isfinite([point["x"], point["y"]]).all() for point in run["points"])
+
+
+def test_case_lv_web_01_ic_01_nativeapp_folder_grant_uses_public_loopback_api(
+    monkeypatch, tmp_path
+):
+    granted = tmp_path / "approved image folder"
+    granted.mkdir()
+    monkeypatch.setenv("NATIVEAPP_API", "http://127.0.0.1:8765")
+    calls = []
+
+    class Response(BytesIO):
+        pass
+
+    def resolve(request, timeout):
+        calls.append(request)
+        assert request.full_url == "http://127.0.0.1:8765/host/grants/resolve"
+        assert request.get_method() == "POST"
+        assert request.get_header("Origin") is None
+        assert timeout == 10
+        assert json.loads(request.data) == {
+            "app_id": "visuallatent", "grant_id": "hostgrant_fixture",
+        }
+        return Response(json.dumps({
+            "app_id": "visuallatent",
+            "grant_id": "hostgrant_fixture",
+            "path": str(granted),
+            "display_name": granted.name,
+        }).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", resolve)
+    assert react_web_shell._resolve_nativeapp_folder_grant(
+        "hostgrant_fixture", "visuallatent",
+    ) == granted.resolve()
+    assert len(calls) == 1
+
+    monkeypatch.setenv("NATIVEAPP_API", "https://example.com")
+    with pytest.raises(react_web_shell.HTTPException) as rejected:
+        react_web_shell._resolve_nativeapp_folder_grant("hostgrant_fixture", "visuallatent")
+    assert rejected.value.status_code == 503
+    assert len(calls) == 1
+
+
+def test_case_lv_web_01_ic_01_nativeapp_grant_required_and_bound_to_selected_folder(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    granted = classifier_fixture["folders"][0].resolve()
+    other = tmp_path / "different-folder"
+    other.mkdir()
+    calls = []
+    monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+    monkeypatch.setattr(
+        react_web_shell,
+        "_resolve_nativeapp_folder_grant",
+        lambda grant_id, app_id: calls.append((grant_id, app_id)) or granted,
+    )
+
+    with _client(monkeypatch, tmp_path / "nativeapp-grant", embedder=_fake_embedder()) as client:
+        missing = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(granted)], "folder_grant_ids": [None],
+            "model_id": "dinov2_vits14", "method": "pca",
+        })
+        assert missing.status_code == 403
+        assert missing.json()["code"] == "FOLDER_GRANT_REQUIRED"
+
+        mismatched = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(other)], "folder_grant_ids": ["hostgrant_fixture"],
+            "model_id": "dinov2_vits14", "method": "pca",
+        })
+        assert mismatched.status_code == 403
+        assert mismatched.json()["code"] == "FOLDER_GRANT_MISMATCH"
+        assert "hostgrant_fixture" not in mismatched.text
+        assert str(granted) not in mismatched.text
+
+        created = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(granted)], "folder_grant_ids": ["hostgrant_fixture"],
+            "model_id": "dinov2_vits14", "method": "pca",
+        })
+        assert created.status_code == 202, created.text
+        assert str(granted) not in created.text
+        job_id = created.json()["job_id"]
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            status = client.get(f"/api/v1/jobs/{job_id}").json()
+            if status["state"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.02)
+        assert status["state"] == "completed", status
+        run = client.get(f"/api/v1/runs/{status['run_id']}")
+        assert run.status_code == 200
+        assert len(run.json()["records"]) == 3
+
+    assert calls == [
+        ("hostgrant_fixture", "visuallatent"),
+        ("hostgrant_fixture", "visuallatent"),
+    ]
 
 
 def test_case_lv_web_01_ic_01_selected_image_is_run_bound(

@@ -12,6 +12,9 @@ import os
 import tempfile
 import threading
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -106,6 +109,7 @@ class ComparisonObjectPolicy(BaseModel):
 
 class CreateVisualizationJob(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     mode: Literal["classifier", "detector"] = "classifier"
     unit: Literal["image", "object"] = "image"
     class_names: list[str] = Field(default_factory=list, max_length=256)
@@ -116,6 +120,124 @@ class CreateVisualizationJob(BaseModel):
     methods: list[str] = Field(default_factory=list, max_length=5)
     umap_reference: bool = False
     umap_rebuild: bool = False
+
+
+def _resolve_nativeapp_folder_grant(grant_id: str, app_id: str) -> Path:
+    """Resolve a renderer's opaque Host grant through the public NativeApp API."""
+    base = os.environ.get("NATIVEAPP_API", "").rstrip("/")
+    parsed = urllib.parse.urlsplit(base)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise _folder_permission_error(
+            503,
+            "NATIVEAPP_HOST_UNAVAILABLE",
+            "The NativeApp host connection is unavailable. Reopen the app from NativeApp and choose the folder again.",
+        )
+    body = json.dumps({"app_id": app_id, "grant_id": grant_id}).encode("utf-8")
+    request = urllib.request.Request(
+        base + "/host/grants/resolve",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise _folder_permission_error(
+            403,
+            "FOLDER_GRANT_REJECTED",
+            "NativeApp rejected this folder permission. Choose the folder again.",
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise _folder_permission_error(
+            503,
+            "NATIVEAPP_HOST_UNAVAILABLE",
+            "The NativeApp host could not verify folder permission. Reopen the app and choose the folder again.",
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("app_id") != app_id:
+        raise _folder_permission_error(
+            403,
+            "FOLDER_GRANT_REJECTED",
+            "NativeApp returned a folder permission for a different app.",
+        )
+    try:
+        selected = Path(str(payload.get("path") or "")).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise _folder_permission_error(
+            403,
+            "FOLDER_GRANT_REJECTED",
+            "The granted folder is no longer available. Choose it again.",
+        ) from exc
+    if not selected.is_dir():
+        raise _folder_permission_error(
+            403,
+            "FOLDER_GRANT_REJECTED",
+            "The granted location is not a folder. Choose a folder again.",
+        )
+    return selected
+
+
+def _folder_permission_error(status_code: int, code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message, "request_id": uuid.uuid4().hex},
+    )
+
+
+def _visualization_folders_for_request(request: CreateVisualizationJob) -> list[str]:
+    app_id = os.environ.get("NATIVEAPP_APP_ID", "").strip()
+    if not app_id:
+        if any(request.folder_grant_ids):
+            raise _folder_permission_error(
+                403,
+                "FOLDER_GRANT_REJECTED",
+                "A NativeApp folder permission cannot be used outside its managed app session.",
+            )
+        return request.folders
+    if len(request.folder_grant_ids) != len(request.folders):
+        raise _folder_permission_error(
+            403,
+            "FOLDER_GRANT_REQUIRED",
+            "Choose each image folder with the NativeApp folder picker before running the analysis.",
+        )
+
+    resolved: list[str] = []
+    for submitted_path, grant_id in zip(request.folders, request.folder_grant_ids):
+        if not grant_id:
+            raise _folder_permission_error(
+                403,
+                "FOLDER_GRANT_REQUIRED",
+                "Choose each image folder with the NativeApp folder picker before running the analysis.",
+            )
+        granted_path = _resolve_nativeapp_folder_grant(grant_id, app_id)
+        try:
+            displayed_path = Path(submitted_path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise _folder_permission_error(
+                403,
+                "FOLDER_GRANT_MISMATCH",
+                "The selected folder no longer matches its NativeApp permission. Choose it again.",
+            ) from exc
+        if (
+            not displayed_path.is_dir()
+            or os.path.normcase(os.path.normpath(str(displayed_path)))
+            != os.path.normcase(os.path.normpath(str(granted_path)))
+        ):
+            raise _folder_permission_error(
+                403,
+                "FOLDER_GRANT_MISMATCH",
+                "The selected folder no longer matches its NativeApp permission. Choose it again.",
+            )
+        resolved.append(str(granted_path))
+    return resolved
 
 
 class CreateDiagnosticReferenceRequest(BaseModel):
@@ -2380,6 +2502,11 @@ def create_app(
 
     @app.post("/api/v1/visualize/jobs", status_code=202)
     def create_visualization_job(request: CreateVisualizationJob) -> dict:
+        resolved_folders = _visualization_folders_for_request(request)
+        request = request.model_copy(update={
+            "folders": resolved_folders,
+            "folder_grant_ids": [],
+        })
         job_id = uuid.uuid4().hex
         job = _Job(job_id=job_id, request=request)
         with app.state.lock:

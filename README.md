@@ -4,6 +4,8 @@ VisualLatent analyses image dataset distributions with local feature models. **M
 
 ## React Web migration (M24)
 
+The first NativeApp folder-grant slice for `LV-WEB-01-IC-01` is implemented on the app side: React forwards the opaque picker grant, and the Python API resolves it through the public loopback grant endpoint and binds it to the selected folder. API tests and a visible Chromium journey pass with a synthetic host picker. The actual NativeApp release package, OS picker, real-model grant journey, and worker lifecycle remain unverified.
+
 The selection-to-curation flow (`LV-WEB-01-CART-01`) now has a React cart persisted in `LV_CACHE_DIR`, with CSV/JSON/ZIP export and visible readback after a different worker PID starts. It accepts Visualize and Compare selections; Compare object selections are collapsed to unique original images, matching the legacy cart. Importing the Streamlit session cart and NativeApp cache-root integration are still unverified.
 
 The independent image-level embedding coverage flow (`LV-WEB-03-IMG-01`) now runs from its own folder/model controls, computes sparsity in the original high-dimensional cosine space, supports projection and color-mode switching, and provides 2D box selection, 3D point selection, thumbnail readback, and explicit clearing. Fixture API and visible browser evidence pass; real-model numeric parity with Streamlit and NativeApp folder-grant/package evidence remain unverified.

@@ -429,6 +429,101 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_ic_01_nativeapp_folder_grant_visible_react_journey(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """React forwards the opaque picker grant and the worker resolves it before analysis."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    dataset = _fixture(tmp_path / "nativeapp-grant-fixture")
+    selected_folder = dataset / "train"
+    source_hashes = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    cache_root = tmp_path / "nativeapp-grant-cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
+    monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+    monkeypatch.setenv("NATIVEAPP_API", "http://127.0.0.1:8765")
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=_worker_fixture_model,
+    )
+    server = server_thread = None
+    nativeapp_calls = []
+    try:
+        server, server_thread, base_url = _start_api(application)
+
+        def resolve_folder_grant(request, timeout):
+            nativeapp_calls.append(request)
+            assert request.full_url == "http://127.0.0.1:8765/host/grants/resolve"
+            assert request.get_method() == "POST"
+            assert request.get_header("Origin") is None
+            assert timeout == 10
+            assert json.loads(request.data) == {
+                "app_id": "visuallatent", "grant_id": "hostgrant_fixture",
+            }
+            return BytesIO(json.dumps({
+                "app_id": "visuallatent",
+                "grant_id": "hostgrant_fixture",
+                "path": str(selected_folder),
+                "display_name": selected_folder.name,
+            }).encode("utf-8"))
+
+        monkeypatch.setattr(urllib.request, "urlopen", resolve_folder_grant)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.set_default_timeout(15_000)
+            folder = json.dumps(str(selected_folder))
+            page.add_init_script(
+                "window.cimHost = { chooseFile: async () => ({ path: " + folder
+                + ", grant_id: 'hostgrant_fixture', display_name: 'train' }) };"
+            )
+            run_payloads = []
+            create_payloads = []
+            page.on(
+                "response",
+                lambda response: run_payloads.append(response.json())
+                if _is_run_summary_response(response) and response.ok else None,
+            )
+            page.on(
+                "request",
+                lambda request: create_payloads.append(json.loads(request.post_data))
+                if request.method == "POST" and urlparse(request.url).path == "/api/v1/visualize/jobs"
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.locator(".host-picker").click()
+            expect(page.get_by_role("list", name="Selected folders")).to_contain_text("train")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=30_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(3)
+            assert len(create_payloads) == 1
+            assert create_payloads[0]["folder_grant_ids"] == ["hostgrant_fixture"]
+            assert len(nativeapp_calls) == 1
+            assert run_payloads and run_payloads[-1]["embedding_shape"] == [3, 384]
+            assert "hostgrant_fixture" not in json.dumps(run_payloads[-1])
+            assert str(dataset) not in json.dumps(run_payloads[-1])
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+
+
 def test_lv_web_01_ic_02_multi_model_projections_visible_journey(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
