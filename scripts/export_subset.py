@@ -161,6 +161,22 @@ def _check_containment(dst: Path, source_roots: list[Path]) -> None:
             )
 
 
+def validate_export_destination(
+    items: list[ExportItem], dst: Path, *, source_roots: list[Path] | None = None,
+) -> Path:
+    """Resolve and validate an output folder without creating or changing it.
+
+    The React local API uses this during its preflight so the UI can reject a
+    source-overlapping destination before the user starts a materialising
+    export. ``export_subset`` repeats the same guard immediately before writes.
+    """
+    roots = ([Path(root) for root in source_roots] if source_roots
+             else [_infer_source_root(item.image_path) for item in items])
+    resolved = Path(dst).expanduser().resolve()
+    _check_containment(resolved, roots)
+    return resolved
+
+
 def _parse_label_lines(text: str) -> tuple[list[list[float]], list[str]]:
     """Parse a YOLO .txt → (rows, warnings). Each row is ``[cls, cx, cy, w, h]``
     with cls kept as the original (possibly-float-looking) int. Malformed lines
@@ -635,13 +651,9 @@ def export_subset(
     if layout not in ("yolo", "crop-out"):
         raise ValueError(f"unknown layout {layout!r}")
 
-    dst = Path(dst)
-    report = ExportReport(dst=str(dst.resolve()))
-
     # 1) dst-containment hard guard — BEFORE writing anything.
-    roots = ([Path(r) for r in source_roots] if source_roots
-             else [_infer_source_root(it.image_path) for it in items])
-    _check_containment(dst, roots)
+    dst = validate_export_destination(items, Path(dst), source_roots=source_roots)
+    report = ExportReport(dst=str(dst))
 
     # 2) sha256 resolve + dedup (unresolved logged, excluded).
     merged = _resolve_and_dedup(items, report)

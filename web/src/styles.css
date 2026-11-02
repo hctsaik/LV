@@ -382,6 +382,22 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .curation-controls .curation-reason-control { flex: 1; min-width: 210px; }
 .curation-controls .curation-reason-control input { width: 100%; }
 .curation-controls .curation-clear { margin-left: auto; color: #945d5d; }
+.curation-subset-panel { margin: 0 0 18px; padding: 16px; border: 1px solid #dfe6ef; border-radius: 8px; background: #fff; }
+.curation-subset-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 13px; }
+.curation-subset-heading h2 { margin: 0 0 4px; color: #273752; font-size: 14px; }
+.curation-subset-heading p, .curation-subset-heading > span { margin: 0; color: #7b8798; font-size: 10px; }
+.curation-subset-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 10px; }
+.curation-subset-controls label { display: grid; gap: 5px; min-width: 170px; color: #78869a; font-size: 9px; }
+.curation-subset-controls .curation-subset-destination { flex: 1; min-width: 240px; }
+.curation-subset-controls input, .curation-subset-controls select { min-height: 34px; border: 1px solid #dfe4ec; border-radius: 5px; padding: 0 9px; background: #fff; color: #34425b; font-size: 10px; }
+.curation-subset-controls .curation-subset-destination input { width: 100%; }
+.curation-subset-buttons { display: flex; gap: 7px; }
+.curation-subset-buttons button { min-height: 34px; border: 1px solid #dbe4f0; border-radius: 6px; padding: 0 12px; background: #fff; color: #49658e; font-size: 10px; font-weight: 700; cursor: pointer; }
+.curation-subset-buttons button.primary { border-color: #3568b7; background: #3568b7; color: #fff; }
+.curation-subset-buttons button:disabled { cursor: default; opacity: .5; }
+.curation-subset-preview { display: grid; gap: 5px; margin-top: 12px; padding: 10px 12px; border-radius: 6px; background: #f3f7fc; color: #53627a; font-size: 10px; }
+.curation-subset-preview strong { color: #29446c; }
+.curation-subset-preview .curation-subset-warning { color: #9a6a23; }
 .curation-clear-confirm { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-left: auto; color: #8c6161; font-size: 9px; }
 .curation-clear-confirm button:first-of-type { border-color: #e2c1c1; color: #8a4b4b; }
 .curation-empty { display: grid; min-height: 35vh; place-items: center; border: 1px dashed #dfe4ec; border-radius: 9px; background: #fff; color: #8d98a8; font-size: 12px; text-align: center; }
@@ -397,7 +413,7 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .curation-item-reason { margin: 7px 0 0; color: #56657b; font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
 .curation-workspace .alert { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .curation-workspace .alert button { border: 0; background: transparent; color: inherit; text-decoration: underline; cursor: pointer; }
-@media (max-width: 700px) { .curation-header { flex-direction: column; }.curation-controls { align-items: stretch; flex-direction: column; }.curation-controls > button, .curation-controls .curation-clear { margin-left: 0; }.curation-clear-confirm { margin-left: 0; } }
+@media (max-width: 700px) { .curation-header { flex-direction: column; }.curation-controls { align-items: stretch; flex-direction: column; }.curation-controls > button, .curation-controls .curation-clear { margin-left: 0; }.curation-clear-confirm { margin-left: 0; }.curation-subset-heading { flex-direction: column; }.curation-subset-controls { align-items: stretch; flex-direction: column; }.curation-subset-controls label { min-width: 0; }.curation-subset-buttons button { flex: 1; } }
 .search-workspace-heading, .search-tool-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .search-workspace-heading h3 { margin: 4px 0 0; color: #35425a; font: 700 14px Manrope, "Segoe UI", sans-serif; }
 .search-workspace-heading > span { color: #98a2b0; font-size: 9px; }

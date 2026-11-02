@@ -1569,6 +1569,18 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         expect(page.locator(".curation-item-reason")).to_have_count(2)
         expect(page.locator(".curation-item-reason").first).to_have_text("checked in the visible React review")
 
+        subset_dir = tmp_path / "curation-yolo-subset"
+        page.get_by_label("Subset destination folder").fill(str(subset_dir))
+        page.get_by_test_id("curation-subset-preview-button").click()
+        expect(page.get_by_test_id("curation-subset-preview")).to_contain_text(
+            "Preflight: 2 available · 2 unique · 0 duplicate(s) · 0 missing"
+        )
+        page.get_by_test_id("curation-subset-export-button").click()
+        expect(page.locator(".alert-info")).to_contain_text("YOLO subset exported: 2 image(s)")
+        assert (subset_dir / "manifest.csv").is_file()
+        assert (subset_dir / "lineage.json").is_file()
+        assert len(list((subset_dir / "images").rglob("*.png"))) == 2
+
         with page.expect_download() as csv_download:
             page.get_by_test_id("curation-export-csv").click()
         with Path(csv_download.value.path()).open(encoding="utf-8-sig", newline="") as handle:

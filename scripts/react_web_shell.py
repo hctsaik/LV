@@ -31,7 +31,13 @@ from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 from PIL import Image
 
-from _utils import available_models, load_model, load_text_encoder, supports_text_query
+from _utils import (
+    available_models,
+    load_model,
+    load_text_encoder,
+    supports_text_query,
+    yaml_class_names,
+)
 from interaction import (
     crop_bbox,
     draw_yolo_boxes,
@@ -482,6 +488,17 @@ class AddAnomalyCurationRequest(BaseModel):
 class SetCurationReasonRequest(BaseModel):
     item_ids: list[str] = Field(min_length=1, max_length=10000)
     reason: str = Field(min_length=1, max_length=2000)
+
+
+class CurationSubsetPreviewRequest(BaseModel):
+    source: str = Field(default="all", max_length=128)
+    destination: str = Field(min_length=1, max_length=4096)
+    mode: Literal["copy", "symlink", "manifest-only"] = "copy"
+    on_exists: Literal["skip", "rename", "overwrite"] = "skip"
+
+
+class CurationSubsetExportRequest(CurationSubsetPreviewRequest):
+    preview_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 @dataclass
@@ -4960,6 +4977,267 @@ def create_app(
     def get_curation_items() -> dict:
         items = curation_snapshot()
         return {"items": [public_curation_item(item) for item in items], "total": len(items)}
+
+    def build_curation_subset_plan(source: str) -> tuple[list, list[Path], dict, str]:
+        """Translate the saved cart into the framework-free subset contract."""
+        import export_subset as _export_subset
+
+        selected = curation_snapshot()
+        if source != "all":
+            selected = [
+                item for item in selected
+                if (item.get("source") or "manual") == source
+            ]
+        if not selected:
+            raise HTTPException(status_code=422, detail={
+                "code": "CURATION_SUBSET_EMPTY",
+                "message": "There are no curation items in the selected source.",
+                "request_id": uuid.uuid4().hex,
+            })
+
+        export_items = []
+        fingerprints = []
+        available_hashes: set[str] = set()
+        missing_files: list[str] = []
+        label_files: set[str] = set()
+        source_roots: set[str] = set()
+        available = 0
+
+        def source_root_for(image_path: Path, split: str) -> Path:
+            ancestors = list(image_path.parents)
+            for folder in ancestors:
+                if folder.name.casefold() == "images":
+                    return folder.parent
+            if split:
+                for folder in ancestors:
+                    if folder.name.casefold() == split.casefold():
+                        return folder.parent
+            return image_path.parent
+
+        def class_names_for(image_path: Path) -> list[str]:
+            # Follow dataset ancestors instead of importing Streamlit's app.py
+            # helper; classes.txt and all supported data.yaml names forms use
+            # the shared framework-free parser.
+            for folder in list(image_path.parents)[:7]:
+                classes_file = folder / "classes.txt"
+                if classes_file.is_file():
+                    try:
+                        names = [
+                            line.strip()
+                            for line in classes_file.read_text(
+                                encoding="utf-8-sig",
+                            ).splitlines()
+                            if line.strip()
+                        ]
+                    except OSError:
+                        names = []
+                    if names:
+                        return names
+                names = yaml_class_names(folder / "data.yaml")
+                if names:
+                    return names
+            return []
+
+        for item in selected:
+            is_object = item.get("level") == "object" and item.get("image_path")
+            image_path = Path(
+                item["image_path"] if is_object else item["path"],
+            ).expanduser()
+            image_path = image_path.resolve(strict=False)
+            source_root = source_root_for(
+                image_path, str(item.get("split") or ""),
+            ).resolve(strict=False)
+            source_roots.add(str(source_root))
+            label_path = yolo_label_path_for(image_path)
+            names = class_names_for(image_path)
+            image_sha = None
+            image_state = "missing"
+            try:
+                if image_path.is_file():
+                    image_sha = _sha256_file(image_path)
+                    image_state = "available"
+                    available += 1
+                    available_hashes.add(image_sha)
+                else:
+                    missing_files.append(image_path.name)
+            except OSError:
+                image_state = "unreadable"
+                missing_files.append(image_path.name)
+
+            label_sha = None
+            label_state = "missing"
+            if label_path.is_file():
+                try:
+                    label_sha = _sha256_file(label_path)
+                    label_state = "available"
+                    label_files.add(str(label_path.resolve(strict=False)))
+                except OSError:
+                    label_state = "unreadable"
+
+            object_index = item.get("obj_index") if is_object else None
+            object_ids = (
+                [int(object_index)]
+                if isinstance(object_index, int) and object_index >= 0 else None
+            )
+            export_items.append(_export_subset.ExportItem(
+                image_path=image_path,
+                label_path=label_path if label_path.is_file() else None,
+                class_names=names,
+                split=(str(item.get("split") or "") or None),
+                source_tool=str(item.get("source") or "manual"),
+                source_tag=str(item.get("source") or "manual"),
+                reason=str(item.get("reason") or ""),
+                level="object" if is_object else "image",
+                object_ids=object_ids,
+                # Re-hash at export time so a stale cart digest cannot mask a
+                # changed or missing source image.
+                sha256=None,
+            ))
+            fingerprints.append({
+                "id": item.get("id"),
+                "path": str(image_path),
+                "image_state": image_state,
+                "image_sha256": image_sha,
+                "label_path": str(label_path.resolve(strict=False)),
+                "label_state": label_state,
+                "label_sha256": label_sha,
+                "class_names": names,
+                "source": item.get("source", "manual"),
+                "reason": item.get("reason", ""),
+                "split": item.get("split", ""),
+                "level": item.get("level", "image"),
+                "obj_index": object_index,
+            })
+
+        summary = {
+            "selected": len(selected),
+            "available": available,
+            "unique_images": len(available_hashes),
+            "deduplicated": max(0, available - len(available_hashes)),
+            "missing": len(missing_files),
+            "missing_filenames": missing_files[:50],
+            "label_files": len(label_files),
+            "object_items": sum(
+                1 for item in selected if item.get("level") == "object"
+            ),
+        }
+        fingerprint = json.dumps(
+            fingerprints,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return (
+            export_items,
+            [Path(root) for root in sorted(source_roots)],
+            summary,
+            fingerprint,
+        )
+
+    def prepare_curation_subset(
+        source: str, destination: str, mode: str, on_exists: str,
+    ):
+        import export_subset as _export_subset
+
+        export_items, source_roots, summary, fingerprint = build_curation_subset_plan(
+            source,
+        )
+        try:
+            resolved_destination = _export_subset.validate_export_destination(
+                export_items, Path(destination), source_roots=source_roots,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={
+                "code": "CURATION_SUBSET_DESTINATION_OVERLAP",
+                "message": (
+                    "The destination overlaps a source dataset. "
+                    "Choose a separate output folder."
+                ),
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+        token_input = json.dumps(
+            {
+                "fingerprint": fingerprint,
+                "destination": str(resolved_destination),
+                "mode": mode,
+                "on_exists": on_exists,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        token = hashlib.sha256(token_input.encode("utf-8")).hexdigest()
+        return export_items, source_roots, summary, token, resolved_destination
+
+    def curation_subset_preview(
+        source: str, destination: str, mode: str, on_exists: str,
+    ) -> dict:
+        _items, _roots, summary, token, _destination = prepare_curation_subset(
+            source, destination, mode, on_exists,
+        )
+        return {**summary, "preview_token": token, "destination_safe": True}
+
+    @app.post("/api/v1/curation/subset/preview")
+    def preview_curation_subset(request: CurationSubsetPreviewRequest) -> dict:
+        return curation_subset_preview(
+            request.source, request.destination, request.mode, request.on_exists,
+        )
+
+    @app.post("/api/v1/curation/subset/export")
+    def export_curation_subset(request: CurationSubsetExportRequest) -> dict:
+        import export_subset as _export_subset
+
+        (
+            export_items,
+            source_roots,
+            _summary,
+            current_token,
+            destination,
+        ) = prepare_curation_subset(
+            request.source,
+            request.destination,
+            request.mode,
+            request.on_exists,
+        )
+        if current_token != request.preview_token:
+            raise HTTPException(status_code=409, detail={
+                "code": "CURATION_SUBSET_PREVIEW_STALE",
+                "message": (
+                    "The curation items or source files changed after preview. "
+                    "Preview again before exporting."
+                ),
+                "request_id": uuid.uuid4().hex,
+            })
+        try:
+            report = _export_subset.export_subset(
+                export_items,
+                destination,
+                mode=request.mode,
+                layout="yolo",
+                source_roots=source_roots,
+                on_exists=request.on_exists,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={
+                "code": "CURATION_SUBSET_EXPORT_REJECTED",
+                "message": (
+                    "The export destination or options are no longer valid. "
+                    "Preview again and choose a separate output folder."
+                ),
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+        return {
+            "exported": report.exported,
+            "skipped": len(report.skipped),
+            "deduplicated": report.deduped,
+            "unresolved": len(report.unresolved),
+            "corrupt": len(report.corrupt),
+            "warnings": len(report.warnings),
+            "errors": len(report.errors),
+            "annotations_preserved": report.annotations_preserved,
+            "partial": bool(report.unresolved or report.corrupt or report.errors),
+            "training_warning": "This is a deliberately skewed diagnostic subset; evaluate with an independent hold-out set.",
+        }
 
     @app.post("/api/v1/coverage/runs/{run_id}/candidates/curation", status_code=201)
     def add_coverage_candidates_to_curation(

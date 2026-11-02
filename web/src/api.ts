@@ -747,6 +747,36 @@ export type CurationItem = {
 
 export type CurationItemsResponse = { items: CurationItem[]; total: number };
 export type AddCurationResponse = CurationItemsResponse & { added: number; skipped: number };
+export type CurationSubsetOptions = {
+  source: string;
+  destination: string;
+  mode: "copy" | "symlink" | "manifest-only";
+  on_exists: "skip" | "rename" | "overwrite";
+};
+export type CurationSubsetPreview = {
+  selected: number;
+  available: number;
+  unique_images: number;
+  deduplicated: number;
+  missing: number;
+  missing_filenames: string[];
+  label_files: number;
+  object_items: number;
+  preview_token: string;
+  destination_safe: boolean;
+};
+export type CurationSubsetExport = {
+  exported: number;
+  skipped: number;
+  deduplicated: number;
+  unresolved: number;
+  corrupt: number;
+  warnings: number;
+  errors: number;
+  annotations_preserved: number;
+  partial: boolean;
+  training_warning: string;
+};
 
 export type FalsePositiveSource = {
   id: string;
@@ -1394,6 +1424,16 @@ export const api = {
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/comparisons/" + encodeURIComponent(runId)
       + "/images/" + side + "/" + index,
   curationItems: () => request<CurationItemsResponse>("/api/v1/curation/items"),
+  curationSubsetPreview: (input: CurationSubsetOptions) =>
+    request<CurationSubsetPreview>("/api/v1/curation/subset/preview", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  curationSubsetExport: (input: CurationSubsetOptions & { preview_token: string }) =>
+    request<CurationSubsetExport>("/api/v1/curation/subset/export", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
   addCuration: (runId: string, indices: number[], source = "manual", reason = "") =>
     request<AddCurationResponse>("/api/v1/runs/" + encodeURIComponent(runId) + "/curation/items", {
       method: "POST",

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, CurationItem } from "./api";
+import { api, CurationItem, CurationSubsetOptions, CurationSubsetPreview } from "./api";
 
 type Props = { onCountChange: (count: number) => void };
 
@@ -13,6 +13,10 @@ export default function CurationWorkspace({ onCountChange }: Props) {
   const [items, setItems] = useState<CurationItem[]>([]);
   const [sourceFilter, setSourceFilter] = useState("all");
   const [reasonDraft, setReasonDraft] = useState("");
+  const [subsetDestination, setSubsetDestination] = useState("");
+  const [subsetMode, setSubsetMode] = useState<CurationSubsetOptions["mode"]>("copy");
+  const [subsetOnExists, setSubsetOnExists] = useState<CurationSubsetOptions["on_exists"]>("skip");
+  const [subsetPreview, setSubsetPreview] = useState<{ key: string; data: CurationSubsetPreview } | null>(null);
   const [clearConfirmation, setClearConfirmation] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -44,6 +48,17 @@ export default function CurationWorkspace({ onCountChange }: Props) {
     () => sourceFilter === "all" ? items : items.filter((item) => item.source === sourceFilter),
     [items, sourceFilter],
   );
+  const subsetRequest = useMemo<CurationSubsetOptions>(() => ({
+    source: sourceFilter,
+    destination: subsetDestination.trim(),
+    mode: subsetMode,
+    on_exists: subsetOnExists,
+  }), [sourceFilter, subsetDestination, subsetMode, subsetOnExists]);
+  const subsetKey = useMemo(() => JSON.stringify({
+    ...subsetRequest,
+    itemIds: visibleItems.map((item) => item.id),
+  }), [subsetRequest, visibleItems]);
+  const currentSubsetPreview = subsetPreview?.key === subsetKey ? subsetPreview.data : null;
 
   async function removeItem(itemId: string) {
     setBusy(true);
@@ -123,6 +138,48 @@ export default function CurationWorkspace({ onCountChange }: Props) {
     }
   }
 
+  async function previewSubset() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    setSubsetPreview(null);
+    try {
+      const response = await api.curationSubsetPreview(subsetRequest);
+      setSubsetPreview({ key: subsetKey, data: response });
+      setNotice("Export preview is ready. Review missing files and duplicate counts before exporting.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not preview the YOLO subset export.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportSubset() {
+    if (!currentSubsetPreview) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const response = await api.curationSubsetExport({
+        ...subsetRequest,
+        preview_token: currentSubsetPreview.preview_token,
+      });
+      setSubsetPreview(null);
+      setNotice(
+        `${response.partial ? "Export completed with unresolved items" : "YOLO subset exported"}: `
+        + `${response.exported} image(s), ${response.deduplicated} duplicate(s), `
+        + `${response.unresolved} unresolved, ${response.skipped} skipped, `
+        + `${response.annotations_preserved} original-format annotation(s) preserved. `
+        + response.training_warning,
+      );
+    } catch (reason) {
+      setSubsetPreview(null);
+      setError(reason instanceof Error ? reason.message : "Could not export the YOLO subset.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function retryLoad() {
     setLoading(true);
     setError("");
@@ -174,6 +231,58 @@ export default function CurationWorkspace({ onCountChange }: Props) {
           </div>
         ) : (
           <button type="button" className="curation-clear" disabled={busy || !items.length} onClick={() => void clearItems()}>Clear list</button>
+        )}
+      </section>
+
+      <section className="curation-subset-panel" aria-label="Export as YOLO subset">
+        <div className="curation-subset-heading">
+          <div>
+            <h2>Export as YOLO subset</h2>
+            <p>Uses the current source filter. Object selections export their original image and full annotations.</p>
+          </div>
+          <span>{visibleItems.length} selected item(s)</span>
+        </div>
+        <div className="curation-subset-controls">
+          <label className="curation-subset-destination">
+            <span>Destination folder</span>
+            <input
+              aria-label="Subset destination folder"
+              data-testid="curation-subset-destination"
+              value={subsetDestination}
+              onChange={(event) => setSubsetDestination(event.target.value)}
+              placeholder="C:\\output\\my_subset"
+            />
+          </label>
+          <label>
+            <span>Image handling</span>
+            <select aria-label="Subset image handling" value={subsetMode} onChange={(event) => setSubsetMode(event.target.value as CurationSubsetOptions["mode"])}>
+              <option value="copy">Copy images (recommended)</option>
+              <option value="symlink">Create symlinks</option>
+              <option value="manifest-only">Manifest only</option>
+            </select>
+          </label>
+          <label>
+            <span>Existing destination files</span>
+            <select aria-label="Subset collision policy" value={subsetOnExists} onChange={(event) => setSubsetOnExists(event.target.value as CurationSubsetOptions["on_exists"])}>
+              <option value="skip">Skip</option>
+              <option value="rename">Rename with a number</option>
+              <option value="overwrite">Overwrite</option>
+            </select>
+          </label>
+          <div className="curation-subset-buttons">
+            <button type="button" data-testid="curation-subset-preview-button" disabled={busy || !visibleItems.length || !subsetRequest.destination} onClick={() => void previewSubset()}>Preview export</button>
+            <button type="button" className="primary" data-testid="curation-subset-export-button" disabled={busy || !currentSubsetPreview || !visibleItems.length} onClick={() => void exportSubset()}>Export subset</button>
+          </div>
+        </div>
+        {currentSubsetPreview && (
+          <div className="curation-subset-preview" data-testid="curation-subset-preview" role="status">
+            <strong>Preflight: {currentSubsetPreview.available} available · {currentSubsetPreview.unique_images} unique · {currentSubsetPreview.deduplicated} duplicate(s) · {currentSubsetPreview.missing} missing</strong>
+            <span>{currentSubsetPreview.label_files} YOLO label file(s) · {currentSubsetPreview.object_items} object selection(s) · separate destination confirmed</span>
+            {currentSubsetPreview.missing_filenames.length > 0 && (
+              <span>Missing: {currentSubsetPreview.missing_filenames.join(", ")}</span>
+            )}
+            <span className="curation-subset-warning">This is a deliberately skewed diagnostic subset. Evaluate with an independent hold-out set.</span>
+          </div>
         )}
       </section>
 
