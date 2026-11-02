@@ -1342,7 +1342,7 @@ export default function App() {
           <LazyAnomalyBankWorkspace models={models} connected={connected} onCurationCountChange={setCurationCount} />
         </Suspense>
       ) : activeTool === "curation" ? (
-        <CurationWorkspace onCountChange={setCurationCount} />
+        <CurationWorkspace onCountChange={setCurationCount} currentRunId={currentRunId} onRunUpdated={setRun} />
       ) : activeTool === "compare" ? (
         <CompareDistributions models={models} loadingModels={loadingModels} connected={connected} onCurationCountChange={setCurationCount} />
       ) : activeTool === "groupdiff" ? (

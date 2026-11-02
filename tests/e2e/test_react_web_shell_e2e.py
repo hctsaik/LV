@@ -1595,7 +1595,27 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         handoff_root = cache_root / "labeling-inbox" / "lv_labeling_handoff"
         handoff_specs = list(handoff_root.glob("*/_handoff.json"))
         assert len(handoff_specs) == 1
-        assert len(json.loads(handoff_specs[0].read_text(encoding="utf-8"))["items"]) == 2
+        handoff_spec_path = handoff_specs[0]
+        handoff_spec = json.loads(handoff_spec_path.read_text(encoding="utf-8"))
+        assert len(handoff_spec["items"]) == 2
+        for item in handoff_spec["items"]:
+            sidecar = handoff_spec_path.parent / "images" / Path(item["image"]).with_suffix(".json").name
+            sidecar.write_text(json.dumps({
+                "shapes": [{"label": "reviewed-label"}], "annotator": "Fixture Annotator",
+            }), encoding="utf-8")
+        page.get_by_test_id("refresh-labeling-inbox").click()
+        expect(page.get_by_test_id("labeling-handoff-row")).to_contain_text("2/2 labeled")
+        handoff_id = handoff_spec["handoff_id"]
+        page.get_by_test_id(f"labeling-readback-{handoff_id}").click()
+        expect(page.locator(".alert-info")).to_contain_text("Applied 2 labeled image(s)")
+        expect(page.locator(".alert-info")).to_contain_text("2 label change(s) · batch complete · annotator Fixture Annotator")
+        expect(page.get_by_test_id("labeling-readback-audit")).to_contain_text("2 corrected image(s) · 2 audit event(s)")
+        with page.expect_download() as audit_download:
+            page.get_by_role("button", name="Export correction CSV").click()
+        audit_csv = Path(audit_download.value.path()).read_text(encoding="utf-8-sig")
+        assert audit_csv.count("reviewed-label") == 2
+        assert "Fixture Annotator" in audit_csv
+        assert page.request.get(base_url + "/api/v1/readback/audit").json()["summary"]["n_images"] == 2
 
         subset_dir = tmp_path / "curation-yolo-subset"
         page.get_by_label("Subset destination folder").fill(str(subset_dir))
@@ -1642,6 +1662,22 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         expect(page.locator(".curation-item-reason").first).to_have_text("checked in the visible React review")
         expect(page.get_by_test_id("active-learning-round")).to_have_count(2)
         assert len(page.request.get(restarted_url + "/api/v1/rounds").json()["rounds"]) == 2
+        expect(page.get_by_test_id("labeling-readback-audit")).to_contain_text("2 corrected image(s)")
+        page.get_by_role("button", name="Visualize").click()
+        page.get_by_test_id("model-choice-fixture-model").check()
+        page.get_by_label("Supervised UMAP").uncheck()
+        page.get_by_label("PCA").check()
+        page.get_by_label("Image folder").fill(str(dataset / "train"))
+        page.get_by_role("button", name="Add folder").click()
+        page.get_by_label("Image folder").fill(str(dataset / "test"))
+        page.get_by_role("button", name="Add folder").click()
+        page.get_by_role("button", name="Run analysis").click()
+        expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+        reviewed_points = [
+            point.get_attribute("aria-label") or ""
+            for point in page.get_by_test_id("embedding-point").all()
+        ]
+        assert sum("reviewed-label" in label for label in reviewed_points) == 2
         assert worker.pid != first_pid
     finally:
         if browser is not None:

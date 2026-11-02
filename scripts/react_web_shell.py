@@ -518,6 +518,10 @@ class AttachRoundMetricRequest(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class ApplyLabelingReadbackRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=128)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -2278,6 +2282,15 @@ def create_app(
                     job.total = total
                     job.message = f"Extracting embeddings ({done}/{total})"
 
+            label_overrides = {}
+            if job.request.mode == "classifier" and job.request.unit == "image":
+                try:
+                    import readback_store as _readback_store
+
+                    label_overrides = _readback_store.load_overlay()
+                except OSError:
+                    logger.exception("LV read-back overlay could not be loaded")
+
             result = run_image_visualization(
                 job.request.folders,
                 model_names=selected_models,
@@ -2285,6 +2298,7 @@ def create_app(
                 mode=job.request.mode,
                 unit=job.request.unit,
                 class_names=job.request.class_names,
+                label_overrides=label_overrides,
                 object_policy=(
                     job.request.object_policy.model_dump()
                     if job.request.object_policy is not None else None
@@ -5204,6 +5218,196 @@ def create_app(
                 request.note,
             )
             return {"rounds": _round_ledger.load_rounds()}
+
+    @app.get("/api/v1/labeling/handoffs")
+    def get_labeling_handoffs() -> dict:
+        import labeling_handoff as _labeling_handoff
+
+        rows = _labeling_handoff.list_pending()
+        return {"items": [
+            {
+                key: row.get(key)
+                for key in ("handoff_id", "source", "task", "created_at", "status", "n_total", "n_annotated")
+            }
+            for row in rows
+        ]}
+
+    @app.post("/api/v1/labeling/handoffs/{handoff_id}/readback")
+    def apply_labeling_readback(handoff_id: str, request: ApplyLabelingReadbackRequest) -> dict:
+        import labeling_handoff as _labeling_handoff
+        import pool_registry as _pool_registry
+        import readback_store as _readback_store
+        import round_ledger as _round_ledger
+        from collections import Counter
+
+        with app.state.lock:
+            run = app.state.runs.get(request.run_id)
+            if run is None or request.run_id != app.state.current_run_id:
+                raise HTTPException(status_code=409, detail={
+                    "code": "READBACK_RUN_NOT_CURRENT",
+                    "message": "Load the dataset in Visualize again before applying Labeling results.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if run.get("mode") != "classifier" or run.get("unit") != "image":
+                raise HTTPException(status_code=422, detail={
+                    "code": "READBACK_REQUIRES_IMAGE_CLASSIFIER",
+                    "message": "Read-back into the current run currently requires Image Classifier at whole-image level.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            row = next((item for item in _labeling_handoff.list_pending()
+                        if item.get("handoff_id") == handoff_id), None)
+            if row is None:
+                raise HTTPException(status_code=404, detail={
+                    "code": "LABELING_HANDOFF_NOT_FOUND",
+                    "message": "The selected Labeling handoff could not be found.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if row.get("status") == _labeling_handoff.STATUS_READ:
+                raise HTTPException(status_code=409, detail={
+                    "code": "LABELING_READBACK_ALREADY_APPLIED",
+                    "message": "This Labeling handoff has already been fully applied.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            handoff_root = _labeling_handoff.handoff_root().resolve(strict=False)
+            try:
+                handoff_dir = Path(row["dir"]).resolve(strict=True)
+            except (KeyError, OSError, RuntimeError) as exc:
+                raise HTTPException(status_code=404, detail={
+                    "code": "LABELING_HANDOFF_UNAVAILABLE",
+                    "message": "The selected Labeling handoff folder is unavailable.",
+                    "request_id": uuid.uuid4().hex,
+                }) from exc
+            if not handoff_dir.is_relative_to(handoff_root):
+                raise HTTPException(status_code=404, detail={
+                    "code": "LABELING_HANDOFF_NOT_FOUND",
+                    "message": "The selected Labeling handoff could not be found.",
+                    "request_id": uuid.uuid4().hex,
+                })
+
+            paths = run.get("image_paths", [])
+            hashes = run.get("_source_sha256", [])
+            public_records = run.get("records", [])
+            if len(paths) != len(public_records) or len(hashes) != len(public_records):
+                raise HTTPException(status_code=409, detail={
+                    "code": "READBACK_RUN_IDENTITY_UNAVAILABLE",
+                    "message": "The active run no longer has complete source-image identity data. Reload the dataset before applying read-back.",
+                    "request_id": uuid.uuid4().hex,
+                })
+
+            readback_records = [
+                {**record, "path": str(paths[index]), "sha256": hashes[index]}
+                for index, record in enumerate(public_records)
+            ]
+            try:
+                results = _labeling_handoff.read_labeling_results(handoff_dir)
+                changes = _labeling_handoff.apply_readback(handoff_dir, readback_records)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                logger.exception("LV could not read Labeling results for handoff %s", handoff_id)
+                raise HTTPException(status_code=422, detail={
+                    "code": "LABELING_READBACK_INVALID",
+                    "message": "The handoff or its annotation sidecars could not be read. Check the Labeling export and try again.",
+                    "request_id": uuid.uuid4().hex,
+                }) from exc
+
+            labeled_shas = [sha for sha, result in results.items() if result.get("label")]
+            if not labeled_shas:
+                raise HTTPException(status_code=409, detail={
+                    "code": "LABELING_READBACK_NOT_READY",
+                    "message": "No completed labels were found in this handoff yet.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if labeled_shas:
+                _pool_registry.mark_labeled(labeled_shas, handoff_id)
+            summary = {
+                "batch_id": handoff_id,
+                "n_labeled": len(labeled_shas),
+                "n_changed": len(changes),
+                "changed_by_class": dict(Counter(change["new_label"] for change in changes)),
+            }
+            matching_round = next((round_row["round_id"] for round_row in _round_ledger.load_rounds()
+                                   if any(batch.get("batch_id") == handoff_id
+                                          for batch in round_row.get("batches", []))), None)
+            if matching_round:
+                _round_ledger.record_readback(matching_round, summary)
+
+            annotator = next((result.get("annotator") for result in results.values()
+                              if result.get("annotator")), "")
+            persisted_changes = []
+            for change in changes:
+                index = change.get("lv_index")
+                if isinstance(index, int) and 0 <= index < len(hashes):
+                    persisted_changes.append({**change, "sha256": hashes[index]})
+            _readback_store.record_corrections(
+                persisted_changes,
+                batch_id=handoff_id,
+                round_id=matching_round or "",
+                annotator=annotator,
+            )
+
+            changes_by_index = {change["lv_index"]: change for change in changes}
+            for index, change in changes_by_index.items():
+                public_records[index]["label"] = change["new_label"]
+            for point in run.get("points", []):
+                change = changes_by_index.get(point.get("index"))
+                if change:
+                    point["label"] = change["new_label"]
+            for view in run.get("views", []):
+                for point in view.get("points", []):
+                    change = changes_by_index.get(point.get("index"))
+                    if change:
+                        point["label"] = change["new_label"]
+            complete = len(labeled_shas) >= int(row.get("n_total") or 0)
+            if complete:
+                _labeling_handoff.update_pending(
+                    handoff_id,
+                    status=_labeling_handoff.STATUS_READ,
+                    read_back_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+            return {
+                "handoff_id": handoff_id,
+                "run_id": request.run_id,
+                "round_id": matching_round,
+                "n_labeled": len(labeled_shas),
+                "n_changed": len(changes),
+                "complete": complete,
+                "annotator": annotator,
+                "orphan_round": matching_round is None,
+                "changes": [
+                    {key: change.get(key) for key in ("filename", "old_label", "new_label")}
+                    for change in changes
+                ],
+            }
+
+    @app.get("/api/v1/readback/audit")
+    def get_readback_audit() -> dict:
+        import readback_store as _readback_store
+
+        return {
+            "summary": _readback_store.corrections_summary(),
+            "events": [
+                {
+                    key: row.get(key, "")
+                    for key in ("ts", "sha256", "filename", "old_label", "new_label", "batch_id", "round_id", "annotator")
+                }
+                for row in _readback_store.load_changelog()
+            ],
+        }
+
+    @app.get("/api/v1/readback/audit.csv")
+    def export_readback_audit() -> Response:
+        import readback_store as _readback_store
+
+        buffer = StringIO()
+        fields = ["sha256", "filename", "old_label", "new_label", "annotator", "ts"]
+        writer = csv.DictWriter(buffer, fieldnames=fields)
+        writer.writeheader()
+        for row in _readback_store.load_changelog():
+            writer.writerow({key: row.get(key, "") for key in fields})
+        return Response(
+            content="\ufeff" + buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="labeling_readback_corrections.csv"'},
+        )
 
     def build_curation_subset_plan(source: str) -> tuple[list, list[Path], dict, str]:
         """Translate the saved cart into the framework-free subset contract."""

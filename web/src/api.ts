@@ -817,6 +817,34 @@ export type ActiveLearningRoundsResponse = {
   rounds: ActiveLearningRound[];
   orphan_events: Array<Record<string, unknown>>;
 };
+export type LabelingHandoff = {
+  handoff_id: string;
+  source: string;
+  task: string;
+  created_at: string;
+  status: string;
+  n_total: number | null;
+  n_annotated: number | null;
+};
+export type LabelingHandoffsResponse = { items: LabelingHandoff[] };
+export type LabelingReadbackResult = {
+  handoff_id: string;
+  run_id: string;
+  round_id: string | null;
+  n_labeled: number;
+  n_changed: number;
+  complete: boolean;
+  annotator: string;
+  orphan_round: boolean;
+  changes: Array<{ filename: string | null; old_label: string | null; new_label: string | null }>;
+};
+export type ReadbackAuditResponse = {
+  summary: { n_events: number; n_images: number; by_new_label: Record<string, number> };
+  events: Array<{
+    ts: string; sha256: string; filename: string; old_label: string; new_label: string;
+    batch_id: string; round_id: string; annotator: string;
+  }>;
+};
 
 export type FalsePositiveSource = {
   id: string;
@@ -1481,6 +1509,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  labelingHandoffs: () => request<LabelingHandoffsResponse>("/api/v1/labeling/handoffs"),
+  applyLabelingReadback: (handoffId: string, runId: string) =>
+    request<LabelingReadbackResult>("/api/v1/labeling/handoffs/" + encodeURIComponent(handoffId) + "/readback", {
+      method: "POST",
+      body: JSON.stringify({ run_id: runId }),
+    }),
+  readbackAudit: () => request<ReadbackAuditResponse>("/api/v1/readback/audit"),
+  readbackAuditCsv: () => requestGetBlob("/api/v1/readback/audit.csv"),
   curationSubsetPreview: (input: CurationSubsetOptions) =>
     request<CurationSubsetPreview>("/api/v1/curation/subset/preview", {
       method: "POST",

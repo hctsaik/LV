@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ActiveLearningRound, CurationHandoffPreview, CurationItem, CurationSubsetOptions, CurationSubsetPreview } from "./api";
+import { api, ActiveLearningRound, CurationHandoffPreview, CurationItem, CurationSubsetOptions, CurationSubsetPreview, LabelingHandoff, ReadbackAuditResponse, VisualizationRun } from "./api";
 
-type Props = { onCountChange: (count: number) => void };
+type Props = {
+  onCountChange: (count: number) => void;
+  currentRunId: string | null;
+  onRunUpdated: (run: VisualizationRun) => void;
+};
 
 const downloadName: Record<"csv" | "json" | "zip", string> = {
   csv: "curation_cart.csv",
@@ -9,7 +13,7 @@ const downloadName: Record<"csv" | "json" | "zip", string> = {
   zip: "curation_cart_images.zip",
 };
 
-export default function CurationWorkspace({ onCountChange }: Props) {
+export default function CurationWorkspace({ onCountChange, currentRunId, onRunUpdated }: Props) {
   const [items, setItems] = useState<CurationItem[]>([]);
   const [sourceFilter, setSourceFilter] = useState("all");
   const [reasonDraft, setReasonDraft] = useState("");
@@ -22,6 +26,9 @@ export default function CurationWorkspace({ onCountChange }: Props) {
   const [newRound, setNewRound] = useState(true);
   const [selectedRoundId, setSelectedRoundId] = useState("");
   const [rounds, setRounds] = useState<ActiveLearningRound[]>([]);
+  const [handoffs, setHandoffs] = useState<LabelingHandoff[]>([]);
+  const [readbackAudit, setReadbackAudit] = useState<ReadbackAuditResponse | null>(null);
+  const [readbackBusyId, setReadbackBusyId] = useState("");
   const [curveMetric, setCurveMetric] = useState("");
   const [metricRoundId, setMetricRoundId] = useState("");
   const [metricName, setMetricName] = useState("");
@@ -107,6 +114,18 @@ export default function CurationWorkspace({ onCountChange }: Props) {
       }
     }).catch((reason: unknown) => {
       if (active) setError(reason instanceof Error ? reason.message : "Could not load the active-learning rounds.");
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([api.labelingHandoffs(), api.readbackAudit()]).then(([pending, audit]) => {
+      if (!active) return;
+      setHandoffs(pending.items);
+      setReadbackAudit(audit);
+    }).catch((reason: unknown) => {
+      if (active) setError(reason instanceof Error ? reason.message : "Could not load Labeling read-back records.");
     });
     return () => { active = false; };
   }, []);
@@ -242,6 +261,18 @@ export default function CurationWorkspace({ onCountChange }: Props) {
     return response.rounds;
   }
 
+  async function refreshHandoffs() {
+    const response = await api.labelingHandoffs();
+    setHandoffs(response.items);
+    return response.items;
+  }
+
+  async function refreshReadbackAudit() {
+    const response = await api.readbackAudit();
+    setReadbackAudit(response);
+    return response;
+  }
+
   async function sendToLabeling() {
     if (!visibleItemIds.length || !handoffPreview?.sendable_images) return;
     setBusy(true);
@@ -254,7 +285,7 @@ export default function CurationWorkspace({ onCountChange }: Props) {
         new_round: newRound,
         round_id: newRound ? null : selectedRoundId || null,
       });
-      const refreshedRounds = await refreshRounds();
+      const [refreshedRounds] = await Promise.all([refreshRounds(), refreshHandoffs()]);
       if (response.created_round) {
         const latestRound = refreshedRounds[refreshedRounds.length - 1];
         if (latestRound) {
@@ -290,6 +321,50 @@ export default function CurationWorkspace({ onCountChange }: Props) {
       setMetricName("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not add the round metric.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyReadback(handoff: LabelingHandoff) {
+    if (!currentRunId || !handoff.n_annotated || handoff.status === "read_back") return;
+    setReadbackBusyId(handoff.handoff_id);
+    setError("");
+    setNotice("");
+    try {
+      const response = await api.applyLabelingReadback(handoff.handoff_id, currentRunId);
+      if (response.n_changed) onRunUpdated(await api.run(currentRunId));
+      await Promise.all([refreshHandoffs(), refreshReadbackAudit(), refreshRounds()]);
+      setNotice(
+        `Applied ${response.n_labeled} labeled image(s) from ${handoff.handoff_id}; `
+        + `${response.n_changed} label change(s)${response.complete ? " · batch complete" : " · partial read-back"}`
+        + `${response.annotator ? ` · annotator ${response.annotator}` : ""}`
+        + (response.orphan_round ? " · no matching round; this handoff remains outside the round timeline" : ""),
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not apply Labeling read-back.");
+    } finally {
+      setReadbackBusyId("");
+    }
+  }
+
+  async function exportReadbackAudit() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const blob = await api.readbackAuditCsv();
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = href;
+      anchor.download = "labeling_readback_corrections.csv";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(href);
+      setNotice("Exported the Labeling correction audit as CSV.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not export the read-back audit.");
     } finally {
       setBusy(false);
     }
@@ -397,6 +472,63 @@ export default function CurationWorkspace({ onCountChange }: Props) {
             <strong>{handoffPreview.sendable_images} sendable · {handoffPreview.new_images} new · {handoffPreview.handled_images} already handled</strong>
             <span>{handoffPreview.unique_images} unique source image(s) · {handoffPreview.deduplicated} duplicate(s) merged · {handoffPreview.unavailable} unavailable</span>
             {handoffPreview.skipped_handled > 0 && <span>Default send skips {handoffPreview.skipped_handled} already handled image(s). The checkbox above is the explicit override.</span>}
+          </div>
+        )}
+      </section>
+
+      <section className="curation-subset-panel labeling-readback" aria-label="Labeling feedback and read-back" data-testid="labeling-readback-panel">
+        <div className="curation-subset-heading">
+          <div>
+            <h2>Labeling feedback</h2>
+            <p>Refresh after the annotator exports results. Read-back matches images by SHA-256, records corrections locally, and never edits the source dataset.</p>
+          </div>
+          <button type="button" data-testid="refresh-labeling-inbox" className="secondary-action" disabled={busy || !!readbackBusyId} onClick={() => void Promise.all([refreshHandoffs(), refreshReadbackAudit()])}>Refresh inbox</button>
+        </div>
+        {!currentRunId && <div className="labeling-readback-warning" role="status">Load the matching image-level classifier dataset in Visualize before applying labels.</div>}
+        {handoffs.length === 0 ? (
+          <div className="curation-empty labeling-readback-empty" data-testid="labeling-inbox-empty">No local Labeling handoffs yet.</div>
+        ) : (
+          <div className="labeling-handoff-list">
+            {handoffs.map((handoff) => (
+              <article className="labeling-handoff-row" key={handoff.handoff_id} data-testid="labeling-handoff-row">
+                <div>
+                  <strong>{handoff.source} · {handoff.task}</strong>
+                  <span>{handoff.created_at} · {handoff.n_annotated ?? 0}/{handoff.n_total ?? 0} labeled · {handoff.status}</span>
+                  <code>{handoff.handoff_id}</code>
+                </div>
+                <button
+                  type="button"
+                  data-testid={`labeling-readback-${handoff.handoff_id}`}
+                  disabled={!currentRunId || !handoff.n_annotated || handoff.status === "read_back" || !!readbackBusyId}
+                  onClick={() => void applyReadback(handoff)}
+                >
+                  {readbackBusyId === handoff.handoff_id ? "Applying…" : handoff.status === "read_back" ? "Read back applied" : `Apply read-back (${handoff.n_annotated ?? 0})`}
+                </button>
+              </article>
+            ))}
+          </div>
+        )}
+        {readbackAudit && (
+          <div className="labeling-readback-audit" data-testid="labeling-readback-audit">
+            <div className="labeling-readback-audit-heading">
+              <strong>{readbackAudit.summary.n_images} corrected image(s) · {readbackAudit.summary.n_events} audit event(s)</strong>
+              <button type="button" disabled={busy || !readbackAudit.summary.n_events} onClick={() => void exportReadbackAudit()}>Export correction CSV</button>
+            </div>
+            {readbackAudit.events.length > 0 && (
+              <div className="labeling-readback-audit-table-wrap">
+                <table className="labeling-readback-audit-table">
+                  <thead><tr><th>Image</th><th>Old label</th><th>New label</th><th>Annotator</th><th>Round</th></tr></thead>
+                  <tbody>
+                    {[...readbackAudit.events].reverse().slice(0, 20).map((event, index) => (
+                      <tr key={`${event.ts}-${event.sha256}-${index}`}>
+                        <td title={event.sha256}>{event.filename}</td><td>{event.old_label || "—"}</td>
+                        <td>{event.new_label}</td><td>{event.annotator || "—"}</td><td>{event.round_id || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
       </section>

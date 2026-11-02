@@ -221,6 +221,7 @@ def run_image_visualization(
     unit: str = "image",
     class_names: Sequence[str] = (),
     object_policy: dict | None = None,
+    label_overrides: dict[str, str] | None = None,
     umap_reference: bool = False,
     umap_rebuild: bool = False,
     model_loader: Callable[[str], Callable[[Path], np.ndarray]] = load_model,
@@ -355,6 +356,15 @@ def run_image_visualization(
             continue
         manifest_by_folder[folder] = update_manifest(folder, folder_records)
         paths_by_folder[folder] = [Path(record["path"]) for record in folder_records]
+
+    if label_overrides and mode == "classifier" and unit == "image":
+        for record in source_records:
+            path = Path(record["path"]).resolve()
+            folder = next(folder for folder in resolved_folders if _is_under(path, folder))
+            source_sha = manifest_by_folder[folder][rel_key(folder, path)]["sha256"]
+            corrected_label = label_overrides.get(source_sha)
+            if corrected_label:
+                record["label"] = str(corrected_label)
 
     completed = 0
     total = len(records) * len(selected_models)
