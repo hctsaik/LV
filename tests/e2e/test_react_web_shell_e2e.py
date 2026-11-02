@@ -707,6 +707,8 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
             page.get_by_label("Upload class similarity evaluation JSON").set_input_files(str(heldout_path))
             expect(page.get_by_role("status").filter(has_text="Heldout verdicts validated")).to_be_visible(timeout=15_000)
             expect(page.get_by_role("img", name="Precision recall curve")).to_have_count(0)
+            expect(page.get_by_label("Class similarity threshold", exact=True)).to_be_disabled()
+            expect(page.get_by_role("button", name="No candidates")).to_be_disabled()
 
             with page.expect_download() as report_download_info:
                 page.get_by_role("button", name="CSV", exact=True).first.click()

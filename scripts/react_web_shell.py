@@ -5251,6 +5251,17 @@ def create_app(
             recipe=prepared.embedding_recipe, analysis_split=prepared.analysis_split,
         )
 
+    def class_similarity_policy_for_job(job: _ClassSimilarityJob, policy: dict):
+        requested = parse_class_similarity_policy(policy)
+        if job.evaluation and job.evaluation.get("purpose") == "heldout":
+            if not job.frozen_policy:
+                raise HTTPException(status_code=409, detail="Heldout policy is unavailable; restore a valid tuning point.")
+            frozen = parse_class_similarity_policy(job.frozen_policy.get("policy"))
+            if requested != frozen:
+                raise HTTPException(status_code=409, detail="Heldout threshold is locked to the saved operating point.")
+            return frozen
+        return requested
+
     @app.post("/api/v1/class-similarity/jobs/{job_id}/evaluation/template")
     def download_class_similarity_evaluation_template(
         job_id: str, request: ClassSimilarityEvaluationTemplateRequest,
@@ -5394,7 +5405,10 @@ def create_app(
     ) -> dict:
         job = current_class_similarity_job(job_id)
         try:
-            return class_similarity_evaluation_payload(job, request.policy)
+            policy = class_similarity_policy_for_job(job, request.policy)
+            return class_similarity_evaluation_payload(job, policy.__dict__)
+        except HTTPException:
+            raise
         except ClassSimilarityError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -5404,7 +5418,7 @@ def create_app(
         prepared = job.prepared
         analysis = job.analysis
         try:
-            policy = parse_class_similarity_policy(request.policy)
+            policy = class_similarity_policy_for_job(job, request.policy)
             mask = class_similarity_candidate_mask(analysis.items, policy)
             counts = evaluate_class_similarity_threshold(
                 analysis.items, mask, job.evaluation,

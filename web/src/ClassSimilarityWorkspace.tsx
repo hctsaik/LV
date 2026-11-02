@@ -142,6 +142,8 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
   };
   const evaluationPreviewIsCurrent = evaluationPreview?.policy.mode === currentPolicy.mode
     && evaluationPreview.policy.threshold === currentPolicy.threshold;
+  const heldoutLocked = evaluationPreview?.evaluation?.purpose === "heldout"
+    && evaluationPreview.frozen_policy !== null;
 
   async function calculate() {
     if (busy) return;
@@ -370,13 +372,13 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
           </section>
 
           <section className="class-similarity-threshold-panel" aria-label="Threshold candidate preview">
-            <div className="class-similarity-panel-heading"><div><div className="eyebrow">HUMAN REVIEW QUEUE</div><h2>Threshold preview</h2></div><span>Precision / Recall unavailable without a verified review set.</span></div>
+            <div className="class-similarity-panel-heading"><div><div className="eyebrow">HUMAN REVIEW QUEUE</div><h2>Threshold preview</h2></div><span>{heldoutLocked ? "Heldout threshold is locked to the saved operating point." : "Precision / Recall unavailable without a verified review set."}</span></div>
             <div className="class-similarity-threshold-controls">
-              <label><span>Margin threshold</span><input aria-label="Class similarity threshold" type="number" min={-2} max={2} step="any" value={threshold} disabled={candidateMode !== "threshold"} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= -2 && value <= 2) setThreshold(value); }} /></label>
-              <input aria-label="Class similarity threshold slider" type="range" min={-2} max={2} step={0.01} value={threshold} disabled={candidateMode !== "threshold"} onChange={(event) => setThreshold(Number(event.target.value))} />
-              <button type="button" className={candidateMode === "none" ? "active" : ""} onClick={() => setCandidateMode("none")}>No candidates</button>
-              <button type="button" className={candidateMode === "all_eligible" ? "active" : ""} onClick={() => setCandidateMode("all_eligible")}>All scored</button>
-              <button type="button" className="secondary-action" onClick={() => { setCandidateMode("threshold"); setThreshold(0); }}>Reset threshold</button>
+              <label><span>Margin threshold</span><input aria-label="Class similarity threshold" type="number" min={-2} max={2} step="any" value={threshold} disabled={candidateMode !== "threshold" || heldoutLocked} onChange={(event) => { const value = Number(event.target.value); if (Number.isFinite(value) && value >= -2 && value <= 2) setThreshold(value); }} /></label>
+              <input aria-label="Class similarity threshold slider" type="range" min={-2} max={2} step={0.01} value={threshold} disabled={candidateMode !== "threshold" || heldoutLocked} onChange={(event) => setThreshold(Number(event.target.value))} />
+              <button type="button" className={candidateMode === "none" ? "active" : ""} onClick={() => setCandidateMode("none")} disabled={heldoutLocked}>No candidates</button>
+              <button type="button" className={candidateMode === "all_eligible" ? "active" : ""} onClick={() => setCandidateMode("all_eligible")} disabled={heldoutLocked}>All scored</button>
+              <button type="button" className="secondary-action" onClick={() => { setCandidateMode("threshold"); setThreshold(0); }} disabled={heldoutLocked}>Reset threshold</button>
             </div>
             <p className="class-similarity-candidate-count" data-testid="class-similarity-candidate-count">
               {candidateIds.length.toLocaleString()} candidates · {eligibleCount ? (candidateIds.length / eligibleCount * 100).toFixed(1) : "0.0"}% of scored records · {result.items.length - eligibleCount} unscored

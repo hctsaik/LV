@@ -314,6 +314,20 @@ def test_class_similarity_saved_operating_point_requires_disjoint_heldout_review
         assert heldout_payload["counts"]["status"] == "ready"
         assert heldout_payload["precision_recall_curve"] == []
 
+        changed_preview = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation/preview",
+            json={"policy": {"mode": "threshold", "threshold": -1.0}},
+        )
+        assert changed_preview.status_code == 409
+        assert "locked" in changed_preview.json()["message"]
+        changed_report = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/report",
+            json={"scope": "all", "selected_ids": [],
+                  "policy": {"mode": "threshold", "threshold": -1.0}, "format": "json"},
+        )
+        assert changed_report.status_code == 409
+        assert "locked" in changed_report.json()["message"]
+
         reused = client.put(
             f"/api/v1/class-similarity/jobs/{job_id}/evaluation",
             json={"manifest": heldout_template, "policy": {"mode": "threshold", "threshold": 0.5}},
