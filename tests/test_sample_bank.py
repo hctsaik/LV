@@ -177,6 +177,29 @@ def test_ac_os2_object_source_roundtrip(tmp_path):  # AC-OS-2:save→load 往返
     assert sb.load_sample_bank(tmp_path / "sb")["object_source"] == "whole_image"
 
 
+def test_append_preserves_whole_image_source_and_candidate_identity(tmp_path):
+    sb = _sb()
+    bank = _bank([[1, 0, 0, 0]], ["image"])
+    bank["object_source"] = "whole_image"
+    sb.save_sample_bank(tmp_path / "sb", bank)
+
+    sb.append_sample(
+        tmp_path / "sb",
+        vectors=np.asarray([[0, 1, 0, 0]], dtype=np.float32),
+        labels=["image"],
+        provenance=[{
+            "image_path": "/new/whole.png",
+            "bbox": [0.5, 0.5, 1.0, 1.0],
+            "label": "image",
+            "item_id": "source-hash:0.500,0.500,1.000,1.000:image:0",
+        }],
+    )
+
+    reopened = sb.load_sample_bank(tmp_path / "sb")
+    assert reopened["object_source"] == "whole_image"
+    assert reopened["provenance"][-1]["item_id"].startswith("source-hash:")
+
+
 def test_ac_os3_load_legacy_defaults_yolo(tmp_path):  # AC-OS-3:舊集(meta 無 object_source)→ 回填 "yolo"
     sb = _sb()
     d = tmp_path / "old"

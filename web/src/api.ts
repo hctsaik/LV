@@ -104,6 +104,37 @@ export type FewshotSampleBankJob = {
   can_cancel: boolean;
 };
 
+export type FewshotCandidate = {
+  index: number;
+  item_id: string;
+  filename: string;
+  bbox: [number, number, number, number];
+  obj_index: number;
+  label: string;
+  suggested_class: string;
+  similarity: number;
+  reason: string;
+};
+
+export type FewshotScan = {
+  scan_id: string;
+  sample_bank_id: string;
+  model_id: string;
+  target_res: number;
+  object_source: "yolo" | "whole_image";
+  k: number;
+  images_total: number;
+  images_processed: number;
+  objects_scored: number;
+  candidate_count: number;
+  done: boolean;
+  candidates: FewshotCandidate[];
+};
+
+export type FewshotScanJob = Omit<FewshotSampleBankJob, "result"> & {
+  result: FewshotScan | null;
+};
+
 export type AnomalyRun = {
   run_id: string;
   revision: number;
@@ -879,6 +910,31 @@ export const api = {
   ),
   getFewshotSampleBank: (sampleBankId: string) => request<{ sample_bank: FewshotSampleBank }>(
     "/api/v1/fewshot/sample-banks/" + encodeURIComponent(sampleBankId),
+  ),
+  createFewshotScanJob: (input: {
+    sample_bank_id: string;
+    target_folders: string[];
+    k: number;
+    min_proposal_conf: number;
+  }) => request<{ job_id: string; state: string }>("/api/v1/fewshot/scans/jobs", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  fewshotScanJob: (jobId: string) => request<FewshotScanJob>(
+    "/api/v1/fewshot/jobs/" + encodeURIComponent(jobId),
+  ),
+  fewshotCandidatePreviewUrl: (scanId: string, index: number) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fewshot/scans/" + encodeURIComponent(scanId)
+      + "/records/" + index + "/preview.jpg",
+  addFewshotCandidates: (input: {
+    sample_bank_id: string;
+    scan_id: string;
+    item_ids: string[];
+    theta: number;
+    class_overrides: Record<string, string>;
+  }) => request<{ added: number; skipped: number; sample_bank: FewshotSampleBank }>(
+    "/api/v1/fewshot/sample-banks/add-candidates",
+    { method: "POST", body: JSON.stringify(input) },
   ),
   anomalyJob: (jobId: string) => request<AnomalyModelJob>(
     "/api/v1/anomaly/jobs/" + encodeURIComponent(jobId),

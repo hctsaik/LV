@@ -3587,3 +3587,107 @@ def test_lv_web_06_review_01_visible_anomaly_candidate_cart_exports_original_ima
     finally:
         server.should_exit = True
         server_thread.join(timeout=10)
+
+
+def test_lv_web_07_scan_01_visible_reviews_and_appends_fewshot_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Review scan candidates in React, append accepted samples, then scan again."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    sample_root = tmp_path / "fewshot-samples"
+    (sample_root / "images").mkdir(parents=True)
+    (sample_root / "labels").mkdir()
+    (sample_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    Image.new("RGB", (48, 40), (220, 30, 40)).save(sample_root / "images" / "sample-0.png")
+    Image.new("RGB", (48, 40), (20, 180, 80)).save(sample_root / "images" / "sample-1.png")
+    (sample_root / "labels" / "sample-0.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n1 0.25 0.25 0.25 0.25\n", encoding="utf-8",
+    )
+    (sample_root / "labels" / "sample-1.txt").write_text(
+        "0 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+    )
+
+    target_root = tmp_path / "fewshot-targets"
+    (target_root / "images").mkdir(parents=True)
+    (target_root / "labels").mkdir()
+    (target_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    Image.new("RGB", (48, 40), (220, 30, 40)).save(target_root / "images" / "target-0.png")
+    Image.new("RGB", (48, 40), (20, 180, 80)).save(target_root / "images" / "target-1.png")
+    (target_root / "labels" / "target-0.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n1 0.25 0.25 0.25 0.25\n", encoding="utf-8",
+    )
+    (target_root / "labels" / "target-1.txt").write_text(
+        "0 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+    )
+    source_files = [path for root in (sample_root, target_root) for path in root.rglob("*") if path.is_file()]
+    source_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: lambda crop: np.asarray(
+            [np.asarray(crop.convert("RGB"), dtype=np.float32).mean(), crop.width, crop.height, 1],
+            dtype=np.float32,
+        ),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1050})
+            page.set_default_timeout(20_000)
+            anomaly_model_build_requests: list[str] = []
+            scan_requests: list[dict] = []
+            page.on("request", lambda request: anomaly_model_build_requests.append(request.url)
+                    if "/api/v1/anomaly/models/jobs" in request.url else None)
+            page.on("request", lambda request: scan_requests.append(json.loads(request.post_data or "{}"))
+                    if request.method == "POST"
+                    and request.url.rstrip("/").endswith("/api/v1/fewshot/scans/jobs") else None)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fewshot-samples").click()
+            expect(page.get_by_role("heading", name="以樣搜樣：建立樣本集")).to_be_visible()
+
+            page.get_by_test_id("fewshot-sample-folders").fill(str(sample_root))
+            page.get_by_test_id("fewshot-object-source").select_option("yolo")
+            page.get_by_test_id("fewshot-build-bank").click()
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("3 個樣本", timeout=60_000)
+            bank_id = page.get_by_test_id("fewshot-bank-id").input_value()
+
+            page.get_by_test_id("fewshot-target-folders").fill(str(target_root))
+            page.get_by_test_id("fewshot-theta").fill("0.9")
+            page.get_by_test_id("fewshot-scan").click()
+            expect(page.get_by_test_id("fewshot-scan-summary")).to_contain_text("候選 3", timeout=60_000)
+            candidates = page.get_by_test_id("fewshot-candidate")
+            expect(candidates).to_have_count(3)
+            preview = candidates.nth(0).get_by_test_id("fewshot-candidate-preview")
+            page.wait_for_function(
+                "element => element.complete && element.naturalWidth > 0",
+                arg=preview.element_handle(),
+                timeout=15_000,
+            )
+
+            candidates.nth(1).get_by_role("checkbox").uncheck()
+            candidates.nth(0).get_by_role("combobox").select_option(label="stain")
+            page.get_by_test_id("fewshot-add-selected").click()
+            expect(page.get_by_test_id("fewshot-scan-notice")).to_contain_text("已加入 2 顆", timeout=30_000)
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("5 個樣本")
+            updated_summary = page.get_by_test_id("fewshot-bank-summary").inner_text()
+            assert "stain 2" in updated_summary or "stain 3" in updated_summary
+
+            page.get_by_test_id("fewshot-scan").click()
+            expect(page.get_by_test_id("fewshot-scan-summary")).to_contain_text("候選 3", timeout=60_000)
+            assert [item["sample_bank_id"] for item in scan_requests] == [bank_id, bank_id]
+            assert anomaly_model_build_requests == []
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes}

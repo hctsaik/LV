@@ -81,7 +81,8 @@ def append_sample(bank_dir, *, vectors, labels, provenance) -> dict:
     merged = {"vectors": np.concatenate([bank["vectors"], nv], axis=0),
               "labels": np.array(list(bank["labels"]) + [str(l) for l in labels]),
               "provenance": list(bank["provenance"]) + list(provenance),
-              "model": bank["model"], "target_res": bank["target_res"]}
+              "model": bank["model"], "target_res": bank["target_res"],
+              "object_source": bank.get("object_source") or "yolo"}
     save_sample_bank(bank_dir, merged)
     return merged
 

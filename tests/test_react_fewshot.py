@@ -151,3 +151,118 @@ def test_fewshot_yolo_without_objects_fails_before_loading_model(monkeypatch, tm
         assert job["state"] == "failed"
         assert job["error"]["code"] == "INVALID_SAMPLE_DATA"
         assert not (tmp_path / "cache" / "fewshot_sample_banks").exists()
+
+
+def test_fewshot_scan_threshold_confirm_append_and_reuse_updated_bank(monkeypatch, tmp_path: Path):
+    samples = _samples(tmp_path / "sample-set", with_labels=True)
+    targets = _samples(tmp_path / "target-set", with_labels=True)
+    source_hashes = {
+        path: path.read_bytes()
+        for root in (samples, targets)
+        for path in root.rglob("*") if path.is_file()
+    }
+    with _client(monkeypatch, tmp_path) as worker:
+        created_bank = worker.post("/api/v1/fewshot/sample-banks/jobs", json={
+            "sample_folders": [str(samples)],
+            "model_id": "fixture-model",
+            "object_source": "yolo",
+        })
+        assert created_bank.status_code == 202, created_bank.text
+        bank_job = _wait_job(worker, created_bank.json()["job_id"])
+        assert bank_job["state"] == "completed", bank_job
+        bank = bank_job["result"]
+
+        created_scan = worker.post("/api/v1/fewshot/scans/jobs", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "target_folders": [str(targets)],
+            "k": 20,
+            "min_proposal_conf": 0.0,
+        })
+        assert created_scan.status_code == 202, created_scan.text
+        scan_job = _wait_job(worker, created_scan.json()["job_id"])
+        assert scan_job["state"] == "completed", scan_job
+        scan = scan_job["result"]
+        assert scan["candidate_count"] == 3
+        assert all(item["similarity"] >= 0.99 for item in scan["candidates"])
+        assert str(tmp_path) not in json.dumps(scan_job)
+        preview = worker.get(
+            f"/api/v1/fewshot/scans/{scan['scan_id']}/records/0/preview.jpg"
+        )
+        assert preview.status_code == 200
+        assert Image.open(__import__("io").BytesIO(preview.content)).size[0] > 0
+
+        selected = [scan["candidates"][0], scan["candidates"][2]]
+        appended = worker.post("/api/v1/fewshot/sample-banks/add-candidates", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "scan_id": scan["scan_id"],
+            "item_ids": [item["item_id"] for item in selected],
+            "theta": 0.9,
+            "class_overrides": {selected[0]["item_id"]: "stain"},
+        })
+        assert appended.status_code == 200, appended.text
+        updated_bank = appended.json()["sample_bank"]
+        assert appended.json()["added"] == 2
+        assert updated_bank["sample_count"] == bank["sample_count"] + 2
+        expected_stain = bank["class_counts"]["stain"] + 1 + int(
+            selected[1]["suggested_class"] == "stain"
+        )
+        assert updated_bank["class_counts"]["stain"] == expected_stain
+
+        storage = tmp_path / "cache" / "fewshot_sample_banks" / bank["sample_bank_id"]
+        import sample_bank
+        persisted = sample_bank.load_sample_bank(storage)
+        assert persisted["object_source"] == "yolo"
+        assert {item["item_id"] for item in persisted["provenance"][-2:]} == {
+            item["item_id"] for item in selected
+        }
+
+        duplicate = worker.post("/api/v1/fewshot/sample-banks/add-candidates", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "scan_id": scan["scan_id"],
+            "item_ids": [selected[0]["item_id"]],
+            "theta": 0.9,
+            "class_overrides": {},
+        })
+        assert duplicate.status_code == 200, duplicate.text
+        assert duplicate.json()["added"] == 0
+        assert duplicate.json()["skipped"] == 1
+
+        reused_scan = worker.post("/api/v1/fewshot/scans/jobs", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "target_folders": [str(targets)],
+            "k": 20,
+            "min_proposal_conf": 0.0,
+        })
+        assert reused_scan.status_code == 202, reused_scan.text
+        reused_job = _wait_job(worker, reused_scan.json()["job_id"])
+        assert reused_job["state"] == "completed", reused_job
+        assert reused_job["result"]["sample_bank_id"] == bank["sample_bank_id"]
+        assert worker.get(
+            f"/api/v1/fewshot/sample-banks/{bank['sample_bank_id']}"
+        ).json()["sample_bank"]["sample_count"] == updated_bank["sample_count"]
+
+    assert {path: path.read_bytes() for path in source_hashes} == source_hashes
+
+
+def test_fewshot_whole_image_scan_keeps_full_image_boxes_and_source_identity(monkeypatch, tmp_path: Path):
+    samples = _samples(tmp_path / "whole-samples", with_labels=False)
+    targets = _samples(tmp_path / "whole-targets", with_labels=False)
+    with _client(monkeypatch, tmp_path) as worker:
+        created_bank = worker.post("/api/v1/fewshot/sample-banks/jobs", json={
+            "sample_folders": [str(samples)],
+            "model_id": "fixture-model",
+            "object_source": "whole_image",
+        })
+        assert created_bank.status_code == 202, created_bank.text
+        bank = _wait_job(worker, created_bank.json()["job_id"])["result"]
+        created_scan = worker.post("/api/v1/fewshot/scans/jobs", json={
+            "sample_bank_id": bank["sample_bank_id"],
+            "target_folders": [str(targets)],
+            "k": 10,
+            "min_proposal_conf": 0.0,
+        })
+        assert created_scan.status_code == 202, created_scan.text
+        result = _wait_job(worker, created_scan.json()["job_id"])["result"]
+        assert result["object_source"] == "whole_image"
+        assert result["candidate_count"] == 2
+        assert all(item["bbox"] == [0.5, 0.5, 1.0, 1.0] for item in result["candidates"])

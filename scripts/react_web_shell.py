@@ -244,6 +244,21 @@ class CreateFewshotSampleBankJobRequest(BaseModel):
     class_names: list[str] = Field(default_factory=list, max_length=256)
 
 
+class CreateFewshotScanJobRequest(BaseModel):
+    sample_bank_id: str = Field(min_length=36, max_length=36)
+    target_folders: list[str] = Field(min_length=1, max_length=32)
+    k: int = Field(default=100, ge=10, le=500, multiple_of=10)
+    min_proposal_conf: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+
+
+class AddFewshotCandidatesRequest(BaseModel):
+    sample_bank_id: str = Field(min_length=36, max_length=36)
+    scan_id: str = Field(min_length=36, max_length=36)
+    item_ids: list[str] = Field(min_length=1, max_length=500)
+    theta: float = Field(default=0.3, ge=0.0, le=1.0, allow_inf_nan=False)
+    class_overrides: dict[str, str] = Field(default_factory=dict, max_length=500)
+
+
 class CreateAnomalyScoreJobRequest(BaseModel):
     target_folders: list[str] = Field(min_length=1, max_length=32)
     contamination: float = Field(default=0.05, ge=0.0, le=1.0, allow_inf_nan=False)
@@ -513,6 +528,19 @@ class _FewshotSampleBankJob:
 
 
 @dataclass
+class _FewshotScanJob:
+    job_id: str
+    request: CreateFewshotScanJobRequest
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    result: dict | None = None
+    error: dict | None = None
+
+
+@dataclass
 class _AnomalyScoreJob:
     job_id: str
     model_id: str
@@ -558,7 +586,7 @@ def _anomaly_job_view(job: _AnomalyModelJob) -> dict:
     }
 
 
-def _fewshot_sample_bank_job_view(job: _FewshotSampleBankJob) -> dict:
+def _fewshot_sample_bank_job_view(job: _FewshotSampleBankJob | _FewshotScanJob) -> dict:
     return {
         "job_id": job.job_id,
         "state": job.state,
@@ -638,6 +666,9 @@ def create_app(
     app.state.anomaly_jobs = {}
     app.state.anomaly_score_jobs = {}
     app.state.fewshot_sample_bank_jobs = {}
+    app.state.fewshot_scan_jobs = {}
+    app.state.fewshot_scans = {}
+    app.state.fewshot_lock = threading.RLock()
     app.state.anomaly_runs = {}
     app.state.current_anomaly_run_id = None
     app.state.anomaly_models = {}
@@ -660,6 +691,7 @@ def create_app(
             + list(app.state.anomaly_jobs.values())
             + list(app.state.anomaly_score_jobs.values())
             + list(app.state.fewshot_sample_bank_jobs.values())
+            + list(app.state.fewshot_scan_jobs.values())
         )
         return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
@@ -1443,7 +1475,8 @@ def create_app(
     @app.get("/api/v1/fewshot/jobs/{job_id}")
     def get_fewshot_sample_bank_job(job_id: str) -> dict:
         with app.state.lock:
-            job = app.state.fewshot_sample_bank_jobs.get(job_id)
+            job = (app.state.fewshot_sample_bank_jobs.get(job_id)
+                   or app.state.fewshot_scan_jobs.get(job_id))
             if job is None:
                 raise HTTPException(status_code=404, detail="找不到以樣搜樣工作")
             return _fewshot_sample_bank_job_view(job)
@@ -1459,6 +1492,324 @@ def create_app(
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=422, detail="樣本集損毀或格式不相容") from exc
         return {"sample_bank": fewshot_sample_bank_view(sample_bank_id, bank)}
+
+    def fewshot_scan_public_records(records: list[dict]) -> list[dict]:
+        output = []
+        for index, record in enumerate(records):
+            output.append({
+                "index": index,
+                "item_id": str(record["item_id"]),
+                "filename": Path(record["image_path"]).name,
+                "bbox": [float(value) for value in record["bbox"]],
+                "obj_index": int(record.get("obj_index") or 0),
+                "label": str(record.get("label") or ""),
+                "suggested_class": str(record.get("suggested_class") or ""),
+                "similarity": float(record.get("similarity") or 0.0),
+                "reason": str(record.get("reason") or ""),
+            })
+        return output
+
+    def execute_fewshot_scan_job(
+        job: _FewshotScanJob, bank: dict, roots: list[Path], image_paths: list[Path],
+        class_names: list[str] | None,
+    ) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase = "running", "scanning"
+                job.total = len(image_paths)
+                job.message = f"正在海掃 {job.total} 張影像"
+
+            embedder: Callable | None = None
+
+            def embed_fn(crop):
+                nonlocal embedder
+                if embedder is None:
+                    if has_custom_object_model_loader or not has_custom_model_loader:
+                        embedder = object_loader(
+                            bank["model"], keep_aspect=True,
+                            target_res=int(bank["target_res"]), head="cls",
+                        )
+                    else:
+                        embedder = loader(bank["model"])
+                return embedder(crop)
+
+            def update_progress(data: dict) -> None:
+                with app.state.lock:
+                    job.phase = "scanning"
+                    job.done = max(0, int(data.get("images_processed") or 0))
+                    job.total = max(1, int(data.get("images_total") or len(image_paths)))
+                    scored = int(data.get("objects_scored") or 0)
+                    job.message = f"海掃 {job.done}/{job.total} 張影像 · 已評分 {scored} 個候選"
+
+            from object_eval import dataset_cache_dir
+            import al_batch
+
+            confidence_key = round(float(job.request.min_proposal_conf) * 1000)
+            checkpoint_dir = dataset_cache_dir(
+                roots[0],
+                f"fewshot_retrieve_{job.request.sample_bank_id}_k{job.request.k}_c{confidence_key}",
+            )
+            result = al_batch.run_batched(
+                image_paths,
+                model_dir=None,
+                feature_extractor={"model": bank["model"], "target_res": bank["target_res"]},
+                checkpoint_dir=checkpoint_dir,
+                objective="retrieve",
+                ref_vectors=bank["vectors"],
+                ref_labels=[str(label) for label in bank["labels"]],
+                k=int(job.request.k),
+                object_source=str(bank.get("object_source") or "yolo"),
+                class_names=class_names,
+                dataset_dirs=roots,
+                embed_fn=embed_fn,
+                progress=update_progress,
+                resume=True,
+                on_identity_mismatch="restart",
+                min_proposal_conf=float(job.request.min_proposal_conf),
+                batch_size=20,
+            )
+            records_by_id = {}
+            for record in result.get("topk_records") or []:
+                records_by_id.setdefault(str(record.get("item_id") or ""), record)
+            records = [record for item_id, record in records_by_id.items() if item_id]
+            scan_id = "fss_" + uuid.uuid4().hex
+            public_records = fewshot_scan_public_records(records)
+            with app.state.fewshot_lock:
+                app.state.fewshot_scans[scan_id] = {
+                    "sample_bank_id": job.request.sample_bank_id,
+                    "model_id": str(bank["model"]),
+                    "target_res": int(bank["target_res"]),
+                    "object_source": str(bank.get("object_source") or "yolo"),
+                    "records": records,
+                }
+            with app.state.lock:
+                job.result = {
+                    "scan_id": scan_id,
+                    "sample_bank_id": job.request.sample_bank_id,
+                    "model_id": str(bank["model"]),
+                    "target_res": int(bank["target_res"]),
+                    "object_source": str(bank.get("object_source") or "yolo"),
+                    "k": int(job.request.k),
+                    "images_total": int(result.get("images_total") or len(image_paths)),
+                    "images_processed": int(result.get("images_processed") or 0),
+                    "objects_scored": int(result.get("objects_scored") or 0),
+                    "candidate_count": len(public_records),
+                    "done": bool(result.get("done")),
+                    "candidates": public_records,
+                }
+                job.done = job.total = len(image_paths)
+                job.state, job.phase, job.message = "completed", "completed", "海掃完成"
+        except FileNotFoundError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "MODEL_UNAVAILABLE"
+                job.error = {
+                    "code": "MODEL_UNAVAILABLE",
+                    "message": "樣本集所綁定的本機特徵模型權重無法載入。",
+                    "request_id": job.job_id,
+                }
+        except ValueError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "SCAN_INPUT_INVALID"
+                job.error = {
+                    "code": "SCAN_INPUT_INVALID",
+                    "message": "無法海掃此資料集；請確認樣本集、標註格式與特徵模型相容。",
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV few-shot scan failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "SCAN_FAILED"
+                job.error = {
+                    "code": "SCAN_FAILED",
+                    "message": "海掃失敗。請檢查資料集、模型權重與 worker 記錄。",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/fewshot/scans/jobs", status_code=202)
+    def create_fewshot_scan_job(request: CreateFewshotScanJobRequest) -> dict:
+        bank_dir = fewshot_sample_bank_path(request.sample_bank_id)
+        try:
+            import sample_bank
+            bank = sample_bank.load_sample_bank(bank_dir)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="找不到此樣本集") from exc
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="樣本集損毀或格式不相容") from exc
+        try:
+            available = set(catalog())
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="無法讀取本機模型清單") from exc
+        if str(bank["model"]) not in available:
+            raise HTTPException(status_code=422, detail="樣本集所綁定的本機特徵模型尚未安裝")
+
+        roots = []
+        image_paths: list[Path] = []
+        class_names = None
+        for value in request.target_folders:
+            try:
+                root = Path(value).expanduser().resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise HTTPException(status_code=422, detail="目標資料夾不存在或無法讀取") from exc
+            if not root.is_dir():
+                raise HTTPException(status_code=422, detail="目標資料夾不存在或無法讀取")
+            roots.append(root)
+        from object_eval import classes_for, list_images
+        for root in roots:
+            image_paths.extend(list_images(root))
+            class_names = class_names or classes_for(root)
+        image_paths = sorted(set(image_paths), key=lambda path: str(path))
+        if not image_paths:
+            raise HTTPException(status_code=422, detail="目標資料夾找不到支援的影像")
+
+        normalized = request.model_copy(update={"target_folders": [str(root) for root in roots]})
+        job_id = uuid.uuid4().hex
+        job = _FewshotScanJob(job_id=job_id, request=normalized, total=len(image_paths))
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "請等目前分析完成後再開始海掃。",
+                    "request_id": job_id,
+                })
+            app.state.fewshot_scan_jobs[job_id] = job
+        threading.Thread(
+            target=execute_fewshot_scan_job,
+            args=(job, bank, roots, image_paths, class_names),
+            daemon=True,
+            name=f"lv-fewshot-scan-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/fewshot/scans/{scan_id}/records/{index}/preview.jpg")
+    def get_fewshot_scan_candidate_preview(scan_id: str, index: int) -> Response:
+        if (len(scan_id) != 36 or not scan_id.startswith("fss_")
+                or any(char not in "0123456789abcdef" for char in scan_id[4:])):
+            raise HTTPException(status_code=404, detail="找不到此海掃結果")
+        with app.state.fewshot_lock:
+            scan = app.state.fewshot_scans.get(scan_id)
+            if scan is None or index < 0 or index >= len(scan["records"]):
+                raise HTTPException(status_code=404, detail="找不到此海掃候選")
+            record = scan["records"][index]
+        try:
+            image_path = Path(record["image_path"]).resolve(strict=True)
+            if not image_path.is_file() or _sha256_file(image_path)[:16] != str(record["item_id"]).split(":", 1)[0]:
+                raise OSError("source changed")
+        except (KeyError, OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail="候選原始影像已變更或無法讀取，請重新海掃") from exc
+        image = safe_open_image(image_path)
+        if image is None:
+            raise HTTPException(status_code=404, detail="候選原始影像無法解碼")
+        crop = crop_bbox(image, *record["bbox"], pad=0.1)
+        crop.thumbnail((768, 768))
+        output = BytesIO()
+        crop.convert("RGB").save(output, format="JPEG", quality=86, optimize=True)
+        return Response(content=output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/v1/fewshot/sample-banks/add-candidates")
+    def add_fewshot_candidates_to_bank(request: AddFewshotCandidatesRequest) -> dict:
+        bank_dir = fewshot_sample_bank_path(request.sample_bank_id)
+        with app.state.fewshot_lock:
+            scan = app.state.fewshot_scans.get(request.scan_id)
+            if scan is None:
+                raise HTTPException(status_code=404, detail="找不到此 worker 的海掃結果；請重新海掃")
+            if scan["sample_bank_id"] != request.sample_bank_id:
+                raise HTTPException(status_code=409, detail="海掃結果與所選樣本集不相符")
+            try:
+                import sample_bank
+                bank = sample_bank.load_sample_bank(bank_dir)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=422, detail="樣本集損毀或格式不相容") from exc
+            if (str(bank["model"]) != scan["model_id"]
+                    or int(bank["target_res"]) != scan["target_res"]
+                    or str(bank.get("object_source") or "yolo") != scan["object_source"]):
+                raise HTTPException(status_code=409, detail="樣本集特徵身分已變更；請重新海掃")
+
+            records_by_id = {str(record["item_id"]): record for record in scan["records"]}
+            unique_ids = list(dict.fromkeys(request.item_ids))
+            missing = [item_id for item_id in unique_ids if item_id not in records_by_id]
+            if missing:
+                raise HTTPException(status_code=422, detail="海掃候選清單已過期；請重新整理後再試")
+            eligible = {
+                item_id for item_id in unique_ids
+                if float(records_by_id[item_id].get("similarity") or 0.0) >= request.theta
+            }
+            if len(eligible) != len(unique_ids):
+                raise HTTPException(status_code=422, detail="只可採納達目前相似度門檻的候選")
+            if set(request.class_overrides) - set(unique_ids):
+                raise HTTPException(status_code=422, detail="類別修改清單包含未選取的候選")
+
+            known_classes = {str(label) for label in np.asarray(bank["labels"]).tolist()}
+            for label in request.class_overrides.values():
+                if label not in known_classes:
+                    raise HTTPException(status_code=422, detail="候選類別必須來自目前樣本集")
+            existing_ids = {
+                str(item["item_id"]) for item in bank.get("provenance") or [] if item.get("item_id")
+            }
+            additions = [item_id for item_id in unique_ids if item_id not in existing_ids]
+            skipped = len(request.item_ids) - len(additions)
+            if not additions:
+                return {
+                    "added": 0,
+                    "skipped": skipped,
+                    "sample_bank": fewshot_sample_bank_view(request.sample_bank_id, bank),
+                }
+
+            objmeta = []
+            provenance = []
+            for item_id in additions:
+                record = records_by_id[item_id]
+                label = request.class_overrides.get(item_id) or str(record.get("suggested_class") or "")
+                if not label:
+                    raise HTTPException(status_code=422, detail="候選沒有可採納的建議類別")
+                try:
+                    path = Path(record["image_path"]).resolve(strict=True)
+                    if not path.is_file() or _sha256_file(path)[:16] != item_id.split(":", 1)[0]:
+                        raise OSError("source changed")
+                except (KeyError, OSError, RuntimeError) as exc:
+                    raise HTTPException(status_code=409, detail="候選原始影像已變更或無法讀取，請重新海掃") from exc
+                bbox = [float(value) for value in record["bbox"]]
+                objmeta.append({
+                    "image_path": str(path),
+                    "bbox": bbox,
+                    "label": label,
+                    "obj_index": int(record.get("obj_index") or 0),
+                })
+                provenance.append({
+                    "image_path": str(path),
+                    "bbox": bbox,
+                    "label": label,
+                    "item_id": item_id,
+                })
+
+            embedder: Callable | None = None
+
+            def embed_fn(crop):
+                nonlocal embedder
+                if embedder is None:
+                    if has_custom_object_model_loader or not has_custom_model_loader:
+                        embedder = object_loader(
+                            bank["model"], keep_aspect=True,
+                            target_res=int(bank["target_res"]), head="cls",
+                        )
+                    else:
+                        embedder = loader(bank["model"])
+                return embedder(crop)
+
+            from anomaly_tool import _object_embeddings
+            vectors = np.asarray(
+                _object_embeddings(objmeta, bank["model"], embed_fn), dtype=np.float32,
+            )
+            merged = sample_bank.append_sample(
+                bank_dir,
+                vectors=vectors,
+                labels=[item["label"] for item in objmeta],
+                provenance=provenance,
+            )
+            return {
+                "added": len(additions),
+                "skipped": skipped,
+                "sample_bank": fewshot_sample_bank_view(request.sample_bank_id, merged),
+            }
 
     def execute(job: _Job) -> None:
         try:
