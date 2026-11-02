@@ -1,14 +1,14 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
-> M24 的第一個 UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 本設計目前涵蓋 LV-WEB-01 Image Classifier 整圖模式中的基本及多模型／投影檢視，不表示其他 LV 工具已遷移。
+> M24 的 React UI/API 邊界與分期切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
+> 目前有 LV-WEB-01 Image Classifier 整圖切片及 LV-WEB-02 Compare Distributions 整圖 A/B 的部分實作；兩者及其餘工具是否完成，依 case inventory 的證據狀態判定。
 
 ## 1. 邊界
 
-- `web/` 是 React/Vite UI；`scripts/react_web_shell.py` 是 App-owned FastAPI adapter，`scripts/react_visualize.py` 執行純領域流程。
+- `web/` 是 React/Vite UI；`scripts/react_web_shell.py` 是 App-owned FastAPI adapter，`scripts/react_visualize.py` 與 `scripts/react_compare.py` 執行各自的純領域流程。
 - NativeApp 啟動單一本機 worker，向 UI 提供同源 API 與版本化啟動資訊。API 僅綁 loopback，worker 不啟動 Streamlit。開發模式在 `web/dist` 存在時，FastAPI 也提供同源靜態頁面作獨立本機預覽。
 - 資料夾由 NativeApp 公開 host bridge 選取。開發模式可輸入本機資料夾路徑；API 只對本次 run 已登錄的影像 ID 提供內容，不接受任意檔案讀取路徑。
-- `LV_CACHE_DIR` 指向 worker 的可寫資料區。manifest、縮圖、embedding 與 projection cache 不落入來源資料集。
+- `LV_CACHE_DIR` 指向 worker 的可寫資料區。manifest、縮圖、embedding 與 projection cache 不落入來源資料集；Compare 的 embedding cache 也使用此 app-owned cache。
 - 既有 Streamlit 原流程作為凍結基準；Python 運算語義以 `_utils.py`、`visualize_embeddings.py`、`manifest.py` 和 `interaction.py` 為準，不 import Streamlit UI/session state。
 
 ## 2. HTTP 契約
@@ -24,6 +24,11 @@
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
 | `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案 |
+| `POST /api/v1/compare/jobs` | 建立整圖 A/B comparison job | Folder A／B 各一至 32 個資料夾、LV feature model；同側影像合併並去重 |
+| `GET /api/v1/compare/jobs/{job_id}` / `DELETE /api/v1/compare/jobs/{job_id}` | 讀進度／要求取消 | 共用單一 worker 槽，回報結果 ID 或可恢復錯誤 |
+| `GET /api/v1/compare/runs/{run_id}` | 讀 A/B 形心漂移、計數、警告與順序穩定的影像記錄 | 不回傳私有本機圖片路徑或 embedding |
+| `POST /api/v1/compare/runs/{run_id}/projections` | 建立／重用指定投影 | `method`（PCA、t-SNE、UMAP、LDA、Supervised UMAP）與 `dimension`（2／3）；點以 group/index 對應影像 |
+| `GET /api/v1/compare/runs/{run_id}/images/{group}/{index}` | 讀取 A 或 B 的選取圖片 | group/index 只在該 run 的圖片清單內解析 |
 
 Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`methods`（PCA、t-SNE、UMAP、LDA、Supervised UMAP，最多 5 個）。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
 
@@ -34,6 +39,16 @@ Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`meth
 3. 每個模型各自抽取 embedding 並使用獨立 cache；投影保留同一模型的 embedding 與記錄順序。PCA、t-SNE、UMAP、LDA 和 Supervised UMAP 沿用 legacy 固定參數及小樣本邊界；無法計算的選項明示警告，只有所選投影全部不可用時才以 PCA 維持可檢視結果。監督投影的分群不得解讀為真實可分性。
 4. 2D 使用 SVG 散點；3D 使用隨使用者切換才載入的本機 Plotly bundle，點選與鍵盤輔助操作都能讀回同一 run record。投影維度不足時缺少的座標軸補零。點座標與記錄同序；run ID 變更時清空舊選取。跨工具暫存由各後續 case 定義。
 5. 使用者點選／框選只傳 record index 和 run ID；後端驗證索引，UI 顯示相同 label、split、檔名和原圖。
+
+### LV-WEB-02-IMG-01 — Image-level Compare Distributions
+
+- 兩側各接受一至 32 個資料夾；同一側依選取順序合併，重複路徑／圖片去重。每個根資料夾先使用 `compare_distributions.get_image_paths` 的直接 JPG／JPEG／PNG 全域排序；若該根沒有直接圖片，才遞迴搜尋子資料夾並略過 embedding、crop、thumbnail cache。壞檔略過並顯示警告。
+- 用選定 LV feature model 產生 A、B whole-image embeddings。A 與 B 分別取向量平均並正規化，漂移為 `round(max(0, 1 - dot(normalized_mean_A, normalized_mean_B)), 4)`；這與 `scripts/app.py::_compute_compare_whole` 相同。SHA-256 cache 寫入 `LV_CACHE_DIR`，不寫回來源資料夾。
+- `POST /compare/runs/{run_id}/projections` 以同一組 embeddings 計算 PCA、t-SNE、UMAP、LDA 或 Supervised UMAP；沿用 Streamlit 固定參數、小樣本零座標及 LDA 補軸語義。切換投影或維度時點的 group/index 身分不變。小樣本之外的投影失敗／依賴缺失會明確回報，不靜默替換方法。
+- UI 顯示整體漂移與 A/B 張數，支援投影切換及 2D／3D 檢視。2D 點選／矩形框選後，兩側畫廊顯示選取圖片；沒有選取時顯示前 12 張。3D KMeans 區塊 picker 與 2D 區塊 drilldown、套索選取和加入策展清單仍屬後續 case。
+- `GET /compare/runs/{run_id}` 對外只提供漂移、檔名／index、計數與警告；embedding 和本機檔案路徑留在 worker。圖片只依 run ID、group 與 index 回讀。
+- 目前 Streamlit 整圖路徑不包含 FID/KID/LPIPS/SSIM、Coverage Gap 或 metric export。`tests/e2e/test_scenarios_r1.py::test_s05_compare_distributions_metrics` 已 skip，原因是 Compare 改為 YOLO 物件級按類別流程；不得將其當作本 case 的正向行為錨點。現行整圖基準是 `_compute_compare_whole` 與 `_render_compare_by_class`。
+- `tests/e2e/test_react_web_shell_e2e.py::test_lv_web_02_img_01_visible_compare_contract` 和 API tests 使用 deterministic feature function，證明 React／API 接線、資料回讀與取消；它們不構成真實模型或 Streamlit 數值 parity 收據。
 
 ## 4. 實作狀態與整合限制
 
@@ -55,4 +70,4 @@ Job 輸入欄位：資料夾路徑陣列、`model_ids`（最多 8 個）、`meth
 
 ## 6. 未涵蓋
 
-Object Detector 整圖／物件粒度、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選完整交互、其它九個工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖／物件粒度、Compare 物件級旅程、跨 run 固定 UMAP 參考座標、資料集變更與撤銷、散點框選完整交互、其它八個頂層工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。

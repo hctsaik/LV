@@ -61,7 +61,7 @@ a:hover{text-decoration:underline}
 </tr>
 <tr>
 <td><strong>② Compare Distributions</strong></td>
-<td>兩堆資料像不像？我覆蓋了對方多少？</td>
+<td>A/B 兩組影像的整體特徵漂移多大？</td>
 <td>桶② 分布·覆蓋</td>
 </tr>
 <tr>
@@ -93,13 +93,21 @@ a:hover{text-decoration:underline}
 <p><strong>完全離線</strong>：模型權重只從本機讀取。</p>
 <pre><code class="language-bash">pip install -r requirements.txt
 
+# React Web 開發預覽（目前的遷移目標）
+cd web
+npm ci
+npm run build
+cd ..
+python scripts/react_web_shell.py       # http://127.0.0.1:8765
+
 # 模型權重（不在版控；冪等 provisioning）
 python scripts/setup_models.py                # 核心：DINOv2 + Chinese-CLIP
-python scripts/setup_models.py --with-compare # 多：Compare 用的 Inception / LPIPS
+python scripts/setup_models.py --with-compare # legacy CLI 的 FID/LPIPS 權重；目前整圖 Compare 不需要
 
-# 啟動
+# 舊版 Streamlit 行為參考（不是 React 交付入口）
 streamlit run scripts/app.py                  # 開在 http://localhost:8501
 </code></pre>
+<p>目前 React 可見切片包括 Image Classifier 整圖及 Compare 整圖 A/B；其它既有工具仍依 case inventory 分批遷移。設定 <code>LV_MODELS_DIR</code> 與 <code>LV_CACHE_DIR</code> 可指定本機模型根目錄及 worker 的可寫 cache 位置。</p>
 <p><strong>資料夾結構</strong>：
 - <strong>Object Detector（YOLO）</strong>：<code>&lt;folder&gt;/images/</code>（＋可選 <code>labels/</code> 為 YOLO <code>.txt</code>）。類別名取 <code>classes.txt</code>。
 - <strong>Image Classifier</strong>：<code>&lt;folder&gt;/類別名/影像.jpg</code>（依類別分子資料夾）。</p>
@@ -156,43 +164,39 @@ streamlit run scripts/app.py                  # 開在 http://localhost:8501
 <li><strong>桶③</strong>：找出可疑邊界樣本→體檢卡判 H2/H3→從「匯出清單」分流送組考卷（量一致性）或灰帶覆核（雙簽裁決）。</li>
 </ul>
 <hr />
-<h2 id="2-compare-distributions">② Compare Distributions — 兩堆資料像不像 + 覆蓋盲區</h2>
+<h2 id="2-compare-distributions">② Compare Distributions — A/B 影像群組差異</h2>
 <h3 id="_9">解決什麼問題</h3>
-<p>回答「<strong>A、B 這兩堆影像在特徵空間像不像、B 漏抓了 A 哪些區域</strong>」。各自抽 embedding，算一組分布距離指標（FID/KID/LPIPS/SSIM/PSNR/IS），疊在同一張投影圖，並做 Coverage Gap 象限分析找「兩群都沒覆蓋到」的盲點。服務<strong>桶② 覆蓋/分布</strong>。</p>
+<p>比較兩組影像的 LV feature embedding，回答「<strong>A 與 B 的整體特徵中心差多少</strong>」。整張影像模式會回報 A/B embedding 形心的餘弦漂移；投影圖用來找出可以回看的樣本位置。投影上的距離只供視覺探索，不取代漂移分數。</p>
 <h3 id="_10">什麼時候用</h3>
 <ul>
-<li>真實 vs 生成（合成/擴增逼不逼近真實）。</li>
-<li>train vs val、資料 v1 vs v2（分布漂移偵測）。</li>
+<li>比較 train 與 validation、資料版本更新前後、或真實影像與合成影像。</li>
+<li>不需要 YOLO labels、只想檢查整體影像特徵時使用「整張影像」模式。</li>
+<li>需要找出哪個 YOLO 類別變化時，選「物件級・按類別」模式。</li>
 </ul>
 <blockquote>
-<p>與「完整度熱力圖」的根本差別：<strong>Compare 比兩堆之間（A 對 B）；完整度熱力圖看單一堆內部哪裡缺/假完整。</strong></p>
+<p>與「完整度熱力圖」不同，Compare 對照 A 與 B；完整度熱力圖分析單一資料集內部哪些位置樣本不足。</p>
 </blockquote>
 <h3 id="_11">怎麼操作</h3>
-<p>側欄依序：<strong>Folder A / Folder B</strong>（各填<strong>直接含圖片</strong>的資料夾，例如 <code>dataset/train/images</code>、<code>goal/images</code>）→ <strong>Model</strong> → <strong>Output name prefix</strong> → 可勾「<strong>僅視覺化（跳過指標計算）</strong>」→ <strong>Pairwise metric samples</strong>（預設 500，LPIPS/SSIM/PSNR 隨機配對數）→ <strong>▶ Run</strong>。
-跑完上方出指標卡；下方左欄投影疊圖（<strong>Method</strong> 切 PCA/t-SNE/UMAP、維度 2D/3D，2D 可框選）；再下面 <strong>Coverage Gap Analysis</strong>。</p>
-<h3 id="_12">指標怎麼讀（箭頭＝好的方向）</h3>
-<ul>
-<li><strong>FID ↓ / KID ↓</strong>：整體分布距離越小越像（KID 在小資料更可靠）。</li>
-<li><strong>LPIPS ↓ / SSIM ↑ / PSNR ↑</strong>：抽 <code>n_pairs</code> 對跨組影像的感知/結構/訊噪平均（隨機配對，受 <code>n_pairs</code> 影響）。</li>
-<li><strong>IS ↑ (A) / IS ↑ (B)</strong>：各堆自己的品質/多樣性（基於 ImageNet，供參考、非相似度）。</li>
-</ul>
-<h3 id="coverage-gap">Coverage Gap（盲區象限圖）</h3>
-<p>對每點算到「最近 A 樣本」距離 d_A（x）與「最近 B 樣本」距離 d_B（y），閾值取各自<strong>中位數 P50</strong>切四象限：
-- <strong>右上（d_A、d_B 都大）= 盲點/異常（漏抓風險）</strong>：兩堆都沒覆蓋。
-- <strong>左下（都小）= 邊界重疊（誤報風險）</strong>。
-上方顯示樣本數、盲點數（占比）、邊界重疊數（占比）。可下載 Coverage HTML。</p>
+<ol>
+<li>在 <strong>Folder A</strong> 與 <strong>Folder B</strong> 各加入一個或多個資料夾。同一側的圖片會合併成一組；用各列的 ✕ 可移除資料夾。</li>
+<li>選一個本機 <strong>Model</strong>，再選 <strong>整張影像（不分類別）</strong> 或 <strong>物件級・按類別（YOLO）</strong>。</li>
+<li>按 <strong>▶ Run</strong>。若選物件級，請提供含 <code>images/</code> 與 <code>labels/</code> 的 YOLO 資料集；系統會自動尋找兩側共用的物件設定。</li>
+<li>看整體漂移分數與 A/B 張數。切換 <strong>投影方法</strong>（PCA、t-SNE、UMAP、LDA、監督 UMAP）及 <strong>2D／3D</strong>，觀察 A/B 點群。</li>
+<li>整圖模式可在 2D 散點點選或框選樣本；下方左右畫廊會顯示選取圖片。沒有選取時顯示兩側各前 12 張。物件級模式按類別查看漂移表與縮圖。</li>
+</ol>
+<h3 id="_12">整體漂移怎麼算</h3>
+<p>對 A、B 各自的影像 embedding 取平均並正規化，再算 <code>max(0, 1 - cosine_similarity(mean_A, mean_B))</code>，結果四捨五入到小數第 4 位。分數越大代表兩組的平均特徵方向越不同。若兩側有重複圖片或壞檔，畫面會顯示警告。</p>
 <h3 id="_13">輸入 / 輸出</h3>
 <ul>
-<li><strong>輸入</strong>：兩個直接含圖片的資料夾、一個模型、<code>n_pairs</code>。</li>
-<li><strong>輸出</strong>：指標卡、投影疊圖、Coverage Gap 象限圖；下載 HTML（all views）/ JSON / Coverage HTML。</li>
+<li><strong>輸入</strong>：Folder A、Folder B 各一或多個資料夾，以及一個 LV feature model。若資料夾內沒有直接圖片，整圖模式會遞迴搜尋子資料夾。</li>
+<li><strong>整圖輸出</strong>：整體漂移、可切換的 A/B 投影、選取狀態與兩側縮圖畫廊。</li>
+<li><strong>物件級輸出</strong>：共同類別漂移表、只出現在單側的類別提示、投影與兩側物件縮圖。</li>
 </ul>
-<h3 id="_14">注意事項與限制</h3>
+<h3 id="_14">注意事項與遷移狀態</h3>
 <ul>
-<li><strong>投影只是「畫」，不是密度量尺</strong>：不可拿投影上的距離當相似度分母；真正相似度看指標與 Coverage Gap（後者在高維算）。</li>
-<li>FID/KID/LPIPS/IS 需 Inception/LPIPS 權重，離線機先 <code>python scripts/setup_models.py --with-compare</code>。</li>
-<li>LPIPS/SSIM/PSNR 有抽樣噪音（調大 <code>n_pairs</code> 換穩定）。</li>
-<li>Coverage Gap 閾值是這兩堆自己的 P50，<strong>相對</strong>盲區，換資料就變。</li>
-<li><strong>對應四桶</strong>：桶② 覆蓋/分布。</li>
+<li>PCA／t-SNE／UMAP／監督投影的座標用於視覺檢視；不要以投影距離當成整體漂移分數。</li>
+<li>FID、KID、LPIPS、SSIM、PSNR、IS 與 Coverage Gap 不在目前 Streamlit Compare 畫面中。<code>test_s05_compare_distributions_metrics</code> 已 skip，屬於舊流程，不能作現行 React 驗收基準。</li>
+<li>React case <code>LV-WEB-02-IMG-01</code> 目前實作整圖 A/B；deterministic UI/API 測試只證明接線與讀回，不代表真實模型數值 parity。物件級流程、NativeApp folder grant 與完整 3D KMeans 區塊操作仍待遷移驗證。</li>
 </ul>
 <hr />
 <h2 id="3">③ 完整度熱力圖 — 單一資料集內部完整度</h2>
@@ -317,10 +321,10 @@ streamlit run scripts/app.py                  # 開在 http://localhost:8501
 <h2 id="escape">典型工作流：一筆 escape 來了怎麼走</h2>
 <ol>
 <li><strong>進 Visualize</strong>（Object Detector 模式），把客戶回報的漏逮影像載入、▶ Run。</li>
-<li>在散點上找到它 → 右欄「<strong>體檢卡</strong>」看根因：
-   - <strong>S0=確無 → H0 物理天花板</strong>：補資料無效，標記為桶①，回報需改成像（非工程帳）。
-   - <strong>H1 覆蓋缺口</strong>：補這格有效 → 用「<strong>選樣/相似</strong>」挖同型樣本、或到「<strong>完整度熱力圖</strong>」找該補的格、撈候選 → 補資料重訓。
-   - <strong>H2 定義歧義 / 標籤分歧高</strong>：別急著塞訓練集 → 從「<strong>匯出清單</strong>」送「<strong>組考卷</strong>」量人類一致性；爭議的送「<strong>灰帶覆核</strong>」雙簽裁決。</li>
+<li>在散點上找到它 → 右欄「<strong>體檢卡</strong>」看根因：</li>
+<li><strong>S0=確無 → H0 物理天花板</strong>：補資料無效，標記為桶①，回報需改成像（非工程帳）。</li>
+<li><strong>H1 覆蓋缺口</strong>：補這格有效 → 用「<strong>選樣/相似</strong>」挖同型樣本、或到「<strong>完整度熱力圖</strong>」找該補的格、撈候選 → 補資料重訓。</li>
+<li><strong>H2 定義歧義 / 標籤分歧高</strong>：別急著塞訓練集 → 從「<strong>匯出清單</strong>」送「<strong>組考卷</strong>」量人類一致性；爭議的送「<strong>灰帶覆核</strong>」雙簽裁決。</li>
 <li>想確認新一批資料分布對不對 → 「<strong>Compare Distributions</strong>」比新批 vs 舊批 / 真實 vs 生成。</li>
 <li>桶①門檻沒校過 → 先在「桶①佔比」按「重新校正」，再讀佔比與根因。</li>
 </ol>

@@ -16,6 +16,7 @@ from PIL import Image
 import uvicorn
 
 from _utils import available_models, load_model
+from react_compare import CompareCancelled
 from react_web_shell import create_app
 
 pytestmark = pytest.mark.e2e
@@ -241,3 +242,120 @@ def test_lv_web_01_ic_01_cancel_is_visible_in_react(tmp_path: Path, monkeypatch:
             server.should_exit = True
         if server_thread is not None:
             server_thread.join(timeout=10)
+
+
+def test_lv_web_02_img_01_visible_compare_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Visible React whole-image A/B controls, projections and image readback.
+
+    The local feature function is deterministic. This is API/UI wiring coverage,
+    not evidence of real-model or Streamlit numerical parity.
+    """
+    import numpy as np
+    from playwright.sync_api import expect, sync_playwright
+    from react_compare import run_image_comparison
+
+    folders = {
+        name: tmp_path / name for name in ("A1", "A2", "B1", "B2")
+    }
+    source_bytes = {}
+    for group_index, (name, color) in enumerate((
+        ("A1", (220, 30, 45)), ("A2", (200, 50, 60)),
+        ("B1", (30, 80, 220)), ("B2", (50, 100, 200)),
+    )):
+        folders[name].mkdir()
+        for index in range(2):
+            path = folders[name] / f"image-{index}.png"
+            pixel = tuple(min(255, channel + index * 7 + group_index) for channel in color)
+            Image.new("RGB", (24, 18), pixel).save(path)
+            source_bytes[path] = path.read_bytes()
+
+    slow_mode = {"enabled": False}
+    compare_started = threading.Event()
+
+    def embed(path: Path):
+        image = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        mean = image.mean(axis=(0, 1)) / 255.0
+        return np.r_[mean, mean.mean(), 1.0].astype(np.float32)
+
+    def comparison_runner(folders_a, folders_b, model_id, *, progress=None, cancelled=None):
+        if slow_mode["enabled"]:
+            compare_started.set()
+            while not cancelled():
+                time.sleep(0.01)
+            raise CompareCancelled()
+        return run_image_comparison(
+            folders_a, folders_b, model_id,
+            model_loader=lambda _model_id: embed,
+            progress=progress,
+            cancelled=cancelled,
+        )
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["contract-test-model"],
+        comparison_runner=comparison_runner,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Compare", exact=True).click()
+            expect(page.get_by_role("heading", name="Compare Distributions")).to_be_visible()
+
+            for group, names in (("A", ("A1", "A2")), ("B", ("B1", "B2"))):
+                section = page.locator(f'.compare-folder-group[aria-label="Folder {group}"]')
+                for name in names:
+                    page.get_by_label(f"Folder {group} path").fill(str(folders[name]))
+                    section.get_by_role("button", name="Add").click()
+                expect(section.locator(".compare-folder-list li")).to_have_count(2)
+
+            page.get_by_label("Compare model").select_option("contract-test-model")
+            page.get_by_role("button", name="Run comparison").click()
+            expect(page.get_by_test_id("compare-drift")).to_be_visible(timeout=20_000)
+            expect(page.locator(".drift-count strong").nth(0)).to_have_text("4")
+            expect(page.locator(".drift-count strong").nth(1)).to_have_text("4")
+            page.get_by_label("Compare projection method").select_option("pca")
+            expect(page.get_by_test_id("compare-point")).to_have_count(8, timeout=10_000)
+
+            page.get_by_test_id("compare-point").first.click()
+            expect(page.locator(".compare-selection-summary")).to_contain_text("Selected 1 from A")
+            preview_a = page.get_by_test_id("compare-image-a-0")
+            preview_b = page.get_by_test_id("compare-image-b-0")
+            expect(preview_a).to_be_visible()
+            expect(preview_a).to_have_js_property("naturalWidth", 24)
+            expect(preview_b).to_have_js_property("naturalWidth", 24)
+
+            plot = page.locator("svg.compare-scatter")
+            box = plot.bounding_box()
+            assert box is not None
+            page.mouse.move(box["x"] + 10, box["y"] + 10)
+            page.mouse.down()
+            page.mouse.move(box["x"] + box["width"] - 10, box["y"] + box["height"] - 10, steps=8)
+            page.mouse.up()
+            expect(page.locator(".compare-selection-summary")).to_contain_text(
+                "Selected 4 from A · 4 from B", timeout=5_000
+            )
+
+            page.get_by_role("group", name="Compare projection dimension").get_by_role("button", name="3D").click()
+            expect(page.get_by_test_id("embedding-plot-3d")).to_be_visible(timeout=15_000)
+            page.get_by_role("group", name="Compare projection dimension").get_by_role("button", name="2D").click()
+            expect(page.get_by_test_id("compare-plot")).to_be_visible()
+
+            slow_mode["enabled"] = True
+            page.get_by_role("button", name="Run comparison").click()
+            assert compare_started.wait(timeout=5)
+            page.get_by_role("button", name="Cancel comparison").click()
+            expect(page.get_by_text(
+                "Comparison cancelled. Adjust the folders and run it again.", exact=True
+            )).to_be_visible(timeout=10_000)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert all(path.read_bytes() == content for path, content in source_bytes.items())

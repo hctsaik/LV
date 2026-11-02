@@ -16,7 +16,7 @@ LV 不是五個各自獨立的功能，而是一條「**探索 → 診斷 → �
 | 工具 | 回答的問題 | 對應四桶 |
 |---|---|---|
 | **① Visualize Embeddings** | 這批影像長怎樣？這筆漏逮為何沒抓到？ | 樞紐（碰①②③） |
-| **② Compare Distributions** | 兩堆資料像不像？我覆蓋了對方多少？ | 桶② 分布·覆蓋 |
+| **② Compare Distributions** | A/B 兩組影像的整體特徵漂移多大？ | 桶② 分布·覆蓋 |
 | **③ 完整度熱力圖** | 我這堆內部哪裡缺／假完整？ | 桶② 覆蓋不足 |
 | **④ 組考卷** | 「什麼算瑕疵」這把尺準不準？ | 桶③ 量這把尺 |
 | **⑤ 灰帶覆核** | 連人都會吵的邊界樣本怎麼處置？ | 桶③ 處置·人機協作 |
@@ -37,13 +37,22 @@ LV 不是五個各自獨立的功能，而是一條「**探索 → 診斷 → �
 ```bash
 pip install -r requirements.txt
 
+# React Web 開發預覽（目前的遷移目標）
+cd web
+npm ci
+npm run build
+cd ..
+python scripts/react_web_shell.py       # http://127.0.0.1:8765
+
 # 模型權重（不在版控；冪等 provisioning）
 python scripts/setup_models.py                # 核心：DINOv2 + Chinese-CLIP
-python scripts/setup_models.py --with-compare # 多：Compare 用的 Inception / LPIPS
+python scripts/setup_models.py --with-compare # legacy CLI 的 FID/LPIPS 權重；目前整圖 Compare 不需要
 
-# 啟動
+# 舊版 Streamlit 行為參考（不是 React 交付入口）
 streamlit run scripts/app.py                  # 開在 http://localhost:8501
 ```
+
+目前 React 可見切片包括 Image Classifier 整圖及 Compare 整圖 A/B；其它既有工具仍依 case inventory 分批遷移。設定 `LV_MODELS_DIR` 與 `LV_CACHE_DIR` 可指定本機模型根目錄及 worker 的可寫 cache 位置。
 
 **資料夾結構**：
 - **Object Detector（YOLO）**：`<folder>/images/`（＋可選 `labels/` 為 YOLO `.txt`）。類別名取 `classes.txt`。
@@ -108,42 +117,37 @@ streamlit run scripts/app.py                  # 開在 http://localhost:8501
 
 ---
 
-## ② Compare Distributions — 兩堆資料像不像 + 覆蓋盲區
+## ② Compare Distributions — A/B 影像群組差異
 
 ### 解決什麼問題
-回答「**A、B 這兩堆影像在特徵空間像不像、B 漏抓了 A 哪些區域**」。各自抽 embedding，算一組分布距離指標（FID/KID/LPIPS/SSIM/PSNR/IS），疊在同一張投影圖，並做 Coverage Gap 象限分析找「兩群都沒覆蓋到」的盲點。服務**桶② 覆蓋/分布**。
+比較兩組影像的 LV feature embedding，回答「**A 與 B 的整體特徵中心差多少**」。整張影像模式會回報 A/B embedding 形心的餘弦漂移；投影圖用來找出可以回看的樣本位置。投影上的距離只供視覺探索，不取代漂移分數。
 
 ### 什麼時候用
-- 真實 vs 生成（合成/擴增逼不逼近真實）。
-- train vs val、資料 v1 vs v2（分布漂移偵測）。
+- 比較 train 與 validation、資料版本更新前後、或真實影像與合成影像。
+- 不需要 YOLO labels、只想檢查整體影像特徵時使用「整張影像」模式。
+- 需要找出哪個 YOLO 類別變化時，選「物件級・按類別」模式。
 
-> 與「完整度熱力圖」的根本差別：**Compare 比兩堆之間（A 對 B）；完整度熱力圖看單一堆內部哪裡缺/假完整。**
+> 與「完整度熱力圖」不同，Compare 對照 A 與 B；完整度熱力圖分析單一資料集內部哪些位置樣本不足。
 
 ### 怎麼操作
-側欄依序：**Folder A / Folder B**（A、B 各自都可連續加入多個資料夾；同一側的影像會合併成一群）→ **Model** → **比較單位** → **▶ Run**。所有影像來源／候選來源都可重複按 📁 或輸入路徑後 Enter 來累加，並可用各列的 ✕ 單獨移除；輸出、模型與工作區目錄仍維持單一目的地。
-跑完上方出指標卡；下方左欄投影疊圖（**Method** 切 PCA/t-SNE/UMAP、維度 2D/3D，2D 可框選）；再下面 **Coverage Gap Analysis**。
+1. 在 **Folder A** 與 **Folder B** 各加入一個或多個資料夾。同一側的圖片會合併成一組；用各列的 ✕ 可移除資料夾。
+2. 選一個本機 **Model**，再選 **整張影像（不分類別）** 或 **物件級・按類別（YOLO）**。
+3. 按 **▶ Run**。若選物件級，請提供含 `images/` 與 `labels/` 的 YOLO 資料集；系統會自動尋找兩側共用的物件設定。
+4. 看整體漂移分數與 A/B 張數。切換 **投影方法**（PCA、t-SNE、UMAP、LDA、監督 UMAP）及 **2D／3D**，觀察 A/B 點群。
+5. 整圖模式可在 2D 散點點選或框選樣本；下方左右畫廊會顯示選取圖片。沒有選取時顯示兩側各前 12 張。物件級模式按類別查看漂移表與縮圖。
 
-### 指標怎麼讀（箭頭＝好的方向）
-- **FID ↓ / KID ↓**：整體分布距離越小越像（KID 在小資料更可靠）。
-- **LPIPS ↓ / SSIM ↑ / PSNR ↑**：抽 `n_pairs` 對跨組影像的感知/結構/訊噪平均（隨機配對，受 `n_pairs` 影響）。
-- **IS ↑ (A) / IS ↑ (B)**：各堆自己的品質/多樣性（基於 ImageNet，供參考、非相似度）。
-
-### Coverage Gap（盲區象限圖）
-對每點算到「最近 A 樣本」距離 d_A（x）與「最近 B 樣本」距離 d_B（y），閾值取各自**中位數 P50**切四象限：
-- **右上（d_A、d_B 都大）= 盲點/異常（漏抓風險）**：兩堆都沒覆蓋。
-- **左下（都小）= 邊界重疊（誤報風險）**。
-上方顯示樣本數、盲點數（占比）、邊界重疊數（占比）。可下載 Coverage HTML。
+### 整體漂移怎麼算
+對 A、B 各自的影像 embedding 取平均並正規化，再算 `max(0, 1 - cosine_similarity(mean_A, mean_B))`，結果四捨五入到小數第 4 位。分數越大代表兩組的平均特徵方向越不同。若兩側有重複圖片或壞檔，畫面會顯示警告。
 
 ### 輸入 / 輸出
-- **輸入**：兩個直接含圖片的資料夾、一個模型、`n_pairs`。
-- **輸出**：指標卡、投影疊圖、Coverage Gap 象限圖；下載 HTML（all views）/ JSON / Coverage HTML。
+- **輸入**：Folder A、Folder B 各一或多個資料夾，以及一個 LV feature model。若資料夾內沒有直接圖片，整圖模式會遞迴搜尋子資料夾。
+- **整圖輸出**：整體漂移、可切換的 A/B 投影、選取狀態與兩側縮圖畫廊。
+- **物件級輸出**：共同類別漂移表、只出現在單側的類別提示、投影與兩側物件縮圖。
 
-### 注意事項與限制
-- **投影只是「畫」，不是密度量尺**：不可拿投影上的距離當相似度分母；真正相似度看指標與 Coverage Gap（後者在高維算）。
-- FID/KID/LPIPS/IS 需 Inception/LPIPS 權重，離線機先 `python scripts/setup_models.py --with-compare`。
-- LPIPS/SSIM/PSNR 有抽樣噪音（調大 `n_pairs` 換穩定）。
-- Coverage Gap 閾值是這兩堆自己的 P50，**相對**盲區，換資料就變。
-- **對應四桶**：桶② 覆蓋/分布。
+### 注意事項與遷移狀態
+- PCA／t-SNE／UMAP／監督投影的座標用於視覺檢視；不要以投影距離當成整體漂移分數。
+- FID、KID、LPIPS、SSIM、PSNR、IS 與 Coverage Gap 不在目前 Streamlit Compare 畫面中。`test_s05_compare_distributions_metrics` 已 skip，屬於舊流程，不能作現行 React 驗收基準。
+- React case `LV-WEB-02-IMG-01` 目前實作整圖 A/B；deterministic UI/API 測試只證明接線與讀回，不代表真實模型數值 parity。物件級流程、NativeApp folder grant 與完整 3D KMeans 區塊操作仍待遷移驗證。
 
 ---
 

@@ -4,7 +4,7 @@ VisualLatent analyses image dataset distributions with local feature models. **M
 
 ## React Web migration (M24)
 
-The first React slice implements **Visualize Embeddings → Image Classifier → whole image** (`LV-WEB-01-IC-01`). Local API, manifest-backed embedding cache, real DINOv2-small extraction, PCA scatter, filters, image selection, cancellation, and visible error states have local test evidence. NativeApp packaging and its folder-grant lifecycle are still pending; the other nine tools and nested flows are not migrated yet.
+The React migration has a verified first slice for **Visualize Embeddings → Image Classifier → whole image** (`LV-WEB-01-IC-01`), including real DINOv2-small extraction, PCA, filters, image selection, cancellation, and visible errors. **Compare Distributions → whole-image A/B** (`LV-WEB-02-IMG-01`) now has a React page and local worker API for the current Streamlit flow: LV feature embeddings, A/B centroid cosine drift, projection controls, point/box selection, and image galleries. This slice remains partial: deterministic feature functions cover the React/API wiring, while real-model numerical parity and NativeApp folder grants are pending; object-by-class comparison, 3D KMeans block drilldown, cart handoff, and the remaining app journeys are not migrated yet. The skipped FID/KID/LPIPS Streamlit scenario is not an acceptance baseline for this current flow.
 
 ```powershell
 cd web
@@ -55,7 +55,7 @@ feature is blocked.
 
 ```bash
 python scripts/setup_models.py                # core: DINOv2 + Chinese-CLIP
-python scripts/setup_models.py --with-compare # + Compare Distributions (Inception, LPIPS)
+python scripts/setup_models.py --with-compare # legacy CLI FID/LPIPS weights; not needed for current whole-image Compare
 python scripts/model_manifest.py              # check what's present / missing (✅/❌)
 ```
 
@@ -64,8 +64,7 @@ Everything lives under a single **`models/`** root — one same-named folder per
 Set `LV_MODELS_DIR` to relocate the whole root (so a host platform can point at one
 writable model-house and keep its checkout thin).
 
-The script skips anything already present. FID/KID Inception and LPIPS also auto-download
-on first use, so `--with-compare` is only needed to pre-seed an offline machine. For
+The script skips anything already present. The legacy metric CLI may provision FID/KID Inception and LPIPS weights on first use, so `--with-compare` is only needed to pre-seed an offline machine for that CLI. The current Streamlit whole-image Compare uses the selected LV feature model instead. For
 ResNet, drop `resnet*.pth` into `models/` (or `models/<name>/<name>.pth`).
 
 Supported model name prefixes:
@@ -142,15 +141,14 @@ directories remain single-value destinations.
 
 ## Tool 2 — Compare Distributions
 
-1. Enter **Folder A** and **Folder B** (direct image directories, not split folders), e.g.:
-   ```
-   Folder A: dataset/train/images
-   Folder B: goal/images
-   ```
-2. Select a model, set **Pairwise metric samples** (used for LPIPS and SSIM), click **▶ Run**.
-3. Metrics (FID ↓, KID ↓, LPIPS ↓, SSIM ↑) appear above the plot.
-4. Use the **Method** dropdown to switch between PCA / t-SNE / UMAP.
-5. Download HTML or JSON metrics with the **⬇** buttons.
+Add one or more folders to **Folder A** and **Folder B**; each side is merged into one image group. Select a local LV feature model and choose **whole-image** or **object-by-class (YOLO)** comparison.
+
+- **Whole-image:** labels are not required. The app extracts image embeddings and reports one A/B centroid cosine drift score; larger values mean the group centroids differ more. Choose a projection method and 2D/3D view to inspect the joint embedding plot. In 2D, click or box/lasso-select points; the galleries show selected images or the first 12 from each side.
+- **Object-by-class:** select YOLO dataset folders with `images/` and `labels/`. The app compares shared classes and reports classes found on only one side. Object settings are selected automatically and applied to both sides.
+
+Projection distances are for visual exploration; use the drift score for the numeric whole-image comparison. FID/KID/LPIPS/SSIM/PSNR/IS, Coverage Gap and metric exports are not part of the current Streamlit Compare screen. The skipped `test_s05_compare_distributions_metrics` scenario describes an older flow and is not a migration acceptance case.
+
+React migration status: `LV-WEB-02-IMG-01` currently covers only whole-image A/B. Its deterministic UI/API contract does not yet prove real-model parity; object-by-class behavior and NativeApp folder-grant validation remain pending.
 
 ---
 

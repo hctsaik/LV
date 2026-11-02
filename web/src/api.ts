@@ -52,6 +52,27 @@ export type VisualizationRun = {
   warnings: string[];
 };
 
+export type ComparePoint = {
+  group: "a" | "b";
+  index: number;
+  x: number;
+  y: number;
+  z: number;
+};
+
+export type CompareView = { method: ProjectionMethod; dimension: 2 | 3; points: ComparePoint[] };
+export type CompareRecord = { index: number; filename: string };
+export type CompareRun = {
+  folder_a: string;
+  folder_b: string;
+  model_id: string;
+  drift: number;
+  records_a: CompareRecord[];
+  records_b: CompareRecord[];
+  warnings: string[];
+  overlap_count: number;
+};
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const base = window.NATIVEAPP_LOCAL_API || "";
   const response = await fetch(base + path, {
@@ -83,6 +104,30 @@ export const api = {
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
   ),
+  createCompareJob: (foldersA: string[], foldersB: string[], modelId: string) =>
+    request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
+      method: "POST",
+      body: JSON.stringify({ folders_a: foldersA, folders_b: foldersB, model_id: modelId }),
+    }),
+  compareJob: (jobId: string) => request<JobStatus>(
+    "/api/v1/compare/jobs/" + encodeURIComponent(jobId),
+  ),
+  cancelCompare: (jobId: string) => request<{ job_id: string; state: string }>(
+    "/api/v1/compare/jobs/" + encodeURIComponent(jobId),
+    { method: "DELETE" },
+  ),
+  compareRun: (runId: string) => request<CompareRun>(
+    "/api/v1/compare/runs/" + encodeURIComponent(runId),
+  ),
+  compareProjection: (runId: string, method: ProjectionMethod, dimension: 2 | 3) =>
+    request<CompareView>("/api/v1/compare/runs/" + encodeURIComponent(runId) + "/projections", {
+      method: "POST",
+      body: JSON.stringify({ method, dimension }),
+    }),
+  compareImageUrl: (runId: string, group: "a" | "b", index: number) => {
+    const base = window.NATIVEAPP_LOCAL_API || "";
+    return base + "/api/v1/compare/runs/" + encodeURIComponent(runId) + "/images/" + group + "/" + index;
+  },
 };
 
 export type HostFolderResult = {

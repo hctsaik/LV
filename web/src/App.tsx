@@ -7,6 +7,7 @@ import {
   type ProjectionMethod,
   type VisualizationRun,
 } from "./api";
+import Compare from "./Compare";
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
 
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
@@ -108,6 +109,7 @@ function ScatterPlot({ points, selectedIndex, onSelect, dimension, viewKey }: {
 }
 
 export default function App() {
+  const [activeTool, setActiveTool] = useState<"visualize" | "compare">("visualize");
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
   const [selectedMethods, setSelectedMethods] = useState<ProjectionMethod[]>(["sumap"]);
@@ -305,13 +307,19 @@ export default function App() {
             <div className="brand-caption">LOCAL DATA WORKSPACE</div>
           </div>
         </div>
+        <nav className="tool-nav" aria-label="LV tools">
+          <button type="button" aria-pressed={activeTool === "visualize"}
+            onClick={() => setActiveTool("visualize")}>Visualize</button>
+          <button type="button" aria-pressed={activeTool === "compare"}
+            onClick={() => setActiveTool("compare")}>Compare</button>
+        </nav>
         <div className={"connection " + (connected ? "connection-ready" : "connection-waiting")}>
           <span className="connection-dot" />
           {connected ? "Local worker connected" : "Connecting to local worker"}
         </div>
       </header>
 
-      <div className="workspace">
+      <div className="workspace" hidden={activeTool === "compare"}>
         <aside className="control-panel">
           <div className="eyebrow">VISUALIZE EMBEDDINGS</div>
           <h1>Explore your image space</h1>
@@ -484,6 +492,9 @@ export default function App() {
           )}
           <footer className="canvas-footer"><span>VisualLatent · React Web</span><span>Worker API v1</span></footer>
         </main>
+      </div>
+      <div hidden={activeTool === "visualize"}>
+        <Compare models={models} connected={connected} />
       </div>
     </div>
   );
