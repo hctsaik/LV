@@ -8,6 +8,7 @@ import json
 import multiprocessing
 import os
 import re
+import shutil
 import subprocess
 import socket
 import sys
@@ -4382,6 +4383,193 @@ def test_lv_web_07_scan_01_visible_reviews_and_appends_fewshot_candidates(
             server_thread.join(timeout=10)
 
     assert source_hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes}
+
+
+def test_lv_web_07_scan_01_real_dinov2_visible_reviews_and_appends_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Run the complete visible few-shot journey with the pinned real DINOv2 model."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    configured_models = Path(
+        os.environ.get("LV_TEST_MODELS_DIR") or os.environ.get("LV_MODELS_DIR") or ROOT / "models"
+    ).expanduser().resolve()
+    configured_weights = (
+        configured_models / "dinov2_vits14" / "dinov2_vits14.pth",
+        configured_models / "dinov2_vits14.pth",
+    )
+    cache_weights = Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "dinov2_vits14_pretrain.pth"
+    source_weights = next((path for path in configured_weights if path.is_file()), None)
+    if source_weights is None and cache_weights.is_file():
+        source_weights = cache_weights
+    if source_weights is None:
+        pytest.skip("pinned real DINOv2-small weights are unavailable in LV models or the local torch cache")
+    assert hashlib.sha256(source_weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
+        "the local model weights differ from the LV-WEB-06-BANK-01 baseline"
+
+    models_dir = tmp_path / "models"
+    model_dir = models_dir / "dinov2_vits14"
+    model_dir.mkdir(parents=True)
+    weights = model_dir / "dinov2_vits14.pth"
+    try:
+        os.link(source_weights, weights)
+    except OSError:
+        shutil.copyfile(source_weights, weights)
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256
+
+    sample_root = tmp_path / "real-fewshot-samples"
+    (sample_root / "images").mkdir(parents=True)
+    (sample_root / "labels").mkdir()
+    (sample_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    colors = {"scratch": (205, 38, 46), "stain": (26, 104, 188)}
+    sample_hashes = {}
+    for index, (label, color) in enumerate(colors.items()):
+        image_path = sample_root / "images" / f"sample-{label}.png"
+        image = Image.new("RGB", (96, 96), color)
+        for offset in range(12, 84, 12):
+            image.putpixel((offset, (offset * 3) % 84 + 6), (245, 220, 45))
+        image.save(image_path)
+        (sample_root / "labels" / f"sample-{label}.txt").write_text(
+            f"{index} 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+        )
+        sample_hashes[image_path.name] = hashlib.sha256(image_path.read_bytes()).hexdigest()
+
+    target_root = tmp_path / "real-fewshot-targets"
+    (target_root / "images").mkdir(parents=True)
+    (target_root / "labels").mkdir()
+    (target_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    for index, label in enumerate(colors):
+        shutil.copyfile(sample_root / "images" / f"sample-{label}.png",
+                        target_root / "images" / f"target-{label}.png")
+        (target_root / "labels" / f"target-{label}.txt").write_text(
+            f"{index} 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+        )
+    source_files = [
+        path for root in (sample_root, target_root) for path in root.rglob("*") if path.is_file()
+    ]
+    source_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+
+    monkeypatch.setenv("LV_MODELS_DIR", str(models_dir))
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: available_models(models_dir),
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1050})
+            page.set_default_timeout(300_000)
+            job_responses: list[dict] = []
+            add_responses: list[dict] = []
+            scan_requests: list[dict] = []
+            fewshot_response_bodies: list[str] = []
+            anomaly_model_requests: list[str] = []
+
+            def capture_response(response):
+                if not response.ok:
+                    return
+                if "/api/v1/fewshot/jobs/" in response.url:
+                    job_responses.append(response.json())
+                    fewshot_response_bodies.append(response.text())
+                elif response.request.method == "POST" and response.url.rstrip("/").endswith(
+                    "/api/v1/fewshot/sample-banks/add-candidates"
+                ):
+                    add_responses.append(response.json())
+                    fewshot_response_bodies.append(response.text())
+                elif response.request.method == "GET" and "/api/v1/fewshot/sample-banks/" in response.url:
+                    fewshot_response_bodies.append(response.text())
+
+            page.on("response", capture_response)
+            page.on("request", lambda request: scan_requests.append(json.loads(request.post_data or "{}"))
+                    if request.method == "POST"
+                    and request.url.rstrip("/").endswith("/api/v1/fewshot/scans/jobs") else None)
+            page.on("request", lambda request: anomaly_model_requests.append(request.url)
+                    if "/api/v1/anomaly/models/jobs" in request.url else None)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fewshot-samples").click()
+            expect(page.get_by_role("heading", name="以樣搜樣：建立樣本集")).to_be_visible()
+
+            page.get_by_test_id("fewshot-sample-folders").fill(str(sample_root))
+            page.get_by_test_id("fewshot-object-source").select_option("yolo")
+            page.get_by_test_id("fewshot-model").select_option("dinov2_vits14")
+            page.get_by_test_id("fewshot-build-bank").click()
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("2 個樣本", timeout=300_000)
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("特徵維度 D=384")
+            bank_id = page.get_by_test_id("fewshot-bank-id").input_value()
+            built_jobs = [job for job in job_responses if job.get("state") == "completed"
+                          and job.get("result", {}).get("sample_bank_id") == bank_id]
+            assert built_jobs
+            assert built_jobs[-1]["result"]["model_id"] == "dinov2_vits14"
+            assert built_jobs[-1]["result"]["feature_dimension"] == 384
+            assert built_jobs[-1]["result"]["class_counts"] == {"scratch": 1, "stain": 1}
+
+            page.get_by_test_id("fewshot-reload-bank").click()
+            expect(page.get_by_test_id("fewshot-notice")).to_contain_text("重新讀回", timeout=15_000)
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("D=384")
+            page.get_by_test_id("fewshot-target-folders").fill(str(target_root))
+            page.get_by_test_id("fewshot-theta").fill("0.95")
+            page.get_by_test_id("fewshot-scan").click()
+            expect(page.get_by_test_id("fewshot-scan-summary")).to_contain_text("候選 2", timeout=300_000)
+            candidates = page.get_by_test_id("fewshot-candidate")
+            expect(candidates).to_have_count(2)
+            completed_scan_jobs = [job for job in job_responses if job.get("state") == "completed"
+                                   and job.get("result", {}).get("scan_id")]
+            assert completed_scan_jobs
+            scan_result = completed_scan_jobs[-1]["result"]
+            assert scan_result["sample_bank_id"] == bank_id
+            assert scan_result["model_id"] == "dinov2_vits14"
+            assert scan_result["objects_scored"] == 2
+            assert scan_result["candidate_count"] == 2
+            matches = {Path(candidate["filename"]).stem: candidate for candidate in scan_result["candidates"]}
+            assert set(matches) == {"target-scratch", "target-stain"}
+            assert all(candidate["similarity"] >= 0.99 for candidate in matches.values())
+            assert matches["target-scratch"]["suggested_class"] == "scratch"
+            assert matches["target-stain"]["suggested_class"] == "stain"
+            for index in range(2):
+                preview = candidates.nth(index).get_by_test_id("fewshot-candidate-preview")
+                page.wait_for_function(
+                    "element => element.complete && element.naturalWidth > 0",
+                    arg=preview.element_handle(), timeout=30_000,
+                )
+
+            # Confirm the suggested labels in the visible review controls and append both vectors.
+            visible_labels = {}
+            for index in range(2):
+                item = candidates.nth(index)
+                item_text = item.inner_text()
+                filename = next(name for name in ("target-scratch.png", "target-stain.png") if name in item_text)
+                visible_labels[filename] = item.get_by_role("combobox").input_value()
+                expect(item.get_by_role("checkbox")).to_be_checked()
+            assert visible_labels == {"target-scratch.png": "scratch", "target-stain.png": "stain"}
+            page.get_by_test_id("fewshot-add-selected").click()
+            expect(page.get_by_test_id("fewshot-scan-notice")).to_contain_text("已加入 2 顆", timeout=300_000)
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("4 個樣本", timeout=30_000)
+            assert add_responses and add_responses[-1]["sample_bank"]["sample_count"] == 4
+            assert add_responses[-1]["sample_bank"]["feature_dimension"] == 384
+            page.get_by_test_id("fewshot-reload-bank").click()
+            expect(page.get_by_test_id("fewshot-notice")).to_contain_text("重新讀回", timeout=15_000)
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("4 個樣本")
+            page.get_by_test_id("fewshot-scan").click()
+            expect(page.get_by_test_id("fewshot-scan-summary")).to_contain_text("候選 2", timeout=300_000)
+            assert [request["sample_bank_id"] for request in scan_requests] == [bank_id, bank_id]
+            assert anomaly_model_requests == []
+            assert all(str(tmp_path) not in body for body in fewshot_response_bodies)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes}
+    assert source_hashes[sample_root / "images" / "sample-scratch.png"] == \
+        sample_hashes["sample-scratch.png"]
 
 
 def test_lv_web_07_export_01_visible_monitor_queue_without_anomaly_model(
