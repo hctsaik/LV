@@ -108,6 +108,7 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
   const [cartBusy, setCartBusy] = useState(false);
   const [cartMessage, setCartMessage] = useState("");
   const [evaluationScope, setEvaluationScope] = useState<"all" | "selected">("all");
+  const [evaluationPurpose, setEvaluationPurpose] = useState<"tuning" | "heldout">("tuning");
   const [evaluationPreview, setEvaluationPreview] = useState<ClassSimilarityEvaluationPreview | null>(null);
   const [evaluationBusy, setEvaluationBusy] = useState(false);
   const [evaluationMessage, setEvaluationMessage] = useState("");
@@ -211,10 +212,11 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
     try {
       const blob = await api.classSimilarityEvaluationTemplate(jobId, {
         scope: evaluationScope,
+        purpose: evaluationPurpose,
         selected_ids: evaluationScope === "selected" ? selectedIds : [],
       });
       saveBlob(blob, "class_similarity_evaluation.json");
-      setEvaluationMessage("Template downloaded. Review verdicts in the JSON, then upload it here.");
+      setEvaluationMessage(`${evaluationPurpose} template downloaded. Review verdicts in the JSON, then upload it here.`);
     } catch (reason) {
       setEvaluationMessage(reason instanceof Error ? reason.message : "Could not create the review template.");
     } finally {
@@ -230,7 +232,14 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
       const manifest = JSON.parse(await file.text()) as Record<string, unknown>;
       const preview = await api.importClassSimilarityEvaluation(jobId, manifest, currentPolicy);
       setEvaluationPreview(preview);
-      setEvaluationMessage("Review set validated against this Visualize source snapshot.");
+      setEvaluationPurpose(preview.evaluation?.purpose || "tuning");
+      if (preview.evaluation?.purpose === "heldout") {
+        setCandidateMode(preview.policy.mode);
+        if (preview.policy.threshold !== null) setThreshold(preview.policy.threshold);
+      }
+      setEvaluationMessage(preview.evaluation?.purpose === "heldout"
+        ? "Heldout verdicts validated against the saved operating point and disjoint source groups."
+        : "Tuning review set validated against this Visualize source snapshot.");
     } catch (reason) {
       setEvaluationPreview(null);
       setEvaluationMessage(reason instanceof Error ? reason.message : "Could not validate this review JSON.");
@@ -247,6 +256,39 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
       setEvaluationPreview(await api.previewClassSimilarityEvaluation(jobId, currentPolicy));
     } catch (reason) {
       setEvaluationMessage(reason instanceof Error ? reason.message : "Could not score the current threshold.");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  }
+
+  async function saveOperatingPoint() {
+    if (!jobId || !evaluationPreview?.evaluation || evaluationPreview.evaluation.purpose !== "tuning" || evaluationBusy) return;
+    setEvaluationBusy(true);
+    setEvaluationMessage("");
+    try {
+      const saved = await api.saveClassSimilarityOperatingPoint(jobId, currentPolicy);
+      setEvaluationPreview(saved);
+      setEvaluationMessage("Current tuning policy saved as the operating point for a disjoint heldout review.");
+    } catch (reason) {
+      setEvaluationMessage(reason instanceof Error ? reason.message : "Could not save this operating point.");
+    } finally {
+      setEvaluationBusy(false);
+    }
+  }
+
+  async function restoreOperatingPoint() {
+    const frozen = evaluationPreview?.frozen_policy;
+    if (!jobId || !frozen || evaluationBusy) return;
+    setEvaluationBusy(true);
+    setEvaluationMessage("");
+    try {
+      const policy = frozen.policy;
+      setCandidateMode(policy.mode);
+      if (policy.threshold !== null) setThreshold(policy.threshold);
+      setEvaluationPreview(await api.previewClassSimilarityEvaluation(jobId, policy));
+      setEvaluationMessage("Saved operating point restored.");
+    } catch (reason) {
+      setEvaluationMessage(reason instanceof Error ? reason.message : "Could not restore this operating point.");
     } finally {
       setEvaluationBusy(false);
     }
@@ -358,9 +400,14 @@ export default function ClassSimilarityWorkspace({ runId, modelId, unit, records
               <label><span>Template population</span><select aria-label="Evaluation template scope" value={evaluationScope} onChange={(event) => setEvaluationScope(event.target.value as "all" | "selected")}>
                 <option value="all">All eligible records</option><option value="selected">Selected records ({selectedIds.length})</option>
               </select></label>
+              <label><span>Review purpose</span><select aria-label="Evaluation purpose" value={evaluationPurpose} onChange={(event) => setEvaluationPurpose(event.target.value as "tuning" | "heldout")}>
+                <option value="tuning">Tune threshold</option><option value="heldout">Heldout verification</option>
+              </select></label>
               <button type="button" className="secondary-action" onClick={() => void downloadEvaluationTemplate()} disabled={evaluationBusy || (evaluationScope === "selected" && !selectedIds.length)}>Download evaluation template</button>
               <label className="class-similarity-file-input"><span>Upload reviewed JSON</span><input aria-label="Upload class similarity evaluation JSON" type="file" accept="application/json,.json" disabled={evaluationBusy} onChange={(event) => { void importEvaluationFile(event.target.files?.[0]); event.currentTarget.value = ""; }} /></label>
               {evaluationPreview?.evaluation && <button type="button" className="secondary-action" onClick={() => void previewEvaluation()} disabled={evaluationBusy}>{evaluationBusy ? "Calculating…" : "Evaluate current threshold"}</button>}
+              {evaluationPreview?.evaluation?.purpose === "tuning" && <button type="button" className="secondary-action" onClick={() => void saveOperatingPoint()} disabled={evaluationBusy || evaluationPreview.counts?.status !== "ready"}>Save operating point</button>}
+              {evaluationPreview?.frozen_policy && <button type="button" className="secondary-action" onClick={() => void restoreOperatingPoint()} disabled={evaluationBusy}>Restore saved operating point</button>}
             </div>
             {evaluationMessage && <div className="class-similarity-progress" role="status">{evaluationMessage}</div>}
             {evaluationPreview?.evaluation && <div className="class-similarity-evaluation-results" data-testid="class-similarity-evaluation-results">

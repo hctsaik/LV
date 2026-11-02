@@ -103,8 +103,12 @@ from class_similarity_threshold import (
     parse_policy as parse_class_similarity_policy,
     precision_recall_curve as class_similarity_precision_recall_curve,
     preview_key as class_similarity_preview_key,
+    make_operating_point as make_class_similarity_operating_point,
+    score_protocol_key as class_similarity_score_protocol_key,
+    source_group_id as class_similarity_source_group_id,
     summarize_candidates as summarize_class_similarity_candidates,
     validate_evaluation_manifest as validate_class_similarity_manifest,
+    validate_heldout as validate_class_similarity_heldout,
     workload_curve as class_similarity_workload_curve,
 )
 from react_visualize import JobCancelled, VisualizationInputError, run_image_visualization
@@ -156,6 +160,7 @@ class CreateClassSimilarityJob(BaseModel):
 
 class ClassSimilarityEvaluationTemplateRequest(BaseModel):
     scope: Literal["all", "selected"] = "all"
+    purpose: Literal["tuning", "heldout"] = "tuning"
     selected_ids: list[str] = Field(default_factory=list, max_length=10000)
 
 
@@ -173,6 +178,10 @@ class ClassSimilarityReportRequest(BaseModel):
     selected_ids: list[str] = Field(default_factory=list, max_length=10000)
     policy: dict = Field(default_factory=lambda: {"mode": "threshold", "threshold": 0.0})
     format: Literal["csv", "json"]
+
+
+class ClassSimilarityOperatingPointRequest(BaseModel):
+    policy: dict
 
 
 class CreateDetectionEvaluationRequest(BaseModel):
@@ -781,6 +790,10 @@ class _ClassSimilarityJob:
     analysis: object | None = None
     source_hashes: dict[str, str] = field(default_factory=dict)
     evaluation: dict | None = None
+    tuning_evaluation: dict | None = None
+    frozen_policy: dict | None = None
+    heldout_used_ids: set[str] = field(default_factory=set)
+    heldout_used_groups: set[str] = field(default_factory=set)
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -5208,6 +5221,7 @@ def create_app(
                 "pending_n": sum(1 for review in evaluation.get("reviews") or []
                                  if review.get("verdict") == "unreviewed"),
             } if evaluation else None),
+            "frozen_policy": job.frozen_policy,
             "counts": ({
                 "status": counts.status,
                 "unavailable_reason": counts.unavailable_reason,
@@ -5229,6 +5243,14 @@ def create_app(
             "precision_recall_curve": precision_recall,
         }
 
+    def class_similarity_protocol_key(job: _ClassSimilarityJob) -> str:
+        prepared = job.prepared
+        return class_similarity_score_protocol_key(
+            method_version="class_topk_margin_v1", k=prepared.k,
+            model=prepared.model, weights_id="unknown",
+            recipe=prepared.embedding_recipe, analysis_split=prepared.analysis_split,
+        )
+
     @app.post("/api/v1/class-similarity/jobs/{job_id}/evaluation/template")
     def download_class_similarity_evaluation_template(
         job_id: str, request: ClassSimilarityEvaluationTemplateRequest,
@@ -5249,7 +5271,8 @@ def create_app(
         payload = class_similarity_evaluation_template(
             frozen_ids=ids, records=prepared.records, record_ids=prepared.record_ids,
             labels=prepared.effective_label, snapshot_key=prepared.source_snapshot_key,
-            selection_method=method, evaluation_id=f"eval-{prepared.analysis_key[:8]}",
+            purpose=request.purpose, selection_method=method,
+            evaluation_id=f"eval-{prepared.analysis_key[:8]}-{request.purpose}",
             level=str(job.result.get("unit") or "image"),
         )
         return Response(
@@ -5273,11 +5296,97 @@ def create_app(
                 request.manifest, snapshot, job.analysis.items,
             )
             parse_class_similarity_policy(request.policy)
+            level = str(job.result.get("unit") or "image")
+            if evaluation.get("purpose") == "heldout":
+                frozen = job.frozen_policy
+                if not frozen:
+                    raise ClassSimilarityError("Heldout review requires a saved operating point.")
+                tuning = job.tuning_evaluation
+                if not tuning or tuning.get("purpose") != "tuning":
+                    raise ClassSimilarityError("Heldout review requires a validated tuning set.")
+                frozen_policy = frozen.get("policy") or {}
+                tuning_mask = class_similarity_candidate_mask(job.analysis.items, frozen_policy)
+                tuning_counts = evaluate_class_similarity_threshold(
+                    job.analysis.items, tuning_mask, tuning,
+                    source_verified=prepared.source_verified,
+                )
+                record_by_id = {record_id: prepared.records[index]
+                                for index, record_id in enumerate(prepared.record_ids)}
+                heldout_ids = list(evaluation.get("frozen_ids") or [])
+                heldout_groups = [class_similarity_source_group_id(record_by_id[record_id], level)
+                                  for record_id in heldout_ids]
+                validate_class_similarity_heldout(
+                    frozen, analysis_key=prepared.analysis_key,
+                    score_protocol_key=class_similarity_protocol_key(job),
+                    heldout_ids=heldout_ids, heldout_groups=heldout_groups,
+                    tuning_complete=(tuning_counts.status == "ready"),
+                )
+                if set(heldout_ids) & job.heldout_used_ids:
+                    raise ClassSimilarityError("Heldout IDs were already evaluated in this session.")
+                if set(heldout_groups) & job.heldout_used_groups:
+                    raise ClassSimilarityError("Heldout source groups were already evaluated in this session.")
+                effective_policy = frozen_policy
+            else:
+                effective_policy = request.policy
         except ClassSimilarityError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         with app.state.lock:
             job.evaluation = evaluation
-        return class_similarity_evaluation_payload(job, request.policy)
+            if evaluation.get("purpose") == "heldout":
+                ids = list(evaluation.get("frozen_ids") or [])
+                groups = [class_similarity_source_group_id(record_by_id[record_id], level)
+                          for record_id in ids]
+                job.heldout_used_ids.update(ids)
+                job.heldout_used_groups.update(groups)
+            else:
+                job.tuning_evaluation = evaluation
+                if job.frozen_policy and job.frozen_policy.get("tuning_evaluation_key") != evaluation.get("truth_digest"):
+                    job.frozen_policy = None
+                    job.heldout_used_ids.clear()
+                    job.heldout_used_groups.clear()
+        return class_similarity_evaluation_payload(job, effective_policy)
+
+    @app.post("/api/v1/class-similarity/jobs/{job_id}/operating-point")
+    def save_class_similarity_operating_point(
+        job_id: str, request: ClassSimilarityOperatingPointRequest,
+    ) -> dict:
+        job = current_class_similarity_job(job_id, verify_sources=True)
+        prepared = job.prepared
+        evaluation = job.tuning_evaluation
+        if not evaluation or evaluation.get("purpose") != "tuning":
+            raise HTTPException(status_code=409, detail="Import a tuning review set before saving an operating point.")
+        try:
+            policy = parse_class_similarity_policy(request.policy)
+            mask = class_similarity_candidate_mask(job.analysis.items, policy)
+            counts = evaluate_class_similarity_threshold(
+                job.analysis.items, mask, evaluation,
+                source_verified=prepared.source_verified,
+            )
+            if counts.status != "ready":
+                raise ClassSimilarityError("The tuning review set must have complete binary verdicts before saving.")
+            record_by_id = {record_id: prepared.records[index]
+                            for index, record_id in enumerate(prepared.record_ids)}
+            tuning_ids = list(evaluation.get("frozen_ids") or [])
+            level = str(job.result.get("unit") or "image")
+            tuning_groups = [class_similarity_source_group_id(record_by_id[record_id], level)
+                             for record_id in tuning_ids]
+            preview = class_similarity_preview_key(
+                prepared.analysis_key, policy, evaluation.get("truth_digest"),
+            )
+            frozen = make_class_similarity_operating_point(
+                policy=policy, analysis_key=prepared.analysis_key,
+                score_protocol_key=class_similarity_protocol_key(job),
+                tuning_evaluation_key=evaluation.get("truth_digest"),
+                tuning_ids=tuning_ids, tuning_group_ids=tuning_groups,
+                policy_id=preview[:12], created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except ClassSimilarityError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        with app.state.lock:
+            job.frozen_policy = frozen
+            job.heldout_used_ids.clear()
+            job.heldout_used_groups.clear()
+        return {"frozen_policy": frozen, **class_similarity_evaluation_payload(job, policy.__dict__)}
 
     @app.post("/api/v1/class-similarity/jobs/{job_id}/evaluation/preview")
     def preview_class_similarity_evaluation(
@@ -5312,7 +5421,7 @@ def create_app(
                 evaluation_counts=counts, prepared=prepared,
                 level=str(job.result.get("unit") or "image"),
                 analysis_key=prepared.analysis_key, preview_key=preview,
-                label_status=prepared.label_status,
+                frozen_policy=job.frozen_policy, label_status=prepared.label_status,
             )
         except ClassSimilarityError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

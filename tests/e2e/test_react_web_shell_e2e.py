@@ -661,19 +661,53 @@ def test_lv_web_01_cs_01_visible_class_similarity_evidence(
             page.get_by_role("button", name="Add selected to Curation").click()
             expect(page.get_by_role("status").filter(has_text="Added 4; skipped 0")).to_be_visible(timeout=15_000)
 
+            page.get_by_role("button", name="Clear selection (4)").click()
+            rows = page.get_by_test_id("class-similarity-row")
+            rows.nth(0).locator("input[type=checkbox]").check()
+            rows.nth(1).locator("input[type=checkbox]").check()
+            page.get_by_label("Evaluation template scope").select_option("selected")
             with page.expect_download() as download_info:
                 page.get_by_role("button", name="Download evaluation template").click()
-            template_download = download_info.value
-            edited_template_path = tmp_path / "class_similarity_review.json"
-            template = json.loads(Path(template_download.path()).read_text(encoding="utf-8"))
-            for index, review in enumerate(template["reviews"]):
+            tuning_download = download_info.value
+            tuning_path = tmp_path / "class_similarity_tuning.json"
+            tuning_template = json.loads(Path(tuning_download.path()).read_text(encoding="utf-8"))
+            assert tuning_template["purpose"] == "tuning"
+            assert len(tuning_template["frozen_ids"]) == 2
+            for index, review in enumerate(tuning_template["reviews"]):
                 review["verdict"] = "incorrect" if index == 0 else "correct"
-            edited_template_path.write_text(json.dumps(template), encoding="utf-8")
-            page.get_by_label("Upload class similarity evaluation JSON").set_input_files(str(edited_template_path))
+            tuning_path.write_text(json.dumps(tuning_template), encoding="utf-8")
+            page.get_by_label("Upload class similarity evaluation JSON").set_input_files(str(tuning_path))
             expect(page.get_by_test_id("class-similarity-evaluation-results")).to_be_visible(timeout=15_000)
             expect(page.get_by_test_id("class-similarity-evaluation-results")).to_contain_text("TP")
             expect(page.get_by_test_id("class-similarity-evaluation-results")).to_contain_text("precision")
             expect(page.get_by_role("img", name="Precision recall curve")).to_be_visible()
+
+            page.get_by_role("button", name="Save operating point").click()
+            expect(page.get_by_role("button", name="Restore saved operating point")).to_be_visible()
+            page.get_by_label("Class similarity threshold", exact=True).fill("-1")
+            page.get_by_role("button", name="Restore saved operating point").click()
+            expect(page.get_by_label("Class similarity threshold", exact=True)).to_have_value("2")
+
+            page.get_by_role("button", name="Clear selection (2)").click()
+            rows.nth(2).locator("input[type=checkbox]").check()
+            rows.nth(3).locator("input[type=checkbox]").check()
+            page.get_by_label("Evaluation purpose").select_option("heldout")
+            with page.expect_download() as heldout_download_info:
+                page.get_by_role("button", name="Download evaluation template").click()
+            heldout_template = json.loads(Path(heldout_download_info.value.path()).read_text(encoding="utf-8"))
+            assert heldout_template["purpose"] == "heldout"
+            assert set(heldout_template["frozen_ids"]).isdisjoint(tuning_template["frozen_ids"])
+            assert {row["source_group_id"] for row in heldout_template["record_catalog"]}.isdisjoint(
+                {row["source_group_id"] for row in tuning_template["record_catalog"]}
+            )
+            for index, review in enumerate(heldout_template["reviews"]):
+                review["verdict"] = "incorrect" if index == 0 else "correct"
+            heldout_path = tmp_path / "class_similarity_heldout.json"
+            heldout_path.write_text(json.dumps(heldout_template), encoding="utf-8")
+            page.get_by_label("Upload class similarity evaluation JSON").set_input_files(str(heldout_path))
+            expect(page.get_by_role("status").filter(has_text="Heldout verdicts validated")).to_be_visible(timeout=15_000)
+            expect(page.get_by_role("img", name="Precision recall curve")).to_have_count(0)
+
             with page.expect_download() as report_download_info:
                 page.get_by_role("button", name="CSV", exact=True).first.click()
             report_download = report_download_info.value

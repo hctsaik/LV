@@ -228,6 +228,100 @@ def test_class_similarity_evaluation_template_review_and_scoped_exports(tmp_path
                for path, digest in source_hashes.items())
 
 
+def test_class_similarity_saved_operating_point_requires_disjoint_heldout_review(
+    tmp_path: Path, monkeypatch,
+):
+    folders, _source_hashes = _fixture(tmp_path / "heldout-dataset")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
+    app = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: _embedder,
+    )
+    with TestClient(app) as client:
+        created = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(folder) for folder in folders],
+            "model_id": "fixture-model", "method": "pca",
+        })
+        run_job = _wait_for_job(client, "/api/v1/jobs/{job_id}", created.json()["job_id"])
+        assert run_job["state"] == "completed", run_job
+        run_id = run_job["run_id"]
+        started = client.post(f"/api/v1/runs/{run_id}/class-similarity/jobs", json={
+            "model_id": "fixture-model", "k": 1,
+        })
+        analysis = _wait_for_job(
+            client, "/api/v1/class-similarity/jobs/{job_id}", started.json()["job_id"],
+        )
+        assert analysis["state"] == "completed", analysis
+        job_id = started.json()["job_id"]
+        record_ids = [item["record_id"] for item in analysis["result"]["items"]]
+        tuning_ids, heldout_ids = record_ids[:2], record_ids[2:]
+
+        tuning_template_response = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation/template",
+            json={"scope": "selected", "purpose": "tuning", "selected_ids": tuning_ids},
+        )
+        assert tuning_template_response.status_code == 200, tuning_template_response.text
+        tuning_template = json.loads(tuning_template_response.content)
+        for index, review in enumerate(tuning_template["reviews"]):
+            review["verdict"] = "incorrect" if index == 0 else "correct"
+        tuning = client.put(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation",
+            json={"manifest": tuning_template, "policy": {"mode": "threshold", "threshold": 0.5}},
+        )
+        assert tuning.status_code == 200, tuning.text
+        assert tuning.json()["evaluation"]["purpose"] == "tuning"
+        assert tuning.json()["counts"]["status"] == "ready"
+
+        saved = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/operating-point",
+            json={"policy": {"mode": "threshold", "threshold": 0.5}},
+        )
+        assert saved.status_code == 200, saved.text
+        frozen = saved.json()["frozen_policy"]
+        assert frozen["policy"]["threshold"] == 0.5
+        assert set(frozen["tuning_ids"]) == set(tuning_ids)
+
+        heldout_template_response = client.post(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation/template",
+            json={"scope": "selected", "purpose": "heldout", "selected_ids": heldout_ids},
+        )
+        assert heldout_template_response.status_code == 200, heldout_template_response.text
+        heldout_template = json.loads(heldout_template_response.content)
+        assert heldout_template["purpose"] == "heldout"
+        heldout_review_seed = heldout_template["reviews"]
+        heldout_template["frozen_ids"] = [tuning_ids[0]]
+        heldout_template["reviews"] = [{"record_id": tuning_ids[0], "verdict": "incorrect"}]
+        overlap = client.put(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation",
+            json={"manifest": heldout_template, "policy": {"mode": "threshold", "threshold": -1.0}},
+        )
+        assert overlap.status_code == 422
+        assert "overlap tuning IDs" in overlap.json()["message"]
+
+        heldout_template["frozen_ids"] = heldout_ids
+        heldout_template["reviews"] = heldout_review_seed
+        for index, review in enumerate(heldout_template["reviews"]):
+            review["verdict"] = "incorrect" if index == 0 else "correct"
+        heldout = client.put(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation",
+            json={"manifest": heldout_template, "policy": {"mode": "threshold", "threshold": -1.0}},
+        )
+        assert heldout.status_code == 200, heldout.text
+        heldout_payload = heldout.json()
+        assert heldout_payload["evaluation"]["purpose"] == "heldout"
+        assert heldout_payload["policy"]["threshold"] == 0.5
+        assert heldout_payload["counts"]["status"] == "ready"
+        assert heldout_payload["precision_recall_curve"] == []
+
+        reused = client.put(
+            f"/api/v1/class-similarity/jobs/{job_id}/evaluation",
+            json={"manifest": heldout_template, "policy": {"mode": "threshold", "threshold": 0.5}},
+        )
+        assert reused.status_code == 422
+        assert "already evaluated" in reused.json()["message"]
+
+
 def test_class_similarity_rejects_a_run_after_its_source_changes(tmp_path: Path, monkeypatch):
     folders, _source_hashes = _fixture(tmp_path / "dataset")
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
