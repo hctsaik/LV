@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
 import socket
 import threading
 import time
 from pathlib import Path
 
 import uvicorn
-from PIL import Image
+from PIL import Image, ImageDraw
 from playwright.sync_api import expect, sync_playwright
 
 from react_web_shell import create_app
@@ -94,6 +96,164 @@ def test_lv_web_02_img_01_react_compare_flow_with_local_worker(tmp_path: Path, m
             page.get_by_label("Comparison unit").select_option("object")
             expect(page.get_by_role("heading", name="Your comparison workspace is ready")).to_be_visible()
             expect(page.get_by_role("heading", name="Overall image drift")).to_have_count(0)
+            browser.close()
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+def test_lv_web_02_img_01_real_dinov2_visible_streamlit_parity(tmp_path: Path, monkeypatch):
+    """Compare the visible React result with the legacy whole-image Streamlit formula."""
+    import json
+
+    import numpy as np
+    import pytest
+    from sklearn.decomposition import PCA
+
+    from _utils import load_model
+
+    root = Path(__file__).resolve().parents[2]
+    configured_models = Path(
+        os.environ.get("LV_TEST_MODELS_DIR") or os.environ.get("LV_MODELS_DIR") or root / "models"
+    ).expanduser().resolve()
+    configured_weights = (
+        configured_models / "dinov2_vits14" / "dinov2_vits14.pth",
+        configured_models / "dinov2_vits14.pth",
+    )
+    cache_weights = Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "dinov2_vits14_pretrain.pth"
+    source_weights = next((path for path in configured_weights if path.is_file()), None)
+    if source_weights is None and cache_weights.is_file():
+        source_weights = cache_weights
+    if source_weights is None:
+        pytest.skip("pinned real DINOv2-small weights are unavailable in LV models or the local torch cache")
+    expected_sha256 = "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9"
+    assert hashlib.sha256(source_weights.read_bytes()).hexdigest() == expected_sha256, \
+        "the local model weights differ from the LV-WEB-01/06 baseline"
+
+    models_dir = tmp_path / "models"
+    model_dir = models_dir / "dinov2_vits14"
+    model_dir.mkdir(parents=True)
+    weights = model_dir / "dinov2_vits14.pth"
+    try:
+        os.link(source_weights, weights)
+    except OSError:
+        shutil.copyfile(source_weights, weights)
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == expected_sha256
+
+    roots = [tmp_path / "group-a", tmp_path / "group-b"]
+    source_files = []
+    for side, root_dir, color in (("a", roots[0], (215, 36, 42)), ("b", roots[1], (28, 58, 212))):
+        root_dir.mkdir()
+        for index in range(4):
+            image = Image.new("RGB", (80, 64), (color[0], min(255, color[1] + index * 9), color[2]))
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((8 + index * 3, 10, 32 + index * 3, 42), fill=(240, 196, 34))
+            draw.line((4, 56 - index, 74, 8 + index), fill=(30 + index * 20, 220, 130), width=2)
+            path = root_dir / f"{side}-{index}.png"
+            image.save(path)
+            source_files.append(path)
+    source_hashes = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files}
+    monkeypatch.setenv("LV_MODELS_DIR", str(models_dir))
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    embed = load_model("dinov2_vits14", models_dir=models_dir)
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+    )
+    port = _free_port()
+    server = uvicorn.Server(uvicorn.Config(
+        application, host="127.0.0.1", port=port, log_level="error", lifespan="off",
+    ))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                import urllib.request
+
+                with urllib.request.urlopen(base_url + "/api/v1/health", timeout=1) as response:
+                    if response.status == 200:
+                        break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise AssertionError("local worker did not start")
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1050})
+            page.set_default_timeout(300_000)
+            comparison_results: list[dict] = []
+            projection_results: list[dict] = []
+            visible_image_bodies: dict[str, bytes] = {}
+
+            def capture_response(response):
+                if not response.ok:
+                    return
+                path = response.url.split("?", 1)[0]
+                if response.request.method == "GET" and "/api/v1/comparisons/" in path \
+                        and not path.endswith("/projections") and "/images/" not in path:
+                    comparison_results.append(response.json())
+                elif response.request.method == "POST" and path.endswith("/projections"):
+                    projection_results.append(response.json())
+                elif "/api/v1/comparisons/" in path and "/images/" in path:
+                    image_parts = path.rsplit("/", 2)
+                    visible_image_bodies[f"{image_parts[-2]}/{image_parts[-1]}"] = response.body()
+
+            page.on("response", capture_response)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Compare").click()
+            page.get_by_label("Comparison unit").select_option("whole")
+            for index, root_dir in enumerate(roots):
+                page.get_by_label("Image folder", exact=True).nth(index).fill(str(root_dir))
+                page.get_by_role("button", name=f"Add Folder {'A' if index == 0 else 'B'}").click()
+            page.get_by_label("Feature model").select_option("dinov2_vits14")
+            page.get_by_role("button", name="Run comparison").click()
+            expect(page.get_by_test_id("compare-job-status")).to_contain_text("Completed", timeout=300_000)
+            expect(page.get_by_role("heading", name="Overall image drift")).to_be_visible()
+            expect(page.get_by_test_id("comparison-point")).to_have_count(8, timeout=300_000)
+            page.get_by_label("Comparison projection", exact=True).select_option("pca")
+            expect(page.get_by_test_id("comparison-point")).to_have_count(8, timeout=300_000)
+            expect(page.locator(".compare-gallery-grid img").first).to_be_visible()
+            page.get_by_test_id("comparison-point").nth(0).click()
+            expect(page.get_by_test_id("comparison-focused-record")).to_contain_text("Group A")
+
+            assert comparison_results and projection_results
+            result = comparison_results[-1]
+            projection = projection_results[-1]
+            assert result["unit"] == "whole" and result["model"] == "dinov2_vits14"
+            paths_a = sorted(roots[0].glob("*.png"))
+            paths_b = sorted(roots[1].glob("*.png"))
+            embeddings_a = np.stack([embed(path) for path in paths_a])
+            embeddings_b = np.stack([embed(path) for path in paths_b])
+            assert embeddings_a.shape == embeddings_b.shape == (4, 384)
+            assert np.isfinite(embeddings_a).all() and np.isfinite(embeddings_b).all()
+
+            # Match scripts/app.py::_compute_compare_whole using identical real embeddings.
+            mean_a = embeddings_a.mean(axis=0)
+            mean_a /= np.linalg.norm(mean_a) + 1e-9
+            mean_b = embeddings_b.mean(axis=0)
+            mean_b /= np.linalg.norm(mean_b) + 1e-9
+            expected_drift = round(max(0.0, 1.0 - float(mean_a @ mean_b)), 4)
+            assert result["rows"] == [{
+                "label": "(全部影像)", "a_count": 4, "b_count": 4, "drift": expected_drift,
+            }]
+            expect(page.get_by_text(f"{expected_drift:.4f}", exact=True)).to_be_visible()
+            expected_pca = PCA(n_components=2, random_state=42).fit_transform(
+                np.vstack([embeddings_a, embeddings_b])
+            )
+            actual_pca = np.asarray([[point["x"], point["y"]] for point in projection["points"]])
+            assert projection["requested_method"] == "pca"
+            assert np.allclose(actual_pca, expected_pca, rtol=1e-5, atol=1e-5)
+            assert len(result["records_a"]) == len(result["records_b"]) == 4
+            public_payload = json.dumps({"comparison": result, "projection": projection})
+            assert str(tmp_path) not in public_payload
+            assert "a/0" in visible_image_bodies
+            assert visible_image_bodies["a/0"] == paths_a[0].read_bytes()
+            assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_files} == source_hashes
             browser.close()
     finally:
         server.should_exit = True
