@@ -1010,7 +1010,7 @@ def test_x_diversity_sampling(flow_page):
 # ── (y) §1 annotator-agreement quiz tool ────────────────────────────────
 
 @pytest.mark.skip(reason="組考卷已退出獨立工具列旅程；舊 Streamlit 路由不可達。"
-                         "多人派件／重複標註移至 ANnoTation，LV agreement/kappa successor 另行驗收。")
+                         "產品檢視規劃多人派件／重複標註由 ANnoTation 負責；LV agreement/kappa successor 另行驗收。")
 def test_y_quiz_tool(app_page, tmp_path):
     import numpy as np
     from PIL import Image

@@ -712,6 +712,41 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
                   <div><strong>{round.round_id}</strong><span>Strategy: {round.strategy || "—"}</span></div>
                   <p>Sent {round.n_sent} · Read back {round.n_labeled} · Changed {round.n_changed}</p>
                   {round.metrics.length > 0 && <p>Metrics: {round.metrics.map((metric) => `${metric.name}=${metric.value ?? "—"}`).join(" · ")}</p>}
+                  {round.evaluations.map((evaluation) => (
+                    <details className="active-learning-evaluation-report" data-testid="active-learning-evaluation-report" key={evaluation.evaluation_id}>
+                      <summary>Detection evaluation · {(evaluation.summary.overall.recall * 100).toFixed(1)}% recall</summary>
+                      <p>
+                        Precision {(evaluation.summary.overall.precision * 100).toFixed(1)}% ·
+                        FN {evaluation.summary.overall.fn} · FP {evaluation.summary.overall.fp} ·
+                        Consensus GT {evaluation.summary.consensus_gt_count ?? "not provided"} ·
+                        Gray GT {evaluation.summary.gray_gt_count}
+                      </p>
+                      <p>
+                        IoU {evaluation.parameters.iou_thresh.toFixed(2)} ·
+                        confidence ≥ {evaluation.parameters.conf_thresh.toFixed(2)} ·
+                        {evaluation.parameters.class_aware ? "class-aware" : "class-agnostic"} ·
+                        {evaluation.summary.image_count} GT images ·
+                        {evaluation.summary.prediction_image_count} prediction images
+                      </p>
+                      {evaluation.summary.per_class.length > 0 && (
+                        <div className="active-learning-evaluation-table-wrap">
+                          <table className="active-learning-evaluation-table">
+                            <thead><tr><th>Class</th><th>Recall</th><th>Precision</th><th>FN</th><th>FP</th></tr></thead>
+                            <tbody>{evaluation.summary.per_class.map((item) => (
+                              <tr key={item.class_name}>
+                                <th scope="row">{item.class_name}</th>
+                                <td>{(item.recall * 100).toFixed(1)}%</td>
+                                <td>{(item.precision * 100).toFixed(1)}%</td>
+                                <td>{item.fn}</td>
+                                <td>{item.fp}</td>
+                              </tr>
+                            ))}</tbody>
+                          </table>
+                        </div>
+                      )}
+                      {evaluation.summary.warnings.length > 0 && <p role="note">Warnings: {evaluation.summary.warnings.join(", ")}</p>}
+                    </details>
+                  ))}
                   <button type="button" data-testid={`active-learning-probe-${round.round_id}`} disabled={!currentRunId || !!probeBusyRoundId} onClick={() => void runProbe(round.round_id)}>
                     {probeBusyRoundId === round.round_id ? "Running probe…" : "Run probe evaluation"}
                   </button>

@@ -886,6 +886,24 @@ export type ActiveLearningRound = {
   n_labeled: number;
   n_changed: number;
   metrics: Array<{ name: string; value: number | null; source: string; ts: string }>;
+  evaluations: DetectionEvaluationRoundReport[];
+};
+export type DetectionEvaluationRoundReport = {
+  evaluation_id: string;
+  ts: string;
+  parameters: { iou_thresh: number; conf_thresh: number; class_aware: boolean };
+  summary: {
+    overall: Omit<DetectionEvaluationClass, "class_name">;
+    per_class: DetectionEvaluationClass[];
+    escape_count: number;
+    confusion: Array<{ ground_truth: string; predicted: string; count: number }>;
+    gray_gt_count: number;
+    consensus_gt_count: number | null;
+    image_count: number;
+    prediction_image_count: number;
+    used_consensus: boolean;
+    warnings: DetectionEvaluation["warnings"];
+  };
 };
 export type ActiveLearningRoundsResponse = {
   rounds: ActiveLearningRound[];
@@ -1638,6 +1656,12 @@ export const api = {
     body: JSON.stringify(input),
   }),
   activeLearningRounds: () => request<ActiveLearningRoundsResponse>("/api/v1/rounds"),
+  attachEvaluationToRound: (roundId: string, evaluationId: string) =>
+    request<{ round_id: string; attached: boolean; rounds: ActiveLearningRound[] }>(
+      "/api/v1/rounds/" + encodeURIComponent(roundId) + "/evaluations", {
+        method: "POST",
+        body: JSON.stringify({ evaluation_id: evaluationId }),
+      }),
   attachRoundMetric: (roundId: string, input: { name: string; value: number; source?: string; note?: string }) =>
     request<ActiveLearningRoundsResponse>("/api/v1/rounds/" + encodeURIComponent(roundId) + "/metrics", {
       method: "POST",

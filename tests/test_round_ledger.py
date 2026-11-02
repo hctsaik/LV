@@ -127,3 +127,30 @@ def test_acD1_metric_last_wins_and_x_monotonic(rl):  # AC-D1 同名 metric 取�
     assert ys == [0.7, 0.9]                       # last-wins,非 0.5
     assert all(b >= a for a, b in zip(xs, xs[1:]))  # xs 單調不減
     assert xs == [10, 15]
+
+
+def test_acD2_detection_evaluation_is_one_report_event_and_feeds_learning_curve(rl):
+    rid = rl.start_round("cart", {}, "curation")
+    rl.attach_evaluation(rid, {
+        "evaluation_id": "eval-01",
+        "parameters": {"iou_thresh": 0.5, "conf_thresh": 0.1, "class_aware": True},
+        "summary": {
+            "overall": {"tp": 3, "fp": 1, "fn": 2, "n_gt": 5,
+                        "precision": 0.75, "recall": 0.6},
+            "per_class": [], "escape_count": 2, "confusion": [],
+            "gray_gt_count": 1, "consensus_gt_count": 5,
+            "image_count": 4, "prediction_image_count": 3,
+            "used_consensus": True, "warnings": [],
+        },
+    })
+
+    saved = rl.load_rounds()[0]
+    assert saved["evaluations"][0]["evaluation_id"] == "eval-01"
+    assert saved["evaluations"][0]["parameters"]["iou_thresh"] == 0.5
+    assert {metric["name"]: metric["value"] for metric in saved["metrics"]} == {
+        "detection_recall": 0.6,
+        "detection_precision": 0.75,
+        "detection_fn": 2,
+        "detection_fp": 1,
+    }
+    assert rl.learning_curve([saved], "detection_recall") == ([0], [0.6])

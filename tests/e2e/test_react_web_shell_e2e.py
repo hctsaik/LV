@@ -4269,7 +4269,12 @@ def test_lv_web_10_eval_01_visible_react_detection_evaluation_and_escape_export(
         path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in dataset.rglob("*") if path.is_file()
     }
+    import round_ledger
+
+    output_dir = tmp_path / "evaluation-output"
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "evaluation-cache"))
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(output_dir))
+    round_id = round_ledger.start_round("fixture", {}, "curation")
     application = create_app()
     server = server_thread = browser = None
     try:
@@ -4287,6 +4292,8 @@ def test_lv_web_10_eval_01_visible_react_detection_evaluation_and_escape_export(
             expect(page.get_by_test_id("evaluation-results")).to_be_visible()
             expect(page.get_by_role("status").filter(has_text="範例資料")).to_be_visible()
             expect(page.get_by_test_id("evaluation-escape-count")).not_to_have_text("0")
+            expect(page.get_by_test_id("sample-evaluation-not-attachable")).to_be_visible()
+            expect(page.get_by_test_id("attach-evaluation-to-round")).to_have_count(0)
 
             page.get_by_label("Dataset folder path").fill(str(dataset))
             page.get_by_role("button", name="Add dataset folder").click()
@@ -4319,6 +4326,9 @@ def test_lv_web_10_eval_01_visible_react_detection_evaluation_and_escape_export(
             expect(page.get_by_test_id("evaluation-escape-count")).to_have_text("1")
             expect(page.get_by_test_id("evaluation-per-class-table").locator("tbody tr")).to_have_count(1)
             expect(page.get_by_text("共識 GT 2 · 灰帶 GT 1")).to_be_visible()
+            page.get_by_label("Round to attach evaluation").select_option(round_id)
+            page.get_by_test_id("attach-evaluation-to-round").click()
+            expect(page.get_by_test_id("evaluation-round-attached")).to_contain_text(round_id)
             image = page.locator("img[alt*='missed.png']")
             expect(image).to_be_visible()
             page.wait_for_function(
@@ -4331,6 +4341,13 @@ def test_lv_web_10_eval_01_visible_react_detection_evaluation_and_escape_export(
             assert download.suggested_filename == "escapes.csv"
             exported = Path(download.path()).read_text(encoding="utf-8")
             assert "missed.png,dent,0.5,0.5,0.25,0.25" in exported
+            page.get_by_test_id("open-curation").click()
+            report = page.get_by_test_id("active-learning-evaluation-report")
+            expect(report).to_contain_text("50.0% recall")
+            report.locator("summary").click()
+            expect(report).to_contain_text("IoU 0.50")
+            expect(report).to_contain_text("FN 1")
+            expect(report.locator("tbody tr")).to_have_count(1)
             browser.close()
             browser = None
     finally:

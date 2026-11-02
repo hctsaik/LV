@@ -64,6 +64,11 @@ def attach_metric(round_id: str, name: str, value: float,
              "value": value, "source": source, "note": note})
 
 
+def attach_evaluation(round_id: str, report: dict) -> None:
+    """Attach one path-free detection-evaluation report as a single ledger event."""
+    _append({"kind": "evaluation", "round_id": round_id, "evaluation": report})
+
+
 def _iter_valid_events():
     """逐行 yield 合法事件(dict 有 kind 與 round_id);壞行/缺鍵不 yield。"""
     p = ledger_path()
@@ -96,7 +101,7 @@ def load_rounds() -> list[dict]:
                 "tool": row.get("tool", ""), "note": row.get("note", ""),
                 "batches": [], "n_sent": 0,
                 "readbacks": [], "n_labeled": 0, "n_changed": 0,
-                "metrics": [],
+                "metrics": [], "evaluations": [],
             })
         else:
             pending.append(row)
@@ -120,11 +125,29 @@ def load_rounds() -> list[dict]:
                                  "value": row.get("value"),
                                  "source": row.get("source", ""),
                                  "ts": row.get("ts", "")})
+        elif kind == "evaluation":
+            report = row.get("evaluation")
+            if isinstance(report, dict):
+                saved = {**report, "ts": row.get("ts", "")}
+                r["evaluations"].append(saved)
+                overall = (report.get("summary") or {}).get("overall") or {}
+                for name, field in (
+                    ("detection_recall", "recall"),
+                    ("detection_precision", "precision"),
+                    ("detection_fn", "fn"),
+                    ("detection_fp", "fp"),
+                ):
+                    value = overall.get(field)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        r["metrics"].append({
+                            "name": name, "value": value,
+                            "source": "detection_evaluation", "ts": row.get("ts", ""),
+                        })
     return sorted(rounds.values(), key=lambda r: r["ts"])
 
 
 def orphan_events() -> list[dict]:
-    """掛在不存在 round_id 上的事件(batch/readback/metric);正常情況為 []。"""
+    """掛在不存在 round_id 上的事件(batch/readback/metric/evaluation);正常情況為 []。"""
     starts = {row["round_id"] for row in _iter_valid_events()
               if row["kind"] == "start"}
     return [row for row in _iter_valid_events()

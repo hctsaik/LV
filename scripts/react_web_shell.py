@@ -672,6 +672,10 @@ class AttachRoundMetricRequest(BaseModel):
     note: str = Field(default="", max_length=2000)
 
 
+class AttachEvaluationToRoundRequest(BaseModel):
+    evaluation_id: str = Field(min_length=1, max_length=128)
+
+
 class ApplyLabelingReadbackRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=128)
 
@@ -2531,6 +2535,9 @@ def create_app(
         with app.state.lock:
             app.state.evaluation_runs[evaluation_id] = {
                 "escape_csv": escape_csv.getvalue(),
+                "summary": evaluated["summary"],
+                "parameters": evaluated.get("parameters", {}),
+                "demo": demo,
                 "image_by_name": {
                     name: evaluated["image_by_name"][name]
                     for name in preview_image_names
@@ -2566,6 +2573,11 @@ def create_app(
             )
         except EvaluationInputError as exc:
             raise detection_evaluation_error(exc) from exc
+        evaluated["parameters"] = {
+            "iou_thresh": request.iou_thresh,
+            "conf_thresh": request.conf_thresh,
+            "class_aware": request.class_aware,
+        }
         return store_detection_evaluation(evaluated)
 
     @app.post("/api/v1/evaluations/demo")
@@ -2578,6 +2590,9 @@ def create_app(
             evaluated = run_detection_evaluation_demo(sample_root)
         except EvaluationInputError as exc:
             raise detection_evaluation_error(exc) from exc
+        evaluated["parameters"] = {
+            "iou_thresh": 0.5, "conf_thresh": 0.0, "class_aware": True,
+        }
         return store_detection_evaluation(evaluated, demo=True)
 
     @app.get("/api/v1/evaluations/{evaluation_id}/escapes.csv")
@@ -5666,6 +5681,67 @@ def create_app(
                 request.note,
             )
             return {"rounds": _round_ledger.load_rounds()}
+
+    @app.post("/api/v1/rounds/{round_id}/evaluations")
+    def attach_detection_evaluation_to_round(
+        round_id: str, request: AttachEvaluationToRoundRequest,
+    ) -> dict:
+        import round_ledger as _round_ledger
+
+        with app.state.lock:
+            rounds = _round_ledger.load_rounds()
+            target_round = next((row for row in rounds if row["round_id"] == round_id), None)
+            if target_round is None:
+                raise HTTPException(status_code=404, detail={
+                    "code": "ROUND_NOT_FOUND",
+                    "message": "The selected active-learning round no longer exists.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            evaluation = app.state.evaluation_runs.get(request.evaluation_id)
+            if evaluation is None:
+                raise HTTPException(status_code=404, detail={
+                    "code": "EVALUATION_NOT_FOUND",
+                    "message": "This evaluation is no longer available. Run it again.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if evaluation.get("demo"):
+                raise HTTPException(status_code=422, detail={
+                    "code": "SAMPLE_EVALUATION_NOT_ATTACHABLE",
+                    "message": "Sample evaluations cannot be added to an active-learning round.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            prior_round = next((
+                row for row in rounds
+                if any(saved.get("evaluation_id") == request.evaluation_id
+                       for saved in row.get("evaluations", []))
+            ), None)
+            if prior_round is not None and prior_round["round_id"] != round_id:
+                raise HTTPException(status_code=409, detail={
+                    "code": "EVALUATION_ALREADY_ATTACHED",
+                    "message": "This evaluation is already attached to another round.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            attached = prior_round is None
+            if attached:
+                summary = evaluation.get("summary", {})
+                safe_summary = {
+                    key: summary.get(key)
+                    for key in (
+                        "overall", "per_class", "escape_count", "confusion",
+                        "gray_gt_count", "consensus_gt_count", "image_count",
+                        "prediction_image_count", "used_consensus", "warnings",
+                    )
+                }
+                _round_ledger.attach_evaluation(round_id, {
+                    "evaluation_id": request.evaluation_id,
+                    "parameters": evaluation.get("parameters", {}),
+                    "summary": safe_summary,
+                })
+            return {
+                "round_id": round_id,
+                "attached": attached,
+                "rounds": _round_ledger.load_rounds(),
+            }
 
     @app.post("/api/v1/rounds/{round_id}/probe")
     def run_active_learning_probe(round_id: str, request: RunRoundProbeRequest) -> dict:

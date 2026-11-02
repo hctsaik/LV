@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { api, type DetectionEvaluation } from "./api";
+import { useEffect, useState } from "react";
+import { api, type ActiveLearningRound, type DetectionEvaluation } from "./api";
 
 export default function EvaluationWorkspace() {
   const [folders, setFolders] = useState<string[]>([]);
@@ -10,15 +10,34 @@ export default function EvaluationWorkspace() {
   const [confThresh, setConfThresh] = useState(0);
   const [classAware, setClassAware] = useState(true);
   const [result, setResult] = useState<DetectionEvaluation | null>(null);
+  const [rounds, setRounds] = useState<ActiveLearningRound[]>([]);
+  const [selectedRoundId, setSelectedRoundId] = useState("");
   const [busy, setBusy] = useState(false);
+  const [attaching, setAttaching] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [roundLoadError, setRoundLoadError] = useState("");
+  const [attachedRoundId, setAttachedRoundId] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    api.activeLearningRounds().then((response) => {
+      if (!active) return;
+      setRounds(response.rounds);
+      const latest = response.rounds[response.rounds.length - 1];
+      if (latest) setSelectedRoundId(latest.round_id);
+    }).catch((reason: unknown) => {
+      if (active) setRoundLoadError(reason instanceof Error ? reason.message : "Could not load active-learning rounds.");
+    });
+    return () => { active = false; };
+  }, []);
 
   function addFolder(path: string, grantId?: string) {
     const normalized = path.trim();
     if (!normalized) return;
     if (grantId) api.rememberFolderGrant(normalized, grantId);
     setResult(null);
+    setAttachedRoundId("");
     setFolders((current) => current.includes(normalized) ? current : [...current, normalized]);
     setFolderDraft("");
   }
@@ -57,6 +76,7 @@ export default function EvaluationWorkspace() {
     }
     setBusy(true);
     setResult(null);
+    setAttachedRoundId("");
     try {
       const evaluated = await api.evaluateDetections({
         folders,
@@ -80,6 +100,7 @@ export default function EvaluationWorkspace() {
     setNotice("");
     setBusy(true);
     setResult(null);
+    setAttachedRoundId("");
     try {
       setResult(await api.demoDetectionEvaluation());
     } catch (reason) {
@@ -88,6 +109,29 @@ export default function EvaluationWorkspace() {
       setBusy(false);
     }
   }
+
+  async function attachEvaluationToRound() {
+    if (!result || result.demo || !selectedRoundId) return;
+    setError("");
+    setNotice("");
+    setAttaching(true);
+    try {
+      const response = await api.attachEvaluationToRound(selectedRoundId, result.evaluation_id);
+      setRounds(response.rounds);
+      setAttachedRoundId(response.round_id);
+      setNotice(response.attached
+        ? `評估摘要已加入回合 ${response.round_id}。`
+        : `這筆評估已在回合 ${response.round_id}，沒有重複新增。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not add this evaluation to the round.");
+    } finally {
+      setAttaching(false);
+    }
+  }
+
+  const existingEvaluationRound = result
+    ? rounds.find((round) => round.evaluations.some((item) => item.evaluation_id === result.evaluation_id))
+    : undefined;
 
   return (
     <main className="evaluation-page" aria-labelledby="evaluation-title" data-testid="evaluation-workspace">
@@ -209,6 +253,46 @@ export default function EvaluationWorkspace() {
           <article><span>誤報 FP</span><strong data-testid="evaluation-false-positive-count">{result.overall.fp}</strong></article>
         </div>
         {result.used_consensus && <p className="evaluation-consensus-note">共識 GT {result.consensus_gt_count} · 灰帶 GT {result.gray_gt_count}（灰帶不計入 recall）。</p>}
+
+        <section className="evaluation-round-attachment" aria-label="Add evaluation to an active-learning round" data-testid="evaluation-round-attachment">
+          <div>
+            <h3>加入回合報告</h3>
+            <p>保存 recall、precision、FN／FP、逐類指標與本次比對條件；不保存資料夾路徑或影像。</p>
+          </div>
+          {result.demo ? (
+            <p role="status" data-testid="sample-evaluation-not-attachable">範例結果不能加入正式回合。</p>
+          ) : roundLoadError ? (
+            <p role="alert">無法載入回合：{roundLoadError}</p>
+          ) : existingEvaluationRound || attachedRoundId ? (
+            <p role="status" data-testid="evaluation-round-attached">此評估已加入回合 {attachedRoundId || existingEvaluationRound?.round_id}。</p>
+          ) : rounds.length === 0 ? (
+            <p role="status">目前沒有可加入的回合。請先在 Curation 送出標註批次建立回合。</p>
+          ) : (
+            <div className="evaluation-round-controls">
+              <label htmlFor="evaluation-round-select">回合</label>
+              <select
+                id="evaluation-round-select"
+                aria-label="Round to attach evaluation"
+                data-testid="evaluation-round-select"
+                value={selectedRoundId}
+                onChange={(event) => setSelectedRoundId(event.target.value)}
+              >
+                {[...rounds].reverse().map((round) => (
+                  <option key={round.round_id} value={round.round_id}>{round.round_id} · {round.strategy || "—"}</option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="primary-action"
+                data-testid="attach-evaluation-to-round"
+                disabled={attaching || !selectedRoundId}
+                onClick={() => void attachEvaluationToRound()}
+              >
+                {attaching ? "加入中…" : "加入回合報告"}
+              </button>
+            </div>
+          )}
+        </section>
 
         {result.per_class.length > 0 && <section className="evaluation-table-section" aria-label="Per-class metrics">
           <h3>逐型態（FN 多的在前）</h3>

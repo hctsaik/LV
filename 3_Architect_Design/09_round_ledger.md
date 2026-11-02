@@ -4,7 +4,7 @@
 
 ## 1. 目的(Purpose)
 
-給主動學習迴圈一個持久的「記憶」:每一輪選樣策略、送標批次、回讀結果、(可掛的)模型指標,
+給主動學習迴圈一個持久的「記憶」:每一輪選樣策略、送標批次、回讀結果、模型指標與偵測評估報告,
 以 append-only 帳本記錄,並在 📥 標註回饋分頁長出「回合時間軸」視圖。它是停止判準(M11/12)
 與學習曲線的資料底座。
 
@@ -34,16 +34,21 @@ def record_readback(round_id: str, summary: dict) -> None
 def attach_metric(round_id: str, name: str, value: float, source: str, note: str = "") -> None
     # {"kind":"metric", ...};source ∈ {"probe","external","manual"}(自由字串,不驗enum)。
 
+def attach_evaluation(round_id: str, report: dict) -> None
+    # 以單一 {"kind":"evaluation", "round_id", "evaluation": report} 事件保存偵測評估摘要。
+    # report 不得包含絕對路徑、CSV 內容、影像 bytes 或漏抓檔名；sample evaluation 不得呼叫。
+
 def load_rounds() -> list[dict]
     # 折疊成**乾淨的 round 物件 list**(依 start ts 排序;空/檔不存在 → []):
     # {"round_id","ts","strategy","params","tool","note",
     #  "batches":[{"batch_id","n_sent"}...], "n_sent": Σ,
     #  "readbacks":[summary...], "n_labeled": Σ, "n_changed": Σ,
-    #  "metrics":[{"name","value","source","ts"}...]}
+    #  "metrics":[{"name","value","source","ts"}...],
+    #  "evaluations":[{"evaluation_id","parameters","summary","ts"}...]}
     # 壞行跳過(不進 list);掛在不存在 round_id 上的事件不丟失、不崩潰,由 orphan_events() 另取。
 
 def orphan_events() -> list[dict]
-    # 掛在不存在 round_id 上的事件(batch/readback/metric);正常情況為 []。供 UI 健康度顯示。
+    # 掛在不存在 round_id 上的事件(batch/readback/metric/evaluation);正常情況為 []。供 UI 健康度顯示。
 
 def learning_curve(rounds: list[dict], metric_name: str) -> tuple[list[int], list[float]]
     # x = 依回合序的「累積 n_labeled」;y = 該回合此 metric 的**最後一筆** value;
@@ -66,6 +71,10 @@ def learning_curve(rounds: list[dict], metric_name: str) -> tuple[list[int], lis
   `送出 n_sent · 回讀 n_labeled · 變更 n_changed`、metrics badges);卡內
   「➕ 掛指標」表單(name / value / source=manual)呼叫 `attach_metric`。
   有 ≥2 個帶同名 metric 的回合時,畫 `learning_curve` 折線(plotly,x=累積標註量)。
+- **偵測評估報告**:React 評估結果只可由使用者明確選擇既有 round 後附加；sample 不可入帳。
+  一次 append evaluation event，報告只保存整體／逐類數值、共識／灰帶計數及 IoU、confidence、
+  class-aware 設定，不保存資料夾路徑、CSV 或影像。折疊 round 時同時產生
+  `detection_recall`、`detection_precision`、`detection_fn`、`detection_fp` learning-curve metrics。
 
 ## 3. 資料流
 
@@ -82,6 +91,8 @@ def learning_curve(rounds: list[dict], metric_name: str) -> tuple[list[int], lis
 | 一回合多批次 | batches 累加,n_sent=Σ |
 | 同回合多次 readback(分批標完) | readbacks 累加,n_labeled/n_changed=Σ |
 | 同名 metric 多筆 | 曲線取該回合最後一筆;卡上全列 |
+| 偵測評估附加 | 每次附加是一筆完整 report event;同一 evaluation id 重送冪等;不得重掛其他 round |
+| sample evaluation 附加 | 拒絕寫入 round ledger |
 | round_id 不存在(record/attach) | 照寫事件(append-only),折疊時進 _orphans(見上) |
 | 使用者刪 output/rounds.jsonl | 一切歸零但 app 不崩潰(等同全新) |
 
@@ -98,6 +109,8 @@ def learning_curve(rounds: list[dict], metric_name: str) -> tuple[list[int], lis
   `learning_curve(rounds,"acc") == ([10, 60], [0.5, 0.8])`(x 為累積;缺 metric 回合跳過)。
 - **AC6(壞行容忍)**:塞壞行後 load_rounds 正常。
 - **AC7(無重依賴)**:同 08-AC8,乾淨子行程 import 不拉 numpy。
+- **AC8(評估報告)**:附加一個 evaluation event 後，`load_rounds()` 讀回其報告和參數，並將 recall／precision／FN／FP
+  轉成同一 round 的 metrics；report 不得含來源路徑與影像檔名。
 
 **GUI / 整合(真實 E2E,`tests/e2e/test_round_ledger_e2e.py`)**
 
@@ -106,6 +119,7 @@ def learning_curve(rounds: list[dict], metric_name: str) -> tuple[list[int], lis
 - **AC-G2(回讀入帳)**:對該批模擬結果檔 → 套用讀回 → 同一張卡出現 `回讀 M · 變更 K`(數字與 fixture 一致)。
 - **AC-G3(重啟存活)**:重啟 Streamlit server(harness 重起 session)後時間軸卡仍在(讀自 rounds.jsonl)。
 - **AC-G4(手動掛指標+曲線)**:對兩個回合各掛 "acc" → 折線圖渲染且點數==2。
+- **AC-G5(評估報告)**:真實評估可選既有 round 附加並在 Curation 時間軸讀回逐類摘要；sample 明確不能入帳。
 
 ## 6. 給 /pm 的提示
 

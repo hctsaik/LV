@@ -2733,6 +2733,8 @@ def _make_detection_evaluation_fixture(root: Path) -> Path:
 def test_case_lv_web_10_eval_01_api_reuses_legacy_core_and_exports_path_safe_escapes(
     monkeypatch, tmp_path
 ):
+    import round_ledger
+
     root = _make_detection_evaluation_fixture(tmp_path / "detection-evaluation")
     source_hashes = {
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -2749,6 +2751,8 @@ def test_case_lv_web_10_eval_01_api_reuses_legacy_core_and_exports_path_safe_esc
         "gray.png,false,0.5,0.5,0.25,0.25\n"
     )
 
+    output_dir = tmp_path / "eval-output"
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(output_dir))
     with _client(monkeypatch, tmp_path / "eval-api") as client:
         response = client.post("/api/v1/evaluations", json={
             "folders": [str(root)],
@@ -2789,6 +2793,39 @@ def test_case_lv_web_10_eval_01_api_reuses_legacy_core_and_exports_path_safe_esc
             "w": "0.25", "h": "0.25",
         }]
 
+        round_id = round_ledger.start_round("fixture", {}, "curation")
+        attached = client.post(f"/api/v1/rounds/{round_id}/evaluations", json={
+            "evaluation_id": evaluation_id,
+        })
+        assert attached.status_code == 200, attached.text
+        attached_body = attached.json()
+        assert attached_body["attached"] is True
+        saved_round = next(row for row in attached_body["rounds"] if row["round_id"] == round_id)
+        report = saved_round["evaluations"][0]
+        assert report["evaluation_id"] == evaluation_id
+        assert report["parameters"] == {
+            "iou_thresh": 0.5, "conf_thresh": 0.0, "class_aware": True,
+        }
+        assert report["summary"]["overall"]["recall"] == 0.5
+        assert report["summary"]["escape_count"] == 1
+        assert "escapes" not in report["summary"]
+        assert str(root) not in attached.text
+        assert {metric["name"] for metric in saved_round["metrics"]} == {
+            "detection_recall", "detection_precision", "detection_fn", "detection_fp",
+        }
+        duplicate_attach = client.post(f"/api/v1/rounds/{round_id}/evaluations", json={
+            "evaluation_id": evaluation_id,
+        })
+        assert duplicate_attach.status_code == 200
+        assert duplicate_attach.json()["attached"] is False
+
+        other_round_id = round_ledger.start_round("other", {}, "curation")
+        conflicting_attach = client.post(f"/api/v1/rounds/{other_round_id}/evaluations", json={
+            "evaluation_id": evaluation_id,
+        })
+        assert conflicting_attach.status_code == 409
+        assert conflicting_attach.json()["code"] == "EVALUATION_ALREADY_ATTACHED"
+
         duplicate_root = tmp_path / "duplicate-dataset"
         (duplicate_root / "images").mkdir(parents=True)
         (duplicate_root / "labels").mkdir()
@@ -2803,6 +2840,14 @@ def test_case_lv_web_10_eval_01_api_reuses_legacy_core_and_exports_path_safe_esc
         assert duplicate.status_code == 400
         assert duplicate.json()["code"] == "DUPLICATE_IMAGE_FILENAMES"
         assert "matched.png" in duplicate.json()["message"]
+
+    with _client(monkeypatch, tmp_path / "eval-api-reopened") as reopened:
+        persisted = reopened.get("/api/v1/rounds")
+        assert persisted.status_code == 200
+        saved_round = next(row for row in persisted.json()["rounds"] if row["round_id"] == round_id)
+        assert len(saved_round["evaluations"]) == 1
+        assert saved_round["evaluations"][0]["summary"]["overall"]["recall"] == 0.5
+        assert len(saved_round["metrics"]) == 4
 
     assert source_hashes == {
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -2836,7 +2881,10 @@ def test_case_lv_web_10_eval_01_managed_app_requires_granted_dataset_folder(
 def test_case_lv_web_10_eval_01_demo_is_explicit_sample_with_fn_and_gray_band(
     monkeypatch, tmp_path
 ):
+    import round_ledger
+
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "evaluation-demo-cache"))
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(tmp_path / "evaluation-demo-output"))
     with _client(monkeypatch, tmp_path / "eval-demo") as client:
         response = client.post("/api/v1/evaluations/demo")
         assert response.status_code == 200, response.text
@@ -2847,6 +2895,13 @@ def test_case_lv_web_10_eval_01_demo_is_explicit_sample_with_fn_and_gray_band(
         assert result["gray_gt_count"] > 0
         assert result["consensus_gt_count"] > 0
         assert str(tmp_path) not in response.text
+        round_id = round_ledger.start_round("fixture", {}, "curation")
+        attach_demo = client.post(f"/api/v1/rounds/{round_id}/evaluations", json={
+            "evaluation_id": result["evaluation_id"],
+        })
+        assert attach_demo.status_code == 422
+        assert attach_demo.json()["code"] == "SAMPLE_EVALUATION_NOT_ATTACHABLE"
+        assert client.get("/api/v1/rounds").json()["rounds"][0]["evaluations"] == []
         exported = client.get(f"/api/v1/evaluations/{result['evaluation_id']}/escapes.csv")
         assert exported.status_code == 200
         assert len(list(csv.DictReader(StringIO(exported.text)))) == result["escape_count"]
