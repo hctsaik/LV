@@ -2838,6 +2838,88 @@ def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_revi
     }, "case intake or review modified its source files"
 
 
+def test_lv_web_07_sample_01_visible_builds_yolo_and_whole_image_banks_without_anomaly_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Build and read back both sample-source modes from the dedicated React workspace."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    yolo_root = tmp_path / "fewshot-yolo"
+    (yolo_root / "images").mkdir(parents=True)
+    (yolo_root / "labels").mkdir()
+    (yolo_root / "classes.txt").write_text("scratch\nstain\n", encoding="utf-8")
+    for index, color in enumerate(((210, 40, 50), (30, 190, 70))):
+        Image.new("RGB", (48, 40), color).save(yolo_root / "images" / f"sample-{index}.png")
+    (yolo_root / "labels" / "sample-0.txt").write_text(
+        "0 0.5 0.5 0.5 0.5\n1 0.25 0.25 0.25 0.25\n", encoding="utf-8",
+    )
+    (yolo_root / "labels" / "sample-1.txt").write_text(
+        "0 0.5 0.5 0.75 0.75\n", encoding="utf-8",
+    )
+
+    whole_root = tmp_path / "fewshot-whole-image"
+    (whole_root / "images").mkdir(parents=True)
+    for index, color in enumerate(((190, 80, 50), (50, 90, 210))):
+        Image.new("RGB", (52, 36), color).save(whole_root / "images" / f"whole-{index}.png")
+
+    original_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (*yolo_root.rglob("*"), *whole_root.rglob("*")) if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: lambda crop: np.asarray(
+            [np.asarray(crop.convert("RGB"), dtype=np.float32).mean(), crop.width, crop.height, 1],
+            dtype=np.float32,
+        ),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page.set_default_timeout(15_000)
+            anomaly_model_build_requests = []
+            page.on("request", lambda request: anomaly_model_build_requests.append(request.url)
+                    if "/api/v1/anomaly/models/jobs" in request.url else None)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fewshot-samples").click()
+            expect(page.get_by_role("heading", name="以樣搜樣：建立樣本集")).to_be_visible()
+
+            page.get_by_test_id("fewshot-sample-folders").fill(str(yolo_root))
+            page.get_by_test_id("fewshot-object-source").select_option("yolo")
+            page.get_by_test_id("fewshot-build-bank").click()
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("3 個樣本", timeout=60_000)
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("scratch 2、stain 1")
+            first_bank_id = page.get_by_test_id("fewshot-bank-id").input_value()
+            page.get_by_test_id("fewshot-reload-bank").click()
+            expect(page.get_by_test_id("fewshot-notice")).to_contain_text("重新讀回", timeout=10_000)
+
+            page.get_by_test_id("fewshot-sample-folders").fill(str(whole_root))
+            page.get_by_test_id("fewshot-object-source").select_option("whole_image")
+            page.get_by_test_id("fewshot-build-bank").click()
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("2 個樣本", timeout=60_000)
+            expect(page.get_by_test_id("fewshot-bank-summary")).to_contain_text("整張影像語義")
+            second_bank_id = page.get_by_test_id("fewshot-bank-id").input_value()
+            assert first_bank_id != second_bank_id
+            assert anomaly_model_build_requests == []
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert original_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest() for path in original_hashes
+    }
+
+
 def test_lv_web_05_ext_01_visible_onnx_profile_inference_replay_and_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

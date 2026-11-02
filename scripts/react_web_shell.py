@@ -237,6 +237,13 @@ class CreateAnomalyModelJobRequest(BaseModel):
     confirmed: dict[str, Literal["good", "bad"]] = Field(default_factory=dict)
 
 
+class CreateFewshotSampleBankJobRequest(BaseModel):
+    sample_folders: list[str] = Field(min_length=1, max_length=32)
+    model_id: str = Field(min_length=1, max_length=128)
+    object_source: Literal["yolo", "whole_image"] = "yolo"
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+
+
 class CreateAnomalyScoreJobRequest(BaseModel):
     target_folders: list[str] = Field(min_length=1, max_length=32)
     contamination: float = Field(default=0.05, ge=0.0, le=1.0, allow_inf_nan=False)
@@ -493,6 +500,19 @@ class _AnomalyModelJob:
 
 
 @dataclass
+class _FewshotSampleBankJob:
+    job_id: str
+    request: CreateFewshotSampleBankJobRequest
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    result: dict | None = None
+    error: dict | None = None
+
+
+@dataclass
 class _AnomalyScoreJob:
     job_id: str
     model_id: str
@@ -538,6 +558,21 @@ def _anomaly_job_view(job: _AnomalyModelJob) -> dict:
     }
 
 
+def _fewshot_sample_bank_job_view(job: _FewshotSampleBankJob) -> dict:
+    return {
+        "job_id": job.job_id,
+        "state": job.state,
+        "phase": job.phase,
+        "done": job.done,
+        "total": job.total,
+        "percent": (job.done / job.total * 100.0) if job.total else 0.0,
+        "message": job.message,
+        "result": job.result,
+        "error": job.error,
+        "can_cancel": False,
+    }
+
+
 def _anomaly_score_job_view(job: _AnomalyScoreJob) -> dict:
     return {
         "job_id": job.job_id,
@@ -567,6 +602,7 @@ def create_app(
 ) -> FastAPI:
     catalog = model_catalog or available_models
     has_custom_model_loader = model_loader is not None
+    has_custom_object_model_loader = object_model_loader is not None
     loader = model_loader or load_model
     text_loader = text_model_loader or load_text_encoder
     if object_model_loader is not None:
@@ -601,6 +637,7 @@ def create_app(
     app.state.coverage_candidates = {}
     app.state.anomaly_jobs = {}
     app.state.anomaly_score_jobs = {}
+    app.state.fewshot_sample_bank_jobs = {}
     app.state.anomaly_runs = {}
     app.state.current_anomaly_run_id = None
     app.state.anomaly_models = {}
@@ -622,6 +659,7 @@ def create_app(
             + list(app.state.coverage_candidate_jobs.values())
             + list(app.state.anomaly_jobs.values())
             + list(app.state.anomaly_score_jobs.values())
+            + list(app.state.fewshot_sample_bank_jobs.values())
         )
         return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
@@ -1267,6 +1305,160 @@ def create_app(
                 "request_id": uuid.uuid4().hex,
             }) from exc
         return {"items": [{"model_id": name, "name": name, "available": True} for name in names]}
+
+    def fewshot_sample_bank_path(sample_bank_id: str) -> Path:
+        if (len(sample_bank_id) != 36 or not sample_bank_id.startswith("fsb_")
+                or any(char not in "0123456789abcdef" for char in sample_bank_id[4:])):
+            raise HTTPException(status_code=404, detail="找不到此樣本集")
+        root = (app.state.curation_store.path.parent / "fewshot_sample_banks").resolve()
+        target = (root / sample_bank_id).resolve()
+        if target.parent != root:
+            raise HTTPException(status_code=404, detail="找不到此樣本集")
+        return target
+
+    def fewshot_sample_bank_view(sample_bank_id: str, bank: dict) -> dict:
+        from collections import Counter
+
+        labels = [str(label) for label in np.asarray(bank["labels"]).tolist()]
+        vectors = np.asarray(bank["vectors"])
+        return {
+            "sample_bank_id": sample_bank_id,
+            "model_id": str(bank["model"]),
+            "target_res": int(bank["target_res"]),
+            "object_source": str(bank.get("object_source") or "yolo"),
+            "sample_count": len(labels),
+            "class_counts": dict(sorted(Counter(labels).items())),
+            "feature_dimension": int(vectors.shape[1]) if vectors.ndim == 2 else 0,
+        }
+
+    def execute_fewshot_sample_bank_job(job: _FewshotSampleBankJob) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase = "running", "embedding"
+                job.message = "正在讀取樣本影像並準備特徵器"
+                job.total = 100
+
+            embedder: Callable | None = None
+
+            def embed_fn(crop):
+                nonlocal embedder
+                if embedder is None:
+                    if has_custom_object_model_loader or not has_custom_model_loader:
+                        embedder = object_loader(
+                            job.request.model_id, keep_aspect=True, target_res=224, head="cls",
+                        )
+                    else:
+                        embedder = loader(job.request.model_id)
+                return embedder(crop)
+
+            def update_progress(done: int, total: int) -> None:
+                with app.state.lock:
+                    job.phase = "embedding"
+                    job.done = max(0, int(done))
+                    job.total = max(1, int(total))
+                    job.message = f"正在建立樣本特徵 {job.done}/{job.total}"
+
+            import sample_bank
+            bank = sample_bank.build_sample_bank(
+                [Path(folder) for folder in job.request.sample_folders],
+                model=job.request.model_id,
+                target_res=224,
+                class_names=job.request.class_names or None,
+                object_source=job.request.object_source,
+                embed_fn=embed_fn,
+                progress=update_progress,
+            )
+            sample_bank_id = "fsb_" + uuid.uuid4().hex
+            bank_dir = fewshot_sample_bank_path(sample_bank_id)
+            with app.state.lock:
+                job.phase, job.message = "saving", "正在保存樣本集至 LV_CACHE_DIR"
+            sample_bank.save_sample_bank(bank_dir, bank)
+            result = fewshot_sample_bank_view(sample_bank_id, bank)
+            with app.state.lock:
+                job.result = result
+                job.done = job.total = 100
+                job.state, job.phase, job.message = "completed", "completed", "樣本集已建立並保存"
+        except FileNotFoundError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "MODEL_UNAVAILABLE"
+                job.error = {
+                    "code": "MODEL_UNAVAILABLE",
+                    "message": "所選本機特徵模型權重無法載入。",
+                    "request_id": job.job_id,
+                }
+        except ValueError:
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "INVALID_SAMPLE_DATA"
+                job.error = {
+                    "code": "INVALID_SAMPLE_DATA",
+                    "message": "找不到可用樣本；請確認影像格式、YOLO labels，或改選整張影像模式。",
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV few-shot sample bank build failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "SAMPLE_BANK_BUILD_FAILED"
+                job.error = {
+                    "code": "SAMPLE_BANK_BUILD_FAILED",
+                    "message": "建立樣本集失敗。請檢查本機模型權重、資料格式與 worker 記錄。",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/fewshot/sample-banks/jobs", status_code=202)
+    def create_fewshot_sample_bank_job(request: CreateFewshotSampleBankJobRequest) -> dict:
+        try:
+            available = set(catalog())
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="無法讀取本機模型清單") from exc
+        if request.model_id not in available:
+            raise HTTPException(status_code=422, detail="所選本機特徵模型不存在或尚未安裝")
+        folders = []
+        for value in request.sample_folders:
+            try:
+                folder = Path(value).expanduser().resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise HTTPException(status_code=422, detail="樣本資料夾不存在或無法讀取") from exc
+            if not folder.is_dir():
+                raise HTTPException(status_code=422, detail="樣本資料夾不存在或無法讀取")
+            folders.append(str(folder))
+        normalized = request.model_copy(update={"sample_folders": folders})
+        job_id = uuid.uuid4().hex
+        job = _FewshotSampleBankJob(job_id=job_id, request=normalized)
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "請等目前分析完成後再建立樣本集。",
+                    "request_id": job_id,
+                })
+            app.state.fewshot_sample_bank_jobs[job_id] = job
+        threading.Thread(
+            target=execute_fewshot_sample_bank_job,
+            args=(job,),
+            daemon=True,
+            name=f"lv-fewshot-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/fewshot/jobs/{job_id}")
+    def get_fewshot_sample_bank_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.fewshot_sample_bank_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="找不到以樣搜樣工作")
+            return _fewshot_sample_bank_job_view(job)
+
+    @app.get("/api/v1/fewshot/sample-banks/{sample_bank_id}")
+    def get_fewshot_sample_bank(sample_bank_id: str) -> dict:
+        bank_dir = fewshot_sample_bank_path(sample_bank_id)
+        if not bank_dir.is_dir():
+            raise HTTPException(status_code=404, detail="找不到此樣本集")
+        try:
+            import sample_bank
+            bank = sample_bank.load_sample_bank(bank_dir)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="樣本集損毀或格式不相容") from exc
+        return {"sample_bank": fewshot_sample_bank_view(sample_bank_id, bank)}
 
     def execute(job: _Job) -> None:
         try:

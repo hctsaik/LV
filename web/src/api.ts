@@ -81,6 +81,29 @@ export type AnomalyScoreJob = {
   can_cancel: boolean;
 };
 
+export type FewshotSampleBank = {
+  sample_bank_id: string;
+  model_id: string;
+  target_res: number;
+  object_source: "yolo" | "whole_image";
+  sample_count: number;
+  class_counts: Record<string, number>;
+  feature_dimension: number;
+};
+
+export type FewshotSampleBankJob = {
+  job_id: string;
+  state: JobStatus["state"];
+  phase: string;
+  done: number;
+  total: number;
+  percent: number;
+  message: string;
+  result: FewshotSampleBank | null;
+  error: JobStatus["error"];
+  can_cancel: boolean;
+};
+
 export type AnomalyRun = {
   run_id: string;
   revision: number;
@@ -842,6 +865,21 @@ export const api = {
     method: "POST",
     body: JSON.stringify(input),
   }),
+  createFewshotSampleBankJob: (input: {
+    sample_folders: string[];
+    model_id: string;
+    object_source: "yolo" | "whole_image";
+    class_names?: string[];
+  }) => request<{ job_id: string; state: string }>("/api/v1/fewshot/sample-banks/jobs", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  fewshotSampleBankJob: (jobId: string) => request<FewshotSampleBankJob>(
+    "/api/v1/fewshot/jobs/" + encodeURIComponent(jobId),
+  ),
+  getFewshotSampleBank: (sampleBankId: string) => request<{ sample_bank: FewshotSampleBank }>(
+    "/api/v1/fewshot/sample-banks/" + encodeURIComponent(sampleBankId),
+  ),
   anomalyJob: (jobId: string) => request<AnomalyModelJob>(
     "/api/v1/anomaly/jobs/" + encodeURIComponent(jobId),
   ),

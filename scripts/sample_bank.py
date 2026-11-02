@@ -14,7 +14,8 @@ _SCHEMA = 1
 
 
 def build_sample_bank(sample_dirs, *, model, target_res, class_names=None,
-                      object_source="yolo", embed_fn=None, extractor=None) -> dict:
+                      object_source="yolo", embed_fn=None, extractor=None,
+                      progress=None) -> dict:
     """樣本資料夾 → discover objects → _object_embeddings → bank dict。無物件 → ValueError。
     embed_fn 可注入(測試)。回 {vectors,labels,provenance,model,target_res}。"""
     from anomaly_tool import _object_embeddings
@@ -30,7 +31,9 @@ def build_sample_bank(sample_dirs, *, model, target_res, class_names=None,
                     else discover_yolo_objects(imgs, cn))
     if not meta:
         raise ValueError("樣本資料夾找不到物件(YOLO 需 images/ + labels/;或改整張影像來源)")
-    vectors = np.asarray(_object_embeddings(meta, model, embed_fn), dtype=np.float32)
+    vectors = np.asarray(
+        _object_embeddings(meta, model, embed_fn, progress=progress), dtype=np.float32
+    )
     labels = np.array([str(m.get("label") or "—") for m in meta])
     provenance = [{"image_path": str(m["image_path"]),
                    "bbox": [float(x) for x in m["bbox"]], "label": str(m.get("label") or "—")}
