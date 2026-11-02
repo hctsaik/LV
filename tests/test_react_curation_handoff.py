@@ -6,7 +6,9 @@ import shutil
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+import numpy as np
 from PIL import Image
+import pytest
 
 from react_web_shell import create_app
 
@@ -197,4 +199,82 @@ def test_react_labeling_readback_updates_run_overlay_pool_round_and_audit(
         assert replay.status_code == 409
         assert replay.json()["code"] == "LABELING_READBACK_ALREADY_APPLIED"
         assert hashlib.sha256(image.read_bytes()).hexdigest() == source_sha
+
+
+def test_react_round_probe_records_metrics_and_reports_insufficient_classes(
+    monkeypatch, tmp_path: Path,
+):
+    output_dir = tmp_path / "output"
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(output_dir))
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    with TestClient(application) as client:
+        import round_ledger
+
+        round_id = round_ledger.start_round("cart", {}, "cart")
+        run_id = "probe-run"
+        labels = ["apple"] * 4 + ["banana"] * 4
+        vectors = np.asarray([
+            [1.0, 0.0], [1.1, 0.0], [0.9, 0.1], [1.0, 0.1],
+            [-1.0, 0.0], [-1.1, 0.0], [-0.9, -0.1], [-1.0, -0.1],
+        ])
+        application.state.runs[run_id] = {
+            "mode": "classifier", "unit": "image", "model_id": "fixture-model",
+            "records": [{"index": index, "filename": f"{index}.png", "label": label}
+                        for index, label in enumerate(labels)],
+        }
+        application.state.current_run_id = run_id
+        application.state.raw_embeddings[run_id] = {"fixture-model": vectors}
+
+        response = client.post(f"/api/v1/rounds/{round_id}/probe", json={"run_id": run_id})
+        assert response.status_code == 200, response.text
+        result = response.json()
+        assert result["model_id"] == "fixture-model"
+        assert result["acc"] == 1.0
+        assert result["macro_f1"] == 1.0
+        assert result["n_train"] == 6 and result["n_test"] == 2
+        assert {metric["name"] for metric in round_ledger.load_rounds()[0]["metrics"]} == {
+            "probe_acc", "probe_macro_f1",
+        }
+
+        application.state.runs[run_id]["records"] = application.state.runs[run_id]["records"][:6]
+        application.state.raw_embeddings[run_id]["fixture-model"] = vectors[:6]
+        insufficient = client.post(f"/api/v1/rounds/{round_id}/probe", json={"run_id": run_id})
+        assert insufficient.status_code == 422
+        assert insufficient.json()["code"] == "PROBE_INSUFFICIENT_SAMPLES"
+        assert "insufficient_class:banana" in insufficient.json()["message"]
+        assert len(round_ledger.load_rounds()[0]["metrics"]) == 2
+
+
+def test_react_learning_curve_advice_uses_labeled_counts_and_never_auto_stops(
+    monkeypatch, tmp_path: Path,
+):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True)
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(output_dir))
+    rows = []
+    for index, value in enumerate((0.70, 0.80, 0.802), start=1):
+        round_id = f"probe-round-{index}"
+        stamp = f"2026-07-12T00:00:0{index}+00:00"
+        rows.extend([
+            {"kind": "start", "round_id": round_id, "ts": stamp, "strategy": "cart",
+             "params": {}, "tool": "cart", "note": ""},
+            {"kind": "batch", "round_id": round_id, "batch_id": f"b{index}", "n_sent": 100},
+            {"kind": "readback", "round_id": round_id, "batch_id": f"b{index}",
+             "n_labeled": 100, "n_changed": 10},
+            {"kind": "metric", "round_id": round_id, "name": "probe_acc", "value": value,
+             "source": "probe", "ts": stamp},
+        ])
+    (output_dir / "rounds.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8",
+    )
+
+    with TestClient(create_app(model_catalog=lambda: [], model_loader=lambda _model: None)) as client:
+        advice = client.get("/api/v1/rounds/learning-curve/advice?metric_name=probe_acc")
+        assert advice.status_code == 200, advice.text
+        payload = advice.json()
+        assert payload["xs"] == [100, 200, 300]
+        assert payload["ys"] == [0.70, 0.80, 0.802]
+        assert payload["advice"]["status"] == "plateau"
+        assert payload["advice"]["slope_per_100"] == pytest.approx(0.002)
+        assert "報酬遞減" in payload["advice"]["reason"]
 

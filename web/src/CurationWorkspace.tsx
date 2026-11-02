@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, ActiveLearningRound, CurationHandoffPreview, CurationItem, CurationSubsetOptions, CurationSubsetPreview, LabelingHandoff, ReadbackAuditResponse, VisualizationRun } from "./api";
+import { api, ActiveLearningRound, CurationHandoffPreview, CurationItem, CurationSubsetOptions, CurationSubsetPreview, LabelingHandoff, LearningCurveAdvice, ReadbackAuditResponse, VisualizationRun } from "./api";
 
 type Props = {
   onCountChange: (count: number) => void;
@@ -30,9 +30,11 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
   const [readbackAudit, setReadbackAudit] = useState<ReadbackAuditResponse | null>(null);
   const [readbackBusyId, setReadbackBusyId] = useState("");
   const [curveMetric, setCurveMetric] = useState("");
+  const [curveAdvice, setCurveAdvice] = useState<LearningCurveAdvice["advice"] | null>(null);
   const [metricRoundId, setMetricRoundId] = useState("");
   const [metricName, setMetricName] = useState("");
   const [metricValue, setMetricValue] = useState("0");
+  const [probeBusyRoundId, setProbeBusyRoundId] = useState("");
   const [clearConfirmation, setClearConfirmation] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -117,6 +119,18 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
     });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (!activeCurveMetric) {
+      setCurveAdvice(null);
+      return;
+    }
+    let active = true;
+    api.activeLearningCurveAdvice(activeCurveMetric)
+      .then((response) => active && setCurveAdvice(response.advice))
+      .catch((reason: unknown) => active && setError(reason instanceof Error ? reason.message : "Could not calculate the learning-curve advice."));
+    return () => { active = false; };
+  }, [activeCurveMetric, rounds]);
 
   useEffect(() => {
     let active = true;
@@ -323,6 +337,26 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
       setError(reason instanceof Error ? reason.message : "Could not add the round metric.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function runProbe(roundId: string) {
+    if (!currentRunId) return;
+    setProbeBusyRoundId(roundId);
+    setError("");
+    setNotice("");
+    try {
+      const response = await api.runRoundProbe(roundId, currentRunId);
+      await refreshRounds();
+      setNotice(
+        `Probe complete (${response.model_id}): probe_acc=${response.acc.toFixed(3)} · `
+        + `macro-F1=${response.macro_f1.toFixed(3)} · train ${response.n_train} / test ${response.n_test} `
+        + `· ${response.classes.length} classes.`,
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Probe unavailable for this run.");
+    } finally {
+      setProbeBusyRoundId("");
     }
   }
 
@@ -667,15 +701,20 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
                     <text x={13} y={height / 2} transform={`rotate(-90 13 ${height / 2})`}>{activeCurveMetric}</text>
                   </svg>;
                 })()}
-                <p className="active-learning-curve-note">Metrics are descriptive. Review model quality on an independent hold-out set before deciding to stop.</p>
+                {curveAdvice && <p className="active-learning-advice" data-testid="active-learning-advice"><strong>停止建議：</strong>{curveAdvice.reason}</p>}
+                <p className="active-learning-curve-note">Probe metrics are directional only. Review an independent hold-out set; LV never stops a workflow automatically. You decide when to stop.</p>
               </div>
             )}
+            <p className="active-learning-discipline">Probe results need enough labeled examples in every class. A low-sample warning does not add any metric to the ledger. Plateau advice is informational and never stops a workflow automatically.</p>
             <div className="active-learning-cards">
               {[...rounds].reverse().map((round) => (
                 <article className="active-learning-card" key={round.round_id} data-testid="active-learning-round">
                   <div><strong>{round.round_id}</strong><span>Strategy: {round.strategy || "—"}</span></div>
                   <p>Sent {round.n_sent} · Read back {round.n_labeled} · Changed {round.n_changed}</p>
                   {round.metrics.length > 0 && <p>Metrics: {round.metrics.map((metric) => `${metric.name}=${metric.value ?? "—"}`).join(" · ")}</p>}
+                  <button type="button" data-testid={`active-learning-probe-${round.round_id}`} disabled={!currentRunId || !!probeBusyRoundId} onClick={() => void runProbe(round.round_id)}>
+                    {probeBusyRoundId === round.round_id ? "Running probe…" : "Run probe evaluation"}
+                  </button>
                 </article>
               ))}
             </div>

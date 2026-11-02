@@ -1518,6 +1518,17 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         pytest.skip("build the web workspace with npm run build before running this E2E")
 
     dataset = _fixture(tmp_path / "curation-fixture")
+    # The visible journey exercises both a successful probe and the honest low-sample
+    # path after readback changes labels. Keep four images per source class initially.
+    for relative, color in (
+        ("train/apple/image-03.png", (224, 36, 45)),
+        ("train/apple/image-04.png", (210, 45, 52)),
+        ("train/banana/image-04.png", (32, 72, 215)),
+        ("train/banana/image-05.png", (40, 68, 205)),
+    ):
+        path = dataset / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 64), color).save(path)
     source_before = {
         path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in dataset.rglob("*") if path.is_file()
@@ -1545,7 +1556,7 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
         page.get_by_role("button", name="Add folder").click()
         page.get_by_role("button", name="Run analysis").click()
         expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
-        expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+        expect(page.get_by_test_id("embedding-point")).to_have_count(8)
 
         page.get_by_test_id("open-curation").click()
         expect(page.get_by_test_id("curation-empty")).to_be_visible()
@@ -1592,6 +1603,21 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
             expect(page.locator(".alert-info")).to_contain_text("Added review_accuracy to round")
         expect(page.get_by_test_id("active-learning-curve-chart")).to_be_visible()
         expect(page.get_by_test_id("active-learning-round")).to_have_count(2)
+        probe_round_id = rounds[0]["round_id"]
+        page.get_by_test_id(f"active-learning-probe-{probe_round_id}").click()
+        expect(page.locator(".alert-info")).to_contain_text("Probe complete (fixture-model)")
+        round_after_probe = next(
+            row for row in page.request.get(base_url + "/api/v1/rounds").json()["rounds"]
+            if row["round_id"] == probe_round_id
+        )
+        successful_probe_metrics = [
+            metric for metric in round_after_probe["metrics"] if metric.get("source") == "probe"
+        ]
+        assert {metric["name"] for metric in successful_probe_metrics} == {
+            "probe_acc", "probe_macro_f1",
+        }
+        probe_round_card = page.get_by_test_id("active-learning-round").filter(has_text=probe_round_id)
+        expect(probe_round_card).to_contain_text("probe_acc=")
         handoff_root = cache_root / "labeling-inbox" / "lv_labeling_handoff"
         handoff_specs = list(handoff_root.glob("*/_handoff.json"))
         assert len(handoff_specs) == 1
@@ -1678,6 +1704,16 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
             for point in page.get_by_test_id("embedding-point").all()
         ]
         assert sum("reviewed-label" in label for label in reviewed_points) == 2
+        page.get_by_test_id("open-curation").click()
+        expect(page.get_by_test_id("active-learning-round")).to_have_count(2)
+        insufficient_round_id = rounds[1]["round_id"]
+        page.get_by_test_id(f"active-learning-probe-{insufficient_round_id}").click()
+        expect(page.locator(".alert-error")).to_contain_text("insufficient_class:", timeout=20_000)
+        round_after_warning = next(
+            row for row in page.request.get(restarted_url + "/api/v1/rounds").json()["rounds"]
+            if row["round_id"] == insufficient_round_id
+        )
+        assert not any(metric.get("source") == "probe" for metric in round_after_warning["metrics"])
         assert worker.pid != first_pid
     finally:
         if browser is not None:

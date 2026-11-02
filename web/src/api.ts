@@ -817,6 +817,22 @@ export type ActiveLearningRoundsResponse = {
   rounds: ActiveLearningRound[];
   orphan_events: Array<Record<string, unknown>>;
 };
+export type ProbeEvaluationResult = {
+  round_id: string;
+  model_id: string;
+  acc: number;
+  macro_f1: number;
+  per_class: Record<string, { n: number; recall: number }>;
+  n_train: number;
+  n_test: number;
+  classes: string[];
+};
+export type LearningCurveAdvice = {
+  metric_name: string;
+  xs: number[];
+  ys: number[];
+  advice: { status: "insufficient" | "improving" | "plateau"; slope_per_100: number | null; reason: string };
+};
 export type LabelingHandoff = {
   handoff_id: string;
   source: string;
@@ -1509,6 +1525,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
+  runRoundProbe: (roundId: string, runId: string) =>
+    request<ProbeEvaluationResult>("/api/v1/rounds/" + encodeURIComponent(roundId) + "/probe", {
+      method: "POST",
+      body: JSON.stringify({ run_id: runId }),
+    }),
+  activeLearningCurveAdvice: (metricName: string) =>
+    request<LearningCurveAdvice>("/api/v1/rounds/learning-curve/advice?metric_name=" + encodeURIComponent(metricName)),
   labelingHandoffs: () => request<LabelingHandoffsResponse>("/api/v1/labeling/handoffs"),
   applyLabelingReadback: (handoffId: string, runId: string) =>
     request<LabelingReadbackResult>("/api/v1/labeling/handoffs/" + encodeURIComponent(handoffId) + "/readback", {

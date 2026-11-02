@@ -522,6 +522,10 @@ class ApplyLabelingReadbackRequest(BaseModel):
     run_id: str = Field(min_length=1, max_length=128)
 
 
+class RunRoundProbeRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=128)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -5218,6 +5222,73 @@ def create_app(
                 request.note,
             )
             return {"rounds": _round_ledger.load_rounds()}
+
+    @app.post("/api/v1/rounds/{round_id}/probe")
+    def run_active_learning_probe(round_id: str, request: RunRoundProbeRequest) -> dict:
+        import probe_eval as _probe_eval
+        import round_ledger as _round_ledger
+
+        with app.state.lock:
+            if not any(row["round_id"] == round_id for row in _round_ledger.load_rounds()):
+                raise HTTPException(status_code=404, detail={
+                    "code": "ROUND_NOT_FOUND",
+                    "message": "The selected active-learning round no longer exists.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            run = app.state.runs.get(request.run_id)
+            if run is None or request.run_id != app.state.current_run_id:
+                raise HTTPException(status_code=409, detail={
+                    "code": "PROBE_RUN_NOT_CURRENT",
+                    "message": "Load a current Visualize run before running a probe evaluation.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if run.get("mode") != "classifier" or run.get("unit") != "image":
+                raise HTTPException(status_code=422, detail={
+                    "code": "PROBE_REQUIRES_IMAGE_CLASSIFIER",
+                    "message": "Probe evaluation currently requires Image Classifier at whole-image level.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            model_id = str(run.get("model_id") or "")
+            model_vectors = app.state.raw_embeddings.get(request.run_id, {}).get(model_id)
+            records = run.get("records", [])
+            if model_vectors is None or len(model_vectors) != len(records):
+                raise HTTPException(status_code=409, detail={
+                    "code": "PROBE_EMBEDDINGS_UNAVAILABLE",
+                    "message": "Frozen embeddings for the current run are unavailable. Run Visualize again before evaluating.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            keep = [
+                index for index, record in enumerate(records)
+                if (str(record.get("label") or "").strip() not in ("", "unknown"))
+            ]
+            labels = [str(records[index]["label"]) for index in keep]
+            try:
+                result = _probe_eval.train_probe(np.asarray(model_vectors)[keep], labels)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail={
+                    "code": "PROBE_INSUFFICIENT_SAMPLES",
+                    "message": f"Probe unavailable: {exc}",
+                    "request_id": uuid.uuid4().hex,
+                }) from exc
+            _round_ledger.attach_metric(round_id, "probe_acc", round(result["acc"], 4), "probe")
+            _round_ledger.attach_metric(round_id, "probe_macro_f1", round(result["macro_f1"], 4), "probe")
+            return {"round_id": round_id, "model_id": model_id, **result}
+
+    @app.get("/api/v1/rounds/learning-curve/advice")
+    def get_active_learning_curve_advice(metric_name: str) -> dict:
+        import probe_eval as _probe_eval
+        import round_ledger as _round_ledger
+
+        name = metric_name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="A metric name is required")
+        xs, ys = _round_ledger.learning_curve(_round_ledger.load_rounds(), name)
+        return {
+            "metric_name": name,
+            "xs": xs,
+            "ys": ys,
+            "advice": _probe_eval.plateau_advice(xs, ys),
+        }
 
     @app.get("/api/v1/labeling/handoffs")
     def get_labeling_handoffs() -> dict:
