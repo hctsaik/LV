@@ -3270,6 +3270,134 @@ def test_lv_web_04_expl_01_real_dinov2_attention_and_gradcam(
     }
 
 
+def test_lv_web_04_expl_01_visible_real_dinov2_attention_and_gradcam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Run real pinned DINO diagnostics through the visible React interface."""
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    import _utils
+
+    monkeypatch.setattr(_utils, "_DEFAULT_MODELS_DIR", models_dir)
+    monkeypatch.setattr(_utils.available_models, "__defaults__", (models_dir,))
+    monkeypatch.setattr(
+        _utils.load_model,
+        "__defaults__",
+        (models_dir, *_utils.load_model.__defaults__[1:]),
+    )
+    cache_root = tmp_path / "visible-real-diagnostics-cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
+
+    dataset = _fixture(tmp_path / "visible-real-diagnostics-fixture")
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    application = create_app()
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1450, "height": 1050})
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text(
+                "Completed", timeout=180_000
+            )
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+            page.get_by_test_id("embedding-point").nth(0).click()
+            page.get_by_test_id("open-diagnostics-reference").click()
+            expect(page.get_by_test_id("diagnostic-reference-status")).to_contain_text(
+                "Context current"
+            )
+            expect(page.get_by_test_id("diagnostics-no-auto-inference")).to_be_visible()
+            expect(page.get_by_test_id("diagnostic-explain-run")).to_be_disabled()
+            page.get_by_test_id("diagnostic-head-build").click()
+            expect(page.get_by_test_id("diagnostic-head-status")).to_contain_text(
+                "Head ready: 224×224", timeout=180_000
+            )
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/explanations")
+                and response.request.method == "POST",
+                timeout=180_000,
+            ) as attention_response:
+                page.get_by_test_id("diagnostic-explain-run").click()
+            attention_payload = attention_response.value.json()
+            assert attention_payload["method"] == "attention"
+            assert attention_payload["grid"] == [16, 16]
+            assert np.isfinite(
+                np.asarray(attention_payload["display_scores"], dtype=np.float32)
+            ).all()
+            assert "not a defect mask" in attention_payload["warning"]
+            expect(page.get_by_test_id("diagnostic-evidence-grid")).to_be_visible()
+            expect(
+                page.get_by_test_id("diagnostic-evidence-grid").locator("span")
+            ).to_have_count(256)
+
+            page.get_by_test_id("diagnostic-method").select_option("gradcam")
+            page.get_by_test_id("diagnostic-target-class").select_option("banana")
+            page.get_by_test_id("diagnostic-display-mode").select_option("signed")
+            with page.expect_response(
+                lambda response: response.url.endswith("/explanations")
+                and response.request.method == "POST",
+                timeout=180_000,
+            ) as gradcam_response:
+                page.get_by_test_id("diagnostic-explain-run").click()
+            gradcam_payload = gradcam_response.value.json()
+            assert gradcam_payload["method"] == "gradcam"
+            assert gradcam_payload["target_class"] == "banana"
+            assert gradcam_payload["score_mode"] == "signed"
+            assert gradcam_payload["grid"] == [16, 16]
+            assert np.isfinite(
+                np.asarray(gradcam_payload["display_scores"], dtype=np.float32)
+            ).all()
+            expect(page.get_by_test_id("diagnostic-target-result")).to_contain_text(
+                "banana"
+            )
+            expect(page.get_by_test_id("diagnostic-model-input-image")).to_be_visible()
+            expect(page.get_by_test_id("diagnostic-overlay-image")).to_have_js_property(
+                "naturalWidth", 224
+            )
+            with page.expect_download() as png_download:
+                page.get_by_test_id("diagnostic-download-png").click()
+            png_file = png_download.value.path()
+            assert png_file and Image.open(png_file).format == "PNG"
+            with page.expect_download() as json_download:
+                page.get_by_test_id("diagnostic-download-json").click()
+            json_file = json_download.value.path()
+            assert json_file
+            metadata = json.loads(Path(json_file).read_text(encoding="utf-8"))
+            assert metadata["method"] == "gradcam"
+            assert metadata["target_class"] == "banana"
+            assert "overlay_png_base64" not in metadata
+            assert str(dataset) not in Path(json_file).read_text(encoding="utf-8")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }, "real-model diagnostics changed the source dataset"
+
+
 def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
