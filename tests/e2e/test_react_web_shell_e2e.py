@@ -419,7 +419,12 @@ class _DeterministicUMAP:
 
 
 def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """AC2/AC3: real DINOv2 vectors, projection switching, 3D view and image readback."""
+    """AC2/AC3/CS-01: real DINOv2 projection and class-similarity numerical journey."""
+    tests_path = str(ROOT / "tests")
+    if tests_path not in sys.path:
+        sys.path.insert(0, tests_path)
+    from class_similarity_oracle import almost, oracle_analyze
+
     models_dir = _pinned_dinov2_models_dir(tmp_path)
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
@@ -441,9 +446,11 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             run_payloads = []
+            run_ids = []
 
             def capture_run(response):
                 if _is_run_summary_response(response) and response.ok:
+                    run_ids.append(urlparse(response.url).path.rstrip("/").rsplit("/", 1)[-1])
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)
@@ -498,6 +505,65 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             image = page.get_by_test_id("selected-image")
             expect(image).to_be_visible()
             expect(image).to_have_js_property("naturalWidth", 64)
+
+            real_run_id = run_ids[-1]
+            with application.state.lock:
+                raw_embeddings = application.state.raw_embeddings[real_run_id]["dinov2_vits14"].copy()
+            assert raw_embeddings.shape == (4, 384)
+            assert np.isfinite(raw_embeddings).all() and np.any(raw_embeddings != 0)
+            page.get_by_test_id("open-class-similarity").click()
+            expect(page.get_by_test_id("class-similarity-workspace")).to_be_visible()
+            page.get_by_role("button", name="Calculate class similarity").click()
+            expect(page.get_by_test_id("class-similarity-summary")).to_contain_text("eligible", timeout=30_000)
+
+            with application.state.lock:
+                similarity_jobs = [
+                    job for job in application.state.class_similarity_jobs.values()
+                    if job.run_id == real_run_id
+                ]
+            assert len(similarity_jobs) == 1
+            similarity_job = similarity_jobs[0]
+            assert similarity_job.state == "completed"
+            prepared = similarity_job.prepared
+            actual_items = similarity_job.analysis.items
+            assert prepared.source_verified is True
+            assert np.array_equal(prepared.embeddings, raw_embeddings)
+            expected_items = oracle_analyze(
+                prepared.embeddings,
+                prepared.labels,
+                prepared.record_ids,
+                eligibility=prepared.eligibility,
+                invalid_reasons=prepared.invalid_reasons,
+                k=similarity_job.request.k,
+            )
+            assert len(actual_items) == len(expected_items) == 4
+            for actual, expected in zip(actual_items, expected_items, strict=True):
+                assert actual.record_id == expected.record_id
+                assert actual.rival_class == expected.rival_class
+                assert actual.same_k == expected.same_k
+                assert actual.rival_k == expected.rival_k
+                assert almost(actual.same, expected.same)
+                assert almost(actual.other, expected.other)
+                assert almost(actual.margin, expected.margin)
+                assert [neighbor.record_id for neighbor in actual.same_neighbors] == [
+                    neighbor.record_id for neighbor in expected.same_neighbors
+                ]
+                assert all(
+                    almost(actual_neighbor.cosine, expected_neighbor.cosine)
+                    for actual_neighbor, expected_neighbor in zip(
+                        actual.same_neighbors, expected.same_neighbors, strict=True
+                    )
+                )
+                assert [neighbor.record_id for neighbor in actual.rival_neighbors] == [
+                    neighbor.record_id for neighbor in expected.rival_neighbors
+                ]
+                assert all(
+                    almost(actual_neighbor.cosine, expected_neighbor.cosine)
+                    for actual_neighbor, expected_neighbor in zip(
+                        actual.rival_neighbors, expected.rival_neighbors, strict=True
+                    )
+                )
+            page.get_by_role("button", name="Return to Visualize").click()
 
             for folder in (dataset / "train", dataset / "test"):
                 page.get_by_role("button", name=f"Remove {folder}").click()
