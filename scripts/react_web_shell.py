@@ -9,8 +9,10 @@ import json
 import logging
 import mimetypes
 import os
+import tempfile
 import threading
 import uuid
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -45,6 +47,8 @@ from interaction import (
 )
 from curation_store import CurationStore, CurationStoreError
 from fp_case_store import FalsePositiveCaseStore, public_case
+from fp_external_models import ExternalModelRegistry, MAX_MODEL_BYTES
+from fp_external_runtime import Runtime as ExternalOnnxRuntime, compare_reference as compare_external_reference
 from fp_case_search import add_candidate as add_fp_search_candidate
 from fp_case_search import model_recipe as fp_case_model_recipe
 from fp_case_search import search_case as run_fp_case_search
@@ -212,6 +216,29 @@ class PrepareFalsePositiveReviewBatchRequest(BaseModel):
 class ReturnFalsePositiveReviewBatchRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     manifest: dict
+
+
+class CreateExternalModelProfileRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=240)
+    asset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    config: dict
+
+
+class ReviseExternalModelProfileRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    name: str | None = Field(default=None, max_length=240)
+    asset_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    config: dict | None = None
+
+
+class RunExternalModelRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    source_id: str = Field(min_length=1, max_length=64)
+    profile_id: str = Field(min_length=1, max_length=64)
+    profile_revision: int = Field(default=1, ge=1)
+    reference: dict | None = None
+    score_atol: float = Field(default=0.001, ge=0.0, le=0.1)
+    box_atol: float = Field(default=0.001, ge=0.0, le=0.1)
 
 
 class CreateComparisonJob(BaseModel):
@@ -476,6 +503,7 @@ def create_app(
     app.state.coverage_candidates = {}
     app.state.curation_store = CurationStore()
     app.state.fp_case_store = FalsePositiveCaseStore()
+    app.state.external_model_registry = ExternalModelRegistry(app.state.fp_case_store.root)
     app.state.case_search_model_provider = case_search_model_provider
     app.state.fp_case_lock = threading.RLock()
     app.state.lock = threading.RLock()
@@ -919,6 +947,206 @@ def create_app(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return {"case": save_fp_case(staged), "applied": applied,
                     "counts": fp_case_review_counts(staged["candidates"]), "training_ready_images": 0}
+
+    @app.post("/api/v1/external-model-assets", status_code=201)
+    async def upload_external_model_asset(filename: str, request: Request) -> dict:
+        """Stream ONNX bytes to local content-addressed storage without JSON/base64 expansion."""
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_MODEL_BYTES:
+                    raise HTTPException(status_code=413, detail="ONNX 檔案超過 1 GiB 匯入上限")
+            except ValueError as exc:
+                if isinstance(exc, HTTPException):
+                    raise
+                raise HTTPException(status_code=400, detail="Content-Length 格式無效") from exc
+        registry = app.state.external_model_registry
+        staged = None
+        try:
+            fd, staged_name = tempfile.mkstemp(prefix=".upload-", suffix=".tmp", dir=registry.assets)
+            staged = Path(staged_name)
+            total = 0
+            with os.fdopen(fd, "wb") as stream:
+                async for chunk in request.stream():
+                    total += len(chunk)
+                    if total > MAX_MODEL_BYTES:
+                        raise HTTPException(status_code=413, detail="ONNX 檔案超過 1 GiB 匯入上限")
+                    stream.write(chunk)
+                stream.flush()
+                os.fsync(stream.fileno())
+            asset = registry.ingest_file(staged, filename)
+            return {key: asset[key] for key in ("sha256", "name", "format", "size", "created_at")}
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+
+    @app.get("/api/v1/external-model-profiles")
+    def list_external_model_profiles() -> dict:
+        return {"items": app.state.external_model_registry.list()}
+
+    @app.post("/api/v1/external-model-profiles", status_code=201)
+    def create_external_model_profile(request: CreateExternalModelProfileRequest) -> dict:
+        try:
+            profile = app.state.external_model_registry.create(
+                request.name, request.asset_sha256, request.config,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return profile
+
+    @app.patch("/api/v1/external-model-profiles/{profile_id}")
+    def revise_external_model_profile(
+        profile_id: str,
+        request: ReviseExternalModelProfileRequest,
+    ) -> dict:
+        try:
+            return app.state.external_model_registry.revise(
+                profile_id,
+                request.expected_revision,
+                name=request.name,
+                asset_sha256=request.asset_sha256,
+                config=request.config,
+            )
+        except ValueError as exc:
+            status = 404 if "找不到" in str(exc) else 409 if "另一個視窗" in str(exc) else 422
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    @app.post("/api/v1/fp-cases/{case_id}/external-runs", status_code=201)
+    def run_external_model(case_id: str, request: RunExternalModelRequest) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            source = next((row for row in case["sources"] if row["id"] == request.source_id), None)
+            if source is None:
+                raise HTTPException(status_code=404, detail="找不到案件影像來源")
+            case_snapshot = copy.deepcopy(case)
+            source_snapshot = copy.deepcopy(source)
+        if request.reference is not None and len(json.dumps(request.reference, ensure_ascii=False).encode("utf-8")) > 2_000_000:
+            raise HTTPException(status_code=413, detail="歷史部署紀錄不可超過 2 MB")
+        registry = app.state.external_model_registry
+        try:
+            profile = registry.get(request.profile_id, request.profile_revision)
+            config = registry.runtime_config(request.profile_id, request.profile_revision)
+            source_bytes = app.state.fp_case_store.image_path(source_snapshot).read_bytes()
+            runtime = ExternalOnnxRuntime(config)
+            run = runtime.infer(
+                source_bytes,
+                app.state.fp_case_store.root / "external" / case_id,
+            )
+            parity = compare_external_reference(
+                run,
+                request.reference,
+                source_snapshot["kind"],
+                score_atol=request.score_atol,
+                box_atol=request.box_atol,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("LV external ONNX inference failed (case=%s)", case_id)
+            raise HTTPException(status_code=503, detail={
+                "code": "EXTERNAL_MODEL_FAILED",
+                "message": "外部模型執行失敗；請確認本機 ONNX Runtime 與模型契約後重試。",
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+
+        safe_config = {key: value for key, value in runtime.config.items() if key != "model_path"}
+        run.update({
+            "case_id": case_id,
+            "source_id": source_snapshot["id"],
+            "source_context_id": source_snapshot["sha256"],
+            "source_kind": source_snapshot["kind"],
+            "profile_id": profile["id"],
+            "profile_revision": profile["revision"],
+            "profile_name": profile["name"],
+            "profile_asset_sha256": profile["asset"]["sha256"],
+            "config": safe_config,
+            "parity": parity,
+        })
+        if request.reference is not None:
+            run["historical_reference"] = copy.deepcopy(request.reference)
+        evidence_id = "e_" + uuid.uuid4().hex[:12]
+        run["evidence_id"] = evidence_id
+        case_snapshot.setdefault("external_runs", []).append(run)
+        case_snapshot.setdefault("evidence", []).append({
+            "id": evidence_id,
+            "role": "external_inference",
+            "text": "外部 ONNX 本機推論與完整歷史輸出比對",
+            "at": run["at"],
+            "source_id": source_snapshot["id"],
+            "run_id": run["id"],
+            "contract_id": run["contract_id"],
+            "parity_status": parity["status"],
+        })
+        run_root = Path(run["artifact_dir"])
+        (run_root / "case_run.json").write_text(
+            json.dumps(public_case(run), ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        with app.state.fp_case_lock:
+            latest = get_fp_case(case_id)
+            check_fp_revision(latest, request.expected_revision)
+            current_source = next((row for row in latest["sources"] if row["id"] == request.source_id), None)
+            if current_source is None or current_source["sha256"] != source_snapshot["sha256"]:
+                raise HTTPException(status_code=409, detail="案件影像已變更，請重新載入後重跑")
+            saved = save_fp_case(case_snapshot)
+        saved_run = next(row for row in saved["external_runs"] if row["id"] == run["id"])
+        return {"case": saved, "run": saved_run}
+
+    def get_external_run(case_id: str, run_id: str) -> tuple[dict, dict, Path]:
+        case = get_fp_case(case_id)
+        run = next((row for row in case.get("external_runs", []) if row.get("id") == run_id), None)
+        if run is None:
+            raise HTTPException(status_code=404, detail="找不到外部推論紀錄")
+        case_root = (app.state.fp_case_store.root / "external" / case_id).resolve()
+        run_root = Path(str(run.get("artifact_dir", ""))).resolve()
+        if not run_root.is_relative_to(case_root):
+            raise HTTPException(status_code=409, detail="推論證據位置無效")
+        return case, run, run_root
+
+    @app.get("/api/v1/fp-cases/{case_id}/external-runs/{run_id}/input-preview.png")
+    def get_external_model_input_preview(case_id: str, run_id: str) -> Response:
+        with app.state.fp_case_lock:
+            _case, _run, run_root = get_external_run(case_id, run_id)
+            path = run_root / "model_input.png"
+            try:
+                content = path.read_bytes()
+            except OSError as exc:
+                raise HTTPException(status_code=404, detail="模型輸入預覽不存在") from exc
+        return Response(content, media_type="image/png", headers={
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.get("/api/v1/fp-cases/{case_id}/external-runs/{run_id}/evidence.json")
+    def download_external_model_evidence_json(case_id: str, run_id: str) -> Response:
+        with app.state.fp_case_lock:
+            _case, run, _run_root = get_external_run(case_id, run_id)
+            content = json.dumps(public_case(run), ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False).encode("utf-8")
+        return Response(content, media_type="application/json", headers={
+            "Content-Disposition": f'attachment; filename="{run_id}.json"',
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        })
+
+    @app.get("/api/v1/fp-cases/{case_id}/external-runs/{run_id}/evidence.zip")
+    def download_external_model_evidence_zip(case_id: str, run_id: str) -> Response:
+        with app.state.fp_case_lock:
+            _case, run, run_root = get_external_run(case_id, run_id)
+            output = BytesIO()
+            with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr("evidence.json", json.dumps(public_case(run), ensure_ascii=False, indent=2, allow_nan=False))
+                for name in ("model_input.png", "source.png", "tensors.npz"):
+                    path = run_root / name
+                    if path.is_file():
+                        archive.write(path, name)
+            content = output.getvalue()
+        return Response(content, media_type="application/zip", headers={
+            "Content-Disposition": f'attachment; filename="{run_id}.zip"',
+            "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+        })
 
     @app.get("/api/v1/models")
     def models() -> dict:

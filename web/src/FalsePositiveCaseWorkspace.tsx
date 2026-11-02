@@ -9,6 +9,7 @@ import {
 } from "./api";
 import FalsePositiveCaseReport from "./FalsePositiveCaseReport";
 import FalsePositiveReviewBatches from "./FalsePositiveReviewBatches";
+import FalsePositiveExternalModels from "./FalsePositiveExternalModels";
 
 const verdicts: Array<{ value: FalsePositiveRegion["review"]["verdict"]; label: string }> = [
   { value: "pending", label: "待覆核" },
@@ -513,7 +514,7 @@ export default function FalsePositiveCaseWorkspace() {
               <div>
                 <div className="eyebrow">CASE {selectedCase.id}</div>
                 <h2 data-testid="fp-case-title-readback">{selectedCase.title}</h2>
-                <p>版本 {selectedCase.revision} · 外部模型尚未重播 · 逐區域記錄，不產生整圖標籤</p>
+                <p>版本 {selectedCase.revision} · 外部模型 {selectedCase.external_runs.length ? `${selectedCase.external_runs.length} 筆推論已保存` : "尚未執行"} · 逐區域記錄，不產生整圖標籤</p>
               </div>
               <button type="button" className="fp-secondary-button" onClick={() => void reloadCase()} disabled={busy}>重新載入案件</button>
             </header>
@@ -672,6 +673,15 @@ export default function FalsePositiveCaseWorkspace() {
                 </>}
               </section>
             </div>
+            <FalsePositiveExternalModels
+              key={selectedCase.id}
+              caseData={selectedCase}
+              selectedSourceId={selectedSource?.id || ""}
+              onCaseUpdated={(next) => {
+                setSelectedCase(next);
+                void refreshCases();
+              }}
+            />
             <section className="fp-card fp-search-card" aria-labelledby="fp-search-title">
               <div className="fp-card-heading">
                 <div><div className="eyebrow">AUXILIARY RETRIEVAL</div><h3 id="fp-search-title">找對照</h3></div>

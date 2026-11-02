@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的本機 React UI/API 垂直切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions 及 LV-WEB-03 image/object/attribute coverage 的局部流程；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
+> 目前有 LV-WEB-01 Image Classifier、LV-WEB-01-CART-01 持久策展清單、LV-WEB-02 Compare Distributions、LV-WEB-03 image/object/attribute coverage、LV-WEB-05 CASE/RETRIEVE/REPORT/AL 及 EXT-01 外部 ONNX 推論／歷史比對的局部流程；fixture case 不代表完整真模型、NativeApp 或產品 parity 已驗收。
 
 ## 1. 邊界
 
@@ -50,6 +50,12 @@
 | `GET /api/v1/comparisons/{run_id}` | 讀取比較結果 | 群組記錄、類別漂移、policy 與警告；不回傳本機路徑 |
 | `POST /api/v1/comparisons/{run_id}/projections` | 計算選定群組的投影 | PCA、t-SNE、UMAP、LDA、Supervised UMAP、維度與物件篩選 |
 | `GET /api/v1/comparisons/{run_id}/images/{side}/{index}` | 讀取對應來源影像 | 只依本次比較登錄的 group/index 解析，不接受檔案路徑 |
+| `POST /api/v1/external-model-assets?filename=...` | 串流匯入單檔 ONNX | 上限 1 GiB；以內容 SHA-256 儲存，回應不含資產路徑 |
+| `GET /api/v1/external-model-profiles` / `POST ...` / `PATCH .../{profile_id}` | 列出、新增或修訂外部模型設定 | profile revision 綁定模型 SHA 與明確 runtime contract；不接受使用者提供的 server path |
+| `POST /api/v1/fp-cases/{case_id}/external-runs` | 對案件來源執行明確 ONNX 推論與歷史輸出比對 | 需案件 revision、source ID、profile revision；分類／最終 detection、tensor identity 與 parity 結果存入案件 evidence |
+| `GET /api/v1/fp-cases/{case_id}/external-runs/{run_id}/input-preview.png` / `evidence.json` / `evidence.zip` | 讀回模型輸入預覽或匯出推論證據 | 僅依已保存的 run ID 查找；JSON／ZIP 移除本機路徑，ZIP 含 source、model input 與 NPZ tensors |
+
+外部模型 asset 只能由 worker 從串流匯入，runtime config 不能指定任意本機模型路徑。推論只有在使用者明確操作後才執行；profile revision 保存契約但不執行模型。歷史 parity 需原圖 SHA-256、deployment origin、記錄時間、contract ID 及完整分類分數或 detection 框／分數／警報一致。此 React slice 尚未移植對照實驗、paired holdout、訓練資料 ZIP；Windows ARM64 worker 與 NativeApp 發布包仍待實機驗證。
 
 Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`，預設 `classifier`）、`unit`（`image` 或 `object`，預設 `image`）、可選的逗號類別名稱 fallback、`model_ids`（最多 8 個）、`methods`（最多 5 個）和可選 `object_policy`（pad、target resolution、head）。Classifier 只接受整圖；Detector 讀取 YOLO `images/` 與 `labels/`，整圖時一張影像一筆，物件級時一個支援的 bbox 一筆。資料集旁 `classes.txt` 優先於手動 fallback，選取的類別表不一致時明確失敗。舊版單數 `model_id`／`method` 欄位仍可供相容呼叫。此切片的路徑由 React host picker 或開發模式文字欄提供；重複路徑依原流程規則去重。空資料、無 bbox、不可讀影像、缺模型和無法計算的投影回可辨識錯誤或警告，不得靜默替換模型。
 
@@ -77,6 +83,7 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 - Curation cart 的 fixture API 與可見 Chromium E2E（含不同 worker PID 重開）已通過；這只完成 Visualize 到 cart 的 case slice，不代表跨工具統一收集器、legacy state import、subset folder export 或 NativeApp cache-root 接線完成。
 - Image-level coverage 以獨立 job 保留舊工具「自己選資料夾／模型並開始分析」流程；object-level coverage 使用相同 job 和 YOLO crop path。高維 cosine 稀疏度與顯示投影分開計算；object view 可按 class、confidence、source short edge 篩選並保持來源索引對齊，顯示類別計數／稀疏度、tiny-class 警示與 class blocks，選取後讀回 bbox crop。`LV-WEB-03-REF-01` 也已用獨立候選資料夾實作 joint projection、pool gap-filler ranking、reference recall／class gap、候選 bbox thumbnail 與 curation provenance。Image／object／candidate-reference 三個 slice 均有 fixture API 和可見 Chromium E2E；真實模型數值對照、NativeApp picker／grant／package 仍未完成。
 - Attribute completeness `LV-WEB-03-ATTR-01` 已接入既有 image-level run，提供 label/split／影像統計軸、quantile bins、樣本目標、d* 門檻、頻率先驗編輯、格狀健康摘要、缺格工作列、格內原圖、候選池最近鄰與 CSV。Fixture API 與可見 Chromium journey 通過；真實模型數值對照與 NativeApp picker／grant／package 仍待驗。
+- False-positive `LV-WEB-05-EXT-01` 已局部支援 content-addressed ONNX profile、明確單圖分類與 YOLO contract、歷史完整輸出 parity、tensor/artifact persistence 及 path-safe JSON／ZIP。API/runtime 和 visible Chromium fixture journey 已驗分類、偵測、profile revision 與錯誤布局拒絕；受控實驗、paired evaluation、訓練交接、正式模型 parity、Windows ARM64 實機與 NativeApp package 尚未完成。
 
 ## 5. React 驗收契約
 
@@ -93,4 +100,4 @@ Job 輸入欄位：資料夾路徑陣列、`mode`（`classifier` 或 `detector`�
 
 ## 6. 未涵蓋
 
-Object Detector 整圖及物件級已有 React/API 可見流程與固定 DINOv2-small 的 ARM64 UI run；物件級 candidate handoff、policy autotune、與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。Image-level coverage fixture API／可見 UI 已涵蓋獨立啟動、投影／維度／顏色切換、框選、縮圖讀回及清除。Object-level coverage fixture API／可見 UI 已涵蓋 class/object 篩選、confidence 與 source-pixel 門檻、來源索引及監督式 projection 對齊、tiny-class guard、class blocks 和 bbox-cropped thumbnail；真實模型數值 parity、NativeApp host bridge、reference/candidate coverage、屬性棋盤及其他 nested workflows 尚待完成。固定 UMAP reference 的 React 控制、快取座標沿用、增刪圖片與重建有 deterministic API／UI 覆蓋，實際 `umap-learn` 0.5.12 integration 在隔離 CPython 3.11 AMD64 驗證通過；Windows ARM64 runtime 和 legacy 座標數值 parity 尚未驗；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖及物件級已有 React/API 可見流程與固定 DINOv2-small 的 ARM64 UI run；物件級 candidate handoff、policy autotune、與 Streamlit 數值逐項比較及 NativeApp host bridge 尚待驗。Image-level coverage fixture API／可見 UI 已涵蓋獨立啟動、投影／維度／顏色切換、框選、縮圖讀回及清除。Object-level coverage fixture API／可見 UI 已涵蓋 class/object 篩選、confidence 與 source-pixel 門檻、來源索引及監督式 projection 對齊、tiny-class guard、class blocks 和 bbox-cropped thumbnail；真實模型數值 parity、NativeApp host bridge、reference/candidate coverage、屬性棋盤及其他 nested workflows 尚待完成。固定 UMAP reference 的 React 控制、快取座標沿用、增刪圖片與重建有 deterministic API／UI 覆蓋，實際 `umap-learn` 0.5.12 integration 在隔離 CPython 3.11 AMD64 驗證通過；Windows ARM64 runtime 和 legacy 座標數值 parity 尚未驗。False-positive EXT-01 目前只完成 ONNX 模型設定、推論、歷史完整輸出比對與證據下載；固定目標對照實驗、paired holdout gate、人工完整標註訓練 ZIP、真實部署模型 parity、Windows ARM64 實機與 NativeApp package 尚未驗；本設計不縮小全產品 PRD 範圍。

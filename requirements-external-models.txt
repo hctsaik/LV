@@ -1,0 +1,4 @@
+# Local external-model investigation (CPU). Does not download model weights.
+onnxruntime>=1.20,<2
+# Graph construction for executable adapter tests / example model generation.
+onnx>=1.17,<2

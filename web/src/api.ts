@@ -616,6 +616,55 @@ export type FalsePositiveBatch = {
   unique_images: number;
 };
 
+export type FalsePositiveExternalProfile = {
+  schema_version: number;
+  id: string;
+  revision: number;
+  latest_revision: number;
+  name: string;
+  created_at: string;
+  asset: { sha256: string; name: string; format: "onnx"; size: number };
+  config: Record<string, unknown>;
+};
+
+export type FalsePositiveExternalRun = {
+  id: string;
+  at: string;
+  case_id: string;
+  source_id: string;
+  source_context_id: string;
+  source_kind: "original" | "screenshot" | "reference";
+  profile_id: string;
+  profile_revision: number;
+  profile_name: string;
+  profile_asset_sha256: string;
+  image_sha256: string;
+  contract: Record<string, unknown>;
+  contract_id: string;
+  runtime: { name: string; version: string; provider: string };
+  input_sha256: string;
+  output_sha256: string;
+  input_shape: number[];
+  output_shape: number[];
+  prediction: {
+    task: "classification" | "detection";
+    alarm: boolean;
+    class?: string;
+    score?: number;
+    decision?: string;
+    scores?: Record<string, number>;
+    detections: Array<{ class: string; score: number; box: [number, number, number, number]; output_index?: number }>;
+    candidates?: Array<{ class: string; score: number; box: [number, number, number, number]; output_index?: number }>;
+    candidate_count?: number;
+    candidate_json_truncated?: boolean;
+    raw_candidates_available?: boolean;
+    nms_applied?: boolean;
+  };
+  geometry: Record<string, unknown>;
+  parity: { status: "matched" | "mismatched" | "unavailable"; reasons: string[]; score_atol: number; box_atol: number };
+  evidence_id: string;
+};
+
 export type FalsePositiveCase = {
   schema_version: number;
   id: string;
@@ -630,6 +679,7 @@ export type FalsePositiveCase = {
   searches: FalsePositiveSearch[];
   claims: FalsePositiveClaim[];
   batches: FalsePositiveBatch[];
+  external_runs: FalsePositiveExternalRun[];
   reply_status: "draft" | "replied";
   cause_status: "unknown" | "hypothesis";
   improvement_status: string;
@@ -656,6 +706,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const detail = body?.detail;
     const message = body?.message || (typeof detail === "string" ? detail : detail?.message);
     throw new Error(message || "Local API request failed (" + response.status + ")");
+  }
+  return body as T;
+}
+
+async function uploadFile<T>(path: string, file: File): Promise<T> {
+  const response = await fetch((window.NATIVEAPP_LOCAL_API || "") + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: file,
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = body?.detail;
+    const message = body?.message || (typeof detail === "string" ? detail : detail?.message);
+    throw new Error(message || "ONNX 模型匯入失敗 (" + response.status + ")");
   }
   return body as T;
 }
@@ -927,6 +992,44 @@ export const api = {
   curationThumbnailUrl: (itemId: string) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/curation/items/" + encodeURIComponent(itemId) + "/thumbnail",
   falsePositiveCases: () => request<FalsePositiveCasesResponse>("/api/v1/fp-cases"),
+  externalModelProfiles: () => request<{ items: FalsePositiveExternalProfile[] }>("/api/v1/external-model-profiles"),
+  uploadExternalModelAsset: (file: File) => uploadFile<{
+    sha256: string; name: string; format: "onnx"; size: number; created_at: string;
+  }>("/api/v1/external-model-assets?filename=" + encodeURIComponent(file.name), file),
+  createExternalModelProfile: (input: {
+    name: string; asset_sha256: string; config: Record<string, unknown>;
+  }) => request<FalsePositiveExternalProfile>("/api/v1/external-model-profiles", {
+    method: "POST",
+    body: JSON.stringify(input),
+  }),
+  reviseExternalModelProfile: (profileId: string, input: {
+    expected_revision: number; name?: string; asset_sha256?: string; config?: Record<string, unknown>;
+  }) => request<FalsePositiveExternalProfile>(
+    "/api/v1/external-model-profiles/" + encodeURIComponent(profileId), {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    },
+  ),
+  runExternalModel: (caseId: string, input: {
+    expected_revision: number; source_id: string; profile_id: string; profile_revision: number;
+    reference?: Record<string, unknown>; score_atol: number; box_atol: number;
+  }) => request<{ case: FalsePositiveCase; run: FalsePositiveExternalRun }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/external-runs", {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  ),
+  externalModelInputPreviewUrl: (caseId: string, runId: string) =>
+    (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/fp-cases/" + encodeURIComponent(caseId)
+      + "/external-runs/" + encodeURIComponent(runId) + "/input-preview.png",
+  externalModelEvidence: (caseId: string, runId: string) => requestGetBlob(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/external-runs/"
+      + encodeURIComponent(runId) + "/evidence.json",
+  ),
+  externalModelEvidenceZip: (caseId: string, runId: string) => requestGetBlob(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/external-runs/"
+      + encodeURIComponent(runId) + "/evidence.zip",
+  ),
   falsePositiveCase: (caseId: string) =>
     request<FalsePositiveCase>("/api/v1/fp-cases/" + encodeURIComponent(caseId)),
   createFalsePositiveCase: (input: {

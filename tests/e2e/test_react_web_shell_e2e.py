@@ -2777,6 +2777,133 @@ def test_lv_web_05_case_01_visible_case_intake_source_navigation_and_region_revi
     }, "case intake or review modified its source files"
 
 
+def test_lv_web_05_ext_01_visible_onnx_profile_inference_replay_and_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """React uploads a local ONNX, runs it explicitly, replays full history and downloads evidence."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    pytest.importorskip("onnx")
+
+    from fp_onnx_demo import make_demo_model
+    from playwright.sync_api import expect, sync_playwright
+
+    cases_root = tmp_path / "fp-cases"
+    monkeypatch.setenv("LV_CASES_DIR", str(cases_root))
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    source_path = tmp_path / "original.png"
+    model_path = make_demo_model(tmp_path / "demo-classifier.onnx")
+    Image.new("RGB", (80, 60), (220, 220, 220)).save(source_path)
+    source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1480, "height": 1120}, accept_downloads=True)
+            page.set_default_timeout(20_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fp-cases").click()
+            page.get_by_label("案件名稱（可留空）").fill("External ONNX replay")
+            page.get_by_label("新案件來源類型").select_option("original")
+            page.get_by_label("建立案件圖片").set_input_files(str(source_path))
+            page.get_by_role("button", name="建立案件", exact=True).click()
+            expect(page.get_by_test_id("fp-case-title-readback")).to_have_text("External ONNX replay")
+            external = page.get_by_test_id("fp-external-models")
+            expect(external).to_be_visible()
+            page.get_by_label("外部模型設定名稱").fill("Visible fixture classifier")
+            page.get_by_label("保存的模型版本名稱").fill("visible-fixture-v1")
+            page.get_by_label("ONNX 模型檔").set_input_files(str(model_path))
+            page.get_by_label("外部模型輸入寬度").fill("32")
+            page.get_by_label("外部模型輸入高度").fill("32")
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/v1/external-model-profiles")
+                and response.request.method == "POST" and response.ok,
+            ) as profile_response:
+                page.get_by_test_id("fp-save-external-profile").click()
+            profile = profile_response.value.json()
+            assert profile["asset"]["sha256"] == hashlib.sha256(model_path.read_bytes()).hexdigest()
+            expect(page.get_by_test_id("fp-external-notice")).to_contain_text("不會執行推論")
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/external-runs")
+                and response.request.method == "POST" and response.ok,
+            ) as first_run_response:
+                page.get_by_test_id("fp-run-external-model").click()
+            first = first_run_response.value.json()
+            first_run = first["run"]
+            expect(page.get_by_test_id("fp-external-classification")).to_contain_text("crack")
+            expect(page.get_by_test_id("fp-external-parity")).to_contain_text("歷史 parity 不可用")
+            expect(page.get_by_test_id("fp-external-results")).to_be_visible()
+            preview = external.locator(".fp-ext-input-preview")
+            expect(preview).to_have_js_property("naturalWidth", 32)
+            assert first["case"]["items"] == [], "inference must not silently become a human-reviewed region"
+            assert str(tmp_path) not in first_run_response.value.text()
+
+            reference = {
+                "origin": "deployment",
+                "recorded_at": "2026-09-01T00:00:00Z",
+                "image_sha256": first_run["image_sha256"],
+                "contract_id": first_run["contract_id"],
+                "prediction": first_run["prediction"],
+            }
+            page.get_by_label("歷史部署輸出 JSON 文字").fill(json.dumps(reference))
+            with page.expect_response(
+                lambda response: response.url.endswith("/external-runs")
+                and response.request.method == "POST" and response.ok,
+            ) as replay_response:
+                page.get_by_test_id("fp-run-external-model").click()
+            replay = replay_response.value.json()
+            expect(page.get_by_test_id("fp-external-parity")).to_contain_text("完整歷史輸出相符")
+            assert replay["run"]["parity"]["status"] == "matched"
+
+            detector_path = make_demo_model(tmp_path / "demo-detector.onnx", detection=True)
+            page.get_by_label("外部模型輸出契約").select_option("xyxy")
+            page.get_by_label("外部模型類別順序").fill("crack")
+            page.get_by_label("外部模型正常類別").fill("")
+            page.get_by_label("ONNX 模型檔").set_input_files(str(detector_path))
+            with page.expect_response(
+                lambda response: "/api/v1/external-model-profiles/" in response.url
+                and response.request.method == "PATCH" and response.ok,
+            ) as revised_profile_response:
+                page.get_by_test_id("fp-save-external-profile").click()
+            revised_profile = revised_profile_response.value.json()
+            assert revised_profile["revision"] == 2
+            assert revised_profile["asset"]["sha256"] == hashlib.sha256(detector_path.read_bytes()).hexdigest()
+            assert revised_profile["asset"]["sha256"] != profile["asset"]["sha256"]
+            page.get_by_label("歷史部署輸出 JSON 文字").fill("")
+            with page.expect_response(
+                lambda response: response.url.endswith("/external-runs")
+                and response.request.method == "POST" and response.ok,
+            ) as detection_response:
+                page.get_by_test_id("fp-run-external-model").click()
+            detection = detection_response.value.json()["run"]
+            assert detection["profile_revision"] == 2
+            assert detection["prediction"]["task"] == "detection"
+            expect(page.get_by_test_id("fp-ext-detection-summary")).to_contain_text("最終輸出 1 個框")
+            expect(external.locator(".fp-ext-detection-box")).to_have_count(1)
+            assert detection["prediction"]["detections"][0]["box"] == pytest.approx(
+                [0.125, 0.0, 0.875, 1.0], abs=1e-5,
+            )
+
+            with page.expect_download() as zip_download:
+                page.get_by_role("button", name="下載完整推論 ZIP").click()
+            zip_path = zip_download.value.path()
+            assert zip_path
+            with zipfile.ZipFile(zip_path) as archive:
+                assert set(archive.namelist()) == {"evidence.json", "model_input.png", "source.png", "tensors.npz"}
+                exported_evidence = archive.read("evidence.json").decode("utf-8")
+                assert "model_path" not in exported_evidence
+                assert str(tmp_path) not in exported_evidence
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+
+    assert hashlib.sha256(source_path.read_bytes()).hexdigest() == source_hash
+
+
 def test_lv_web_05_retrieve_01_visible_explicit_search_and_candidate_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

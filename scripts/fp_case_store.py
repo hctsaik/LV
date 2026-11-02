@@ -29,6 +29,7 @@ CASE_DEFAULTS = {
     "improvement_status": "not_evaluated",
     "effort_minutes": 0.0,
     "effort_log": [],
+    "external_runs": [],
 }
 
 
@@ -329,7 +330,7 @@ class FalsePositiveCaseStore:
 
 def public_case(case: dict) -> dict:
     """Return case data without private asset names or filesystem locations."""
-    private_fields = {"asset", "path", "source_path", "checkpoint_path"}
+    private_fields = {"asset", "path", "source_path", "checkpoint_path", "model_path", "artifact_dir", "relative_path"}
 
     def public_value(value):
         if isinstance(value, dict):
