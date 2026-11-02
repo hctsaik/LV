@@ -112,6 +112,18 @@ def _png_bytes(color: tuple[int, int, int]) -> bytes:
     return buffer.getvalue()
 
 
+def test_nativeapp_dynamic_port_is_used_when_lv_port_is_unset(monkeypatch):
+    monkeypatch.delenv("LV_WEB_API_PORT", raising=False)
+    monkeypatch.setenv("PORT", "49127")
+    assert react_web_shell._configured_api_port() == 49127
+
+
+def test_explicit_lv_api_port_takes_precedence(monkeypatch):
+    monkeypatch.setenv("LV_WEB_API_PORT", "49128")
+    monkeypatch.setenv("PORT", "49127")
+    assert react_web_shell._configured_api_port() == 49128
+
+
 def test_case_lv_web_05_case_01_case_sources_yolo_regions_and_revision_conflict(
     monkeypatch, tmp_path
 ):

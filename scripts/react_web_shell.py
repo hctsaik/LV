@@ -98,6 +98,11 @@ API_VERSION = "1"
 logger = logging.getLogger("lv.react_web")
 
 
+def _configured_api_port() -> int:
+    """Use the explicit LV setting, then NativeApp's dynamically chosen port."""
+    return int(os.environ.get("LV_WEB_API_PORT") or os.environ.get("PORT") or "8765")
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -6897,4 +6902,4 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("LV_WEB_API_PORT", "8765")))
+    uvicorn.run(app, host="127.0.0.1", port=_configured_api_port())
