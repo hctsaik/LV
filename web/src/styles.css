@@ -833,6 +833,7 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .anomaly-run-filters label, .anomaly-object-details label { display: grid; gap: 5px; color: #53637b; font-size: 10px; font-weight: 650; }
 .anomaly-run-filters .secondary-action, .anomaly-object-details .secondary-action { min-height: 34px; }
 .anomaly-review-actions, .anomaly-pagination { display: flex; justify-content: space-between; align-items: center; gap: 10px; color: #75839a; font-size: 10px; }
+.anomaly-review-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .anomaly-object-list { display: grid; gap: 9px; }
 .anomaly-object { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px; padding: 10px; border: 1px solid #e2e8f0; border-radius: 8px; background: #fbfcfe; }
 .anomaly-object-preview { width: 120px; height: 110px; object-fit: contain; border-radius: 5px; background: #eef2f6; }
@@ -840,6 +841,8 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .anomaly-object-details > strong, .anomaly-object-details > span { min-width: 0; overflow-wrap: anywhere; }
 .anomaly-object-details > strong { color: #33445e; font-size: 11px; }
 .anomaly-object-details > label { grid-column: 1; width: min(240px, 100%); }
+.anomaly-object-details > .anomaly-curation-choice { display: flex; grid-column: 1 / -1; align-items: center; width: auto; gap: 7px; font-weight: 500; }
+.anomaly-curation-choice input { width: auto; min-width: 14px; margin: 0; accent-color: #5075b8; }
 .anomaly-object-details > .secondary-action { grid-column: 2; grid-row: 1 / span 2; }
 .anomaly-object-heatmap { grid-column: 1 / -1; width: min(100%, 600px); max-height: 500px; object-fit: contain; border: 1px solid #e0e6ef; border-radius: 5px; }
 .anomaly-empty-results { margin: 0; padding: 14px; color: #8290a3; font-size: 11px; text-align: center; }
@@ -847,4 +850,4 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .anomaly-pagination > span { min-width: 120px; text-align: center; }
 .anomaly-boundary { margin: 0; padding: 10px 12px; border-left: 3px solid #d8c39b; background: #fffaf1; color: #88755e; font-size: 10px; line-height: 1.6; }
 @media (max-width: 780px) { .anomaly-build-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-run-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-persist-controls { grid-template-columns: 1fr 1fr; }.anomaly-persist-controls label { grid-column: 1 / -1; } }
-@media (max-width: 560px) { .anomaly-workspace { width: calc(100% - 22px); margin-top: 14px; }.anomaly-card { padding: 15px; }.anomaly-build-form, .anomaly-score-form, .anomaly-run-filters, .anomaly-persist-controls { grid-template-columns: 1fr; }.anomaly-build-form .anomaly-wide, .anomaly-score-form .anomaly-wide, .anomaly-persist-controls label { grid-column: auto; }.anomaly-run-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-object { grid-template-columns: 84px minmax(0, 1fr); }.anomaly-object-preview { width: 84px; height: 88px; }.anomaly-object-details { grid-template-columns: minmax(0, 1fr); }.anomaly-object-details > .secondary-action { grid-column: 1; grid-row: auto; }.anomaly-object-details > label { grid-column: 1; }.anomaly-review-actions { align-items: stretch; flex-direction: column; }.anomaly-review-actions > button { width: 100%; } }
+@media (max-width: 560px) { .anomaly-workspace { width: calc(100% - 22px); margin-top: 14px; }.anomaly-card { padding: 15px; }.anomaly-build-form, .anomaly-score-form, .anomaly-run-filters, .anomaly-persist-controls { grid-template-columns: 1fr; }.anomaly-build-form .anomaly-wide, .anomaly-score-form .anomaly-wide, .anomaly-persist-controls label { grid-column: auto; }.anomaly-run-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.anomaly-object { grid-template-columns: 84px minmax(0, 1fr); }.anomaly-object-preview { width: 84px; height: 88px; }.anomaly-object-details { grid-template-columns: minmax(0, 1fr); }.anomaly-object-details > .secondary-action { grid-column: 1; grid-row: auto; }.anomaly-object-details > label { grid-column: 1; }.anomaly-review-actions { align-items: stretch; flex-direction: column; }.anomaly-review-buttons { justify-content: stretch; flex-direction: column; }.anomaly-review-buttons > button { width: 100%; } }

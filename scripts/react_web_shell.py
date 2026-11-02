@@ -411,6 +411,11 @@ class AddCurationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)
 
 
+class AddAnomalyCurationRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    indices: list[int] = Field(min_length=1, max_length=10000)
+
+
 class SetCurationReasonRequest(BaseModel):
     item_ids: list[str] = Field(min_length=1, max_length=10000)
     reason: str = Field(min_length=1, max_length=2000)
@@ -1604,6 +1609,87 @@ def create_app(
                 status = 409 if "已更新" in str(exc) else 422
                 raise HTTPException(status_code=status, detail=str(exc)) from exc
             return anomaly_run_view(run)
+
+    @app.post("/api/v1/anomaly/runs/{run_id}/curation/items", status_code=201)
+    def add_anomaly_candidates_to_curation(
+        run_id: str,
+        request: AddAnomalyCurationRequest,
+    ) -> dict:
+        with app.state.lock:
+            run = app.state.anomaly_runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="找不到目前 worker 的瑕疵偵測結果")
+            if request.expected_revision != int(run["revision"]):
+                raise HTTPException(status_code=409, detail={
+                    "code": "ANOMALY_RUN_REVISION_CONFLICT",
+                    "message": "偵測結果已更新，請重新載入後再加入策展清單。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            records = run["records"]
+            labels = np.asarray(run["labels"], dtype=object)
+            scores = np.asarray(run["scores"], dtype=float)
+            if any(index < 0 or index >= len(records) or index >= len(labels) or index >= len(scores)
+                   for index in request.indices):
+                raise HTTPException(status_code=422, detail={
+                    "code": "INVALID_ANOMALY_RECORD_INDEX",
+                    "message": "選取的異常候選不屬於目前這次評分結果。",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if any(labels[index] != "bad" for index in request.indices):
+                raise HTTPException(status_code=422, detail={
+                    "code": "ANOMALY_CANDIDATE_NOT_BAD",
+                    "message": "只能將目前判為異常候選的物件加入策展清單；請重新整理分數清單。",
+                    "request_id": uuid.uuid4().hex,
+                })
+
+            entries = []
+            for index in dict.fromkeys(request.indices):
+                record = records[index]
+                try:
+                    path = Path(record["image_path"]).expanduser().resolve(strict=True)
+                    if not path.is_file():
+                        raise OSError("source is not a file")
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                except (KeyError, OSError) as exc:
+                    raise HTTPException(status_code=404, detail={
+                        "code": "CURATION_IMAGE_UNAVAILABLE",
+                        "message": "選取的原始影像已無法讀取，沒有加入策展清單。",
+                        "request_id": uuid.uuid4().hex,
+                    }) from exc
+                bbox = [float(value) for value in record.get("bbox", (0, 0, 1, 1))]
+                if len(bbox) != 4 or not np.isfinite(bbox).all():
+                    raise HTTPException(status_code=409, detail="異常候選的原始影像框資料無效")
+                source = {
+                    "index": index,
+                    "filename": path.name,
+                    "path": str(path),
+                    "image_path": str(path),
+                    "label": str(record.get("label") or ""),
+                    "split": str(record.get("split") or ""),
+                    "sha256": digest.hexdigest(),
+                    "source": "anomaly",
+                    "source_run_id": run_id,
+                    "score": float(scores[index]),
+                    "reason": "Anomaly score candidate; human review required.",
+                    "level": "object",
+                    "bbox": bbox,
+                    "obj_index": int(record.get("obj_index") or 0),
+                }
+                entries.append(source)
+            try:
+                added, skipped = app.state.curation_store.add(entries)
+                items = app.state.curation_store.list_items()
+            except CurationStoreError as exc:
+                raise curation_store_error() from exc
+        return {
+            "added": added,
+            "skipped": skipped,
+            "items": [public_curation_item(item) for item in items],
+            "total": len(items),
+        }
 
     def anomaly_object_crop(run_id: str, index: int):
         with app.state.lock:

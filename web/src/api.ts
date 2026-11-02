@@ -886,6 +886,11 @@ export const api = {
     "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/reapply",
     { method: "POST", body: JSON.stringify(input) },
   ),
+  addAnomalyCuration: (runId: string, input: { expected_revision: number; indices: number[] }) =>
+    request<AddCurationResponse>(
+      "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/curation/items",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
   anomalyObjectImageUrl: (runId: string, index: number, kind: "preview" | "heatmap") => {
     const suffix = kind === "heatmap" ? "heatmap.png" : "preview.jpg";
     return (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/anomaly/runs/" + encodeURIComponent(runId)

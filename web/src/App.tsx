@@ -1331,7 +1331,7 @@ export default function App() {
         <FalsePositiveCaseWorkspace />
       ) : activeTool === "anomaly" ? (
         <Suspense fallback={<div className="coverage-loading" role="status">Loading anomaly workspace…</div>}>
-          <LazyAnomalyBankWorkspace models={models} connected={connected} />
+          <LazyAnomalyBankWorkspace models={models} connected={connected} onCurationCountChange={setCurationCount} />
         </Suspense>
       ) : activeTool === "curation" ? (
         <CurationWorkspace onCountChange={setCurationCount} />

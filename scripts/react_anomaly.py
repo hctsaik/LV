@@ -191,7 +191,12 @@ def score_targets(request: dict, bundle: dict, *, progress=None) -> dict:
         progress=report,
     )
     if not result.get("records"):
-        raise ValueError("找不到符合模型物件來源的目標影像或標註")
+        if object_source == "yolo":
+            raise ValueError(
+                "找不到 YOLO 標註：目標資料夾需含 images/ 與 labels/（YOLO .txt）。"
+                "若沒有標註框，請改選「整張影像」模式。"
+            )
+        raise ValueError("目標資料夾內找不到符合整張影像模式的影像。")
     from anomaly_classify import classify
 
     scores = np.asarray(result["scores"], dtype=np.float64)

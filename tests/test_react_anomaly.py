@@ -137,6 +137,10 @@ def test_anomaly_model_rejects_unknown_model_without_creating_job(monkeypatch, t
 
 
 def test_anomaly_score_rank_confirm_reapply_and_heatmap(monkeypatch, tmp_path: Path):
+    import hashlib
+    from io import BytesIO
+    from zipfile import ZipFile
+
     from PIL import Image
 
     image_path = tmp_path / "target.png"
@@ -221,6 +225,33 @@ def test_anomaly_score_rank_confirm_reapply_and_heatmap(monkeypatch, tmp_path: P
         assert heatmap.status_code == 200
         assert heatmap.headers["content-type"] == "image/png"
 
+        original_sha256 = hashlib.sha256(image_path.read_bytes()).hexdigest()
+        curated = client.post(f"/api/v1/anomaly/runs/{run_id}/curation/items", json={
+            "expected_revision": 1,
+            "indices": [0],
+        })
+        assert curated.status_code == 201, curated.text
+        assert curated.json()["added"] == 1
+        assert curated.json()["items"][0]["source"] == "anomaly"
+        assert curated.json()["items"][0]["score"] == 0.9
+        assert curated.json()["items"][0]["sha256"] == original_sha256
+        assert str(image_path) not in curated.text
+        rejected_good = client.post(f"/api/v1/anomaly/runs/{run_id}/curation/items", json={
+            "expected_revision": 1,
+            "indices": [1],
+        })
+        assert rejected_good.status_code == 422
+        assert "異常候選" in rejected_good.json()["message"]
+        archive_response = client.get("/api/v1/curation.zip")
+        assert archive_response.status_code == 200
+        with ZipFile(BytesIO(archive_response.content)) as archive:
+            exported_images = [name for name in archive.namelist() if name.lower().endswith(".png")]
+            assert len(exported_images) == 1
+            exported_bytes = archive.read(exported_images[0])
+        assert hashlib.sha256(exported_bytes).hexdigest() == original_sha256
+        with Image.open(BytesIO(exported_bytes)) as exported_image:
+            assert exported_image.size == (96, 64)
+
         reapply = client.post(f"/api/v1/anomaly/runs/{run_id}/reapply", json={
             "expected_revision": 1,
             "contamination": 0.05,
@@ -238,6 +269,44 @@ def test_anomaly_score_rank_confirm_reapply_and_heatmap(monkeypatch, tmp_path: P
             "confirmed": {},
         })
         assert stale.status_code == 409
+        stale_curation = client.post(f"/api/v1/anomaly/runs/{run_id}/curation/items", json={
+            "expected_revision": 1,
+            "indices": [1],
+        })
+        assert stale_curation.status_code == 409
+
+
+def test_yolo_target_without_labels_returns_friendly_error(monkeypatch, tmp_path: Path):
+    from PIL import Image
+
+    target = tmp_path / "target-without-labels"
+    (target / "images").mkdir(parents=True)
+    Image.new("RGB", (64, 48), (80, 110, 140)).save(target / "images" / "unlabelled.png")
+    with make_app(monkeypatch, tmp_path) as client:
+        train = tmp_path / "training"
+        train.mkdir()
+        created = client.post("/api/v1/anomaly/models/jobs", json={
+            "train_folders": [str(train)],
+            "model_id": "fixture-model",
+            "score_mode": "patch",
+            "object_source": "yolo",
+        })
+        assert created.status_code == 202, created.text
+        model_job = wait_for_job(client, created.json()["job_id"])
+        assert model_job["state"] == "completed", model_job
+
+        scored = client.post("/api/v1/anomaly/score-jobs", json={
+            "target_folders": [str(target)],
+            "contamination": 0.05,
+        })
+        assert scored.status_code == 202, scored.text
+        score_job = wait_for_score_job(client, scored.json()["job_id"])
+        assert score_job["state"] == "failed"
+        assert score_job["error"]["code"] == "ANOMALY_SCORE_INVALID"
+        assert score_job["error"]["message"] == (
+            "找不到 YOLO 標註：目標資料夾需含 images/ 與 labels/（YOLO .txt）。"
+            "若沒有標註框，請改選「整張影像」模式。"
+        )
 
 
 def test_score_targets_uses_locked_object_model_contract(monkeypatch, tmp_path: Path):

@@ -1,7 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, type AnomalyModel, type AnomalyObject, type AnomalyRun, type ModelOption } from "./api";
 
-type Props = { models: ModelOption[]; connected: boolean };
+type Props = {
+  models: ModelOption[];
+  connected: boolean;
+  onCurationCountChange: (count: number) => void;
+};
 
 function modelLabel(model: AnomalyModel) {
   const resolution = model.meta.score_mode === "patch" ? `${model.meta.target_res}px patches` : "object score";
@@ -16,7 +20,7 @@ function pause(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-export default function AnomalyBankWorkspace({ models, connected }: Props) {
+export default function AnomalyBankWorkspace({ models, connected, onCurationCountChange }: Props) {
   const [foldersText, setFoldersText] = useState("");
   const [modelId, setModelId] = useState("");
   const [scoreMode, setScoreMode] = useState<"patch" | "object">("patch");
@@ -46,6 +50,8 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
   const [filterMax, setFilterMax] = useState("");
   const [draftConfirmed, setDraftConfirmed] = useState<Record<string, "good" | "bad" | "">>({});
   const [heatmapIndex, setHeatmapIndex] = useState<number | null>(null);
+  const [selectedCuration, setSelectedCuration] = useState<Set<number>>(() => new Set());
+  const [curationWorking, setCurationWorking] = useState(false);
 
   const availableModels = useMemo(() => models.filter((item) => item.available), [models]);
 
@@ -103,6 +109,7 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
       setRun(null);
       setObjects([]);
       setDraftConfirmed({});
+      setSelectedCuration(new Set());
       setNotice("模型已建立於本機 worker 記憶體。按「保存模型」後，才能在新 worker 程序重新載入。");
       await refreshModels();
     } catch (reason) {
@@ -141,6 +148,7 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
       setRun(null);
       setObjects([]);
       setDraftConfirmed({});
+      setSelectedCuration(new Set());
       setNotice("已從 LV_CACHE_DIR 載入模型；建模時的模型、解析度、分數依據與語義已鎖定。");
       await refreshModels();
     } catch (reason) {
@@ -178,6 +186,7 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
     setNotice("");
     setRun(null);
     setObjects([]);
+    setSelectedCuration(new Set());
     setProgress("排入套用工作…");
     try {
       const created = await api.createAnomalyScoreJob({
@@ -220,12 +229,33 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
       });
       setRun(updated);
       setDraftConfirmed({});
+      setSelectedCuration(new Set());
       await loadObjects(0, updated.run_id);
       setNotice("已按確認標籤與污染率重新計算門檻和排序；Normal Bank 未變更。");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "重算瑕疵標籤失敗。");
     } finally {
       setWorking(false);
+    }
+  }
+
+  async function addSelectedToCuration() {
+    if (!run || selectedCuration.size === 0) return;
+    setCurationWorking(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api.addAnomalyCuration(run.run_id, {
+        expected_revision: run.revision,
+        indices: [...selectedCuration],
+      });
+      setSelectedCuration(new Set());
+      onCurationCountChange(result.total);
+      setNotice(`已加入策展清單 ${result.added} 個原圖候選；重複略過 ${result.skipped} 個。可到 Curation 匯出原始影像。`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "加入策展清單失敗。");
+    } finally {
+      setCurationWorking(false);
     }
   }
 
@@ -361,9 +391,14 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
         </form>
         <div className="anomaly-review-actions">
           <span>依異常分數由高至低排列 · 篩選結果 {objectTotal} 筆。確認標籤用來重估門檻，單筆結果仍依分數與門檻分類。</span>
-          <button type="button" className="run-button" data-testid="anomaly-reapply" disabled={working || scoreWorking || Object.keys(draftConfirmed).length === 0} onClick={() => void reapply()}>
-            套用標註並重算門檻{Object.keys(draftConfirmed).length ? `（${Object.keys(draftConfirmed).length} 筆變更）` : ""}
-          </button>
+          <div className="anomaly-review-buttons">
+            <button type="button" className="secondary-action" data-testid="anomaly-add-selected-curation" disabled={working || scoreWorking || curationWorking || selectedCuration.size === 0} onClick={() => void addSelectedToCuration()}>
+              {curationWorking ? "正在加入…" : `加入策展清單（${selectedCuration.size}）`}
+            </button>
+            <button type="button" className="run-button" data-testid="anomaly-reapply" disabled={working || scoreWorking || Object.keys(draftConfirmed).length === 0} onClick={() => void reapply()}>
+              套用標註並重算門檻{Object.keys(draftConfirmed).length ? `（${Object.keys(draftConfirmed).length} 筆變更）` : ""}
+            </button>
+          </div>
         </div>
         <div className="anomaly-object-list">
           {objects.map((item) => {
@@ -374,6 +409,21 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
                 <strong>{item.filename}</strong>
                 <span>{item.label || "未命名類別"} · 物件 {item.obj_index + 1} · {item.verdict === "bad" ? "異常候選" : "正常候選"}</span>
                 <span>異常分數 {item.score.toFixed(6)} · 框 [ {item.bbox.map((value) => value.toFixed(3)).join(", ")} ]</span>
+                {item.verdict === "bad" && <label className="anomaly-curation-choice">
+                  <input
+                    type="checkbox"
+                    aria-label={`選取 ${item.filename} 物件 ${item.obj_index + 1} 加入策展清單`}
+                    checked={selectedCuration.has(item.index)}
+                    disabled={working || scoreWorking || curationWorking}
+                    onChange={(event) => setSelectedCuration((current) => {
+                      const next = new Set(current);
+                      if (event.target.checked) next.add(item.index);
+                      else next.delete(item.index);
+                      return next;
+                    })}
+                  />
+                  選取異常候選加入策展清單
+                </label>}
                 <label>人工確認
                   <select aria-label={`${item.filename} 人工確認`} value={confirmation} disabled={working || scoreWorking} onChange={(event) => setDraftConfirmed((current) => ({ ...current, [String(item.index)]: event.target.value as "good" | "bad" | "" }))}>
                     <option value="">未確認</option><option value="good">正常</option><option value="bad">異常</option>
@@ -394,7 +444,7 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
           <button type="button" className="secondary-action" disabled={objectOffset + objects.length >= objectTotal} onClick={() => void loadObjects(objectOffset + 40).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "讀取評分清單失敗。"))}>下一頁</button>
         </div>
       </section>}
-      <p className="anomaly-boundary" data-testid="anomaly-boundary">目前包含建模、Normal Bank 保存／載入、目標資料夾評分、分數篩選排序與 Patch 熱圖。跨工作階段的評分結果保存、人工標註交接和完整 Streamlit 數值 parity 尚未驗收。</p>
+      <p className="anomaly-boundary" data-testid="anomaly-boundary">目前包含建模、Normal Bank 保存／載入、目標資料夾評分、異常候選加入策展清單與原圖匯出。評分結果跨 worker 保存、完整 Streamlit 數值 parity 與 NativeApp 資料夾權限仍未驗收；加入清單的候選仍需人工覆核。</p>
     </main>
   );
 }

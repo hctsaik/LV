@@ -3407,3 +3407,101 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
     finally:
         server.should_exit = True
         server_thread.join(timeout=10)
+
+
+def test_lv_web_06_review_01_visible_anomaly_candidate_cart_exports_original_image(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """React sends a scored object to curation and ZIP exports the untouched source image."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
+    training = tmp_path / "training"
+    training.mkdir()
+    target = tmp_path / "target"
+    (target / "images").mkdir(parents=True)
+    source_image = target / "images" / "panel.png"
+    Image.new("RGB", (128, 96), (145, 80, 55)).save(source_image)
+    source_bytes = source_image.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+
+    def score_candidate(request: dict, bundle: dict, *, progress=None) -> dict:
+        if progress:
+            progress(90, 100, "Fixture anomaly candidate ready")
+        return {
+            "records": [{
+                "image_path": str(source_image),
+                "bbox": [0.25, 0.2, 0.75, 0.8],
+                "label": "part",
+                "split": "test",
+                "obj_index": 0,
+            }],
+            "scores": np.asarray([0.95], dtype=np.float64),
+            "labels": np.asarray(["bad"], dtype=object),
+            "ranking": [0],
+            "threshold": 0.5,
+            "n_bad": 1,
+            "auroc": None,
+            "score_mode": "patch",
+            "model_id": bundle["meta"]["model"],
+            "model_meta": bundle["meta"],
+            "model_bank_sha256": "a" * 64,
+            "object_source": "yolo",
+            "bank": None,
+            "skipped_count": 0,
+            "fewshot_aligned": {},
+            "fewshot_unmatched": 0,
+            "confirmed": {},
+            "contamination": float(request["contamination"]),
+            "created_at": 1_798_000_000.0,
+        }
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model: lambda _path: np.zeros(2, dtype=np.float32),
+        anomaly_model_builder=_fixture_anomaly_model_builder,
+        anomaly_scorer=score_candidate,
+    )
+    server, server_thread, base_url = _start_api(application)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1440, "height": 1000}, accept_downloads=True)
+            page.set_default_timeout(20000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-anomaly-bank").click()
+            page.get_by_test_id("anomaly-train-folders").fill(str(training))
+            page.get_by_test_id("anomaly-build").click()
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("模型已建立")
+
+            page.get_by_test_id("anomaly-target-folders").fill(str(target))
+            page.get_by_test_id("anomaly-score").click()
+            expect(page.get_by_test_id("anomaly-review-workspace")).to_be_visible()
+            candidate = page.get_by_test_id("anomaly-object-0")
+            expect(candidate).to_be_visible()
+            candidate.get_by_label("選取 panel.png 物件 1 加入策展清單").check()
+            page.get_by_test_id("anomaly-add-selected-curation").click()
+            expect(page.get_by_test_id("anomaly-notice")).to_contain_text("已加入策展清單 1 個原圖候選")
+            expect(page.get_by_test_id("open-curation")).to_contain_text("Curation (1)")
+
+            page.get_by_test_id("open-curation").click()
+            expect(page.get_by_test_id("curation-item")).to_contain_text("panel.png")
+            with page.expect_download() as download:
+                page.get_by_test_id("curation-export-zip").click()
+            with zipfile.ZipFile(download.value.path()) as archive:
+                exported = [name for name in archive.namelist() if name.lower().endswith(".png")]
+                assert len(exported) == 1
+                exported_bytes = archive.read(exported[0])
+            assert hashlib.sha256(exported_bytes).hexdigest() == source_sha256
+            with Image.open(BytesIO(exported_bytes)) as image:
+                assert image.size == (128, 96)
+            assert source_image.read_bytes() == source_bytes
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
