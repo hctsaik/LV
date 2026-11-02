@@ -7,6 +7,8 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
+import subprocess
 import socket
 import sys
 import threading
@@ -178,6 +180,65 @@ def _start_curation_worker(cache_root: Path):
     base_url = f"http://127.0.0.1:{port}"
     _wait_http(f"{base_url}/api/v1/health", process)
     return process, base_url
+
+
+def _start_annotation_react_server(
+    repo_root: Path,
+    app_data_dir: Path,
+    port: int,
+    log_path: Path,
+):
+    """Run the checked-out ANnoTation React app and its real local service."""
+    web_dir = repo_root / "web" / "dist"
+    if not (repo_root / "annotation_web" / "server.py").is_file():
+        pytest.fail(f"ANnoTation repo has no local web service: {repo_root}")
+    if not (web_dir / "index.html").is_file():
+        pytest.fail(f"Build the ANnoTation React app before this E2E: {web_dir}")
+    python = os.environ.get("ANNOTATION_PYTHON") or sys.executable
+    command = [
+        python, "-m", "annotation_web.server",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--app-data-dir", str(app_data_dir),
+        "--web-dir", str(web_dir),
+    ]
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=repo_root,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+    deadline = time.monotonic() + 30
+    health_url = f"http://127.0.0.1:{port}/api/health"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            pytest.fail(
+                "ANnoTation local service exited before becoming ready:\n"
+                + log_path.read_text(encoding="utf-8", errors="replace")
+            )
+        try:
+            with urllib.request.urlopen(health_url, timeout=1) as response:
+                if response.status == 200:
+                    return process, f"http://127.0.0.1:{port}"
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.1)
+    _stop_annotation_react_server(process)
+    pytest.fail(
+        "ANnoTation local service did not become ready:\n"
+        + log_path.read_text(encoding="utf-8", errors="replace")
+    )
+
+
+def _stop_annotation_react_server(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
 def _fixture(root: Path) -> Path:
@@ -1834,6 +1895,173 @@ def test_lv_web_01_cart_01_visible_curation_exports_and_new_pid_readback(
             path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in dataset.rglob("*") if path.is_file()
         }
+
+
+def test_lv_web_10_send_readback_cross_repo_react_browser_journey(
+    tmp_path: Path,
+):
+    """Send a React curation item through ANnoTation React and read it back after restarts."""
+    annotation_root_value = os.environ.get("ANNOTATION_REPO_ROOT")
+    if not annotation_root_value:
+        pytest.skip("set ANNOTATION_REPO_ROOT to a built ANnoTation checkout for cross-repo E2E")
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.fail("Build LV React with npm run build before running this cross-repo E2E")
+
+    annotation_root = Path(annotation_root_value).expanduser().resolve()
+    if not (annotation_root / "web" / "dist" / "index.html").is_file():
+        pytest.fail(
+            "Build ANnoTation React with npm --prefix web run build before this E2E: "
+            f"{annotation_root / 'web' / 'dist'}"
+        )
+
+    dataset = _fixture(tmp_path / "cross-repo-source")
+    source_before = {
+        path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*") if path.is_file()
+    }
+    cache_root = tmp_path / "cross-repo-lv-cache"
+    annotation_data = tmp_path / "cross-repo-annotation-data"
+    annotation_data.mkdir(parents=True)
+    annotation_log = tmp_path / "annotation-service.log"
+    annotation_port = _free_port()
+    worker = None
+    annotation_process = None
+    browser = None
+    playwright = None
+    try:
+        worker, lv_url = _start_curation_worker(cache_root)
+        from playwright.sync_api import expect, sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=True)
+        lv_page = browser.new_page(viewport={"width": 1500, "height": 1100})
+        annotation_page = browser.new_page(viewport={"width": 1440, "height": 900})
+        lv_page.set_default_timeout(15_000)
+        annotation_page.set_default_timeout(15_000)
+        lv_page.goto(lv_url, wait_until="networkidle")
+        lv_page.get_by_test_id("model-choice-fixture-model").check()
+        lv_page.get_by_label("Supervised UMAP").uncheck()
+        lv_page.get_by_label("PCA").check()
+        for folder in (dataset / "train", dataset / "test"):
+            lv_page.get_by_label("Image folder").fill(str(folder))
+            lv_page.get_by_role("button", name="Add folder").click()
+        lv_page.get_by_role("button", name="Run analysis").click()
+        expect(lv_page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+        expect(lv_page.get_by_test_id("embedding-point")).to_have_count(4)
+        lv_page.get_by_test_id("embedding-point").first.click()
+        expect(lv_page.get_by_test_id("selection-count")).to_have_text("1 selected")
+        lv_page.get_by_test_id("add-selection-to-curation").click()
+        expect(lv_page.locator(".alert-info")).to_contain_text("Added 1 item(s) to curation")
+        lv_page.get_by_test_id("open-curation").click()
+        expect(lv_page.get_by_test_id("curation-item")).to_have_count(1)
+        expect(lv_page.get_by_test_id("curation-labeling-preview")).to_contain_text(
+            "1 sendable · 1 new · 0 already handled"
+        )
+        lv_page.get_by_test_id("curation-send-labeling").click()
+        expect(lv_page.locator(".alert-info")).to_contain_text(
+            "Saved 1 image(s) to the local Labeling inbox"
+        )
+
+        handoff_specs = list((cache_root / "labeling-inbox" / "lv_labeling_handoff").glob("*/_handoff.json"))
+        assert len(handoff_specs) == 1
+        handoff_spec_path = handoff_specs[0]
+        handoff_spec = json.loads(handoff_spec_path.read_text(encoding="utf-8"))
+        assert handoff_spec["task"] == "re-label"
+        assert len(handoff_spec["items"]) == 1
+        handoff_id = handoff_spec["handoff_id"]
+        item = handoff_spec["items"][0]
+        image_path = handoff_spec_path.parent / "images" / Path(item["image"]).name
+        assert image_path.is_file()
+        assert hashlib.sha256(image_path.read_bytes()).hexdigest() == item["sha256"]
+
+        annotation_process, annotation_url = _start_annotation_react_server(
+            annotation_root, annotation_data, annotation_port, annotation_log
+        )
+        annotation_page.goto(annotation_url, wait_until="networkidle")
+        workflow = annotation_page.get_by_role("navigation", name="工作流程")
+        workflow.get_by_role("button", name="資料集").click()
+        annotation_page.get_by_label("資料夾路徑").fill(str(image_path.parent))
+        annotation_page.get_by_label("資料集名稱").fill("LV React handoff browser journey")
+        annotation_page.get_by_role("button", name=re.compile("建立資料集並開始標注")).click()
+        expect(annotation_page.get_by_role("heading", name="標注工作台")).to_be_visible()
+        expect(annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name)))).to_be_visible()
+
+        workflow.get_by_role("button", name="資料集").click()
+        annotation_page.get_by_role("button", name="標籤管理").click()
+        annotation_page.get_by_label("框選標籤").fill("reviewed-label")
+        annotation_page.get_by_label("整張圖片分類").fill("OK\nNG")
+        annotation_page.get_by_label("外部標注工具").select_option("labelme")
+        annotation_page.get_by_role("button", name=re.compile("保存工作區設定")).click()
+        expect(annotation_page.get_by_text("工作區設定已保存")).to_be_visible()
+        workflow.get_by_role("button", name="標注工作台").click()
+        annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name))).click()
+        canvas = annotation_page.get_by_label("圖片與標注框")
+        expect(canvas).to_be_visible()
+        bounds = canvas.bounding_box()
+        assert bounds is not None
+        annotation_page.mouse.move(bounds["x"] + bounds["width"] * 0.2, bounds["y"] + bounds["height"] * 0.2)
+        annotation_page.mouse.down()
+        annotation_page.mouse.move(bounds["x"] + bounds["width"] * 0.8, bounds["y"] + bounds["height"] * 0.8)
+        annotation_page.mouse.up()
+        expect(annotation_page.get_by_label("第 1 個框選類別")).to_have_value("reviewed-label")
+        annotation_page.get_by_role("button", name=re.compile("保存標注")).click()
+        expect(annotation_page.get_by_text("已同步")).to_be_visible()
+        sidecar_path = image_path.with_suffix(".json")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        assert [shape["label"] for shape in sidecar["shapes"]] == ["reviewed-label"]
+        assert hashlib.sha256(image_path.read_bytes()).hexdigest() == item["sha256"]
+
+        _stop_annotation_react_server(annotation_process)
+        annotation_process, restarted_annotation_url = _start_annotation_react_server(
+            annotation_root, annotation_data, annotation_port, annotation_log
+        )
+        annotation_page.goto(restarted_annotation_url, wait_until="networkidle")
+        expect(annotation_page.get_by_role("heading", name="標注工作台")).to_be_visible()
+        annotation_page.get_by_role("button", name=re.compile(re.escape(image_path.name))).click()
+        expect(annotation_page.get_by_label("第 1 個框選類別")).to_have_value("reviewed-label")
+        expect(annotation_page.get_by_text("已同步")).to_be_visible()
+
+        _stop_worker(worker)
+        worker = None
+        worker, restarted_lv_url = _start_curation_worker(cache_root)
+        lv_page.goto(restarted_lv_url, wait_until="networkidle")
+        lv_page.get_by_test_id("model-choice-fixture-model").check()
+        lv_page.get_by_label("Supervised UMAP").uncheck()
+        lv_page.get_by_label("PCA").check()
+        for folder in (dataset / "train", dataset / "test"):
+            lv_page.get_by_label("Image folder").fill(str(folder))
+            lv_page.get_by_role("button", name="Add folder").click()
+        lv_page.get_by_role("button", name="Run analysis").click()
+        expect(lv_page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+        lv_page.get_by_test_id("open-curation").click()
+        lv_page.get_by_test_id("refresh-labeling-inbox").click()
+        expect(lv_page.get_by_test_id("labeling-handoff-row")).to_contain_text("1/1 labeled")
+        lv_page.get_by_test_id(f"labeling-readback-{handoff_id}").click()
+        expect(lv_page.locator(".alert-info")).to_contain_text("Applied 1 labeled image(s)")
+        expect(lv_page.get_by_test_id("labeling-readback-audit")).to_contain_text(
+            "1 corrected image(s) · 1 audit event(s)"
+        )
+        lv_page.get_by_role("button", name="Visualize").click()
+        lv_page.get_by_role("button", name="Run analysis").click()
+        expect(lv_page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+        point_labels = [
+            point.get_attribute("aria-label") or ""
+            for point in lv_page.get_by_test_id("embedding-point").all()
+        ]
+        assert sum("reviewed-label" in label for label in point_labels) == 1
+        assert source_before == {
+            path.relative_to(dataset).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in dataset.rglob("*") if path.is_file()
+        }
+    finally:
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
+        if worker is not None:
+            _stop_worker(worker)
+        if annotation_process is not None:
+            _stop_annotation_react_server(annotation_process)
 
 
 def test_lv_web_01_ic_03_umap_reference_visible_journey(
