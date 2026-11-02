@@ -138,6 +138,218 @@ def build_model(request: dict, *, progress=None) -> dict:
     }
 
 
+def score_targets(request: dict, bundle: dict, *, progress=None) -> dict:
+    """Apply a built/loaded bank to target folders without changing the model package."""
+    from anomaly_score import MemoryBank
+    from anomaly_tool import run_pipeline
+    from object_eval import classes_for, dataset_cache_dir, list_images
+
+    roots = [Path(value).expanduser().resolve(strict=True) for value in request["target_folders"]]
+    if not roots or any(not root.is_dir() for root in roots):
+        raise ValueError("請選擇存在的目標資料夾")
+    image_paths: list[Path] = []
+    class_names = list(request.get("class_names") or []) or None
+    for root in roots:
+        image_paths.extend(list_images(root))
+        class_names = class_names or classes_for(root)
+    if not image_paths:
+        raise ValueError("目標資料夾內找不到可用影像")
+
+    meta = bundle["meta"]
+    model_name = str(meta["model"])
+    score_mode = str(meta["score_mode"])
+    target_res = int(meta["target_res"])
+    object_source = str(meta["object_source"])
+    bank_vectors = bundle.get("bank_vectors")
+    external_bank = MemoryBank(np.asarray(bank_vectors, dtype=np.float32)) if bank_vectors is not None else None
+    projection = bundle.get("projection") or {}
+    external_ref = np.asarray(projection.get("good_obj_emb"), dtype=np.float32)
+    if score_mode == "patch" and external_bank is None:
+        raise ValueError("patch scoring 模型缺少 Normal Bank，請重新載入有效模型")
+    if score_mode == "object" and (external_ref.ndim != 2 or len(external_ref) == 0):
+        raise ValueError("object scoring 模型缺少正常特徵參照，請重新載入有效模型")
+
+    cache_dir = dataset_cache_dir(roots[0], f"anomaly_patch_{score_mode}_{model_name}_r{target_res}")
+    def report(frac, message):
+        if progress:
+            progress(max(0, min(92, round(float(frac) * 92))), 100, str(message))
+
+    result = run_pipeline(
+        image_paths,
+        class_names,
+        mode="one_stage",
+        score_mode=score_mode,
+        sample_n=64,
+        model=model_name,
+        target_res=target_res,
+        object_source=object_source,
+        cache_dir=cache_dir,
+        external_bank=external_bank,
+        external_ref=external_ref if score_mode == "object" else None,
+        confirmed={},
+        contamination=float(request["contamination"]),
+        progress=report,
+    )
+    if not result.get("records"):
+        raise ValueError("找不到符合模型物件來源的目標影像或標註")
+    from anomaly_classify import classify
+
+    scores = np.asarray(result["scores"], dtype=np.float64)
+    if len(scores) != len(result["records"]) or not np.isfinite(scores).all():
+        raise ValueError("模型產生的目標分數無效或索引未對齊")
+    classification = classify(scores, confirmed={}, contamination=float(request["contamination"]))
+    fewshot = bundle.get("fewshot") or []
+    aligned, unmatched = ({}, 0)
+    if fewshot:
+        from anomaly_bank_store import match_fewshot_to_indices
+        aligned, unmatched = match_fewshot_to_indices(fewshot, result["records"])
+    identity_vectors = bank_vectors if bank_vectors is not None else external_ref
+    model_bank_sha256 = hashlib.sha256(
+        str(identity_vectors.dtype).encode("ascii")
+        + json.dumps(list(identity_vectors.shape), separators=(",", ":")).encode("ascii")
+        + np.ascontiguousarray(identity_vectors, dtype=np.float32).tobytes()
+    ).hexdigest()
+    return {
+        "records": result["records"],
+        "scores": scores,
+        "labels": np.asarray(classification["labels"], dtype=object),
+        "ranking": list(classification["ranking"]),
+        "threshold": float(classification["threshold"]),
+        "n_bad": int(classification["n_bad"]),
+        "auroc": classification.get("auroc"),
+        "score_mode": score_mode,
+        "model_id": model_name,
+        "model_meta": copy.deepcopy(meta),
+        "model_bank_sha256": model_bank_sha256,
+        "object_source": object_source,
+        "target_folders": [str(root) for root in roots],
+        "cache_dir": str(cache_dir),
+        "bank": result.get("bank"),
+        "skipped_count": len(result.get("skipped") or []),
+        "fewshot_aligned": {str(key): value for key, value in aligned.items()},
+        "fewshot_unmatched": int(unmatched),
+        "confirmed": {},
+        "contamination": float(request["contamination"]),
+        "revision": 1,
+        "created_at": time.time(),
+    }
+
+
+def anomaly_run_view(run: dict) -> dict:
+    scores = np.asarray(run["scores"], dtype=float)
+    labels = sorted({str(row.get("label") or "") for row in run["records"] if row.get("label")})
+    verdicts = np.asarray(run["labels"], dtype=object)
+    return {
+        "run_id": run["run_id"],
+        "revision": int(run["revision"]),
+        "model_id": run["model_id"],
+        "model_meta": {key: value for key, value in run["model_meta"].items()},
+        "model_bank_sha256": run["model_bank_sha256"],
+        "score_mode": run["score_mode"],
+        "object_source": run["object_source"],
+        "n_objects": len(run["records"]),
+        "n_bad": int(run["n_bad"]),
+        "threshold": float(run["threshold"]),
+        "auroc": run.get("auroc"),
+        "score_min": float(scores.min()) if len(scores) else None,
+        "score_max": float(scores.max()) if len(scores) else None,
+        "class_labels": labels,
+        "verdict_counts": {
+            "good": int(np.count_nonzero(verdicts == "good")),
+            "bad": int(np.count_nonzero(verdicts == "bad")),
+        },
+        "confirmed_count": len(run.get("confirmed") or {}),
+        "fewshot_aligned": len(run.get("fewshot_aligned") or {}),
+        "fewshot_unmatched": int(run.get("fewshot_unmatched") or 0),
+        "skipped_count": int(run.get("skipped_count") or 0),
+        "created_at": run["created_at"],
+    }
+
+
+def anomaly_run_objects(
+    run: dict,
+    *,
+    offset: int = 0,
+    limit: int = 60,
+    verdict: str | None = None,
+    class_label: str | None = None,
+    score_min: float | None = None,
+    score_max: float | None = None,
+) -> dict:
+    offset = max(0, int(offset))
+    limit = min(200, max(1, int(limit)))
+    scores = np.asarray(run["scores"], dtype=float)
+    labels = np.asarray(run["labels"], dtype=object)
+    visible = []
+    for index in run["ranking"]:
+        row = run["records"][index]
+        score = float(scores[index])
+        if verdict and labels[index] != verdict:
+            continue
+        if class_label and str(row.get("label") or "") != class_label:
+            continue
+        if score_min is not None and score < score_min:
+            continue
+        if score_max is not None and score > score_max:
+            continue
+        visible.append({
+            "index": int(index),
+            "filename": Path(str(row["image_path"])).name,
+            "label": str(row.get("label") or ""),
+            "split": str(row.get("split") or ""),
+            "bbox": [float(value) for value in row["bbox"]],
+            "obj_index": int(row.get("obj_index") or 0),
+            "score": score,
+            "verdict": str(labels[index]),
+            "confirmed": (run.get("confirmed") or {}).get(str(index), ""),
+        })
+    return {
+        "run_id": run["run_id"],
+        "revision": int(run["revision"]),
+        "offset": offset,
+        "limit": limit,
+        "total": len(visible),
+        "items": visible[offset:offset + limit],
+    }
+
+
+def reclassify_anomaly_run(
+    run: dict,
+    *,
+    expected_revision: int,
+    confirmed: dict[str, str],
+    contamination: float,
+) -> dict:
+    if int(expected_revision) != int(run["revision"]):
+        raise ValueError("偵測結果已更新，請重新載入後再套用標註")
+    from anomaly_classify import classify
+
+    normalized = {str(key): value for key, value in (run.get("confirmed") or {}).items()}
+    for raw_index, value in confirmed.items():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            raise ValueError("標註物件索引無效") from None
+        if index < 0 or index >= len(run["scores"]) or value not in {"good", "bad", ""}:
+            raise ValueError("標註內容無效，請重新選擇正常或異常")
+        if value:
+            normalized[str(index)] = value
+        else:
+            normalized.pop(str(index), None)
+    if not 0.0 <= float(contamination) <= 1.0:
+        raise ValueError("污染率必須介於 0 與 1")
+    result = classify(run["scores"], confirmed={int(k): v for k, v in normalized.items()}, contamination=contamination)
+    run["confirmed"] = normalized
+    run["labels"] = np.asarray(result["labels"], dtype=object)
+    run["ranking"] = list(result["ranking"])
+    run["threshold"] = float(result["threshold"])
+    run["n_bad"] = int(result["n_bad"])
+    run["auroc"] = result.get("auroc")
+    run["contamination"] = float(contamination)
+    run["revision"] += 1
+    return run
+
+
 def _view(model_id: str, bundle: dict, *, source: str, saved_at=None) -> dict:
     meta = copy.deepcopy(bundle["meta"])
     meta.setdefault("schema_version", 1)

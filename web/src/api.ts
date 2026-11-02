@@ -67,6 +67,64 @@ export type AnomalyModelJob = {
   can_cancel: boolean;
 };
 
+export type AnomalyScoreJob = {
+  job_id: string;
+  state: JobStatus["state"];
+  phase: string;
+  done: number;
+  total: number;
+  percent: number;
+  message: string;
+  run_id: string | null;
+  result: AnomalyRun | null;
+  error: JobStatus["error"];
+  can_cancel: boolean;
+};
+
+export type AnomalyRun = {
+  run_id: string;
+  revision: number;
+  model_id: string;
+  model_meta: AnomalyModel["meta"];
+  model_bank_sha256: string;
+  score_mode: "patch" | "object";
+  object_source: "yolo" | "whole_image";
+  n_objects: number;
+  n_bad: number;
+  threshold: number;
+  auroc: number | null;
+  score_min: number | null;
+  score_max: number | null;
+  class_labels: string[];
+  verdict_counts: { good: number; bad: number };
+  confirmed_count: number;
+  fewshot_aligned: number;
+  fewshot_unmatched: number;
+  skipped_count: number;
+  created_at: number;
+};
+
+export type AnomalyObject = {
+  index: number;
+  filename: string;
+  label: string;
+  split: string;
+  bbox: [number, number, number, number];
+  obj_index: number;
+  score: number;
+  verdict: "good" | "bad";
+  confirmed: "good" | "bad" | "";
+};
+
+export type AnomalyObjectPage = {
+  run_id: string;
+  revision: number;
+  offset: number;
+  limit: number;
+  total: number;
+  items: AnomalyObject[];
+};
+
 export type RunRecord = {
   index: number;
   filename: string;
@@ -796,6 +854,43 @@ export const api = {
     "/api/v1/anomaly/models/load",
     { method: "POST", body: JSON.stringify({ model_id: modelId }) },
   ),
+  createAnomalyScoreJob: (input: { target_folders: string[]; contamination: number; class_names?: string[] }) =>
+    request<{ job_id: string; state: string }>("/api/v1/anomaly/score-jobs", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  anomalyScoreJob: (jobId: string) => request<AnomalyScoreJob>(
+    "/api/v1/anomaly/score-jobs/" + encodeURIComponent(jobId),
+  ),
+  anomalyRunObjects: (runId: string, input: {
+    offset?: number;
+    limit?: number;
+    verdict?: "good" | "bad";
+    class_label?: string;
+    score_min?: number;
+    score_max?: number;
+  }) => {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(input)) {
+      if (value !== undefined && value !== "") query.set(key, String(value));
+    }
+    return request<AnomalyObjectPage>(
+      "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/objects?" + query.toString(),
+    );
+  },
+  reapplyAnomalyRun: (runId: string, input: {
+    expected_revision: number;
+    contamination: number;
+    confirmed: Record<string, "good" | "bad" | "">;
+  }) => request<AnomalyRun>(
+    "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/reapply",
+    { method: "POST", body: JSON.stringify(input) },
+  ),
+  anomalyObjectImageUrl: (runId: string, index: number, kind: "preview" | "heatmap") => {
+    const suffix = kind === "heatmap" ? "heatmap.png" : "preview.jpg";
+    return (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/anomaly/runs/" + encodeURIComponent(runId)
+      + "/objects/" + index + "/" + suffix;
+  },
   createJob: (
     folders: string[],
     modelIds: string[],

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, type AnomalyModel, type ModelOption } from "./api";
+import { api, type AnomalyModel, type AnomalyObject, type AnomalyRun, type ModelOption } from "./api";
 
 type Props = { models: ModelOption[]; connected: boolean };
 
@@ -33,6 +33,19 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [targetFoldersText, setTargetFoldersText] = useState("");
+  const [contamination, setContamination] = useState(0.05);
+  const [scoreWorking, setScoreWorking] = useState(false);
+  const [run, setRun] = useState<AnomalyRun | null>(null);
+  const [objects, setObjects] = useState<AnomalyObject[]>([]);
+  const [objectOffset, setObjectOffset] = useState(0);
+  const [objectTotal, setObjectTotal] = useState(0);
+  const [filterVerdict, setFilterVerdict] = useState<"" | "good" | "bad">("");
+  const [filterClass, setFilterClass] = useState("");
+  const [filterMin, setFilterMin] = useState("");
+  const [filterMax, setFilterMax] = useState("");
+  const [draftConfirmed, setDraftConfirmed] = useState<Record<string, "good" | "bad" | "">>({});
+  const [heatmapIndex, setHeatmapIndex] = useState<number | null>(null);
 
   const availableModels = useMemo(() => models.filter((item) => item.available), [models]);
 
@@ -87,7 +100,10 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
         throw new Error(job.error?.message || job.message || "建立 Normal Bank 失敗。");
       }
       setActiveModel(job.result);
-      setNotice("模型已建立於本機 worker 記憶體。按「保存模型」後，才能在新 worker 程序重新載入。後續套用偵測流程尚未接入此畫面。 ");
+      setRun(null);
+      setObjects([]);
+      setDraftConfirmed({});
+      setNotice("模型已建立於本機 worker 記憶體。按「保存模型」後，才能在新 worker 程序重新載入。");
       await refreshModels();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "建立 Normal Bank 失敗。");
@@ -122,10 +138,92 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
     try {
       const result = await api.loadAnomalyModel(selectedSavedId);
       setActiveModel(result.model);
+      setRun(null);
+      setObjects([]);
+      setDraftConfirmed({});
       setNotice("已從 LV_CACHE_DIR 載入模型；建模時的模型、解析度、分數依據與語義已鎖定。");
       await refreshModels();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "載入 Normal Bank 失敗。");
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function loadObjects(nextOffset = 0, runId = run?.run_id) {
+    if (!runId) return;
+    const page = await api.anomalyRunObjects(runId, {
+      offset: nextOffset,
+      limit: 40,
+      verdict: filterVerdict || undefined,
+      class_label: filterClass || undefined,
+      score_min: filterMin === "" ? undefined : Number(filterMin),
+      score_max: filterMax === "" ? undefined : Number(filterMax),
+    });
+    setObjects(page.items);
+    setObjectOffset(page.offset);
+    setObjectTotal(page.total);
+  }
+
+  async function scoreTargets(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!activeModel) return;
+    const folders = splitLines(targetFoldersText);
+    if (!folders.length) {
+      setError("請輸入至少一個目標資料夾。");
+      return;
+    }
+    setScoreWorking(true);
+    setError("");
+    setNotice("");
+    setRun(null);
+    setObjects([]);
+    setProgress("排入套用工作…");
+    try {
+      const created = await api.createAnomalyScoreJob({
+        target_folders: folders,
+        contamination,
+        class_names: splitLines(classNames.replaceAll(",", "\n")),
+      });
+      let job = await api.anomalyScoreJob(created.job_id);
+      while (job.state === "queued" || job.state === "running" || job.state === "cancelling") {
+        setProgress(`${job.message}${job.total ? ` · ${job.percent.toFixed(0)}%` : ""}`);
+        await pause(500);
+        job = await api.anomalyScoreJob(created.job_id);
+      }
+      if (job.state !== "completed" || !job.result) {
+        throw new Error(job.error?.message || job.message || "套用瑕疵偵測模型失敗。");
+      }
+      setRun(job.result);
+      setDraftConfirmed({});
+      setHeatmapIndex(null);
+      await loadObjects(0, job.result.run_id);
+      setNotice("已用目前載入的模型評分目標資料夾。此結果只保存於目前 worker；重算門檻不會重建 Normal Bank。");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "套用瑕疵偵測模型失敗。");
+    } finally {
+      setScoreWorking(false);
+      setProgress("");
+    }
+  }
+
+  async function reapply() {
+    if (!run) return;
+    setWorking(true);
+    setError("");
+    setNotice("");
+    try {
+      const updated = await api.reapplyAnomalyRun(run.run_id, {
+        expected_revision: run.revision,
+        contamination,
+        confirmed: draftConfirmed,
+      });
+      setRun(updated);
+      setDraftConfirmed({});
+      await loadObjects(0, updated.run_id);
+      setNotice("已按確認標籤與污染率重新計算門檻和排序；Normal Bank 未變更。");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "重算瑕疵標籤失敗。");
     } finally {
       setWorking(false);
     }
@@ -184,7 +282,7 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
           <label className="anomaly-wide">手動類別名稱（選填，逗號或換行分隔）
             <input aria-label="瑕疵偵測手動類別" value={classNames} disabled={working} onChange={(event) => setClassNames(event.target.value)} />
           </label>
-          <button type="submit" className="run-button anomaly-wide" data-testid="anomaly-build" disabled={working || !connected || !modelId || !splitLines(foldersText).length}>
+          <button type="submit" className="run-button anomaly-wide" data-testid="anomaly-build" disabled={working || scoreWorking || !connected || !modelId || !splitLines(foldersText).length}>
             {working ? "正在處理…" : "建立 Normal Bank"}
           </button>
         </form>
@@ -196,13 +294,13 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
         <p>保存內容包含 patch vectors（如有）、固定投影器、few-shot 標記、可選分類頭和 manifest。新 worker 啟動後可從相同的 <code>LV_CACHE_DIR</code> 載入。</p>
         <div className="anomaly-persist-controls">
           <label>已保存模型
-            <select aria-label="已保存瑕疵偵測模型" data-testid="anomaly-saved-model" value={selectedSavedId} disabled={working || savedModels.filter((item) => item.saved).length === 0} onChange={(event) => setSelectedSavedId(event.target.value)}>
+            <select aria-label="已保存瑕疵偵測模型" data-testid="anomaly-saved-model" value={selectedSavedId} disabled={working || scoreWorking || savedModels.filter((item) => item.saved).length === 0} onChange={(event) => setSelectedSavedId(event.target.value)}>
               {savedModels.filter((item) => item.saved).length === 0 && <option value="">沒有已保存模型</option>}
               {savedModels.filter((item) => item.saved).map((item) => <option key={item.model_id} value={item.model_id}>{modelLabel(item)}</option>)}
             </select>
           </label>
-          <button type="button" className="secondary-action" data-testid="anomaly-load" disabled={working || !selectedSavedId || !connected} onClick={() => void load()}>載入模型</button>
-          <button type="button" className="run-button" data-testid="anomaly-save" disabled={working || !activeModel || activeModel.saved || !connected} onClick={() => void save()}>{activeModel?.saved ? "模型已保存" : "保存模型"}</button>
+          <button type="button" className="secondary-action" data-testid="anomaly-load" disabled={working || scoreWorking || !selectedSavedId || !connected} onClick={() => void load()}>載入模型</button>
+          <button type="button" className="run-button" data-testid="anomaly-save" disabled={working || scoreWorking || !activeModel || activeModel.saved || !connected} onClick={() => void save()}>{activeModel?.saved ? "模型已保存" : "保存模型"}</button>
         </div>
         {activeModel && <div className="anomaly-model-status" data-testid="anomaly-model-status">
           <strong>{activeModel.source === "loaded" ? "模型已載入" : activeModel.saved ? "模型已保存" : "模型已建立"}</strong>
@@ -212,7 +310,91 @@ export default function AnomalyBankWorkspace({ models, connected }: Props) {
           <small>模型 ID {activeModel.model_id}</small>
         </div>}
       </section>
-      <p className="anomaly-boundary" data-testid="anomaly-boundary">目前完成建模與 Normal Bank 保存／載入。套用偵測、風險排序／熱圖、人工標註交接和 Streamlit 數值 parity 尚未完成。</p>
+
+      <section className="anomaly-card" aria-labelledby="anomaly-score-title" data-testid="anomaly-score-workspace">
+        <div className="eyebrow">APPLY · RANK · REVIEW</div>
+        <h2 id="anomaly-score-title">套用模型與風險排序</h2>
+        <p>以目前載入模型掃描目標資料夾。重新套用標註只會重算分類門檻與排序，不會重建 Normal Bank 或重跑特徵。</p>
+        <form className="anomaly-score-form" onSubmit={(event) => void scoreTargets(event)}>
+          <label className="anomaly-wide">目標資料夾（每行一個本機路徑）
+            <textarea aria-label="瑕疵偵測目標資料夾" data-testid="anomaly-target-folders" rows={3} value={targetFoldersText} disabled={scoreWorking || working} onChange={(event) => setTargetFoldersText(event.target.value)} placeholder="C:\\data\\product\\test" />
+            <small>模型的特徵模型、分數依據、解析度與物件來源固定沿用建模設定。NativeApp 資料夾權限橋接尚待接線。</small>
+          </label>
+          <label>預估異常比例
+            <input aria-label="瑕疵偵測污染率" data-testid="anomaly-contamination" type="number" min={0} max={1} step={0.01} value={contamination} disabled={working || scoreWorking} onChange={(event) => setContamination(Number(event.target.value))} />
+          </label>
+          <button type="submit" className="run-button anomaly-wide" data-testid="anomaly-score" disabled={working || scoreWorking || !connected || !activeModel || !splitLines(targetFoldersText).length}>
+            {scoreWorking ? "正在評分…" : "套用目前模型"}
+          </button>
+        </form>
+        {run && <div className="anomaly-run-summary" data-testid="anomaly-run-summary">
+          <div><strong>{run.n_objects}</strong><span>個物件</span></div>
+          <div><strong>{run.verdict_counts.bad}</strong><span>異常候選</span></div>
+          <div><strong>{run.threshold.toFixed(5)}</strong><span>目前門檻</span></div>
+          <div><strong>{run.auroc === null ? "—" : run.auroc.toFixed(3)}</strong><span>確認標籤 AUROC</span></div>
+          <small>結果 {run.run_id.slice(0, 12)} · bank SHA-256 {run.model_bank_sha256.slice(0, 16)}… · revision {run.revision} · 已對齊 few-shot {run.fewshot_aligned} 筆</small>
+        </div>}
+      </section>
+
+      {run && <section className="anomaly-card" aria-labelledby="anomaly-review-title" data-testid="anomaly-review-workspace">
+        <div className="eyebrow">SCORE REVIEW</div>
+        <h2 id="anomaly-review-title">分數清單與確認標註</h2>
+        <form className="anomaly-run-filters" onSubmit={(event) => { event.preventDefault(); void loadObjects(0).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "讀取評分清單失敗。")); }}>
+          <label>結果
+            <select aria-label="瑕疵結果篩選" value={filterVerdict} onChange={(event) => setFilterVerdict(event.target.value as "" | "good" | "bad")}>
+              <option value="">全部</option><option value="bad">異常候選</option><option value="good">正常候選</option>
+            </select>
+          </label>
+          <label>類別
+            <select aria-label="瑕疵類別篩選" value={filterClass} onChange={(event) => setFilterClass(event.target.value)}>
+              <option value="">全部類別</option>
+              {run.class_labels.map((label) => <option key={label} value={label}>{label}</option>)}
+            </select>
+          </label>
+          <label>分數至少
+            <input aria-label="瑕疵最低分數" type="number" step="any" value={filterMin} onChange={(event) => setFilterMin(event.target.value)} />
+          </label>
+          <label>分數至多
+            <input aria-label="瑕疵最高分數" type="number" step="any" value={filterMax} onChange={(event) => setFilterMax(event.target.value)} />
+          </label>
+          <button type="submit" className="secondary-action">套用篩選</button>
+        </form>
+        <div className="anomaly-review-actions">
+          <span>依異常分數由高至低排列 · 篩選結果 {objectTotal} 筆。確認標籤用來重估門檻，單筆結果仍依分數與門檻分類。</span>
+          <button type="button" className="run-button" data-testid="anomaly-reapply" disabled={working || scoreWorking || Object.keys(draftConfirmed).length === 0} onClick={() => void reapply()}>
+            套用標註並重算門檻{Object.keys(draftConfirmed).length ? `（${Object.keys(draftConfirmed).length} 筆變更）` : ""}
+          </button>
+        </div>
+        <div className="anomaly-object-list">
+          {objects.map((item) => {
+            const confirmation = draftConfirmed[String(item.index)] ?? item.confirmed;
+            return <article key={item.index} className="anomaly-object" data-testid={`anomaly-object-${item.index}`}>
+              <img className="anomaly-object-preview" src={api.anomalyObjectImageUrl(run.run_id, item.index, "preview")} alt={`${item.filename} 物件裁切`} loading="lazy" />
+              <div className="anomaly-object-details">
+                <strong>{item.filename}</strong>
+                <span>{item.label || "未命名類別"} · 物件 {item.obj_index + 1} · {item.verdict === "bad" ? "異常候選" : "正常候選"}</span>
+                <span>異常分數 {item.score.toFixed(6)} · 框 [ {item.bbox.map((value) => value.toFixed(3)).join(", ")} ]</span>
+                <label>人工確認
+                  <select aria-label={`${item.filename} 人工確認`} value={confirmation} disabled={working || scoreWorking} onChange={(event) => setDraftConfirmed((current) => ({ ...current, [String(item.index)]: event.target.value as "good" | "bad" | "" }))}>
+                    <option value="">未確認</option><option value="good">正常</option><option value="bad">異常</option>
+                  </select>
+                </label>
+                {run.score_mode === "patch" && <button type="button" className="secondary-action" aria-expanded={heatmapIndex === item.index} onClick={() => setHeatmapIndex((current) => current === item.index ? null : item.index)}>
+                  {heatmapIndex === item.index ? "隱藏 Patch 熱圖" : "顯示 Patch 熱圖"}
+                </button>}
+                {heatmapIndex === item.index && <img className="anomaly-object-heatmap" src={api.anomalyObjectImageUrl(run.run_id, item.index, "heatmap")} alt={`${item.filename} Patch 異常熱圖`} />}
+              </div>
+            </article>;
+          })}
+          {objects.length === 0 && <p className="anomaly-empty-results">目前篩選沒有符合的物件。</p>}
+        </div>
+        <div className="anomaly-pagination">
+          <button type="button" className="secondary-action" disabled={objectOffset <= 0} onClick={() => void loadObjects(Math.max(0, objectOffset - 40)).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "讀取評分清單失敗。"))}>上一頁</button>
+          <span>{objectTotal ? `${objectOffset + 1}–${Math.min(objectOffset + objects.length, objectTotal)} / ${objectTotal}` : "0 筆"}</span>
+          <button type="button" className="secondary-action" disabled={objectOffset + objects.length >= objectTotal} onClick={() => void loadObjects(objectOffset + 40).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "讀取評分清單失敗。"))}>下一頁</button>
+        </div>
+      </section>}
+      <p className="anomaly-boundary" data-testid="anomaly-boundary">目前包含建模、Normal Bank 保存／載入、目標資料夾評分、分數篩選排序與 Patch 熱圖。跨工作階段的評分結果保存、人工標註交接和完整 Streamlit 數值 parity 尚未驗收。</p>
     </main>
   );
 }

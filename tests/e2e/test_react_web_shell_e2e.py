@@ -3339,12 +3339,18 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
             page = browser.new_page(viewport={"width": 1440, "height": 1000})
             page.set_default_timeout(300000)
             job_payloads: list[dict] = []
+            score_payloads: list[dict] = []
 
             def capture_job(response):
                 if response.request.method == "GET" and "/api/v1/anomaly/jobs/" in response.url and response.ok:
                     job_payloads.append(response.json())
 
+            def capture_score_job(response):
+                if response.request.method == "GET" and "/api/v1/anomaly/score-jobs/" in response.url and response.ok:
+                    score_payloads.append(response.json())
+
             page.on("response", capture_job)
+            page.on("response", capture_score_job)
             page.goto(base_url, wait_until="networkidle")
             page.get_by_test_id("open-anomaly-bank").click()
             page.get_by_test_id("anomaly-train-folders").fill(str(root))
@@ -3370,6 +3376,28 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 and payload.get("result", {}).get("summary", {}).get("eligible_classes") == ["bad", "good"]
                 for payload in job_payloads
             )
+
+            page.get_by_test_id("anomaly-target-folders").fill(str(root))
+            page.get_by_test_id("anomaly-score").click()
+            expect(page.get_by_test_id("anomaly-run-summary")).to_contain_text("4", timeout=300000)
+            expect(page.get_by_test_id("anomaly-review-workspace")).to_be_visible()
+            expect(page.locator(".anomaly-object").first).to_be_visible()
+            assert any(
+                payload.get("state") == "completed"
+                and payload.get("result", {}).get("n_objects") == 4
+                and payload.get("result", {}).get("score_mode") == "patch"
+                for payload in score_payloads
+            )
+            original_bank_sha = page.get_by_test_id("anomaly-run-summary").inner_text().split("bank SHA-256 ")[-1].split("…")[0]
+            page.locator(".anomaly-object").first.get_by_role("button", name="顯示 Patch 熱圖").click()
+            heatmap = page.locator(".anomaly-object-heatmap").first
+            expect(heatmap).to_be_visible(timeout=300000)
+            page.wait_for_function("document.querySelector('.anomaly-object-heatmap')?.naturalWidth > 0", timeout=300000)
+            page.locator(".anomaly-object").first.locator("select").select_option("good")
+            page.get_by_test_id("anomaly-reapply").click()
+            expect(page.get_by_test_id("anomaly-run-summary")).to_contain_text("revision 2")
+            updated_bank_sha = page.get_by_test_id("anomaly-run-summary").inner_text().split("bank SHA-256 ")[-1].split("…")[0]
+            assert updated_bank_sha == original_bank_sha, "reclassifying target scores must not rebuild or replace the Normal Bank"
             after_hashes = {
                 path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in root.rglob("*") if path.is_file()

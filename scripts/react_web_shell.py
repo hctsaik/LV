@@ -237,6 +237,18 @@ class CreateAnomalyModelJobRequest(BaseModel):
     confirmed: dict[str, Literal["good", "bad"]] = Field(default_factory=dict)
 
 
+class CreateAnomalyScoreJobRequest(BaseModel):
+    target_folders: list[str] = Field(min_length=1, max_length=32)
+    contamination: float = Field(default=0.05, ge=0.0, le=1.0, allow_inf_nan=False)
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+
+
+class ReapplyAnomalyRunRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    contamination: float = Field(default=0.05, ge=0.0, le=1.0, allow_inf_nan=False)
+    confirmed: dict[str, Literal["good", "bad", ""]] = Field(default_factory=dict, max_length=10000)
+
+
 class LoadAnomalyModelRequest(BaseModel):
     model_id: str = Field(min_length=1, max_length=64)
 
@@ -475,6 +487,21 @@ class _AnomalyModelJob:
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
+@dataclass
+class _AnomalyScoreJob:
+    job_id: str
+    model_id: str
+    request: CreateAnomalyScoreJobRequest
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    run_id: str | None = None
+    result: dict | None = None
+    error: dict | None = None
+
+
 def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob) -> dict:
     return {
         "job_id": job.job_id,
@@ -506,6 +533,22 @@ def _anomaly_job_view(job: _AnomalyModelJob) -> dict:
     }
 
 
+def _anomaly_score_job_view(job: _AnomalyScoreJob) -> dict:
+    return {
+        "job_id": job.job_id,
+        "state": job.state,
+        "phase": job.phase,
+        "done": job.done,
+        "total": job.total,
+        "percent": (job.done / job.total * 100.0) if job.total else 0.0,
+        "message": job.message,
+        "run_id": job.run_id,
+        "result": job.result,
+        "error": job.error,
+        "can_cancel": False,
+    }
+
+
 def create_app(
     *,
     model_catalog: Callable[[], list[str]] | None = None,
@@ -515,6 +558,7 @@ def create_app(
     diagnostic_model_loader: Callable[[str, int, bool, str], Callable] | None = None,
     case_search_model_provider: Callable[[], tuple[dict, Callable]] | None = None,
     anomaly_model_builder: Callable | None = None,
+    anomaly_scorer: Callable | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
     has_custom_model_loader = model_loader is not None
@@ -551,9 +595,13 @@ def create_app(
     app.state.coverage_candidate_jobs = {}
     app.state.coverage_candidates = {}
     app.state.anomaly_jobs = {}
+    app.state.anomaly_score_jobs = {}
+    app.state.anomaly_runs = {}
+    app.state.current_anomaly_run_id = None
     app.state.anomaly_models = {}
     app.state.current_anomaly_model_id = None
     app.state.anomaly_model_builder = anomaly_model_builder
+    app.state.anomaly_scorer = anomaly_scorer
     app.state.curation_store = CurationStore()
     app.state.fp_case_store = FalsePositiveCaseStore()
     app.state.external_model_registry = ExternalModelRegistry(app.state.fp_case_store.root)
@@ -568,6 +616,7 @@ def create_app(
             + list(app.state.coverage_jobs.values())
             + list(app.state.coverage_candidate_jobs.values())
             + list(app.state.anomaly_jobs.values())
+            + list(app.state.anomaly_score_jobs.values())
         )
         return any(job.state in {"queued", "running", "cancelling"} for job in jobs)
 
@@ -1347,6 +1396,8 @@ def create_app(
                 app.state.anomaly_models.clear()
                 app.state.anomaly_models[model_id] = bundle
                 app.state.current_anomaly_model_id = model_id
+                app.state.anomaly_runs.clear()
+                app.state.current_anomaly_run_id = None
                 job.model_id = model_id
                 job.result = result
                 job.done = job.total = 100
@@ -1410,6 +1461,195 @@ def create_app(
                 raise HTTPException(status_code=404, detail="找不到瑕疵偵測建模工作")
             return _anomaly_job_view(job)
 
+    def execute_anomaly_score_job(job: _AnomalyScoreJob, bundle: dict) -> None:
+        try:
+            with app.state.lock:
+                job.state, job.phase, job.message = "running", "scoring", "準備套用已載入模型"
+                job.total = 100
+
+            def update_progress(done: int, total: int, message: str) -> None:
+                with app.state.lock:
+                    job.phase = "scoring"
+                    job.done = max(0, min(int(done), int(total)))
+                    job.total = max(1, int(total))
+                    job.message = str(message)[:240]
+
+            scorer = app.state.anomaly_scorer
+            if scorer is None:
+                from react_anomaly import score_targets
+                scorer = score_targets
+            run = scorer(job.request.model_dump(), bundle, progress=update_progress)
+            if not run.get("records"):
+                raise ValueError("找不到符合模型物件來源的目標影像或標註")
+            run_id = uuid.uuid4().hex
+            run["run_id"] = run_id
+            run["labels"] = np.asarray(run["labels"], dtype=object)
+            run["revision"] = 1
+            from react_anomaly import anomaly_run_view
+            view = anomaly_run_view(run)
+            with app.state.lock:
+                if app.state.current_anomaly_model_id != job.model_id:
+                    raise ValueError("目前載入模型已變更，請重新套用偵測")
+                app.state.anomaly_runs.clear()
+                app.state.anomaly_runs[run_id] = run
+                app.state.current_anomaly_run_id = run_id
+                job.run_id = run_id
+                job.result = view
+                job.done = job.total = 100
+                job.state, job.phase, job.message = "completed", "completed", "目標資料夾評分完成"
+        except (ValueError, FileNotFoundError) as exc:
+            logger.info("LV anomaly scoring input rejected (job=%s): %s", job.job_id, exc)
+            message = str(exc)
+            for selected in job.request.target_folders:
+                for candidate in {selected, os.path.abspath(os.path.expanduser(selected))}:
+                    if candidate:
+                        message = message.replace(candidate, "選取資料夾")
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "目標資料夾評分失敗"
+                job.error = {
+                    "code": "ANOMALY_SCORE_INVALID",
+                    "message": message[:500],
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV anomaly scoring failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "目標資料夾評分失敗"
+                job.error = {
+                    "code": "ANOMALY_SCORE_FAILED",
+                    "message": "套用模型失敗；請檢查本機模型權重、資料集標註及 worker 記錄後重試。",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/anomaly/score-jobs", status_code=202)
+    def create_anomaly_score_job(request: CreateAnomalyScoreJobRequest) -> dict:
+        job_id = uuid.uuid4().hex
+        with app.state.lock:
+            model_id = app.state.current_anomaly_model_id
+            bundle = app.state.anomaly_models.get(model_id) if model_id else None
+            if bundle is None:
+                raise HTTPException(status_code=409, detail="請先建立或載入瑕疵偵測模型")
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "請等目前分析完成後再套用瑕疵偵測模型。",
+                    "request_id": job_id,
+                })
+            job = _AnomalyScoreJob(job_id=job_id, model_id=model_id, request=request)
+            app.state.anomaly_score_jobs[job_id] = job
+        threading.Thread(
+            target=execute_anomaly_score_job,
+            args=(job, bundle),
+            daemon=True,
+            name=f"lv-anomaly-score-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.get("/api/v1/anomaly/score-jobs/{job_id}")
+    def get_anomaly_score_job(job_id: str) -> dict:
+        with app.state.lock:
+            job = app.state.anomaly_score_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="找不到瑕疵偵測套用工作")
+            return _anomaly_score_job_view(job)
+
+    @app.get("/api/v1/anomaly/runs/{run_id}")
+    def get_anomaly_run(run_id: str) -> dict:
+        from react_anomaly import anomaly_run_view
+        with app.state.lock:
+            run = app.state.anomaly_runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="找不到目前 worker 的瑕疵偵測結果")
+            return anomaly_run_view(run)
+
+    @app.get("/api/v1/anomaly/runs/{run_id}/objects")
+    def get_anomaly_run_objects(
+        run_id: str,
+        offset: int = 0,
+        limit: int = 60,
+        verdict: Literal["good", "bad"] | None = None,
+        class_label: str | None = None,
+        score_min: float | None = None,
+        score_max: float | None = None,
+    ) -> dict:
+        from react_anomaly import anomaly_run_objects
+        if score_min is not None and score_max is not None and score_min > score_max:
+            raise HTTPException(status_code=422, detail="最低分數不可高於最高分數")
+        if any(value is not None and not np.isfinite(value) for value in (score_min, score_max)):
+            raise HTTPException(status_code=422, detail="分數範圍必須是有限數值")
+        with app.state.lock:
+            run = app.state.anomaly_runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="找不到目前 worker 的瑕疵偵測結果")
+            return anomaly_run_objects(
+                run, offset=offset, limit=limit, verdict=verdict,
+                class_label=class_label, score_min=score_min, score_max=score_max,
+            )
+
+    @app.post("/api/v1/anomaly/runs/{run_id}/reapply")
+    def reapply_anomaly_run(run_id: str, request: ReapplyAnomalyRunRequest) -> dict:
+        from react_anomaly import anomaly_run_view, reclassify_anomaly_run
+        with app.state.lock:
+            run = app.state.anomaly_runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="找不到目前 worker 的瑕疵偵測結果")
+            try:
+                reclassify_anomaly_run(
+                    run,
+                    expected_revision=request.expected_revision,
+                    confirmed=request.confirmed,
+                    contamination=request.contamination,
+                )
+            except ValueError as exc:
+                status = 409 if "已更新" in str(exc) else 422
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            return anomaly_run_view(run)
+
+    def anomaly_object_crop(run_id: str, index: int):
+        with app.state.lock:
+            run = app.state.anomaly_runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="找不到目前 worker 的瑕疵偵測結果")
+            if index < 0 or index >= len(run["records"]):
+                raise HTTPException(status_code=404, detail="找不到指定物件")
+            record = run["records"][index]
+        image = safe_open_image(record["image_path"])
+        if image is None:
+            raise HTTPException(status_code=404, detail="目標影像已無法讀取")
+        from object_eval import DEFAULT_POLICY, _adaptive_pad_px
+        pad = float((run["model_meta"].get("embedding_recipe") or {}).get("pad", DEFAULT_POLICY["pad"]))
+        bbox = tuple(float(value) for value in record["bbox"])
+        return run, record, crop_bbox(image, *bbox, pad_px=_adaptive_pad_px(bbox, *image.size, pad))
+
+    @app.get("/api/v1/anomaly/runs/{run_id}/objects/{index}/preview.jpg")
+    def get_anomaly_object_preview(run_id: str, index: int) -> Response:
+        _run, _record, crop = anomaly_object_crop(run_id, index)
+        crop.thumbnail((768, 768))
+        output = BytesIO()
+        crop.convert("RGB").save(output, format="JPEG", quality=86, optimize=True)
+        return Response(content=output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/anomaly/runs/{run_id}/objects/{index}/heatmap.png")
+    def get_anomaly_object_heatmap(run_id: str, index: int) -> Response:
+        run, _record, crop = anomaly_object_crop(run_id, index)
+        if run["score_mode"] != "patch" or run.get("bank") is None:
+            raise HTTPException(status_code=409, detail="物件分數模式沒有 patch 熱圖")
+        try:
+            from anomaly_heatmap import render_heatmap
+            from anomaly_score import score_object
+            from patch_features import extract_patch_grid
+            meta = run["model_meta"]
+            patch = extract_patch_grid(crop, target_res=int(meta["target_res"]), model=str(meta["model"]))
+            _score, patch_scores = score_object(patch["feats"], patch["grid"], run["bank"])
+            heatmap = render_heatmap(patch_scores, crop)
+        except Exception as exc:
+            logger.exception("LV anomaly heatmap failed (run=%s, index=%s)", run_id, index)
+            raise HTTPException(status_code=500, detail="無法產生物件熱圖；請檢查本機模型權重與 worker 記錄") from exc
+        heatmap.thumbnail((768, 768))
+        output = BytesIO()
+        heatmap.save(output, format="PNG", optimize=True)
+        return Response(content=output.getvalue(), media_type="image/png", headers={"Cache-Control": "no-store"})
+
     @app.get("/api/v1/anomaly/models")
     def list_anomaly_models() -> dict:
         from react_anomaly import list_saved
@@ -1452,9 +1692,13 @@ def create_app(
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=422, detail="模型檔案不完整、損毀或不相容，請重新選擇有效模型") from exc
         with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail="請等目前工作完成後再切換模型")
             app.state.anomaly_models.clear()
             app.state.anomaly_models[request.model_id] = bundle
             app.state.current_anomaly_model_id = request.model_id
+            app.state.anomaly_runs.clear()
+            app.state.current_anomaly_run_id = None
         return {"model": view}
 
     def coverage_points(records: list[dict], coordinates: np.ndarray) -> list[dict]:
