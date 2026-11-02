@@ -1,0 +1,70 @@
+name: React cross-app handoff
+
+on:
+  push:
+    branches:
+      - codex/react-web-lv-full
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lv-to-annotation:
+    name: LV to ANnoTation React workflow
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out LV
+        uses: actions/checkout@v4
+
+      - name: Check out ANnoTation React branch
+        uses: actions/checkout@v4
+        with:
+          repository: hctsaik/ANnoTation
+          ref: codex/react-web-annotation-rewrite
+          path: external/ANnoTation
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            external/ANnoTation/web/package-lock.json
+
+      - name: Install Python runtime and browser-test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r external/ANnoTation/requirements-web-test.txt playwright
+
+      - name: Build LV React app
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build ANnoTation React app
+        working-directory: external/ANnoTation/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Chromium
+        run: python -m playwright install chromium
+
+      - name: Run the cross-repository React workflow
+        env:
+          ANNOTATION_REPO_ROOT: ${{ github.workspace }}/external/ANnoTation
+        run: >-
+          python -m pytest
+          tests/e2e/test_react_web_shell_e2e.py::test_lv_web_10_send_readback_cross_repo_react_browser_journey
+          -q -s
