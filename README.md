@@ -78,6 +78,11 @@ Both tools run **fully offline** — model architectures and weights are loaded 
 pip install -r requirements.txt
 ```
 
+This installs the Python runtime used by React Web. The legacy Streamlit UI is
+kept as a behavior reference while parity work is in progress; install
+`requirements-streamlit-reference.txt` only when running Streamlit reference
+tests.
+
 External ONNX investigation is optional. Install its CPU runtime and executable test-fixture dependency only when using that workflow:
 
 ```powershell
@@ -150,15 +155,12 @@ If `classes.txt` is not found, class names can be entered manually in the sideba
 
 ---
 
-## Legacy Streamlit behavioral baseline
+## Legacy Streamlit behavior reference
 
-This launcher remains temporarily available for use-case comparison while migration continues. It is not the target interface for new work; parity is tracked by case ID above.
-
-```bash
-streamlit run scripts/app.py
-```
-
-App opens at `http://localhost:8501`.
+The legacy Streamlit implementation is retained as a behavior reference for
+case-by-case React parity checks. It is not a supported end-user launch path.
+Use the React Web launcher above. Current coverage and remaining parity work
+are tracked in [the migration acceptance matrix](4_PM_Feedback/react_web_shell.md).
 
 ---
 

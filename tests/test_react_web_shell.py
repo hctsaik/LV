@@ -8,6 +8,7 @@ import hashlib
 import json
 from io import BytesIO, StringIO
 import os
+import subprocess
 import sys
 import time
 import types
@@ -25,6 +26,51 @@ import react_web_shell
 from react_web_shell import create_app
 from interaction import compute_label_disagreement, compute_outlier_scores
 from visualize_embeddings import discover_images_classifier
+
+
+def test_react_web_shell_imports_without_streamlit():
+    """The supported React API must not depend on the legacy UI package."""
+    script = r"""
+import importlib.abc
+import sys
+
+class BlockStreamlit(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "streamlit" or fullname.startswith("streamlit."):
+            raise ModuleNotFoundError("Streamlit is blocked in this React runtime probe")
+        return None
+
+sys.meta_path.insert(0, BlockStreamlit())
+import react_web_shell
+assert not any(name == "streamlit" or name.startswith("streamlit.") for name in sys.modules)
+"""
+    repo_root = Path(__file__).resolve().parents[1]
+    runtime_requirements = (repo_root / "requirements.txt").read_text(encoding="utf-8")
+    reference_requirements = (
+        repo_root / "requirements-streamlit-reference.txt"
+    ).read_text(encoding="utf-8")
+    assert not any(
+        line.strip().lower().startswith("streamlit")
+        for line in runtime_requirements.splitlines()
+    )
+    assert any(
+        line.strip().lower().startswith("streamlit")
+        for line in reference_requirements.splitlines()
+    )
+    env = os.environ.copy()
+    scripts_dir = str(repo_root / "scripts")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (scripts_dir, env.get("PYTHONPATH", "")) if value
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class _DeterministicUMAP:

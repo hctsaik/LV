@@ -1,0 +1,4 @@
+# Optional dependency for the legacy Streamlit behavior reference and its tests.
+# React Web runtime users should install requirements.txt only.
+-r requirements.txt
+streamlit>=1.32.0

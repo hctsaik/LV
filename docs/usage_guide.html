@@ -40,6 +40,7 @@ a:hover{text-decoration:underline}
 <p><strong>一句話</strong>：先用 <strong>Visualize</strong> 探索＋診斷，再從樞紐<strong>分流</strong>到其餘四個工具。
 每個工具回答一個<strong>不同的問題</strong>、對應瑕疵漏逮的<strong>不同「桶」</strong>。
 圖解見 <a href="tools_overview.html">tools_overview.html</a>（五工具樞紐圖＋四桶對應）。</p>
+<p><strong>React Web 是目前唯一支援的操作入口</strong>。遷移尚未完成；下方逐工具操作步驟記錄舊版 Streamlit 的行為，僅供功能比對，不能視為 React 已具備全部相同行為。請先看<a href="../4_PM_Feedback/react_web_shell.md">React 遷移驗收矩陣</a>確認各案例狀態。Streamlit 程式只保留作比對來源與舊版測試，不再作為支援的使用者介面。</p>
 </blockquote>
 <hr />
 <h2 id="_1">心智模型：探索 → 行動，對應四桶</h2>
@@ -93,13 +94,18 @@ a:hover{text-decoration:underline}
 <p><strong>完全離線</strong>：模型權重只從本機讀取。</p>
 <pre><code class="language-bash">pip install -r requirements.txt
 
+# 建置並啟動 React Web
+cd web
+npm install
+npm run build
+cd ..
+python scripts/react_web_shell.py
+
 # 模型權重（不在版控；冪等 provisioning）
 python scripts/setup_models.py                # 核心：DINOv2 + Chinese-CLIP
 python scripts/setup_models.py --with-compare # 多：Compare 用的 Inception / LPIPS
-
-# 啟動
-streamlit run scripts/app.py                  # 開在 http://localhost:8501
 </code></pre>
+<p>React Web 預設開在 <code>http://127.0.0.1:8765</code>。舊版行為測試需要額外安裝 <code>pip install -r requirements-streamlit-reference.txt</code>；一般 React 使用不需要這個依賴。</p>
 <p><strong>資料夾結構</strong>：
 - <strong>Object Detector（YOLO）</strong>：<code>&lt;folder&gt;/images/</code>（＋可選 <code>labels/</code> 為 YOLO <code>.txt</code>）。類別名取 <code>classes.txt</code>。
 - <strong>Image Classifier</strong>：<code>&lt;folder&gt;/類別名/影像.jpg</code>（依類別分子資料夾）。</p>

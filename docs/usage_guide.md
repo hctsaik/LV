@@ -5,6 +5,8 @@
 > **一句話**：先用 **Visualize** 探索＋診斷，再從樞紐**分流**到其餘四個工具。
 > 每個工具回答一個**不同的問題**、對應瑕疵漏逮的**不同「桶」**。
 > 圖解見 [tools_overview.html](tools_overview.html)（五工具樞紐圖＋四桶對應）。
+>
+> **React Web 是目前唯一支援的操作入口**。遷移尚未完成；下方逐工具操作步驟記錄舊版 Streamlit 的行為，僅供功能比對，不能視為 React 已具備全部相同行為。請先看[React 遷移驗收矩陣](../4_PM_Feedback/react_web_shell.md)確認各案例狀態。Streamlit 程式只保留作比對來源與舊版測試，不再作為支援的使用者介面。
 
 ---
 
@@ -37,13 +39,19 @@ LV 不是五個各自獨立的功能，而是一條「**探索 → 診斷 → �
 ```bash
 pip install -r requirements.txt
 
+# 建置並啟動 React Web
+cd web
+npm install
+npm run build
+cd ..
+python scripts/react_web_shell.py
+
 # 模型權重（不在版控；冪等 provisioning）
 python scripts/setup_models.py                # 核心：DINOv2 + Chinese-CLIP
 python scripts/setup_models.py --with-compare # 多：Compare 用的 Inception / LPIPS
-
-# 啟動
-streamlit run scripts/app.py                  # 開在 http://localhost:8501
 ```
+
+React Web 預設開在 `http://127.0.0.1:8765`。舊版行為測試需要額外安裝 `pip install -r requirements-streamlit-reference.txt`；一般 React 使用不需要這個依賴。
 
 **資料夾結構**：
 - **Object Detector（YOLO）**：`<folder>/images/`（＋可選 `labels/` 為 YOLO `.txt`）。類別名取 `classes.txt`。
