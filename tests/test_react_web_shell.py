@@ -2191,6 +2191,41 @@ def test_case_lv_web_01_ic_02_multi_model_projection_views(
     assert run["method"] == "pca"
 
 
+def test_case_lv_web_01_ic_02_small_sample_tsne_uses_single_thread_only_below_32(monkeypatch):
+    from contextlib import contextmanager
+
+    import sklearn.manifold
+    import threadpoolctl
+
+    from react_visualize import _project_embeddings
+
+    observed_limits = []
+
+    @contextmanager
+    def record_limit(*, limits):
+        observed_limits.append(limits)
+        yield
+
+    class FakeTSNE:
+        def __init__(self, *, n_components, **_kwargs):
+            self.n_components = n_components
+
+        def fit_transform(self, values):
+            return np.zeros((len(values), self.n_components), dtype=np.float64)
+
+    monkeypatch.setattr(threadpoolctl, "threadpool_limits", record_limit)
+    monkeypatch.setattr(sklearn.manifold, "TSNE", FakeTSNE)
+
+    for count in (4, 32):
+        embeddings = np.arange(count * 5, dtype=np.float32).reshape(count, 5)
+        labels = ["apple", "banana"] * (count // 2)
+        projections, warnings, _ = _project_embeddings(embeddings, labels, ["tsne"])
+        assert "tsne" in projections
+        assert not warnings
+
+    assert observed_limits == [1]
+
+
 def test_case_lv_web_01_ic_02_real_models_match_streamlit_projection_values(
     classifier_fixture, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

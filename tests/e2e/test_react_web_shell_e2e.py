@@ -68,6 +68,35 @@ DETECTOR_FIXTURE_SHA256 = {
 }
 
 
+def _pinned_dinov2_models_dir(tmp_path: Path) -> Path:
+    configured_models = Path(
+        os.environ.get("LV_TEST_MODELS_DIR") or os.environ.get("LV_MODELS_DIR") or ROOT / "models"
+    ).expanduser().resolve()
+    configured_weights = (
+        configured_models / "dinov2_vits14" / "dinov2_vits14.pth",
+        configured_models / "dinov2_vits14.pth",
+    )
+    cache_weights = Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / "dinov2_vits14_pretrain.pth"
+    source_weights = next((path for path in configured_weights if path.is_file()), None)
+    if source_weights is None and cache_weights.is_file():
+        source_weights = cache_weights
+    if source_weights is None:
+        pytest.skip("pinned real DINOv2-small weights are unavailable in LV models or the local torch cache")
+    assert hashlib.sha256(source_weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
+        "the local model weights differ from the LV DINOv2-small baseline"
+
+    models_dir = tmp_path / "models"
+    model_dir = models_dir / "dinov2_vits14"
+    model_dir.mkdir(parents=True)
+    weights = model_dir / "dinov2_vits14.pth"
+    try:
+        os.link(source_weights, weights)
+    except OSError:
+        shutil.copyfile(source_weights, weights)
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256
+    return models_dir
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -391,12 +420,7 @@ class _DeterministicUMAP:
 
 def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """AC2/AC3: real DINOv2 vectors, projection switching, 3D view and image readback."""
-    models_dir = Path(os.environ.get("LV_MODELS_DIR", ROOT / "models")).resolve()
-    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
-    if not weights.is_file():
-        pytest.skip(f"real DINOv2-small weights are unavailable: {weights}")
-    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
-        "the local model weights differ from the LV-WEB-01-IC-01 baseline"
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
 
@@ -2617,12 +2641,7 @@ def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """Visible object-level React flow uses the pinned DINOv2 model on real crops."""
-    models_dir = Path(os.environ.get("LV_MODELS_DIR", ROOT / "models")).resolve()
-    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
-    if not weights.is_file():
-        pytest.skip(f"real DINOv2-small weights are unavailable: {weights}")
-    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
-        "the local model weights differ from the LV-WEB-01 baseline"
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
 
@@ -2704,12 +2723,7 @@ def test_lv_web_01_od_01_real_model_visible_detector_ui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """Run detector mode through React with the pinned DINOv2 model and YOLO fixture."""
-    models_dir = Path(os.environ.get("LV_MODELS_DIR", ROOT / "models")).resolve()
-    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
-    if not weights.is_file():
-        pytest.skip(f"real DINOv2-small weights are unavailable: {weights}")
-    assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256, \
-        "the local model weights differ from the LV-WEB-01 baseline"
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
 

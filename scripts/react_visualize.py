@@ -88,11 +88,21 @@ def _project_embeddings(
                 coordinates = pca_coordinates()
             elif method == "tsne":
                 perplexity = min(30, max(1, n_samples - 1))
-                coordinates = TSNE(
+                tsne = TSNE(
                     n_components=n_components,
                     random_state=42,
                     perplexity=perplexity,
-                ).fit_transform(embeddings)
+                )
+                if n_samples < 32:
+                    # For tiny image sets, Windows ARM64 OpenMP/BLAS scheduling
+                    # costs far more than the t-SNE work. Keep the same sklearn
+                    # parameters and seed while avoiding that thread overhead.
+                    from threadpoolctl import threadpool_limits
+
+                    with threadpool_limits(limits=1):
+                        coordinates = tsne.fit_transform(embeddings)
+                else:
+                    coordinates = tsne.fit_transform(embeddings)
             elif method == "umap":
                 neighbors = min(15, max(2, n_samples - 1))
                 if use_umap_reference:
