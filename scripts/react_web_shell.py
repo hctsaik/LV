@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
@@ -43,6 +44,19 @@ class CreateCompareJob(BaseModel):
 class CreateCompareProjection(BaseModel):
     method: str = Field(min_length=1, max_length=16)
     dimension: int = Field(default=2, ge=2, le=3)
+
+
+class CreateRunBlocks(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    method: str = Field(min_length=1, max_length=16)
+    indices: list[int] = Field(min_length=1, max_length=100_000)
+    k: int = Field(default=12, ge=4, le=30)
+
+
+class CreateBlockProjection(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    method: str = Field(min_length=1, max_length=16)
+    indices: list[int] = Field(min_length=1, max_length=100_000)
 
 
 @dataclass
@@ -476,7 +490,122 @@ def create_app(
             run = app.state.runs.get(run_id)
             if run is None:
                 raise HTTPException(status_code=404, detail="Run not found")
-            return {key: value for key, value in run.items() if key != "image_paths"}
+            return {
+                key: value for key, value in run.items()
+                if key != "image_paths" and not key.startswith("_")
+            }
+
+    @app.post("/api/v1/runs/{run_id}/blocks")
+    def create_run_blocks(run_id: str, request: CreateRunBlocks) -> dict:
+        if len(set(request.indices)) != len(request.indices):
+            raise HTTPException(status_code=422, detail="Point indices must be unique")
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            view = next((item for item in run["views"]
+                         if item["model_id"] == request.model_id
+                         and item["method"] == request.method), None)
+            if view is None:
+                raise HTTPException(status_code=404, detail="Projection view not found")
+            by_index = {int(point["index"]): point for point in view["points"]}
+            if any(index not in by_index for index in request.indices):
+                raise HTTPException(status_code=422, detail="Point index is outside this projection")
+            coordinates = np.asarray([
+                [by_index[index]["x"], by_index[index]["y"], by_index[index]["z"]]
+                for index in request.indices
+            ], dtype=np.float64)
+
+        from sklearn.cluster import KMeans
+
+        cluster_count = min(request.k, len(request.indices))
+        fitted = KMeans(n_clusters=cluster_count, n_init=4, random_state=42).fit(coordinates)
+        block_indices = [
+            [request.indices[row] for row, label in enumerate(fitted.labels_) if label == block_id]
+            for block_id in range(cluster_count)
+        ]
+        return {
+            "model_id": request.model_id,
+            "method": request.method,
+            "requested_k": request.k,
+            "effective_k": cluster_count,
+            "blocks": [
+                {"block_id": block_id, "count": len(indices), "indices": indices}
+                for block_id, indices in enumerate(block_indices) if indices
+            ],
+            "centers": [
+                {"block_id": block_id, "x": float(center[0]),
+                 "y": float(center[1]), "z": float(center[2])}
+                for block_id, center in enumerate(fitted.cluster_centers_)
+            ],
+        }
+
+    @app.post("/api/v1/runs/{run_id}/block-projection")
+    def create_block_projection(run_id: str, request: CreateBlockProjection) -> dict:
+        if len(set(request.indices)) != len(request.indices):
+            raise HTTPException(status_code=422, detail="Point indices must be unique")
+        requested_set = set(request.indices)
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            view = next((item for item in run["views"]
+                         if item["model_id"] == request.model_id
+                         and item["method"] == request.method), None)
+            if view is None:
+                raise HTTPException(status_code=404, detail="Projection view not found")
+            by_index = {int(point["index"]): point for point in view["points"]}
+            if any(index not in by_index for index in request.indices):
+                raise HTTPException(status_code=422, detail="Point index is outside this projection")
+            view_points = [by_index[index] for index in request.indices]
+            sources = run.get("_embedding_sources", {}).get(request.model_id, [])
+
+        projection_source = "projection"
+        coordinates = np.asarray([[point["x"], point["y"]] for point in view_points], dtype=np.float64)
+        if len(request.indices) > 2:
+            rows_by_index: dict[int, np.ndarray] = {}
+            cache_error = False
+            for source in sources:
+                source_indices = source.get("indices", [])
+                source_keys = source.get("keys", [])
+                needed = [(int(index), str(key)) for index, key in zip(source_indices, source_keys)
+                          if int(index) in requested_set]
+                if not needed:
+                    continue
+                try:
+                    with np.load(str(source["cache_path"]), allow_pickle=False) as cache:
+                        cache_keys = [str(key) for key in cache["keys"].tolist()]
+                        cache_rows = {key: row for row, key in enumerate(cache_keys)}
+                        embeddings = cache["embeddings"]
+                        for index, key in needed:
+                            if key not in cache_rows:
+                                cache_error = True
+                                break
+                            rows_by_index[index] = embeddings[cache_rows[key]]
+                except (OSError, KeyError, ValueError):
+                    cache_error = True
+                if cache_error:
+                    break
+            if not cache_error and all(index in rows_by_index for index in request.indices):
+                from sklearn.decomposition import PCA
+
+                raw = np.stack([rows_by_index[index] for index in request.indices])
+                coordinates = PCA(n_components=2, random_state=42).fit_transform(raw)
+                projection_source = "embedding_pca"
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Embedding cache is unavailable for this block. Run the analysis again.",
+                )
+        return {
+            "model_id": request.model_id,
+            "method": request.method,
+            "projection_source": projection_source,
+            "points": [
+                {"index": index, "x": float(point[0]), "y": float(point[1])}
+                for index, point in zip(request.indices, coordinates)
+            ],
+        }
 
     @app.get("/api/v1/runs/{run_id}/images/{index}")
     def get_run_image(run_id: str, index: int) -> Response:

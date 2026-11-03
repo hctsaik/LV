@@ -228,14 +228,20 @@ def run_image_classifier(
     embeddings_by_model: dict[str, np.ndarray] = {}
     projections_by_model: dict[str, dict[str, np.ndarray]] = {}
     embedding_shapes: dict[str, list[int]] = {}
+    embedding_sources: dict[str, list[dict[str, object]]] = {}
     warnings: list[str] = []
     labels = [str(record["label"]) for record in records]
+    record_index_by_path = {
+        str(Path(record["path"]).resolve()): index
+        for index, record in enumerate(records)
+    }
 
     for selected_model in selected_models:
         check_cancelled()
         embed_fn = model_loader(selected_model)
         all_embeddings: list[np.ndarray] = []
         all_keys: list[str] = []
+        model_sources: list[dict[str, object]] = []
         for folder in resolved_folders:
             paths = paths_by_folder.get(folder, [])
             if not paths:
@@ -245,6 +251,11 @@ def run_image_classifier(
             keys = [entries[rel_key(folder, path)]["sha256"] for path in paths]
             all_keys.extend(keys)
             cache_path = manifest_path_for(folder).parent / f"embeddings_{selected_model}" / "embeddings.npz"
+            model_sources.append({
+                "cache_path": str(cache_path.resolve()),
+                "indices": [record_index_by_path[str(path.resolve())] for path in paths],
+                "keys": keys,
+            })
 
             def on_item(done: int, _folder_total: int) -> None:
                 check_cancelled()
@@ -269,6 +280,7 @@ def run_image_classifier(
             raise VisualizationInputError("INVALID_EMBEDDINGS", "The selected model returned an empty embedding.")
         embeddings_by_model[selected_model] = raw
         embedding_shapes[selected_model] = [int(raw.shape[0]), int(raw.shape[1])]
+        embedding_sources[selected_model] = model_sources
         umap_reference_path = None
         if umap_reference and "umap" in selected_methods:
             from umap_ref import ref_path_for
@@ -338,4 +350,5 @@ def run_image_classifier(
         "embedding_nonzero": primary["embedding_nonzero"],
         "warnings": base_warnings + warnings,
         "image_paths": [Path(record["path"]).resolve() for record in records],
+        "_embedding_sources": embedding_sources,
     }

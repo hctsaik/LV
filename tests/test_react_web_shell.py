@@ -336,6 +336,62 @@ def test_case_lv_web_01_ic_03_rebuild_requires_fixed_umap_option(monkeypatch, tm
     assert response.json()["code"] == "INVALID_UMAP_REFERENCE"
 
 
+def test_case_lv_web_01_ic_04_kmeans_blocks_and_embedding_drilldown(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    with _client(monkeypatch, tmp_path, embedder=_fake_embedder()) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in classifier_fixture["folders"]],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["pca"],
+        })
+        assert job["state"] == "completed", job
+        run_response = client.get(f"/api/v1/runs/{job['run_id']}")
+        run = run_response.json()
+        assert not any(key.startswith("_") for key in run)
+
+        blocks_response = client.post(f"/api/v1/runs/{job['run_id']}/blocks", json={
+            "model_id": "dinov2_vits14",
+            "method": "pca",
+            "indices": [0, 1, 2, 3],
+            "k": 12,
+        })
+        invalid_index = client.post(f"/api/v1/runs/{job['run_id']}/blocks", json={
+            "model_id": "dinov2_vits14",
+            "method": "pca",
+            "indices": [0, 999],
+            "k": 4,
+        })
+        duplicate_index = client.post(f"/api/v1/runs/{job['run_id']}/blocks", json={
+            "model_id": "dinov2_vits14",
+            "method": "pca",
+            "indices": [0, 0],
+            "k": 4,
+        })
+        projection_response = client.post(f"/api/v1/runs/{job['run_id']}/block-projection", json={
+            "model_id": "dinov2_vits14",
+            "method": "pca",
+            "indices": [0, 1, 2],
+        })
+
+    assert blocks_response.status_code == 200, blocks_response.text
+    blocks = blocks_response.json()
+    assert blocks["effective_k"] == 4
+    flattened = [index for block in blocks["blocks"] for index in block["indices"]]
+    assert sorted(flattened) == [0, 1, 2, 3]
+    assert all(block["count"] == len(block["indices"]) for block in blocks["blocks"])
+    assert all(np.isfinite([center["x"], center["y"], center["z"]]).all()
+               for center in blocks["centers"])
+    assert invalid_index.status_code == 422
+    assert duplicate_index.status_code == 422
+    assert projection_response.status_code == 200, projection_response.text
+    projection = projection_response.json()
+    assert projection["projection_source"] == "embedding_pca"
+    assert [point["index"] for point in projection["points"]] == [0, 1, 2]
+    assert all(np.isfinite([point["x"], point["y"]]).all()
+               for point in projection["points"])
+
+
 def test_case_lv_web_01_ic_02_single_class_supervision_falls_back_to_pca(
     monkeypatch, tmp_path
 ):

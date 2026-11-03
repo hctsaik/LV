@@ -345,6 +345,126 @@ def test_lv_web_01_ic_01_cancel_is_visible_in_react(tmp_path: Path, monkeypatch:
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_ic_04_kmeans_block_selection_round_trips_across_dimensions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The React 3D block labels drill into 2D selection and keep the prior selection."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    dataset = _fixture(tmp_path / "kmeans-block-fixture")
+    colors = [
+        (210, 35, 45), (200, 45, 55), (220, 30, 40),
+        (35, 190, 70), (45, 200, 60), (30, 180, 80),
+        (35, 65, 215), (45, 75, 205), (25, 55, 225),
+        (210, 180, 25), (220, 170, 35), (200, 190, 15),
+    ]
+    for index, color in enumerate(colors, start=5):
+        folder = dataset / ("test" if index % 4 == 0 else "train") / ("apple" if index % 2 else "banana")
+        folder.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32), color).save(folder / f"block-image-{index:02}.png")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "lv-app-cache"))
+
+    def model_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = len(path.name) / 10.0
+            return vector
+        return embed
+
+    application = create_app(model_catalog=lambda: ["dinov2_vits14"], model_loader=model_loader)
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            block_responses = []
+
+            def capture_blocks(response):
+                if response.url.endswith("/blocks"):
+                    block_responses.append(response)
+
+            page.on("response", capture_blocks)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(16)
+
+            page.get_by_test_id("embedding-point").nth(0).click()
+            expect(page.get_by_test_id("selection-summary")).to_have_text("Selected 1 images")
+            page.get_by_test_id("dimension-3d").click()
+            expect(page.get_by_test_id("block-choice")).to_be_visible(timeout=60_000)
+            deadline = time.monotonic() + 20
+            while not block_responses and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert block_responses, [
+                (response.status, response.url) for response in block_responses
+            ]
+            assert block_responses[-1].ok, block_responses[-1].text()
+            blocks_result = block_responses[-1].json()
+            plot3d = page.locator("[data-testid='embedding-plot-3d'] .js-plotly-plot")
+            expect(plot3d).to_be_visible()
+            label_count = plot3d.evaluate("el => el._fullLayout.scene.annotations.length")
+            assert label_count == blocks_result["effective_k"]
+            expect(page.get_by_test_id("selection-summary")).to_have_text("Selected 1 images")
+
+            selected_block = next(
+                block for block in blocks_result["blocks"]
+                if 0 not in block["indices"] and block["count"] > 1
+            )
+            page.get_by_test_id("block-choice").select_option(str(selected_block["block_id"]))
+            expect(page.get_by_test_id("block-selection-plot")).to_be_visible(timeout=60_000)
+            plot2d = page.locator("[data-testid='block-selection-plot'] .js-plotly-plot")
+            box = plot2d.bounding_box()
+            assert box is not None
+            page.mouse.move(box["x"] + 55, box["y"] + 60)
+            page.mouse.down()
+            page.mouse.move(box["x"] + box["width"] - 35, box["y"] + box["height"] - 45, steps=8)
+            page.mouse.up()
+            expect(page.get_by_test_id("selection-summary")).to_have_text("Selected 2 images", timeout=10_000)
+            plot2d.locator('.modebar-btn[data-title="Lasso Select"]').first.click()
+            drag = plot2d.locator(".nsewdrag")
+            drag_box = drag.bounding_box()
+            assert drag_box is not None
+            lasso_path = [
+                (drag_box["x"] + 2, drag_box["y"] + 2),
+                (drag_box["x"] + drag_box["width"] - 2, drag_box["y"] + 2),
+                (drag_box["x"] + drag_box["width"] - 2, drag_box["y"] + drag_box["height"] - 2),
+                (drag_box["x"] + 2, drag_box["y"] + drag_box["height"] - 2),
+                (drag_box["x"] + 2, drag_box["y"] + 2),
+            ]
+            page.mouse.move(*lasso_path[0])
+            page.mouse.down()
+            for x, y in lasso_path[1:]:
+                page.mouse.move(x, y, steps=8)
+            page.mouse.up()
+            expect(page.get_by_test_id("selection-summary")).to_have_text(
+                f"Selected {selected_block['count'] + 1} images", timeout=10_000
+            )
+            page.get_by_test_id("dimension-2d").click()
+            expect(page.get_by_test_id("selection-summary")).to_have_text(
+                f"Selected {selected_block['count'] + 1} images"
+            )
+            page.get_by_role("button", name="Clear selection").click()
+            expect(page.get_by_test_id("selection-summary")).to_have_text("Selected 0 images")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
 def test_lv_web_02_img_01_visible_compare_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Visible React whole-image A/B controls, projections and image readback.
 

@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的 React UI/API 邊界與分期切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier 整圖與固定 UMAP reference 切片，以及 LV-WEB-02 Compare Distributions 整圖 A/B 的部分實作；各 journey 是否完成，依 case inventory 的證據狀態判定。
+> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽切片，以及 LV-WEB-02 Compare Distributions 整圖 A/B 的部分實作；各 journey 是否完成，依 case inventory 的證據狀態判定。
 
 ## 1. 邊界
 
@@ -23,6 +23,8 @@
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
+| `POST /api/v1/runs/{run_id}/blocks` | 對目前投影的可見 record indices 執行 KMeans | K（4–30）、非空 block membership 與 3D centers；不足樣本時降低 effective K |
+| `POST /api/v1/runs/{run_id}/block-projection` | 將選定 block 的原始 embedding 投影到 2D | 只回 record index 與 PCA 座標；cache 路徑及 embedding 不回給 UI |
 | `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案 |
 | `POST /api/v1/compare/jobs` | 建立整圖 A/B comparison job | Folder A／B 各一至 32 個資料夾、LV feature model；同側影像合併並去重 |
 | `GET /api/v1/compare/jobs/{job_id}` / `DELETE /api/v1/compare/jobs/{job_id}` | 讀進度／要求取消 | 共用單一 worker 槽，回報結果 ID 或可恢復錯誤 |
@@ -43,6 +45,12 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 4. 2D 使用 SVG 散點；3D 使用隨使用者切換才載入的本機 Plotly bundle，點選與鍵盤輔助操作都能讀回同一 run record。投影維度不足時缺少的座標軸補零。點座標與記錄同序；run ID 變更時清空舊選取。跨工具暫存由各後續 case 定義。
 5. 使用者點選／框選只傳 record index 和 run ID；後端驗證索引，UI 顯示相同 label、split、檔名和原圖。
 
+### LV-WEB-01-IC-04 — 3D KMeans block navigation
+
+- 3D 檢視依目前 split／class 篩選後的投影點，以 `KMeans(n_init=4, random_state=42)` 分成最多 K 塊；中心以 `#block_id` 標在 Plotly 3D scene，區塊選單只列非空群及點數。
+- 選一塊後，worker 從 app-side embedding cache 讀取該模型的原始向量，沿用 legacy `PCA(n_components=2, random_state=42)` 展開成 2D。小於 3 點時沿用投影的 x/y。
+- 2D 區塊圖支援 Plotly 點選、box 與 lasso。新選取 record indices 併入既有選取；切 2D／3D 不清掉選取，只有明確 Clear selection 會清除。run state 對 UI 只回 record IDs 與座標，不回本機 cache path 或原始 embeddings。
+
 ### LV-WEB-02-IMG-01 — Image-level Compare Distributions
 
 - 兩側各接受一至 32 個資料夾；同一側依選取順序合併，重複路徑／圖片去重。每個根資料夾先使用 `compare_distributions.get_image_paths` 的直接 JPG／JPEG／PNG 全域排序；若該根沒有直接圖片，才遞迴搜尋子資料夾並略過 embedding、crop、thumbnail cache。壞檔略過並顯示警告。
@@ -60,13 +68,14 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 
 ## 5. React 驗收契約
 
-**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03**。前置：凍結 LV source revision/profile、DINOv2-small 權重 SHA-256 `b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9`、固定 Image Classifier fixture、`LV_CACHE_DIR` 指向隔離位置。
+**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04**。前置：凍結 LV source revision/profile、DINOv2-small 權重 SHA-256 `b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9`、固定 Image Classifier fixture、`LV_CACHE_DIR` 指向隔離位置。
 
 - 選 fixture 資料夾、DINOv2-small、PCA，按 Run；UI 顯示 4 個點，API 向量 shape 為 4×384 且值有限、非零。PCA 維度遵循原 Streamlit 主流程 `min(3, max(1, n-2))`，小於 2 維時補零軸。
 - IC-02 對每個選取模型分別驗證 embedding cache、shape 和點索引一致；切換已產生的投影及 2D／3D 後，類別／split 與每個點的原始影像對應不變。UMAP 跨 run 固定參考座標另由 IC-03 驗收。
 - 類別／split 和每個點的原始影像對應與 Streamlit 基準一致；點選結果顯示相同檔案，不得僅以圖表存在或 API 200 判定。
 - 同一輸入重跑使用 LV manifest SHA-256 作為 embedding cache key，結果順序和語義一致；來源圖片與 fixture hash 不變，manifest／embedding 寫入只發生在隔離 `LV_CACHE_DIR`。
 - IC-03：開啟固定 UMAP 參考系後，首次執行建立 reference；相同資料重跑時舊點座標不變；加入新圖片時舊點仍不變且新點由既有 reducer 轉換；手動重建會在下一次執行重 fit。驗證 reference 僅寫入隔離 `LV_CACHE_DIR`，來源 fixture 不含 `umap_ref.pkl`。目前 deterministic feature 與可見 React E2E 證明 UI/API/UMAP reducer 流程，尚未證明真實模型的數值 parity 或 NativeApp host 流程。
+- IC-04：在可見 3D chart 檢查 KMeans center labels；選定非空 block 後，2D box/lasso 把命中的 record indices 加入既有多選；確認切 2D／3D 後選取數和 record 身分一致，Clear selection 才清除；block API 不回原始向量或 cache path。`test_case_lv_web_01_ic_04_kmeans_blocks_and_embedding_drilldown` 與 `test_lv_web_01_ic_04_kmeans_block_selection_round_trips_across_dimensions` 使用 deterministic features，證明 React/API 接線與既有 PCA/KMeans 行為，尚未證明真實模型或 NativeApp parity。
 - 模型缺失、空資料夾和取消須呈現可恢復狀態；不回報成功或改用假的 backend。worker 關閉與 NativeApp lifecycle 由 AC6 驗收。
 - 新 worker PID 讀取相同 run 若有持久結果時必須一致；尚未列入保存語義的暫存 run 不宣稱跨重啟持久。
 
@@ -74,4 +83,4 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 
 ## 6. 未涵蓋
 
-Object Detector 整圖／物件粒度、Compare 物件級旅程、資料集變更與撤銷、散點框選完整交互、其它八個頂層工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Object Detector 整圖／物件粒度、Compare 物件級旅程、資料集變更與撤銷、其它工具各自的散點／縮圖／handoff 交互、另外八個頂層工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。

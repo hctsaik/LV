@@ -52,6 +52,24 @@ export type VisualizationRun = {
   warnings: string[];
 };
 
+export type KMeansBlock = { block_id: number; count: number; indices: number[] };
+export type KMeansCenter = { block_id: number; x: number; y: number; z: number };
+export type KMeansBlocks = {
+  model_id: string;
+  method: ProjectionMethod;
+  requested_k: number;
+  effective_k: number;
+  blocks: KMeansBlock[];
+  centers: KMeansCenter[];
+};
+export type BlockProjectionPoint = { index: number; x: number; y: number };
+export type BlockProjection = {
+  model_id: string;
+  method: ProjectionMethod;
+  projection_source: "embedding_pca" | "projection";
+  points: BlockProjectionPoint[];
+};
+
 export type ComparePoint = {
   group: "a" | "b";
   index: number;
@@ -115,6 +133,25 @@ export const api = {
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
   ),
+  runBlocks: (
+    runId: string,
+    modelId: string,
+    method: ProjectionMethod,
+    indices: number[],
+    k: number,
+  ) => request<KMeansBlocks>("/api/v1/runs/" + encodeURIComponent(runId) + "/blocks", {
+    method: "POST",
+    body: JSON.stringify({ model_id: modelId, method, indices, k }),
+  }),
+  blockProjection: (
+    runId: string,
+    modelId: string,
+    method: ProjectionMethod,
+    indices: number[],
+  ) => request<BlockProjection>("/api/v1/runs/" + encodeURIComponent(runId) + "/block-projection", {
+    method: "POST",
+    body: JSON.stringify({ model_id: modelId, method, indices }),
+  }),
   createCompareJob: (foldersA: string[], foldersB: string[], modelId: string) =>
     request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
       method: "POST",

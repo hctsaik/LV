@@ -2,6 +2,8 @@ import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   api,
   type EmbeddingPoint,
+  type KMeansBlocks,
+  type BlockProjection,
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
@@ -9,6 +11,9 @@ import {
 } from "./api";
 import Compare from "./Compare";
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
+const LazyBlockSelectionPlot = lazy(() => import("./ScatterPlot3D").then((module) => ({
+  default: module.BlockSelectionPlot,
+})));
 
 const labelColors = ["#4976d0", "#e08144", "#38a27c", "#9a6cc3", "#c95567", "#718096"];
 const projectionOptions: { value: ProjectionMethod; label: string }[] = [
@@ -28,9 +33,9 @@ function colorMap(points: EmbeddingPoint[]) {
   return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
 }
 
-function ScatterPlot2D({ points, selectedIndex, onSelect }: {
+function ScatterPlot2D({ points, selectedIndices, onSelect }: {
   points: EmbeddingPoint[];
-  selectedIndex: number | null;
+  selectedIndices: number[];
   onSelect: (index: number) => void;
 }) {
   const width = 860;
@@ -45,6 +50,7 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
   const xSpan = xMax - xMin || 1;
   const ySpan = yMax - yMin || 1;
   const colors = colorMap(points);
+  const selected = new Set(selectedIndices);
 
   return (
     <div className="plot-frame" data-testid="embedding-plot">
@@ -57,7 +63,7 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
           const x = padding + ((point.x - xMin) / xSpan) * (width - padding * 2);
           const y = height - padding - ((point.y - yMin) / ySpan) * (height - padding * 2);
           const color = colors.get(point.label) || labelColors[0];
-          const active = selectedIndex === point.index;
+          const active = selected.has(point.index);
           const shape = point.split.toLowerCase() === "test" ? (
             <rect x={-7} y={-7} width={14} height={14} rx={2} fill={color} />
           ) : point.split.toLowerCase() === "valid" ? (
@@ -91,9 +97,10 @@ function ScatterPlot2D({ points, selectedIndex, onSelect }: {
   );
 }
 
-function ScatterPlot({ points, selectedIndex, onSelect, dimension, viewKey }: {
+function ScatterPlot({ points, selectedIndices, clusters, onSelect, dimension, viewKey }: {
   points: EmbeddingPoint[];
-  selectedIndex: number | null;
+  selectedIndices: number[];
+  clusters: KMeansBlocks | null;
   onSelect: (index: number) => void;
   dimension: 2 | 3;
   viewKey: string;
@@ -101,11 +108,11 @@ function ScatterPlot({ points, selectedIndex, onSelect, dimension, viewKey }: {
   if (dimension === 3) {
     return (
       <Suspense fallback={<div className="plot-frame plot-loading" role="status">Loading 3D plot…</div>}>
-        <LazyScatterPlot3D points={points} selectedIndex={selectedIndex} onSelect={onSelect} viewKey={viewKey} />
+        <LazyScatterPlot3D points={points} selectedIndices={selectedIndices} clusters={clusters} onSelect={onSelect} viewKey={viewKey} />
       </Suspense>
     );
   }
-  return <ScatterPlot2D points={points} selectedIndex={selectedIndex} onSelect={onSelect} />;
+  return <ScatterPlot2D points={points} selectedIndices={selectedIndices} onSelect={onSelect} />;
 }
 
 export default function App() {
@@ -126,6 +133,13 @@ export default function App() {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [blockCount, setBlockCount] = useState(12);
+  const [selectedBlockId, setSelectedBlockId] = useState<number | null>(null);
+  const [blocks, setBlocks] = useState<KMeansBlocks | null>(null);
+  const [blockProjection, setBlockProjection] = useState<BlockProjection | null>(null);
+  const [blocksLoading, setBlocksLoading] = useState(false);
+  const [blocksError, setBlocksError] = useState("");
   const [labelFilter, setLabelFilter] = useState("all");
   const [splitFilter, setSplitFilter] = useState("all");
   const [error, setError] = useState("");
@@ -178,6 +192,54 @@ export default function App() {
   const labels = useMemo(() => [...new Set(run?.records.map((record) => record.label) || [])].sort(), [run]);
   const splits = useMemo(() => [...new Set(run?.records.map((record) => record.split) || [])].sort(), [run]);
   const selectedRecord = selectedIndex === null ? null : run?.records[selectedIndex] || null;
+  const selectedBlock = blocks?.blocks.find((block) => block.block_id === selectedBlockId) || null;
+
+  useEffect(() => {
+    const runId = job?.run_id;
+    if (dimension !== 3 || !run || !runId || !currentView || !currentRecords.length) {
+      setBlocks(null);
+      setBlockProjection(null);
+      setBlocksLoading(false);
+      setBlocksError("");
+      return;
+    }
+    let active = true;
+    setBlocks(null);
+    setBlockProjection(null);
+    setBlocksLoading(true);
+    setBlocksError("");
+    api.runBlocks(runId, activeModelId, currentView.method, currentRecords.map((point) => point.index), blockCount)
+      .then((result) => {
+        if (!active) return;
+        setBlocks(result);
+        setSelectedBlockId((current) =>
+          result.blocks.some((block) => block.block_id === current)
+            ? current
+            : result.blocks[0]?.block_id ?? null,
+        );
+      })
+      .catch((reason: unknown) => {
+        if (active) setBlocksError(reason instanceof Error ? reason.message : "Unable to partition the visible points.");
+      })
+      .finally(() => active && setBlocksLoading(false));
+    return () => { active = false; };
+  }, [dimension, run, job?.run_id, currentView, currentRecords, activeModelId, blockCount]);
+
+  useEffect(() => {
+    const runId = job?.run_id;
+    if (dimension !== 3 || !runId || !selectedBlock || !currentView) {
+      setBlockProjection(null);
+      return;
+    }
+    let active = true;
+    setBlockProjection(null);
+    api.blockProjection(runId, activeModelId, currentView.method, selectedBlock.indices)
+      .then((result) => active && setBlockProjection(result))
+      .catch((reason: unknown) => {
+        if (active) setBlocksError(reason instanceof Error ? reason.message : "Unable to open this KMeans block.");
+      });
+    return () => { active = false; };
+  }, [dimension, job?.run_id, selectedBlock, currentView, activeModelId]);
 
   function addFolder(value = folderDraft) {
     const path = value.trim();
@@ -240,6 +302,10 @@ export default function App() {
     setNotice("");
     setRun(null);
     setSelectedIndex(null);
+    setSelectedIndices([]);
+    setSelectedBlockId(null);
+    setBlocks(null);
+    setBlockProjection(null);
     setLabelFilter("all");
     setSplitFilter("all");
     setDimension(2);
@@ -305,6 +371,22 @@ export default function App() {
     if (!available.some((view) => view.method === activeMethod) && available[0]) {
       setActiveMethod(available[0].method);
     }
+  }
+
+  function selectPoint(index: number) {
+    setSelectedIndex(index);
+    setSelectedIndices([index]);
+  }
+
+  function addBlockSelection(indices: number[]) {
+    if (!indices.length) return;
+    setSelectedIndices((current) => [...new Set([...current, ...indices])]);
+    setSelectedIndex(indices[indices.length - 1]);
+  }
+
+  function clearSelection() {
+    setSelectedIndex(null);
+    setSelectedIndices([]);
   }
 
   return (
@@ -491,17 +573,62 @@ export default function App() {
                 {currentRecords.length ? (
                   <ScatterPlot
                     points={currentRecords}
-                    selectedIndex={selectedIndex}
-                    onSelect={setSelectedIndex}
+                    selectedIndices={selectedIndices}
+                    clusters={blocks}
+                    onSelect={selectPoint}
                     dimension={dimension}
                     viewKey={activeModelId + "-" + currentView.method + "-" + splitFilter + "-" + labelFilter}
                   />
                 ) : <div className="empty-filter">No images match these filters.</div>}
+                {dimension === 3 && (
+                  <section className="block-explorer" data-testid="block-explorer" aria-label="KMeans block explorer">
+                    <div className="block-explorer-heading">
+                      <div><strong>Explore KMeans blocks</strong><small>Choose a 3D block, then add points with a 2D box or lasso.</small></div>
+                      {blocks && <span data-testid="block-effective-count">{blocks.effective_k} blocks</span>}
+                    </div>
+                    <label className="block-count-control">
+                      <span>Block count K <strong data-testid="block-count-value">{blockCount}</strong></span>
+                      <input aria-label="Block count K" type="range" min={4} max={30} step={1} value={blockCount}
+                        onChange={(event) => setBlockCount(Number(event.target.value))} />
+                    </label>
+                    {blocksLoading && <div className="block-loading" role="status">Partitioning visible points…</div>}
+                    {blocksError && <div className="alert alert-error" role="alert">{blocksError}</div>}
+                    {blocks?.blocks.length ? (
+                      <>
+                        <label className="block-picker-label"><span>Enter block → 2D box/lasso</span>
+                          <select aria-label="Enter block for 2D selection" data-testid="block-choice"
+                            value={selectedBlockId ?? ""}
+                            onChange={(event) => setSelectedBlockId(Number(event.target.value))}>
+                            {blocks.blocks.map((block) => (
+                              <option key={block.block_id} value={block.block_id}>
+                                #{block.block_id} ({block.count})
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        {selectedBlock && (
+                          <>
+                            <div className="block-selection-summary" data-testid="block-selection-summary">
+                              Selected {selectedIndices.length} images · block #{selectedBlock.block_id} has {selectedBlock.count}
+                            </div>
+                            {blockProjection ? (
+                              <Suspense fallback={<div className="plot-loading" role="status">Opening block…</div>}>
+                                <LazyBlockSelectionPlot points={blockProjection.points}
+                                  selectedIndices={selectedIndices} onAddSelection={addBlockSelection} />
+                              </Suspense>
+                            ) : <div className="block-loading" role="status">Preparing block projection…</div>}
+                          </>
+                        )}
+                      </>
+                    ) : !blocksLoading && !blocksError && <div className="block-loading">No visible points are available for clustering.</div>}
+                  </section>
+                )}
                 <div className="plot-legend">
                   {labels.map((label) => <span key={label}><i style={{ background: colorMap(currentView.points).get(label) || labelColors[0] }} />{label}</span>)}
                   <span className="legend-separator" />
                   <small>● train　■ test　◆ valid</small>
-                  {selectedIndex !== null && <button type="button" className="clear-selection" onClick={() => setSelectedIndex(null)}>Clear selection</button>}
+                  <span data-testid="selection-summary" className="selection-summary">Selected {selectedIndices.length} images</span>
+                  {selectedIndices.length > 0 && <button type="button" className="clear-selection" onClick={clearSelection}>Clear selection</button>}
                 </div>
               </section>
 
