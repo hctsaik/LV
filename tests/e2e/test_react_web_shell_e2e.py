@@ -1634,6 +1634,112 @@ def test_lv_web_03_img_01_visible_coverage_projection_box_selection_and_clear(
     }
 
 
+def test_lv_web_03_img_01_real_model_visible_streamlit_sparsity_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The visible React coverage run preserves the legacy high-dimensional sparsity values."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from interaction import compute_outlier_scores
+
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
+    dataset = _fixture(tmp_path / "coverage-real-model")
+    folders = [dataset / "train", dataset / "test"]
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for folder in folders
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "coverage-real-cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            for folder in folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+            expect(page.get_by_label("Feature model")).to_have_value("dinov2_vits14")
+            page.get_by_label("Projection method").select_option("pca")
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text("Completed", timeout=300_000)
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("4")
+            expect(page.get_by_test_id("coverage-class-legend-item")).to_have_count(2)
+
+            with application.state.lock:
+                assert len(application.state.coverage_runs) == 1
+                run_id, stored_run = next(iter(application.state.coverage_runs.items()))
+                run = dict(stored_run)
+                vectors = application.state.coverage_embeddings[run_id].copy()
+            assert vectors.shape == (4, 384)
+            assert run["embedding_shape"] == [4, 384]
+            assert {record["label"] for record in run["records"]} == {"apple", "banana"}
+            assert {record["split"] for record in run["records"]} == {"train", "test"}
+
+            # Streamlit's _cov_sparsity delegates to this legacy distance helper.
+            expected_default = compute_outlier_scores(
+                vectors, vectors, k=run["k"], candidates_in_reference=True,
+            )
+            np.testing.assert_allclose(run["sparsity"], expected_default, rtol=1e-7, atol=1e-8)
+            public_run_response = page.request.get(f"{base_url}/api/v1/coverage/runs/{run_id}")
+            assert public_run_response.status == 200
+            public_run = public_run_response.json()
+            np.testing.assert_allclose(public_run["sparsity"], expected_default, rtol=1e-7, atol=1e-8)
+            assert "image_paths" not in public_run
+
+            page.locator("input[name='coverage-color-mode'][value='sparsity']").check()
+            expect(page.locator(".coverage-legend-gradient")).to_be_visible()
+            with page.expect_response(lambda response: response.url.endswith("/sparsity")
+                                      and response.request.method == "POST" and response.ok) as sparsity_response:
+                page.get_by_test_id("coverage-k").fill("2")
+            changed = sparsity_response.value.json()
+            expected_k2 = compute_outlier_scores(
+                vectors, vectors, k=2, candidates_in_reference=True,
+            )
+            assert changed["k"] == 2
+            np.testing.assert_allclose(changed["scores"], expected_k2, rtol=1e-7, atol=1e-8)
+            expect(page.get_by_test_id("coverage-k-summary")).to_have_text("2")
+
+            page.get_by_test_id("coverage-selection-mode-box").click()
+            plot = page.locator("[data-testid='coverage-plot'] .js-plotly-plot")
+            bounds = plot.bounding_box()
+            assert bounds is not None
+            page.mouse.move(bounds["x"] + 58, bounds["y"] + 20)
+            page.mouse.down()
+            page.mouse.move(bounds["x"] + bounds["width"] - 18,
+                            bounds["y"] + bounds["height"] - 45, steps=8)
+            page.mouse.up()
+            expect(page.get_by_test_id("coverage-selected-count")).to_contain_text("selected")
+            selected = page.get_by_test_id("coverage-selected-image").first
+            expect(selected).to_be_visible()
+            thumbnail_src = selected.locator("img").get_attribute("src")
+            assert thumbnail_src and page.request.get(base_url + thumbnail_src).status == 200
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }, "real-model coverage changed the source dataset"
+
+
 def test_lv_web_03_attr_01_visible_attribute_grid_calibration_and_candidate_mining(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
