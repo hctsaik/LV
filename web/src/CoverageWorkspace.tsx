@@ -7,6 +7,7 @@ import type {
   CoverageCandidateViewInput,
   CoverageCandidateWorkRecord,
   CoverageRun,
+  ComparisonObjectPolicy,
   JobStatus,
   ModelOption,
   ProjectionMethod,
@@ -30,6 +31,8 @@ const projectionOptions: Array<{ value: ProjectionMethod; label: string }> = [
   { value: "lda", label: "LDA (supervised)" },
   { value: "sumap", label: "Supervised UMAP" },
 ];
+const defaultObjectPolicy: ComparisonObjectPolicy = { pad: 0.12, target_res: 224, head: "cls" };
+const objectPolicyResolutions: ComparisonObjectPolicy["target_res"][] = [168, 196, 224, 280, 336, 392, 448];
 
 function pause(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -64,6 +67,10 @@ export default function CoverageWorkspace({
   const [method, setMethod] = useState<ProjectionMethod>("sumap");
   const [dimension, setDimension] = useState<2 | 3>(2);
   const [k, setK] = useState(10);
+  const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>(defaultObjectPolicy);
+  const [objectPolicyDraft, setObjectPolicyDraft] = useState<ComparisonObjectPolicy>(defaultObjectPolicy);
+  const [objectPolicySubmitting, setObjectPolicySubmitting] = useState(false);
+  const [objectPolicyJob, setObjectPolicyJob] = useState<JobStatus | null>(null);
   const [blockK, setBlockK] = useState(8);
   const [classFilter, setClassFilter] = useState("");
   const [minShortPx, setMinShortPx] = useState(0);
@@ -115,6 +122,8 @@ export default function CoverageWorkspace({
   const selectedCandidatePoints = useMemo(() => candidatePoints
     .filter((point) => selectedCandidateIndices.includes(point.index)),
   [candidatePoints, selectedCandidateIndices]);
+  const objectPolicyTuning = objectPolicySubmitting || (objectPolicyJob !== null
+    && ["queued", "running", "cancelling"].includes(objectPolicyJob.state));
 
   function objectViewInput(overrides: Partial<CoverageObjectViewInput> = {}): CoverageObjectViewInput {
     return {
@@ -217,6 +226,10 @@ export default function CoverageWorkspace({
       if (result.canceled) return;
       const chosen = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
       if (!chosen.length) throw new Error("The host did not return a folder path.");
+      if (result.grant_id && chosen.length !== 1) {
+        throw new Error("Choose one folder at a time so NativeApp can scope its permission.");
+      }
+      if (result.grant_id) api.rememberFolderGrant(chosen[0], result.grant_id);
       chosen.forEach((path) => addFolder(path));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The folder picker failed.");
@@ -244,16 +257,98 @@ export default function CoverageWorkspace({
       if (result.canceled) return;
       const chosen = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
       if (!chosen.length) throw new Error("The host did not return a folder path.");
+      if (result.grant_id && chosen.length !== 1) {
+        throw new Error("Choose one folder at a time so NativeApp can scope its permission.");
+      }
+      if (result.grant_id) api.rememberFolderGrant(chosen[0], result.grant_id);
       chosen.forEach((path) => addCandidateFolder(path));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The candidate folder picker failed.");
     }
   }
 
+  async function runObjectPolicyAutotune() {
+    if (!folders.length || !modelId) return;
+    setError("");
+    setNotice("");
+    setObjectPolicyJob(null);
+    setObjectPolicySubmitting(true);
+    try {
+      const created = await api.createObjectPolicyAutotuneJob({
+        folders,
+        folderGrantIds: api.folderGrantIds(folders),
+        classNames: [],
+        modelId,
+      });
+      setObjectPolicyJob({
+        job_id: created.job_id,
+        state: "queued",
+        phase: "queued",
+        done: 0,
+        total: 0,
+        percent: 0,
+        message: "Waiting to start",
+        run_id: null,
+        error: null,
+        can_cancel: true,
+      });
+      let latest: JobStatus | null = null;
+      const deadline = Date.now() + 10 * 60_000;
+      while (Date.now() < deadline) {
+        latest = await api.job(created.job_id);
+        setObjectPolicyJob(latest);
+        if (["completed", "failed", "cancelled"].includes(latest.state)) break;
+        await pause(350);
+      }
+      if (!latest || !["completed", "failed", "cancelled"].includes(latest.state)) {
+        throw new Error("Object policy tuning is taking too long. Cancel it and retry with a smaller dataset.");
+      }
+      if (latest.state === "failed") throw new Error(latest.error?.message || "Object policy tuning failed.");
+      if (latest.state === "cancelled") {
+        setNotice("Object policy tuning cancelled.");
+        return;
+      }
+      if (!latest.result) throw new Error("The worker completed without returning tuning results.");
+      setObjectPolicy(latest.result.best_policy);
+      setObjectPolicyDraft(latest.result.best_policy);
+      setNotice("Applied the best object crop policy. Run coverage analysis to use it.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Object policy tuning failed.");
+    } finally {
+      setObjectPolicySubmitting(false);
+    }
+  }
+
+  async function cancelObjectPolicyAutotune() {
+    if (!objectPolicyJob?.job_id) return;
+    try {
+      await api.cancel(objectPolicyJob.job_id);
+      setObjectPolicyJob((current) => current
+        ? { ...current, state: "cancelling", message: "Cancellation requested" }
+        : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not cancel object policy tuning.");
+    }
+  }
+
+  function applyManualObjectPolicy() {
+    const policy = {
+      ...objectPolicyDraft,
+      pad: Math.max(0, Math.min(0.5, Number(objectPolicyDraft.pad))),
+    };
+    setObjectPolicy(policy);
+    setObjectPolicyDraft(policy);
+    setNotice("Applied the manual object crop policy. Run coverage analysis to use it.");
+  }
+
   async function startAnalysis(event: FormEvent) {
     event.preventDefault();
     setError("");
     setNotice("");
+    if (objectPolicyTuning) {
+      setError("Wait for object policy tuning to finish before starting coverage analysis.");
+      return;
+    }
     if (candidateBusy) {
       setError("Wait for candidate analysis to finish before starting another coverage run.");
       return;
@@ -283,7 +378,10 @@ export default function CoverageWorkspace({
     setJob(null);
     setSelectedIndices([]);
     try {
-      const created = await api.createCoverageJob(folders, modelId, unit, method, dimension, k);
+      const created = await api.createCoverageJob(folders, modelId, unit, method, dimension, k, {
+        folderGrantIds: api.folderGrantIds(folders),
+        ...(unit === "object" ? { objectPolicy } : {}),
+      });
       let status: JobStatus | null = null;
       const deadline = Date.now() + 10 * 60_000;
       while (Date.now() < deadline) {
@@ -312,6 +410,10 @@ export default function CoverageWorkspace({
         });
       }
       setRun(coverageRun);
+      if (coverageRun.object_policy) {
+        setObjectPolicy(coverageRun.object_policy);
+        setObjectPolicyDraft(coverageRun.object_policy);
+      }
       setViewMode("embedding");
       setObjectView(initialObjectView);
       setUnit(coverageRun.unit);
@@ -344,6 +446,10 @@ export default function CoverageWorkspace({
 
   async function startCandidateAnalysis() {
     if (!run || !candidateFolders.length || !connected) return;
+    if (objectPolicyTuning) {
+      setError("Wait for object policy tuning to finish before projecting candidates.");
+      return;
+    }
     setError("");
     setNotice("");
     invalidateCandidateView(true);
@@ -351,7 +457,11 @@ export default function CoverageWorkspace({
     setCandidateJob(null);
     setCandidateBusy(true);
     try {
-      const created = await api.createCoverageCandidateJob(run.run_id, candidateFolders);
+      const created = await api.createCoverageCandidateJob(
+        run.run_id,
+        candidateFolders,
+        api.folderGrantIds(candidateFolders),
+      );
       let status: JobStatus | null = null;
       const deadline = Date.now() + 10 * 60_000;
       while (Date.now() < deadline) {
@@ -527,7 +637,7 @@ export default function CoverageWorkspace({
         <form onSubmit={(event) => void startAnalysis(event)}>
           <section className="control-section">
             <div className="section-heading"><span className="step-number">01</span><h2>Image folders</h2></div>
-            <button className="host-picker" type="button" onClick={() => void chooseFolder()}>
+            <button className="host-picker" type="button" onClick={() => void chooseFolder()} disabled={busy || objectPolicyTuning}>
               <span className="folder-icon" aria-hidden="true">▱</span>
               Choose folder from device
               <span className="picker-hint">Native</span>
@@ -542,8 +652,9 @@ export default function CoverageWorkspace({
                 onKeyDown={(event) => event.key === "Enter" && (event.preventDefault(), addFolder())}
                 placeholder="Paste a local folder path"
                 autoComplete="off"
+                disabled={busy || objectPolicyTuning}
               />
-              <button type="button" className="add-folder" onClick={() => addFolder()} aria-label="Add coverage folder">+</button>
+              <button type="button" className="add-folder" onClick={() => addFolder()} aria-label="Add coverage folder" disabled={busy || objectPolicyTuning}>+</button>
             </div>
             {folders.length > 0 && (
               <ul className="folder-list" aria-label="Coverage folders">
@@ -551,7 +662,7 @@ export default function CoverageWorkspace({
                   <li key={folder} title={folder}>
                     <span className="folder-chip-dot" />
                     <span className="folder-chip-name">{folder.split(/[\\/]/).filter(Boolean).at(-1) || folder}</span>
-                    <button type="button" aria-label={`Remove coverage folder ${folder}`} onClick={() => setFolders((current) => current.filter((item) => item !== folder))}>×</button>
+                    <button type="button" aria-label={`Remove coverage folder ${folder}`} onClick={() => setFolders((current) => current.filter((item) => item !== folder))} disabled={busy || objectPolicyTuning}>×</button>
                   </li>
                 ))}
               </ul>
@@ -567,7 +678,7 @@ export default function CoverageWorkspace({
               data-testid="coverage-model"
               value={modelId}
               onChange={(event) => setModelId(event.target.value)}
-              disabled={loadingModels || busy}
+              disabled={loadingModels || busy || objectPolicyTuning}
             >
               <option value="">Choose a model</option>
               {models.filter((model) => model.available).map((model) => (
@@ -580,11 +691,100 @@ export default function CoverageWorkspace({
               data-testid="coverage-unit"
               value={unit}
               onChange={(event) => setUnit(event.target.value as VisualizeUnit)}
-              disabled={busy}
+              disabled={busy || objectPolicyTuning}
             >
               <option value="image">Whole image</option>
               <option value="object">Object level (YOLO)</option>
             </select>
+            {unit === "object" && (
+              <div className="object-policy-fields" aria-label="Coverage object crop policy" data-testid="coverage-object-policy">
+                <div className="field-note">YOLO boxes use this crop policy. Automatic tuning ranks six policies by macro kNN class purity.</div>
+                <label className="field-label" htmlFor="coverage-object-pad">Crop padding</label>
+                <input
+                  id="coverage-object-pad"
+                  data-testid="coverage-object-pad"
+                  type="number"
+                  min="0"
+                  max="0.5"
+                  step="0.02"
+                  value={objectPolicyDraft.pad}
+                  onChange={(event) => setObjectPolicyDraft((current) => ({
+                    ...current,
+                    pad: event.target.value === "" ? 0 : Number(event.target.value),
+                  }))}
+                  disabled={busy || candidateBusy || objectPolicyTuning}
+                />
+                <label className="field-label" htmlFor="coverage-object-resolution">Crop resolution</label>
+                <select
+                  id="coverage-object-resolution"
+                  data-testid="coverage-object-resolution"
+                  value={objectPolicyDraft.target_res}
+                  onChange={(event) => setObjectPolicyDraft((current) => ({
+                    ...current,
+                    target_res: Number(event.target.value) as ComparisonObjectPolicy["target_res"],
+                  }))}
+                  disabled={busy || candidateBusy || objectPolicyTuning}
+                >
+                  {objectPolicyResolutions.map((resolution) => <option key={resolution} value={resolution}>{resolution}px</option>)}
+                </select>
+                <label className="field-label" htmlFor="coverage-object-head">Embedding head</label>
+                <select
+                  id="coverage-object-head"
+                  data-testid="coverage-object-head"
+                  value={objectPolicyDraft.head}
+                  onChange={(event) => setObjectPolicyDraft((current) => ({
+                    ...current,
+                    head: event.target.value as ComparisonObjectPolicy["head"],
+                  }))}
+                  disabled={busy || candidateBusy || objectPolicyTuning}
+                >
+                  <option value="cls">CLS token</option>
+                  <option value="meanpool">Mean pool</option>
+                </select>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  data-testid="coverage-object-policy-autotune"
+                  onClick={() => void runObjectPolicyAutotune()}
+                  disabled={busy || candidateBusy || objectPolicyTuning || !connected || !folders.length || !modelId}
+                >
+                  {objectPolicyTuning ? "Tuning object policy…" : "Find best object policy"}
+                </button>
+                {objectPolicyTuning && (
+                  <div className="progress-card" data-testid="coverage-object-policy-progress" role="status">
+                    <div className="progress-row">
+                      <span>{objectPolicyJob?.message || "Preparing object policy search"}</span>
+                      <strong>{Math.round(objectPolicyJob?.percent || 0)}%</strong>
+                    </div>
+                    <div className="progress-track">
+                      <div className="progress-fill" style={{ width: Math.max(0, Math.min(100, objectPolicyJob?.percent || 0)) + "%" }} />
+                    </div>
+                    <button
+                      type="button"
+                      className="cancel-button"
+                      disabled={!objectPolicyJob?.job_id}
+                      onClick={() => void cancelObjectPolicyAutotune()}
+                    >Cancel tuning</button>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="apply-object-filters"
+                  data-testid="coverage-object-policy-apply"
+                  onClick={applyManualObjectPolicy}
+                  disabled={busy || candidateBusy || objectPolicyTuning}
+                >Apply manual policy</button>
+                <div className="field-note" data-testid="coverage-object-policy-active">
+                  Active policy: pad {objectPolicy.pad.toFixed(2)} · {objectPolicy.target_res}px · {objectPolicy.head}.
+                  {run?.unit === "object" && run.object_policy
+                    && (run.object_policy.pad !== objectPolicy.pad
+                      || run.object_policy.target_res !== objectPolicy.target_res
+                      || run.object_policy.head !== objectPolicy.head)
+                    ? " The current result uses its saved policy; rerun coverage to use this setting."
+                    : ""}
+                </div>
+              </div>
+            )}
             <label className="field-label field-label-spaced" htmlFor="coverage-method">Projection method</label>
             <select
               id="coverage-method"
@@ -624,7 +824,7 @@ export default function CoverageWorkspace({
                 <label><input type="radio" name="coverage-color-mode" value="sparsity" checked={colorMode === "sparsity"} onChange={() => setColorMode("sparsity")} /> Sparsity</label>
               </fieldset>
             )}
-            <button className="run-button" type="submit" disabled={busy || candidateBusy || !connected || loadingModels || !modelId || !folders.length}>
+            <button className="run-button" type="submit" disabled={busy || candidateBusy || objectPolicyTuning || !connected || loadingModels || !modelId || !folders.length}>
               {busy ? "Analyzing…" : "Run coverage analysis"}
             </button>
             {busy && <button className="cancel-button" type="button" onClick={() => void cancelAnalysis()}>Cancel analysis</button>}
@@ -645,7 +845,7 @@ export default function CoverageWorkspace({
 
         {viewMode === "embedding" && <section className="control-section coverage-candidate-controls" aria-label="Candidate and reference folders">
           <div className="section-heading"><span className="step-number">03</span><h2>Candidate / reference</h2></div>
-          <button className="host-picker" type="button" onClick={() => void chooseCandidateFolder()} disabled={candidateBusy}>
+          <button className="host-picker" type="button" onClick={() => void chooseCandidateFolder()} disabled={candidateBusy || objectPolicyTuning}>
             <span className="folder-icon" aria-hidden="true">▱</span>
             Choose candidate folder
             <span className="picker-hint">Native</span>
@@ -660,9 +860,9 @@ export default function CoverageWorkspace({
               onKeyDown={(event) => event.key === "Enter" && (event.preventDefault(), addCandidateFolder())}
               placeholder="Paste a local folder path"
               autoComplete="off"
-              disabled={candidateBusy}
+              disabled={candidateBusy || objectPolicyTuning}
             />
-            <button type="button" className="add-folder" onClick={() => addCandidateFolder()} aria-label="Add candidate folder" disabled={candidateBusy}>+</button>
+            <button type="button" className="add-folder" onClick={() => addCandidateFolder()} aria-label="Add candidate folder" disabled={candidateBusy || objectPolicyTuning}>+</button>
           </div>
           {candidateFolders.length > 0 && (
             <ul className="folder-list" aria-label="Candidate folders">
@@ -674,7 +874,7 @@ export default function CoverageWorkspace({
                     setCandidateFolders((current) => current.filter((item) => item !== folder));
                     invalidateCandidateView(true);
                     setCandidateReady(false);
-                  }} disabled={candidateBusy}>×</button>
+                  }} disabled={candidateBusy || objectPolicyTuning}>×</button>
                 </li>
               ))}
             </ul>
@@ -699,7 +899,7 @@ export default function CoverageWorkspace({
             data-testid="coverage-project-candidates"
             className="run-button"
             onClick={() => void startCandidateAnalysis()}
-            disabled={!run || !candidateFolders.length || !connected || busy || candidateBusy}
+            disabled={!run || !candidateFolders.length || !connected || busy || candidateBusy || objectPolicyTuning}
           >
             {candidateBusy ? "Projecting candidates…" : "Project candidate folders"}
           </button>

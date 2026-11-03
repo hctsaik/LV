@@ -342,6 +342,9 @@ def _resolve_request_folders(
         | CreateObjectPolicyAutotuneJob
         | ObjectPolicyProfileMatchRequest
         | CreateDetectionEvaluationRequest
+        | CreateCoverageJob
+        | CreateCoverageCandidateJob
+        | CoverageCompletenessCandidateRequest
     ),
 ) -> list[str]:
     return _resolve_nativeapp_folder_list(request.folders, request.folder_grant_ids)
@@ -612,11 +615,13 @@ class CreateComparisonJob(BaseModel):
 
 class CreateCoverageJob(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     model_id: str = Field(min_length=1, max_length=128)
     unit: Literal["image", "object"] = "image"
     method: Literal["pca", "tsne", "umap", "lda", "sumap"] = "sumap"
     dimension: Literal[2, 3] = 2
     k: int = Field(default=10, ge=1, le=1000)
+    object_policy: ComparisonObjectPolicy | None = None
 
 
 class CreateGroupDiffJob(BaseModel):
@@ -659,6 +664,7 @@ class CoverageCompletenessRequest(BaseModel):
 
 class CoverageCompletenessCandidateRequest(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     axis_x: Literal["label", "split", "brightness", "contrast", "sharpness", "aspect"] = "label"
     axis_y: Literal["label", "split", "brightness", "contrast", "sharpness", "aspect"] = "brightness"
     bins: int = Field(default=3, ge=2, le=8)
@@ -679,6 +685,7 @@ class CoverageObjectViewRequest(BaseModel):
 
 class CreateCoverageCandidateJob(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     class_names: list[str] = Field(default_factory=list, max_length=256)
 
 
@@ -3909,6 +3916,10 @@ def create_app(
                 methods=["pca"],
                 mode="detector" if job.request.unit == "object" else "classifier",
                 unit=job.request.unit,
+                object_policy=(
+                    job.request.object_policy.model_dump()
+                    if job.request.object_policy is not None else None
+                ),
                 model_loader=loader,
                 object_model_loader=object_loader,
                 include_raw_embeddings=True,
@@ -3995,6 +4006,11 @@ def create_app(
 
     @app.post("/api/v1/coverage/jobs", status_code=202)
     def create_coverage_job(request: CreateCoverageJob) -> dict:
+        resolved_folders = _resolve_request_folders(request)
+        request = request.model_copy(update={
+            "folders": resolved_folders,
+            "folder_grant_ids": [],
+        })
         job_id = uuid.uuid4().hex
         job = _CoverageJob(job_id=job_id, request=request)
         with app.state.lock:
@@ -4143,6 +4159,11 @@ def create_app(
 
     @app.post("/api/v1/coverage/runs/{run_id}/candidates/jobs", status_code=202)
     def create_coverage_candidate_job(run_id: str, request: CreateCoverageCandidateJob) -> dict:
+        resolved_folders = _resolve_request_folders(request)
+        request = request.model_copy(update={
+            "folders": resolved_folders,
+            "folder_grant_ids": [],
+        })
         job_id = uuid.uuid4().hex
         with app.state.lock:
             if app.state.coverage_runs.get(run_id) is None:
@@ -4334,6 +4355,11 @@ def create_app(
         run_id: str,
         request: CoverageCompletenessCandidateRequest,
     ) -> dict:
+        resolved_folders = _resolve_request_folders(request)
+        request = request.model_copy(update={
+            "folders": resolved_folders,
+            "folder_grant_ids": [],
+        })
         run, vectors, bucket_x, labels_x, bucket_y, labels_y = coverage_attribute_axes(
             run_id, request.axis_x, request.axis_y, request.bins,
         )

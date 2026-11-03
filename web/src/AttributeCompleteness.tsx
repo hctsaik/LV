@@ -176,6 +176,10 @@ export default function AttributeCompleteness({ run }: { run: CoverageRun }) {
       const result = await window.cimHost.chooseFile();
       if (result.canceled) return;
       const paths = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
+      if (result.grant_id && paths.length !== 1) {
+        throw new Error("Choose one folder at a time so NativeApp can scope its permission.");
+      }
+      if (result.grant_id) api.rememberFolderGrant(paths[0], result.grant_id);
       paths.forEach(addCandidateFolder);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The candidate folder picker failed.");
@@ -201,6 +205,7 @@ export default function AttributeCompleteness({ run }: { run: CoverageRun }) {
     try {
       const result = await api.mineCoverageCompletenessCandidates(run.run_id, {
         folders: candidateFolders,
+        folderGrantIds: api.folderGrantIds(candidateFolders),
         axis_x: axisX,
         axis_y: axisY,
         bins,

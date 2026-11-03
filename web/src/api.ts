@@ -1695,19 +1695,33 @@ export const api = {
     method: ProjectionMethod,
     dimension: 2 | 3,
     k: number,
+    options: { folderGrantIds?: Array<string | null>; objectPolicy?: ComparisonObjectPolicy } = {},
   ) => request<{ job_id: string; state: string }>("/api/v1/coverage/jobs", {
     method: "POST",
-    body: JSON.stringify({ folders, model_id: modelId, unit, method, dimension, k }),
+    body: JSON.stringify({
+      folders,
+      folder_grant_ids: options.folderGrantIds,
+      model_id: modelId,
+      unit,
+      method,
+      dimension,
+      k,
+      object_policy: options.objectPolicy,
+    }),
   }),
   coverageJob: (jobId: string) =>
     request<JobStatus>("/api/v1/coverage/jobs/" + encodeURIComponent(jobId)),
   cancelCoverage: (jobId: string) => request<{ job_id: string; state: string }>(
     "/api/v1/coverage/jobs/" + encodeURIComponent(jobId), { method: "DELETE" },
   ),
-  createCoverageCandidateJob: (runId: string, folders: string[]) =>
+  createCoverageCandidateJob: (
+    runId: string,
+    folders: string[],
+    folderGrantIds: Array<string | null>,
+  ) =>
     request<{ job_id: string; state: string }>(
       "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/candidates/jobs",
-      { method: "POST", body: JSON.stringify({ folders }) },
+      { method: "POST", body: JSON.stringify({ folders, folder_grant_ids: folderGrantIds }) },
     ),
   coverageCandidateJob: (jobId: string) =>
     request<JobStatus>("/api/v1/coverage/candidate-jobs/" + encodeURIComponent(jobId)),
@@ -1775,10 +1789,29 @@ export const api = {
     ),
   mineCoverageCompletenessCandidates: (
     runId: string,
-    input: { folders: string[]; axis_x: CompletenessAxis; axis_y: CompletenessAxis; bins: number; x: number; y: number },
+    input: {
+      folders: string[];
+      folderGrantIds: Array<string | null>;
+      axis_x: CompletenessAxis;
+      axis_y: CompletenessAxis;
+      bins: number;
+      x: number;
+      y: number;
+    },
   ) => request<CoverageCompletenessCandidateResult>(
     "/api/v1/coverage/runs/" + encodeURIComponent(runId) + "/completeness/candidates",
-    { method: "POST", body: JSON.stringify(input) },
+    {
+      method: "POST",
+      body: JSON.stringify({
+        folders: input.folders,
+        folder_grant_ids: input.folderGrantIds,
+        axis_x: input.axis_x,
+        axis_y: input.axis_y,
+        bins: input.bins,
+        x: input.x,
+        y: input.y,
+      }),
+    },
   ),
   coverageCompletenessCandidateThumbnailUrl: (runId: string, index: number) =>
     (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/coverage/runs/"
