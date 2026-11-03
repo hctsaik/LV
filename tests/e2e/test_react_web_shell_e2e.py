@@ -425,6 +425,8 @@ def test_lv_web_01_ic_04_kmeans_block_selection_round_trips_across_dimensions(
             page.get_by_test_id("block-choice").select_option(str(selected_block["block_id"]))
             expect(page.get_by_test_id("block-selection-plot")).to_be_visible(timeout=60_000)
             plot2d = page.locator("[data-testid='block-selection-plot'] .js-plotly-plot")
+            plot2d.scroll_into_view_if_needed()
+            page.wait_for_timeout(150)
             box = plot2d.bounding_box()
             assert box is not None
             page.mouse.move(box["x"] + 55, box["y"] + 60)
@@ -572,6 +574,132 @@ def test_lv_web_02_img_01_visible_compare_contract(tmp_path: Path, monkeypatch: 
             expect(page.get_by_text(
                 "Comparison cancelled. Adjust the folders and run it again.", exact=True
             )).to_be_visible(timeout=10_000)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert all(path.read_bytes() == content for path, content in source_bytes.items())
+
+
+def test_lv_web_01_od_01_detector_whole_image_and_class_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible detector whole-image flow covers selected, automatic, and missing class sources."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    dataset = tmp_path / "detector-dataset"
+    dataset.mkdir()
+    (dataset / "classes.txt").write_text("good\nrotten\n", encoding="utf-8")
+    source_files = []
+    for split_index, split in enumerate(("train", "val")):
+        images = dataset / split / "images"
+        labels = dataset / split / "labels"
+        labels.mkdir(parents=True)
+        for class_id, color in enumerate(((210, 35, 45), (35, 180, 70))):
+            image_path = images / f"{split_index}-{class_id}.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (32, 32), color).save(image_path)
+            label_path = labels / f"{image_path.stem}.txt"
+            label_path.write_text(f"{class_id} 0.5 0.5 0.6 0.6\n", encoding="utf-8")
+            source_files.extend((image_path, label_path))
+    source_files.append(dataset / "classes.txt")
+    source_bytes = {path: path.read_bytes() for path in source_files}
+
+    def embed(path: Path) -> np.ndarray:
+        pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        vector = np.zeros(384, dtype=np.float32)
+        vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+        vector[3] = len(path.name) / 10.0
+        return vector
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "lv-cache"))
+    models = ["dinov2_vits14", "resnet50"]
+    application = create_app(
+        model_catalog=lambda: models,
+        model_loader=lambda _model_id: embed,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+
+            def capture_run(response):
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                    run_payloads.append(response.json())
+
+            page.on("response", capture_run)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Dataset mode").select_option("object_detector")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_test_id("model-choice-resnet50").check()
+            classes_input = page.get_by_label("Classes file")
+            classes_input.set_input_files({
+                "name": "override-classes.txt",
+                "mimeType": "text/plain",
+                "buffer": b"custom-good\ncustom-bad\n",
+            })
+            expect(page.get_by_test_id("selected-classes-file")).to_contain_text("override-classes.txt")
+            page.get_by_label("Manual class names").fill("manual-good,manual-bad")
+            for folder in (dataset / "train", dataset / "val"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            expect(page.get_by_test_id("dataset-mode-indicator")).to_contain_text(
+                "2 classes · selected classes file"
+            )
+            assert run_payloads[-1]["models"] == models
+            assert run_payloads[-1]["class_names"] == ["custom-good", "custom-bad"]
+            assert [row["label"] for row in run_payloads[-1]["records"]] == [
+                "custom-good", "custom-bad", "custom-good", "custom-bad"
+            ]
+            page.get_by_label("Filter by class").select_option(label="custom-good")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(2)
+            page.get_by_label("Filter by class").select_option(label="All classes")
+            page.get_by_label("Display model").select_option("resnet50")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+            classes_input.set_input_files([])
+            expect(page.get_by_test_id("selected-classes-file")).to_have_count(0)
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("dataset-mode-indicator")).to_contain_text(
+                "2 classes · auto classes txt"
+            )
+            assert run_payloads[-1]["class_names"] == ["good", "rotten"]
+            assert run_payloads[-1]["class_source"] == "auto_classes_txt"
+
+            missing_dataset = tmp_path / "detector-without-classes"
+            missing_train = missing_dataset / "train"
+            missing_images, missing_labels = missing_train / "images", missing_train / "labels"
+            missing_labels.mkdir(parents=True)
+            for class_id, color in enumerate(((200, 45, 55), (45, 190, 75))):
+                image_path = missing_images / f"missing-{class_id}.png"
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (32, 32), color).save(image_path)
+                (missing_labels / f"{image_path.stem}.txt").write_text(
+                    f"{class_id} 0.5 0.5 0.6 0.6\n", encoding="utf-8"
+                )
+            for folder in (dataset / "train", dataset / "val"):
+                page.get_by_role("button", name=f"Remove {folder}").click()
+            page.get_by_label("Image folder").fill(str(missing_train))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_label("Manual class names").fill("")
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_role("alert")).to_contain_text(
+                "Choose a classes.txt file", timeout=20_000
+            )
             browser.close()
     finally:
         if server is not None:

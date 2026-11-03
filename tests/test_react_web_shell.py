@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from react_web_shell import create_app
-from visualize_embeddings import discover_images_classifier
+from visualize_embeddings import discover_images, discover_images_classifier
 
 
 @pytest.fixture
@@ -448,3 +448,135 @@ def test_case_lv_web_01_edge_01_supervised_projection_skips_small_sample(
     assert any("lda skipped because at least four images are required" in warning
                for warning in run["warnings"])
     assert any("PCA was used" in warning for warning in run["warnings"])
+
+
+def test_case_lv_web_01_od_01_detector_whole_image_class_sources_and_models(
+    monkeypatch, tmp_path
+):
+    """Detector whole-image runs preserve class-source priority and multi-model views."""
+    root = tmp_path / "detector"
+    root.mkdir()
+    (root / "classes.txt").write_text("good\nrotten\n", encoding="utf-8")
+    folders = [root / "train", root / "val"]
+    source_hashes = {}
+    for split_index, folder in enumerate(folders):
+        images = folder / "images"
+        labels = folder / "labels"
+        labels.mkdir(parents=True)
+        for class_id, color in enumerate(((210, 35, 45), (35, 180, 70))):
+            image_path = images / f"{split_index}-{class_id}.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (24, 24), color).save(image_path)
+            (labels / f"{image_path.stem}.txt").write_text(
+                f"{class_id} 0.5 0.5 0.6 0.6\n", encoding="utf-8"
+            )
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*") if path.is_file()
+    }
+    models = ["dinov2_vits14", "resnet50"]
+
+    with _client(monkeypatch, tmp_path, models=models) as client:
+        selected_file = _run_custom(client, {
+            "folders": [str(folder) for folder in folders],
+            "model_ids": models,
+            "methods": ["pca"],
+            "mode": "object_detector",
+            "classes_file_text": "override_good\noverride_bad\n",
+            "class_names": ["manual_good", "manual_bad"],
+        })
+        assert selected_file["state"] == "completed", selected_file
+        selected_run = client.get(f"/api/v1/runs/{selected_file['run_id']}").json()
+
+        auto_file = _run_custom(client, {
+            "folders": [str(folder) for folder in folders],
+            "model_ids": [models[0]],
+            "methods": ["pca"],
+            "mode": "object_detector",
+            "class_names": ["manual_good", "manual_bad"],
+        })
+        assert auto_file["state"] == "completed", auto_file
+        auto_run = client.get(f"/api/v1/runs/{auto_file['run_id']}").json()
+
+        yaml_root = tmp_path / "yaml-detector"
+        yaml_root.mkdir()
+        (yaml_root / "data.yaml").write_text(
+            "names: [yaml_good, yaml_bad]\n", encoding="utf-8"
+        )
+        yaml_folder = yaml_root / "train"
+        yaml_images, yaml_labels = yaml_folder / "images", yaml_folder / "labels"
+        yaml_labels.mkdir(parents=True)
+        for class_id, color in enumerate(((195, 40, 50), (40, 185, 65))):
+            image_path = yaml_images / f"yaml-{class_id}.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (24, 24), color).save(image_path)
+            (yaml_labels / f"{image_path.stem}.txt").write_text(
+                f"{class_id} 0.5 0.5 0.6 0.6\n", encoding="utf-8"
+            )
+        yaml_job = _run_custom(client, {
+            "folders": [str(yaml_folder)],
+            "model_ids": [models[0]],
+            "methods": ["pca"],
+            "mode": "object_detector",
+            "class_names": ["manual_good", "manual_bad"],
+        })
+        assert yaml_job["state"] == "completed", yaml_job
+        yaml_run = client.get(f"/api/v1/runs/{yaml_job['run_id']}").json()
+
+        manual_root = tmp_path / "manual-detector"
+        manual_folder = manual_root / "train"
+        images, labels = manual_folder / "images", manual_folder / "labels"
+        labels.mkdir(parents=True)
+        for class_id, color in enumerate(((200, 45, 55), (45, 190, 75))):
+            image_path = images / f"manual-{class_id}.png"
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (24, 24), color).save(image_path)
+            (labels / f"{image_path.stem}.txt").write_text(
+                f"{class_id} 0.5 0.5 0.6 0.6\n", encoding="utf-8"
+            )
+        manual = _run_custom(client, {
+            "folders": [str(manual_folder)],
+            "model_ids": [models[0]],
+            "methods": ["pca"],
+            "mode": "object_detector",
+            "class_names": ["manual_good", "manual_bad"],
+        })
+        assert manual["state"] == "completed", manual
+        manual_run = client.get(f"/api/v1/runs/{manual['run_id']}").json()
+
+        missing = _run_custom(client, {
+            "folders": [str(manual_folder)],
+            "model_ids": [models[0]],
+            "methods": ["pca"],
+            "mode": "object_detector",
+        })
+
+    assert selected_run["source_mode"] == "object_detector"
+    assert selected_run["class_source"] == "selected_classes_file"
+    assert selected_run["class_names"] == ["override_good", "override_bad"]
+    assert [row["label"] for row in selected_run["records"]] == [
+        "override_good", "override_bad", "override_good", "override_bad"
+    ]
+    assert selected_run["models"] == models
+    assert {(view["model_id"], view["method"]) for view in selected_run["views"]} == {
+        (model, "pca") for model in models
+    }
+    assert "classes_file_text" not in selected_run
+    assert auto_run["class_source"] == "auto_classes_txt"
+    assert auto_run["class_names"] == ["good", "rotten"]
+    assert [row["label"] for row in auto_run["records"]] == [
+        "good", "rotten", "good", "rotten"
+    ]
+    assert yaml_run["class_source"] == "auto_data_yaml"
+    assert yaml_run["class_names"] == ["yaml_good", "yaml_bad"]
+    assert manual_run["class_source"] == "manual"
+    assert manual_run["class_names"] == ["manual_good", "manual_bad"]
+    assert missing["state"] == "failed"
+    assert missing["error"]["code"] == "CLASSES_REQUIRED"
+    assert "classes.txt" in missing["error"]["message"]
+    assert all(hashlib.sha256(path.read_bytes()).hexdigest() == digest
+               for path, digest in source_hashes.items())
+    assert {(Path(record["path"]).name, record["split"], record["label"])
+            for record in discover_images(folders, ["good", "rotten"])} == {
+        (row["filename"], row["split"], row["label"]) for row in auto_run["records"]
+    }

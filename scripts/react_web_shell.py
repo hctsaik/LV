@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
@@ -19,7 +20,7 @@ from starlette.staticfiles import StaticFiles
 
 from _utils import available_models, load_model
 from react_compare import CompareCancelled, CompareInputError, project_comparison, run_image_comparison
-from react_visualize import JobCancelled, VisualizationInputError, run_image_classifier
+from react_visualize import JobCancelled, VisualizationInputError, run_visualization
 
 API_VERSION = "1"
 logger = logging.getLogger("lv.react_web")
@@ -31,6 +32,9 @@ class CreateVisualizationJob(BaseModel):
     method: str = "pca"
     model_ids: list[str] = Field(default_factory=list, max_length=8)
     methods: list[str] = Field(default_factory=list, max_length=5)
+    mode: Literal["image_classifier", "object_detector"] = "image_classifier"
+    classes_file_text: str | None = Field(default=None, max_length=128_000)
+    class_names: list[str] = Field(default_factory=list, max_length=512)
     umap_reference: bool = False
     rebuild_umap_reference: bool = False
 
@@ -187,10 +191,13 @@ def create_app(
                     job.total = total
                     job.message = f"Extracting embeddings ({done}/{total})"
 
-            result = run_image_classifier(
+            result = run_visualization(
                 job.request.folders,
                 model_names=selected_models,
                 methods=selected_methods,
+                mode=job.request.mode,
+                classes_file_text=job.request.classes_file_text,
+                manual_class_names=job.request.class_names,
                 umap_reference=job.request.umap_reference,
                 rebuild_umap_reference=job.request.rebuild_umap_reference,
                 model_loader=loader,

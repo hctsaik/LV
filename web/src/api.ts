@@ -38,6 +38,9 @@ export type VisualizationView = {
 };
 
 export type VisualizationRun = {
+  source_mode: "image_classifier" | "object_detector";
+  class_names: string[];
+  class_source: "classifier_folders" | "selected_classes_file" | "auto_classes_txt" | "auto_data_yaml" | "manual";
   model_id: string;
   method: ProjectionMethod;
   records: RunRecord[];
@@ -113,7 +116,13 @@ export const api = {
     folders: string[],
     modelIds: string[],
     methods: ProjectionMethod[],
-    options: { umapReference?: boolean; rebuildUmapReference?: boolean } = {},
+    options: {
+      umapReference?: boolean;
+      rebuildUmapReference?: boolean;
+      mode?: "image_classifier" | "object_detector";
+      classesFileText?: string | null;
+      classNames?: string[];
+    } = {},
   ) =>
     request<{ job_id: string; state: string }>("/api/v1/visualize/jobs", {
       method: "POST",
@@ -121,6 +130,9 @@ export const api = {
         folders,
         model_ids: modelIds,
         methods,
+        mode: options.mode ?? "image_classifier",
+        classes_file_text: options.classesFileText ?? null,
+        class_names: options.classNames ?? [],
         umap_reference: options.umapReference ?? false,
         rebuild_umap_reference: options.rebuildUmapReference ?? false,
       }),

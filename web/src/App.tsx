@@ -125,6 +125,9 @@ export default function App() {
   const [activeModelId, setActiveModelId] = useState("");
   const [activeMethod, setActiveMethod] = useState<ProjectionMethod>("sumap");
   const [dimension, setDimension] = useState<2 | 3>(2);
+  const [datasetMode, setDatasetMode] = useState<"image_classifier" | "object_detector">("image_classifier");
+  const [selectedClassesFile, setSelectedClassesFile] = useState<{ name: string; text: string } | null>(null);
+  const [manualClassNames, setManualClassNames] = useState("apple,banana,orange");
   const [folders, setFolders] = useState<string[]>([]);
   const [folderDraft, setFolderDraft] = useState("");
   const [connected, setConnected] = useState(false);
@@ -315,6 +318,9 @@ export default function App() {
       const created = await api.createJob(selectedFolders, selectedModelIds, selectedMethods, {
         umapReference,
         rebuildUmapReference,
+        mode: datasetMode,
+        classesFileText: selectedClassesFile?.text ?? null,
+        classNames: manualClassNames.split(",").map((name) => name.trim()).filter(Boolean),
       });
       setJob({
         job_id: created.job_id,
@@ -452,6 +458,59 @@ export default function App() {
 
           <section className="control-section model-section">
             <div className="section-heading"><span className="step-number">02</span><h2>Analysis setup</h2></div>
+            <label className="field-label" htmlFor="dataset-mode">Dataset mode</label>
+            <select
+              id="dataset-mode"
+              aria-label="Dataset mode"
+              data-testid="dataset-mode"
+              value={datasetMode}
+              disabled={busy}
+              onChange={(event) => {
+                setDatasetMode(event.target.value as "image_classifier" | "object_detector");
+                setRun(null);
+                setJob(null);
+                clearSelection();
+                setLabelFilter("all");
+                setSplitFilter("all");
+              }}
+            >
+              <option value="image_classifier">Image Classifier</option>
+              <option value="object_detector">Object Detector · whole image</option>
+            </select>
+            {datasetMode === "object_detector" && (
+              <div className="detector-class-controls" data-testid="detector-class-controls">
+                <label className="field-label field-label-spaced" htmlFor="classes-file">Classes file</label>
+                <input
+                  id="classes-file"
+                  aria-label="Classes file"
+                  data-testid="classes-file"
+                  type="file"
+                  accept=".txt,text/plain"
+                  disabled={busy}
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    if (!file) {
+                      setSelectedClassesFile(null);
+                      return;
+                    }
+                    void file.text().then((text) => setSelectedClassesFile({ name: file.name, text })).catch(() => {
+                      setError("Could not read the selected classes file.");
+                    });
+                  }}
+                />
+                {selectedClassesFile && <small data-testid="selected-classes-file">Selected: {selectedClassesFile.name}</small>}
+                <label className="field-label field-label-spaced" htmlFor="manual-class-names">Manual class names</label>
+                <input
+                  id="manual-class-names"
+                  aria-label="Manual class names"
+                  value={manualClassNames}
+                  disabled={busy}
+                  onChange={(event) => setManualClassNames(event.target.value)}
+                  placeholder="name one, name two"
+                />
+                <div className="field-note">Class names use this order: selected file, dataset classes.txt/data.yaml, then these names.</div>
+              </div>
+            )}
             <div className="field-label">Feature models</div>
             <div className="choice-list" aria-label="Feature models">
               {models.map((model) => (
@@ -538,6 +597,11 @@ export default function App() {
               <div className="eyebrow">ANALYSIS CANVAS</div>
               <h2>{run ? "Embedding distribution" : "Your workspace is ready"}</h2>
               <p>{run && currentView ? run.records.length.toLocaleString() + " images · " + activeModelId + " · " + currentView.method.toUpperCase() : "Choose a folder and run an analysis to see your collection."}</p>
+              {run?.source_mode === "object_detector" && (
+                <small data-testid="dataset-mode-indicator">
+                  Object Detector · {run.class_names.length} classes · {run.class_source.replaceAll("_", " ")}
+                </small>
+              )}
             </div>
             {run && <div className="run-badge"><span className="badge-dot" /> Result ready</div>}
           </div>

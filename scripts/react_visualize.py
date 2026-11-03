@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 from sklearn.decomposition import PCA
 
-from _utils import extract_embeddings, load_model
+from _utils import extract_embeddings, load_model, yaml_class_names
+from label_formats import folder_has_annotations
 from manifest import (
     manifest_path_for,
     rel_key,
@@ -16,8 +17,8 @@ from manifest import (
     update_manifest,
     write_manifest,
 )
-from safe_io import partition_readable
-from visualize_embeddings import discover_images_classifier
+from safe_io import partition_readable, safe_read_text
+from visualize_embeddings import discover_images, discover_images_classifier
 
 
 class JobCancelled(Exception):
@@ -145,22 +146,44 @@ def _project_embeddings(
     return projections, warnings
 
 
-def run_image_classifier(
+def _class_names_from_text(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _detector_classes_from_dataset(folder: Path) -> tuple[list[str] | None, str | None]:
+    """Match the legacy first-folder classes.txt/data.yaml discovery order."""
+    for root in (folder.parent, folder, folder.parent.parent):
+        classes_path = root / "classes.txt"
+        if classes_path.is_file():
+            names = _class_names_from_text(safe_read_text(classes_path))
+            if names:
+                return names, "auto_classes_txt"
+        names = yaml_class_names(root / "data.yaml")
+        if names:
+            return names, "auto_data_yaml"
+    return None, None
+
+
+def run_visualization(
     folders: Sequence[str | Path],
     model_name: str | None = None,
     *,
     model_names: Sequence[str] | None = None,
     methods: Sequence[str] = ("pca",),
+    mode: str = "image_classifier",
+    classes_file_text: str | None = None,
+    manual_class_names: Sequence[str] = (),
     umap_reference: bool = False,
     rebuild_umap_reference: bool = False,
     model_loader: Callable[[str], Callable[[Path], np.ndarray]] = load_model,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
 ) -> dict:
-    """Run the legacy whole-image classifier flow without Streamlit state.
+    """Run the legacy whole-image Visualize flow without Streamlit state.
 
-    Discovery, per-model content-hash embedding caches, projection parameters,
-    and label/split alignment follow the existing Visualize Embeddings path.
+    Classifier and Object Detector whole-image discovery, per-model content-hash
+    embedding caches, projection parameters, and label/split alignment follow
+    the existing Visualize Embeddings path.
     Every write is routed through LV's app-side manifest/cache helpers, never
     into selected source folders.
     """
@@ -184,6 +207,8 @@ def run_image_classifier(
             resolved_folders.append(folder)
     if not resolved_folders:
         raise VisualizationInputError("NO_FOLDERS", "Choose at least one image folder.")
+    if mode not in {"image_classifier", "object_detector"}:
+        raise VisualizationInputError("MODE_UNAVAILABLE", "Choose a supported whole-image dataset mode.")
 
     selected_models = list(model_names or ([model_name] if model_name else []))
     selected_models = list(dict.fromkeys(selected_models))
@@ -203,7 +228,44 @@ def run_image_classifier(
         )
 
     check_cancelled()
-    records = discover_images_classifier(resolved_folders, allow_flat=True)
+    class_names: list[str] = []
+    class_source = "classifier_folders"
+    if mode == "object_detector":
+        invalid_folders = [
+            folder for folder in resolved_folders
+            if not (folder / "images").is_dir()
+            and not (folder / "JPEGImages").is_dir()
+            and not folder_has_annotations(folder)
+        ]
+        if invalid_folders:
+            raise VisualizationInputError(
+                "DETECTOR_DATASET_INVALID",
+                "Each Object Detector folder must contain images or supported image annotations.",
+            )
+        if classes_file_text is not None:
+            class_names = _class_names_from_text(classes_file_text)
+            if not class_names:
+                raise VisualizationInputError(
+                    "CLASSES_FILE_EMPTY", "The selected classes file does not contain class names."
+                )
+            class_source = "selected_classes_file"
+        else:
+            detected, detected_source = _detector_classes_from_dataset(resolved_folders[0])
+            if detected:
+                class_names = detected
+                class_source = detected_source or "auto_classes_txt"
+            else:
+                class_names = [name.strip() for name in manual_class_names if name.strip()]
+                class_source = "manual"
+            if not class_names:
+                raise VisualizationInputError(
+                    "CLASSES_REQUIRED",
+                    "Choose a classes.txt file, use a dataset with classes.txt or data.yaml, or enter class names.",
+                )
+        records = discover_images(resolved_folders, class_names)
+    else:
+        records = discover_images_classifier(resolved_folders, allow_flat=True)
+        class_names = sorted({str(record["label"]) for record in records})
     if not records:
         raise VisualizationInputError("NO_IMAGES", "No images were found in the selected folders.")
 
@@ -337,6 +399,9 @@ def run_image_classifier(
     primary = views[0]
     base_warnings = ([f"Skipped {len(unreadable)} unreadable image(s)."] if unreadable else [])
     return {
+        "source_mode": mode,
+        "class_names": class_names,
+        "class_source": class_source,
         "model_id": primary["model_id"],
         "method": primary["method"],
         "records": public_records,
@@ -352,3 +417,7 @@ def run_image_classifier(
         "image_paths": [Path(record["path"]).resolve() for record in records],
         "_embedding_sources": embedding_sources,
     }
+
+
+# Backward-compatible internal name for the original classifier-only caller.
+run_image_classifier = run_visualization
