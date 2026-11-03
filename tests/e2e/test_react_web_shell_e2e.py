@@ -55,6 +55,7 @@ COVERAGE_REF_FIXTURE_TREE_SHA256 = {
     "main": "d372c90e9203550f627f044a29a0f35241a97df216e024f96e45d7d9267ba337",
     "candidate": "2f6e47474450aae0443d6b0e755657f36f81bcd753f6420e0cd03d0c0376782e",
 }
+REAL_KMEANS_FIXTURE_TREE_SHA256 = "819744ee86027ee129e254fb041c2f19520d1f094e7592ea25edb7a18a925b11"
 DETECTOR_FIXTURE_SHA256 = {
     "classes.txt": "6790a8ef4600c53847701c63920499d8ea56375232a8de32fc15b3e26b9d6ba4",
     "test/images/03.png": "d1db8754763264c772e91c2d290fa34eb4fccde5347547a0b88508a03a78e2a8",
@@ -1170,6 +1171,179 @@ def test_lv_web_01_ic_04_kmeans_drilldown_and_multiselection(
             server.should_exit = True
         if server_thread is not None:
             server_thread.join(timeout=10)
+
+
+def test_lv_web_01_ic_04_real_model_matches_streamlit_kmeans_and_drilldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Pinned DINOv2 UI run matches Streamlit KMeans and private-vector drilldown."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    import app as legacy_app
+
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
+    dataset = tmp_path / "classifier-real-kmeans" / "train" / "apple"
+    colors = [(220, 35, 45), (30, 190, 70), (35, 65, 215), (210, 180, 25)]
+    for cluster, color in enumerate(colors):
+        for replicate in range(3):
+            dataset.mkdir(parents=True, exist_ok=True)
+            varied = (color[0] + replicate, color[1] + replicate * 2, color[2])
+            Image.new("RGB", (64, 64), varied).save(
+                dataset / f"cluster-{cluster}-{replicate}.png"
+            )
+
+    source_root = dataset.parent.parent
+    source_hashes = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_root.rglob("*.png")
+    }
+    assert _fixture_tree_digest(source_root, source_hashes) == REAL_KMEANS_FIXTURE_TREE_SHA256
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "real-kmeans-cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+    )
+    server = server_thread = None
+    block_responses: list[tuple[dict, dict]] = []
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+
+            def capture_blocks(response):
+                if not response.ok or not urlparse(response.url).path.endswith("/blocks"):
+                    return
+                request = response.request.post_data_json
+                if request:
+                    block_responses.append((request, response.json()))
+
+            page.on("response", capture_blocks)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_label("Image folder").fill(str(dataset.parent))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text(
+                "Completed", timeout=180_000
+            )
+            expect(page.get_by_test_id("embedding-point")).to_have_count(12)
+
+            with application.state.lock:
+                run_id = next(reversed(application.state.runs))
+                run = application.state.runs[run_id]
+                raw_embeddings = application.state.raw_embeddings[run_id][
+                    "dinov2_vits14"
+                ].copy()
+            assert raw_embeddings.shape == (12, 384)
+            assert np.isfinite(raw_embeddings).all() and np.any(raw_embeddings != 0)
+            pca_view = next(
+                view for view in run["views"]
+                if view["model_id"] == "dinov2_vits14" and view["method"] == "pca"
+            )
+            view_points = sorted(pca_view["points"], key=lambda point: point["index"])
+            assert len(view_points) == 12
+            assert all(
+                np.isfinite([point["x"], point["y"], point["z"]]).all()
+                for point in view_points
+            )
+
+            page.get_by_label("Display method").select_option("pca")
+            page.get_by_test_id("dimension-3d").click()
+            expect(page.get_by_test_id("embedding-plot-3d")).to_be_visible(timeout=60_000)
+            page.get_by_test_id("kmeans-count").focus()
+            page.get_by_test_id("kmeans-count").press("Home")
+            expect(page.get_by_test_id("kmeans-status")).to_contain_text(
+                "4 個區塊", timeout=30_000
+            )
+            expect(page.get_by_test_id("cluster-block-select")).to_be_enabled()
+
+            base_request, base_response = next(
+                (request, response)
+                for request, response in reversed(block_responses)
+                if request.get("k") == 4
+                and request.get("method") == "pca"
+                and request.get("block_id") is None
+            )
+            assert base_request["model_id"] == "dinov2_vits14"
+            assert base_response["k"] == 4
+            indices = [int(point["index"]) for point in view_points]
+            coordinates = np.asarray(
+                [[point["x"], point["y"], point["z"]] for point in view_points],
+                dtype=float,
+            )
+            monkeypatch.setattr(legacy_app.st, "session_state", {})
+            legacy_blocks, legacy_centers = legacy_app._viz_kmeans_blocks(
+                coordinates, indices, 4, f"real-dinov2-{run_id}"
+            )
+            react_blocks = {
+                int(point["index"]): int(point["block_id"])
+                for point in base_response["points"]
+            }
+            assert react_blocks == legacy_blocks
+            react_centers = sorted(
+                base_response["centers"], key=lambda center: center["block_id"]
+            )
+            np.testing.assert_allclose(
+                [[center["x"], center["y"], center["z"]] for center in react_centers],
+                legacy_centers,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+
+            largest = max(base_response["centers"], key=lambda center: center["count"])
+            assert largest["count"] >= 3
+            page.get_by_test_id("cluster-block-select").select_option(
+                str(largest["block_id"])
+            )
+            expect(page.get_by_test_id("block-point")).to_have_count(
+                largest["count"], timeout=30_000
+            )
+            selected_request, selected_response = next(
+                (request, response)
+                for request, response in reversed(block_responses)
+                if request.get("k") == 4
+                and request.get("block_id") == largest["block_id"]
+            )
+            assert selected_request["method"] == "pca"
+            members = sorted(
+                index for index, block_id in legacy_blocks.items()
+                if block_id == largest["block_id"]
+            )
+            assert [point["index"] for point in selected_response["drilldown_points"]] == members
+            expected_drilldown = legacy_app.PCA(
+                n_components=2, random_state=42
+            ).fit_transform(raw_embeddings[members])
+            np.testing.assert_allclose(
+                [
+                    [point["x"], point["y"]]
+                    for point in selected_response["drilldown_points"]
+                ],
+                expected_drilldown,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+            expect(page.get_by_test_id("block-drilldown")).to_be_visible()
+            expect(page.get_by_test_id("block-drilldown")).to_contain_text(
+                f"#{largest['block_id']}"
+            )
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_root.rglob("*.png")
+    }, "real-model KMeans flow changed its source images"
 
 
 def test_lv_web_01_search_01_similar_images_chain_model_switch_and_csv(
