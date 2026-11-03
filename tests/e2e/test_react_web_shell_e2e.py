@@ -1700,6 +1700,12 @@ def test_lv_web_03_img_01_real_model_visible_streamlit_sparsity_parity(
             legacy_3d, _ = legacy_app._cov_projection(
                 vectors, None, "pca", 3, f"img01-real-{run_id}", "",
             )
+            legacy_tsne_2d, _ = legacy_app._cov_projection(
+                vectors, None, "tsne", 2, f"img01-real-{run_id}", "",
+            )
+            legacy_tsne_3d, _ = legacy_app._cov_projection(
+                vectors, None, "tsne", 3, f"img01-real-{run_id}", "",
+            )
             react_2d = np.asarray(
                 [[point["x"], point["y"]] for point in run["points"]],
             )
@@ -1738,6 +1744,51 @@ def test_lv_web_03_img_01_real_model_visible_streamlit_sparsity_parity(
             expect(page.get_by_test_id("coverage-dimension-2d")).to_have_attribute(
                 "aria-pressed", "true",
             )
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as tsne_2d_response:
+                page.get_by_label("Projection method").select_option("tsne")
+            tsne_2d = tsne_2d_response.value.json()
+            assert tsne_2d["method"] == "tsne"
+            react_tsne_2d = np.asarray([
+                [point["x"], point["y"]]
+                for point in tsne_2d["points"]
+            ])
+            np.testing.assert_allclose(react_tsne_2d, legacy_tsne_2d, rtol=1e-5, atol=1e-5)
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as tsne_3d_response:
+                page.get_by_test_id("coverage-dimension-3d").click()
+            tsne_3d = tsne_3d_response.value.json()
+            react_tsne_3d = np.asarray([
+                [point["x"], point["y"], point["z"]]
+                for point in tsne_3d["points"]
+            ])
+            np.testing.assert_allclose(react_tsne_3d, legacy_tsne_3d, rtol=1e-5, atol=1e-5)
+            expect(page.locator(
+                "[data-testid='coverage-plot'] [data-testid='coverage-plot-3d']",
+            )).to_be_visible()
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ):
+                page.get_by_test_id("coverage-dimension-2d").click()
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as restored_pca_response:
+                page.get_by_label("Projection method").select_option("pca")
+            restored_pca = restored_pca_response.value.json()
+            restored_pca_2d = np.asarray([
+                [point["x"], point["y"]]
+                for point in restored_pca["points"]
+            ])
+            np.testing.assert_allclose(restored_pca_2d, legacy_2d, rtol=1e-5, atol=1e-5)
             expect(page.get_by_test_id("coverage-point")).to_have_count(4)
 
             # Streamlit's _cov_sparsity delegates to this legacy distance helper.
