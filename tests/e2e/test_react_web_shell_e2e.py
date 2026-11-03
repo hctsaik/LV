@@ -34,6 +34,8 @@ pytestmark = pytest.mark.e2e
 
 ROOT = Path(__file__).resolve().parents[2]
 DINOV2_VITS14_SHA256 = "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9"
+CHINESE_CLIP_MODEL_ID = "chinese-clip-vit-base-patch16"
+CHINESE_CLIP_PYTORCH_SHA256 = "7b7b583c210c867410bc6bdb8a55fe14eec62999e0a9ea31ff222dc501f9cfbe"
 FIXTURE_SHA256 = {
     "train/apple/image-01.png": "be4582401ec897d3d653f2f52275802d4485ab5106e0e6125344711a3d32b6a3",
     "train/apple/image-02.png": "ed47d5fdeb3b4ad1fb5ff833846ffab6b8fc690d96f5d44a348196b0c1f5d731",
@@ -96,6 +98,30 @@ def _pinned_dinov2_models_dir(tmp_path: Path) -> Path:
         shutil.copyfile(source_weights, weights)
     assert hashlib.sha256(weights.read_bytes()).hexdigest() == DINOV2_VITS14_SHA256
     return models_dir
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _pinned_chinese_clip_models_dir() -> Path:
+    configured_models = Path(
+        os.environ.get("LV_TEST_MODELS_DIR")
+        or os.environ.get("LV_MODELS_DIR")
+        or ROOT / "models"
+    ).expanduser().resolve()
+    model_dir = configured_models / CHINESE_CLIP_MODEL_ID
+    weights = model_dir / "pytorch_model.bin"
+    if not (model_dir / "config.json").is_file() or not weights.is_file():
+        pytest.skip("pinned Chinese-CLIP weights are unavailable in the configured model directory")
+    assert _sha256_file(weights) == CHINESE_CLIP_PYTORCH_SHA256, (
+        "the local Chinese-CLIP weights differ from the pinned LV baseline"
+    )
+    return configured_models
 
 
 def _free_port() -> int:
@@ -1874,6 +1900,170 @@ def test_lv_web_01_search_02_text_and_duplicate_review_visible_journey(
             server.should_exit = True
         if server_thread is not None:
             server_thread.join(timeout=10)
+
+
+def test_lv_web_01_search_02_real_chinese_clip_text_search_visible_streamlit_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Real Chinese-CLIP text ranking and image-query pivot match Streamlit."""
+    import app as legacy_app
+    from _utils import load_text_encoder
+
+    models_dir = _pinned_chinese_clip_models_dir()
+    weights_path = models_dir / CHINESE_CLIP_MODEL_ID / "pytorch_model.bin"
+    weights_hash = _sha256_file(weights_path)
+    dataset = _fixture(tmp_path / "search-02-real")
+    source_hashes = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*.png")
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "search-02-real-cache"))
+    monkeypatch.setenv("LV_OUTPUT_DIR", str(tmp_path / "search-02-real-output"))
+    application = create_app(
+        model_catalog=lambda: [CHINESE_CLIP_MODEL_ID],
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+        text_model_loader=lambda model_id: load_text_encoder(model_id, models_dir=models_dir),
+    )
+    server = server_thread = browser = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id(f"model-choice-{CHINESE_CLIP_MODEL_ID}").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text(
+                "Completed", timeout=300_000
+            )
+            expect(page.get_by_test_id("search-review-workspace")).to_be_visible()
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+
+            run_id = next(iter(application.state.runs))
+            with application.state.lock:
+                run = application.state.runs[run_id]
+                raw_embeddings = application.state.raw_embeddings[run_id][
+                    CHINESE_CLIP_MODEL_ID
+                ].copy()
+            assert raw_embeddings.shape == (4, 512)
+            assert np.isfinite(raw_embeddings).all()
+            assert np.all(np.linalg.norm(raw_embeddings, axis=1) > 0)
+
+            text_encoder = load_text_encoder(CHINESE_CLIP_MODEL_ID, models_dir=models_dir)
+            query = "長頸鹿"
+            query_vector = text_encoder(query)
+            simplified_vector = text_encoder("长颈鹿")
+            np.testing.assert_allclose(query_vector, simplified_vector, rtol=1e-6, atol=1e-7)
+
+            class ExactCosineIndex:
+                def __init__(self, vectors: np.ndarray):
+                    self.vectors = np.asarray(vectors, dtype=np.float32)
+
+                def set_ef(self, _ef: int) -> None:
+                    pass
+
+                def knn_query(self, values: np.ndarray, k: int):
+                    vector = np.asarray(values, dtype=np.float32).reshape(-1)
+                    denominators = np.linalg.norm(self.vectors, axis=1) * np.linalg.norm(vector)
+                    similarities = np.zeros(len(self.vectors), dtype=np.float32)
+                    np.divide(
+                        self.vectors @ vector,
+                        denominators,
+                        out=similarities,
+                        where=denominators > 0,
+                    )
+                    distances = np.maximum(0.0, 1.0 - np.clip(similarities, -1.0, 1.0))
+                    indices = np.lexsort((np.arange(len(self.vectors)), distances))[:k]
+                    return indices.reshape(1, -1), distances[indices].reshape(1, -1)
+
+            exact_index = ExactCosineIndex(raw_embeddings)
+            legacy_indices, legacy_distances = legacy_app.find_similar_to_vector(
+                raw_embeddings, query_vector, k=len(raw_embeddings), nn_index=exact_index
+            )
+            api_response = page.request.post(
+                base_url + f"/api/v1/runs/{run_id}/text-search",
+                data={"model_id": CHINESE_CLIP_MODEL_ID, "query": query, "k": 4},
+            )
+            assert api_response.status == 200
+            api_payload = api_response.json()
+            assert api_payload["query"] == query
+            assert [row["index"] for row in api_payload["results"]] == legacy_indices
+            np.testing.assert_allclose(
+                [row["distance"] for row in api_payload["results"]],
+                legacy_distances,
+                rtol=1e-6,
+                atol=1e-7,
+            )
+
+            page.get_by_label("Chinese-CLIP text query").fill(query)
+            page.get_by_role("button", name="Search images").click()
+            text_rows = page.get_by_test_id("text-search-result")
+            expect(text_rows).to_have_count(4)
+            visible_text_indices = [int(row.get_attribute("data-index")) for row in text_rows.all()]
+            assert visible_text_indices == legacy_indices
+            visible_text_distances = [
+                float(row.locator("small").inner_text().split("d=")[-1])
+                for row in text_rows.all()
+            ]
+            np.testing.assert_allclose(
+                visible_text_distances, legacy_distances, atol=0.00005
+            )
+
+            records = [
+                {**record, "path": path}
+                for record, path in zip(run["records"], run["image_paths"])
+            ]
+            with page.expect_download() as text_download_info:
+                page.get_by_test_id("text-search-export").click()
+            text_download = text_download_info.value
+            assert Path(text_download.path()).read_bytes() == legacy_app.records_to_csv(
+                records, legacy_indices
+            ).encode("utf-8")
+
+            text_rows.first.locator("button[aria-label^='Use ']").click()
+            similar_rows = page.get_by_test_id("similar-result")
+            expect(similar_rows).to_have_count(3)
+            visual_query_index = legacy_indices[0]
+            similar_indices, similar_distances = legacy_app.find_similar_indices(
+                raw_embeddings,
+                visual_query_index,
+                k=3,
+                nn_index=exact_index,
+            )
+            visible_similar_indices = [
+                int(row.get_attribute("data-index")) for row in similar_rows.all()
+            ]
+            assert visible_similar_indices == similar_indices
+            visible_similar_distances = [
+                float(row.locator("span").inner_text().split("d=")[-1])
+                for row in similar_rows.all()
+            ]
+            np.testing.assert_allclose(
+                visible_similar_distances, similar_distances, atol=0.00005
+            )
+            browser.close()
+            browser = None
+    finally:
+        if browser is not None:
+            browser.close()
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*.png")
+    }, "real Chinese-CLIP search changed its source images"
+    assert _sha256_file(weights_path) == weights_hash == CHINESE_CLIP_PYTORCH_SHA256
 
 
 def test_lv_web_01_view_01_selected_gallery_navigation_and_yolo_overlay(
