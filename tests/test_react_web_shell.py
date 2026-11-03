@@ -204,6 +204,131 @@ def test_case_lv_web_01_search_01_similarity_reorders_by_model_and_exports(
     assert invalid_export_count.json()["code"] == "INVALID_RESULT_COUNT"
 
 
+def test_case_lv_web_01_search_02_text_search_and_duplicate_leakage_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SEARCH-02: text retrieval and phash/embedding split review use run records."""
+    root = tmp_path / "dataset"
+    train = root / "train" / "classA"
+    valid = root / "val" / "classA"
+    train.mkdir(parents=True)
+    valid.mkdir(parents=True)
+    rng = np.random.default_rng(2026)
+    image_bytes = {}
+    for index in range(3):
+        path = train / f"unique-{index}.png"
+        Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(path)
+        image_bytes[path] = path.read_bytes()
+    duplicate_path = train / "dup.png"
+    Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(duplicate_path)
+    image_bytes[duplicate_path] = duplicate_path.read_bytes()
+    duplicate_copy = valid / "dup_copy.png"
+    duplicate_copy.write_bytes(image_bytes[duplicate_path])
+    image_bytes[duplicate_copy] = duplicate_copy.read_bytes()
+    unique_val = valid / "unique-val.png"
+    Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(unique_val)
+    image_bytes[unique_val] = unique_val.read_bytes()
+
+    def feature_for(path: Path) -> np.ndarray:
+        return np.frombuffer(hashlib.sha256(path.read_bytes()).digest(), dtype=np.uint8).astype(np.float32) + 1
+
+    text_queries: list[str] = []
+
+    def text_encoder_loader(model_id: str):
+        assert model_id == "chinese-clip-test"
+
+        def encode(query: str) -> np.ndarray:
+            text_queries.append(query)
+            return feature_for(duplicate_path) if query == "斑馬" else feature_for(unique_val)
+
+        return encode
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    client = TestClient(create_app(
+        model_catalog=lambda: ["chinese-clip-test"],
+        model_loader=lambda _model: feature_for,
+        text_encoder_loader=text_encoder_loader,
+    ))
+    created = client.post("/api/v1/visualize/jobs", json={
+        "folders": [str(root / "train"), str(root / "val")],
+        "model_id": "chinese-clip-test",
+        "method": "pca",
+    })
+    assert created.status_code == 202, created.text
+    job_id = created.json()["job_id"]
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/v1/jobs/{job_id}").json()
+        if status["state"] in {"completed", "failed", "cancelled"}:
+            break
+        time.sleep(0.02)
+    assert status["state"] == "completed", status
+    run_id = status["run_id"]
+    run = client.get(f"/api/v1/runs/{run_id}").json()
+    assert "_phashes" not in run and "_embedding_sources" not in run
+    records = run["records"]
+    expected_pair = {
+        next(row["index"] for row in records if row["filename"] == "dup.png"),
+        next(row["index"] for row in records if row["filename"] == "dup_copy.png"),
+    }
+
+    text_result = client.post(f"/api/v1/runs/{run_id}/text-search", json={
+        "model_id": "chinese-clip-test", "query": "斑馬", "k": 3,
+    })
+    assert text_result.status_code == 200, text_result.text
+    assert text_result.json()["query"] == "斑馬"
+    assert text_queries == ["斑馬"]
+    assert {row["filename"] for row in text_result.json()["results"][:2]} == {
+        "dup.png", "dup_copy.png",
+    }
+    assert [row["distance"] for row in text_result.json()["results"]] == sorted(
+        row["distance"] for row in text_result.json()["results"]
+    )
+    text_export = client.get(f"/api/v1/runs/{run_id}/text-search.csv", params={
+        "model_id": "chinese-clip-test", "query": "斑馬", "k": 3,
+    })
+    assert text_export.status_code == 200
+    text_csv_rows = list(csv.reader(io.StringIO(text_export.text)))
+    assert text_csv_rows[0] == ["index", "filename", "path", "label", "split"]
+    assert len(text_csv_rows) == 4
+    assert text_queries == ["斑馬"]  # encoder instance and query vector are reused
+    unsupported_text_model = client.post(f"/api/v1/runs/{run_id}/text-search", json={
+        "model_id": "dinov2_vits14", "query": "zebra", "k": 3,
+    })
+    long_text_query = client.get(f"/api/v1/runs/{run_id}/text-search.csv", params={
+        "model_id": "chinese-clip-test", "query": "x" * 513, "k": 3,
+    })
+    assert unsupported_text_model.status_code == 409
+    assert unsupported_text_model.json()["code"] == "TEXT_QUERY_UNAVAILABLE"
+    assert long_text_query.status_code == 422
+    assert long_text_query.json()["code"] == "TEXT_QUERY_TOO_LONG"
+
+    all_phash = client.post(f"/api/v1/runs/{run_id}/duplicates", json={
+        "model_id": "chinese-clip-test", "method": "phash", "phash_threshold": 4,
+    })
+    cross_phash = client.post(f"/api/v1/runs/{run_id}/duplicates", json={
+        "model_id": "chinese-clip-test", "method": "phash", "phash_threshold": 4,
+        "cross_split_only": True,
+    })
+    cross_embedding = client.post(f"/api/v1/runs/{run_id}/duplicates", json={
+        "model_id": "chinese-clip-test", "method": "embedding", "embedding_threshold": 0.05,
+        "cross_split_only": True,
+    })
+    for response in (all_phash, cross_phash, cross_embedding):
+        assert response.status_code == 200, response.text
+        assert all("path" not in pair["left"] and "path" not in pair["right"]
+                   for pair in response.json()["pairs"])
+    assert any({pair["left"]["index"], pair["right"]["index"]} == expected_pair
+               and pair["distance"] == 0 for pair in all_phash.json()["pairs"])
+    for result in (cross_phash.json(), cross_embedding.json()):
+        assert result["cross_split_only"] is True
+        assert all(pair["left"]["split"] != pair["right"]["split"] for pair in result["pairs"])
+        assert any({pair["left"]["index"], pair["right"]["index"]} == expected_pair
+                   for pair in result["pairs"])
+    assert {path: path.read_bytes() for path in image_bytes} == image_bytes
+    assert {path for path in root.rglob("*") if path.is_file()} == set(image_bytes)
+
+
 def test_case_lv_web_01_ic_01_selected_image_is_run_bound(
     classifier_fixture, monkeypatch, tmp_path
 ):

@@ -90,6 +90,19 @@ export type SimilarSearch = {
   query_index: number;
   results: SimilarResult[];
 };
+export type TextSearch = { model_id: string; query: string; results: SimilarResult[] };
+export type DuplicatePair = {
+  left: RunRecord;
+  right: RunRecord;
+  distance: number;
+};
+export type DuplicateScan = {
+  model_id: string;
+  method: "phash" | "embedding";
+  cross_split_only: boolean;
+  total_pairs: number;
+  pairs: DuplicatePair[];
+};
 
 export type ComparePoint = {
   group: "a" | "b";
@@ -208,6 +221,29 @@ export const api = {
     const query = new URLSearchParams({ model_id: modelId, query_index: String(queryIndex), k: String(k) });
     return base + "/api/v1/runs/" + encodeURIComponent(runId) + "/similar.csv?" + query.toString();
   },
+  searchByText: (runId: string, modelId: string, queryText: string, k: number) =>
+    request<TextSearch>("/api/v1/runs/" + encodeURIComponent(runId) + "/text-search", {
+      method: "POST",
+      body: JSON.stringify({ model_id: modelId, query: queryText, k }),
+    }),
+  textSearchCsvUrl: (runId: string, modelId: string, queryText: string, k: number) => {
+    const base = window.NATIVEAPP_LOCAL_API || "";
+    const query = new URLSearchParams({ model_id: modelId, query: queryText, k: String(k) });
+    return base + "/api/v1/runs/" + encodeURIComponent(runId) + "/text-search.csv?" + query.toString();
+  },
+  scanDuplicates: (
+    runId: string,
+    options: { modelId: string; method: "phash" | "embedding"; crossSplitOnly: boolean; phashThreshold: number; embeddingThreshold: number },
+  ) => request<DuplicateScan>("/api/v1/runs/" + encodeURIComponent(runId) + "/duplicates", {
+    method: "POST",
+    body: JSON.stringify({
+      model_id: options.modelId,
+      method: options.method,
+      cross_split_only: options.crossSplitOnly,
+      phash_threshold: options.phashThreshold,
+      embedding_threshold: options.embeddingThreshold,
+    }),
+  }),
   createCompareJob: (foldersA: string[], foldersB: string[], modelId: string) =>
     request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
       method: "POST",

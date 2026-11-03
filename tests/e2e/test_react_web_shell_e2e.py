@@ -638,7 +638,8 @@ def test_lv_web_01_search_01_visible_chain_cross_model_and_csv(
             search_payloads = []
 
             def capture_response(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if ("/api/v1/runs/" in response.url and "/images/" not in response.url
+                        and not response.url.endswith(".csv") and response.ok):
                     if response.request.method == "POST" and response.url.endswith("/similar"):
                         search_payloads.append(response.json())
                     elif response.request.method == "GET":
@@ -695,6 +696,125 @@ def test_lv_web_01_search_01_visible_chain_cross_model_and_csv(
 
     assert {path: path.read_bytes() for path in source_bytes} == source_bytes
     assert {path for path in (tmp_path / "train").rglob("*") if path.is_file()} == set(source_bytes)
+
+
+def test_lv_web_01_search_02_visible_text_and_duplicate_leakage_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SEARCH-02: Chinese-CLIP text results and duplicate pairs remain reviewable."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    from playwright.sync_api import expect, sync_playwright
+
+    root = tmp_path / "leakage-dataset"
+    train, valid = root / "train" / "classA", root / "val" / "classA"
+    train.mkdir(parents=True)
+    valid.mkdir(parents=True)
+    rng = np.random.default_rng(2026)
+    source_bytes = {}
+    for index in range(3):
+        image_path = train / f"unique-{index}.png"
+        Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(image_path)
+        source_bytes[image_path] = image_path.read_bytes()
+    duplicate = train / "dup.png"
+    Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(duplicate)
+    source_bytes[duplicate] = duplicate.read_bytes()
+    duplicate_copy = valid / "dup_copy.png"
+    duplicate_copy.write_bytes(source_bytes[duplicate])
+    source_bytes[duplicate_copy] = duplicate_copy.read_bytes()
+    unique_val = valid / "unique-val.png"
+    Image.fromarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8)).save(unique_val)
+    source_bytes[unique_val] = unique_val.read_bytes()
+
+    def feature_for(path: Path) -> np.ndarray:
+        return np.frombuffer(hashlib.sha256(path.read_bytes()).digest(), dtype=np.uint8).astype(np.float32) + 1
+
+    text_queries: list[str] = []
+
+    def encode_text(query: str) -> np.ndarray:
+        text_queries.append(query)
+        return feature_for(duplicate) if query == "斑馬" else feature_for(unique_val)
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "lv-cache"))
+    application = create_app(
+        model_catalog=lambda: ["chinese-clip-test"],
+        model_loader=lambda _model: feature_for,
+        text_encoder_loader=lambda _model: encode_text,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+            page.on("response", lambda response: run_payloads.append(response.json())
+                    if response.request.method == "GET" and "/api/v1/runs/" in response.url
+                    and "/images/" not in response.url and not response.url.endswith(".csv")
+                    and response.ok else None)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (root / "train", root / "val"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(6)
+            assert run_payloads
+
+            page.get_by_test_id("search-by-text").click()
+            expect(page.get_by_test_id("similar-panel")).to_be_visible()
+            page.get_by_label("Text search query").fill("斑馬")
+            page.get_by_role("button", name="Search", exact=True).click()
+            expect(page.get_by_test_id("text-search-results")).to_be_visible()
+            expect(page.get_by_test_id("text-search-result")).to_have_count(6)
+            first_names = [
+                page.get_by_test_id("text-search-result").nth(index).inner_text()
+                for index in range(2)
+            ]
+            assert "dup.png" in first_names[0] or "dup_copy.png" in first_names[0]
+            assert "dup.png" in first_names[1] or "dup_copy.png" in first_names[1]
+            assert first_names[0] != first_names[1]
+            assert text_queries == ["斑馬"]
+
+            with page.expect_download() as download:
+                page.get_by_test_id("text-search-export").click()
+            text_csv = list(csv.reader(io.StringIO(Path(download.value.path()).read_text(encoding="utf-8"))))
+            assert len(text_csv) == 1 + 6
+            assert text_queries == ["斑馬"]
+
+            page.get_by_role("button", name=re.compile("Use .* as image query")).first.click()
+            expect(page.get_by_test_id("similar-query-step")).to_have_count(1)
+            expect(page.get_by_test_id("similar-results")).to_be_visible()
+
+            page.get_by_test_id("open-duplicate-review").click()
+            page.get_by_label("Only cross split").check()
+            page.get_by_test_id("scan-duplicates").click()
+            expect(page.get_by_test_id("duplicate-pairs")).to_be_visible()
+            pair_rows = page.get_by_test_id("duplicate-pair")
+            expect(pair_rows.first).to_contain_text("dup.png")
+            expect(pair_rows.first).to_contain_text("dup_copy.png")
+            for index in range(pair_rows.count()):
+                row_text = pair_rows.nth(index).inner_text()
+                assert ("train" in row_text and "val" in row_text)
+
+            page.get_by_label("Duplicate method").select_option("embedding")
+            page.get_by_label("Embedding distance threshold").fill("0.05")
+            page.get_by_test_id("scan-duplicates").click()
+            expect(page.get_by_test_id("duplicate-pair").first).to_contain_text("dup_copy.png")
+            page.get_by_role("button", name="Review right dup_copy.png").click()
+            expect(page.get_by_test_id("selected-image-name")).to_contain_text("dup_copy.png")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert text_queries == ["斑馬"]
+    assert {path: path.read_bytes() for path in source_bytes} == source_bytes
+    assert {path for path in root.rglob("*") if path.is_file()} == set(source_bytes)
 
 
 def test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d(

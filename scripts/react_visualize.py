@@ -620,6 +620,12 @@ def run_visualization(
     for folder, entries in manifest_by_folder.items():
         write_manifest(folder, entries)
 
+    phash_by_path = {
+        str(path.resolve()): entries.get(rel_key(folder, path), {}).get("phash")
+        for folder, entries in manifest_by_folder.items()
+        for path in paths_by_folder.get(folder, [])
+    }
+
     public_records = [
         {
             "index": index,
@@ -674,6 +680,7 @@ def run_visualization(
         "warnings": base_warnings + warnings,
         "image_paths": [Path(record["path"]).resolve() for record in records],
         "_embedding_sources": embedding_sources,
+        "_phashes": [phash_by_path.get(str(Path(record["path"]).resolve())) for record in records],
     }
 
 

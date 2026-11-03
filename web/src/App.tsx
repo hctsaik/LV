@@ -4,10 +4,12 @@ import {
   type EmbeddingPoint,
   type KMeansBlocks,
   type BlockProjection,
+  type DuplicateScan,
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
   type SimilarSearch,
+  type TextSearch,
   type VisualizationRun,
 } from "./api";
 import Compare from "./Compare";
@@ -158,11 +160,26 @@ export default function App() {
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
   const [similarOpen, setSimilarOpen] = useState(false);
+  const [textSearchMode, setTextSearchMode] = useState(false);
   const [similarChain, setSimilarChain] = useState<number[]>([]);
   const [similarK, setSimilarK] = useState(9);
   const [similarResults, setSimilarResults] = useState<SimilarSearch | null>(null);
   const [similarLoading, setSimilarLoading] = useState(false);
   const [similarError, setSimilarError] = useState("");
+  const [textQueryDraft, setTextQueryDraft] = useState("");
+  const [submittedTextQuery, setSubmittedTextQuery] = useState("");
+  const [textResultK, setTextResultK] = useState(9);
+  const [textResults, setTextResults] = useState<TextSearch | null>(null);
+  const [textLoading, setTextLoading] = useState(false);
+  const [textError, setTextError] = useState("");
+  const [duplicateOpen, setDuplicateOpen] = useState(false);
+  const [duplicateMethod, setDuplicateMethod] = useState<"phash" | "embedding">("phash");
+  const [duplicateCrossSplit, setDuplicateCrossSplit] = useState(false);
+  const [phashThreshold, setPhashThreshold] = useState(4);
+  const [embeddingThreshold, setEmbeddingThreshold] = useState(0.05);
+  const [duplicateResults, setDuplicateResults] = useState<DuplicateScan | null>(null);
+  const [duplicateLoading, setDuplicateLoading] = useState(false);
+  const [duplicateError, setDuplicateError] = useState("");
   const [showYoloOverlay, setShowYoloOverlay] = useState(true);
   const [viewerImageMode, setViewerImageMode] = useState<"selected" | "source">("selected");
   const [blockCount, setBlockCount] = useState(12);
@@ -280,7 +297,7 @@ export default function App() {
 
   useEffect(() => {
     const runId = job?.run_id;
-    if (!similarOpen || !runId || !run || run.source_granularity !== "whole_image" || similarQueryIndex === null) {
+    if (!similarOpen || textSearchMode || !runId || !run || run.source_granularity !== "whole_image" || similarQueryIndex === null) {
       setSimilarResults(null);
       setSimilarLoading(false);
       setSimilarError("");
@@ -300,7 +317,43 @@ export default function App() {
       })
       .finally(() => active && setSimilarLoading(false));
     return () => { active = false; };
-  }, [similarOpen, similarQueryIndex, similarK, activeModelId, run, job?.run_id]);
+  }, [similarOpen, textSearchMode, similarQueryIndex, similarK, activeModelId, run, job?.run_id]);
+
+  useEffect(() => {
+    const runId = job?.run_id;
+    if (!similarOpen || !textSearchMode || !runId || !run || run.source_granularity !== "whole_image" || !submittedTextQuery) {
+      setTextResults(null);
+      setTextLoading(false);
+      setTextError("");
+      return;
+    }
+    if (!activeModelId.startsWith("chinese-clip")) {
+      setTextResults(null);
+      setTextLoading(false);
+      setTextError("Select a Chinese-CLIP model in this run to search by text.");
+      return;
+    }
+    let active = true;
+    setTextResults(null);
+    setTextLoading(true);
+    setTextError("");
+    api.searchByText(runId, activeModelId, submittedTextQuery, textResultK)
+      .then((result) => active && setTextResults(result))
+      .catch((reason: unknown) => {
+        if (active) {
+          setTextResults(null);
+          setTextError(reason instanceof Error ? reason.message : "Unable to search images by text.");
+        }
+      })
+      .finally(() => active && setTextLoading(false));
+    return () => { active = false; };
+  }, [similarOpen, textSearchMode, submittedTextQuery, textResultK, activeModelId, run, job?.run_id]);
+
+  useEffect(() => {
+    if (duplicateResults?.method === "embedding" && duplicateResults.model_id !== activeModelId) {
+      setDuplicateResults(null);
+    }
+  }, [activeModelId, duplicateResults]);
 
   function addFolder(value = folderDraft) {
     const path = value.trim();
@@ -363,8 +416,13 @@ export default function App() {
     setNotice("");
     setRun(null);
     setSimilarOpen(false);
+    setTextSearchMode(false);
     setSimilarChain([]);
     setSimilarResults(null);
+    setSubmittedTextQuery("");
+    setTextResults(null);
+    setDuplicateOpen(false);
+    setDuplicateResults(null);
     setSelectedIndex(null);
     setSelectedIndices([]);
     setViewerImageMode("selected");
@@ -453,7 +511,26 @@ export default function App() {
     if (!run || run.source_granularity !== "whole_image" || index === undefined || index === null) return;
     setSimilarK(Math.min(9, Math.max(1, run.records.length - 1)));
     setSimilarChain([index]);
+    setTextSearchMode(false);
+    setSubmittedTextQuery("");
     setSimilarOpen(true);
+  }
+
+  function openTextSearch() {
+    setSimilarChain([]);
+    setSimilarResults(null);
+    setTextSearchMode(true);
+    setTextQueryDraft("");
+    setSubmittedTextQuery("");
+    setTextResultK(Math.min(9, Math.max(1, run?.records.length || 1)));
+    setSimilarOpen(true);
+  }
+
+  function pivotTextResult(index: number) {
+    setTextSearchMode(false);
+    setSubmittedTextQuery("");
+    setTextResults(null);
+    setSimilarChain([index]);
   }
 
   function continueSimilarSearch(index: number) {
@@ -466,9 +543,35 @@ export default function App() {
 
   function closeSimilarSearch() {
     setSimilarOpen(false);
+    setTextSearchMode(false);
     setSimilarChain([]);
     setSimilarResults(null);
     setSimilarError("");
+    setSubmittedTextQuery("");
+    setTextResults(null);
+    setTextError("");
+  }
+
+  async function scanDuplicates() {
+    const runId = job?.run_id;
+    if (!runId || !run || run.source_granularity !== "whole_image") return;
+    setDuplicateLoading(true);
+    setDuplicateError("");
+    setDuplicateResults(null);
+    try {
+      const result = await api.scanDuplicates(runId, {
+        modelId: activeModelId,
+        method: duplicateMethod,
+        crossSplitOnly: duplicateCrossSplit,
+        phashThreshold,
+        embeddingThreshold,
+      });
+      setDuplicateResults(result);
+    } catch (reason) {
+      setDuplicateError(reason instanceof Error ? reason.message : "Unable to scan duplicate candidates.");
+    } finally {
+      setDuplicateLoading(false);
+    }
   }
 
   function navigateViewer(offset: number) {
@@ -794,6 +897,17 @@ export default function App() {
                       Find similar
                     </button>
                   )}
+                  {run.source_granularity === "whole_image" && activeModelId.startsWith("chinese-clip") && (
+                    <button type="button" className="find-similar-button" data-testid="search-by-text" onClick={openTextSearch}>
+                      Search by text
+                    </button>
+                  )}
+                  {run.source_granularity === "whole_image" && (
+                    <button type="button" className="find-similar-button" data-testid="open-duplicate-review"
+                      onClick={() => { setDuplicateOpen(true); setDuplicateResults(null); setDuplicateError(""); }}>
+                      Find duplicates
+                    </button>
+                  )}
                 </div>
                 {currentRecords.length ? (
                   <ScatterPlot
@@ -885,13 +999,58 @@ export default function App() {
                     <p>Select one or more points to see matching thumbnails here.</p>
                   )}
                 </section>
-                {similarOpen && similarQueryIndex !== null && run.source_granularity === "whole_image" && (
+                {similarOpen && run.source_granularity === "whole_image" && (
                   <section className="similar-panel" data-testid="similar-panel" aria-label="Similar images">
                     <div className="similar-panel-heading">
-                      <div><strong>Find similar images</strong><small>Recomputed with the active feature model</small></div>
+                      <div><strong>{textSearchMode ? "Search images by text" : "Find similar images"}</strong><small>{textSearchMode ? "Chinese-CLIP maps text into the selected image feature space" : "Recomputed with the active feature model"}</small></div>
                       <span data-testid="similar-model">{activeModelId}</span>
                       <button type="button" aria-label="Close similar search" onClick={closeSimilarSearch}>×</button>
                     </div>
+                    {textSearchMode && (
+                      <>
+                        <form className="text-search-form" onSubmit={(event) => {
+                          event.preventDefault();
+                          const query = textQueryDraft.trim();
+                          if (query) setSubmittedTextQuery(query);
+                        }}>
+                          <label><span>Text query</span><input aria-label="Text search query" value={textQueryDraft}
+                            onChange={(event) => setTextQueryDraft(event.target.value)}
+                            placeholder="斑馬、夜間反光、zebra" maxLength={512} /></label>
+                          <label><span>Results</span><input aria-label="Text result count" type="number" min={1}
+                            max={Math.max(1, run.records.length)} value={textResultK}
+                            onChange={(event) => setTextResultK(Math.max(1, Math.min(Number(event.target.value) || 1, run.records.length)))} /></label>
+                          <button type="submit" disabled={!textQueryDraft.trim() || !activeModelId.startsWith("chinese-clip")}>Search</button>
+                        </form>
+                        <p className="text-search-note">Traditional Chinese is normalized by the local text model; English is also supported.</p>
+                        {textLoading && <div className="similar-loading" role="status">Searching with {activeModelId}…</div>}
+                        {textError && <div className="alert alert-error" role="alert">{textError}</div>}
+                        {textResults && (
+                          <div className="similar-panel-toolbar">
+                            <span data-testid="text-search-query">“{textResults.query}” · {textResults.results.length} results</span>
+                            <a data-testid="text-search-export" download="text_search.csv"
+                              href={api.textSearchCsvUrl(job?.run_id || "", activeModelId, submittedTextQuery, textResultK)}>
+                              Export CSV
+                            </a>
+                          </div>
+                        )}
+                        {textResults?.results.length ? (
+                          <div className="similar-results" data-testid="text-search-results">
+                            {textResults.results.map((record) => (
+                              <article className="similar-result" key={record.index} data-testid="text-search-result" data-index={record.index}>
+                                <img src={api.runImageUrl(job?.run_id || "", record.index)} alt="" loading="lazy" />
+                                <div><strong>{record.label}｜{record.filename}</strong><small>Cosine distance · d={record.distance.toFixed(4)}</small></div>
+                                <button type="button" aria-label={`Use ${record.filename} as image query`}
+                                  onClick={() => pivotTextResult(record.index)}>Continue by image</button>
+                              </article>
+                            ))}
+                          </div>
+                        ) : textResults && !textLoading ? (
+                          <p className="similar-empty">No images match this text query.</p>
+                        ) : null}
+                      </>
+                    )}
+                    {!textSearchMode && similarQueryIndex !== null && (
+                      <>
                     <div className="similar-query-chain" aria-label="Query history">
                       {similarChain.map((index, position) => (
                         <button type="button" key={`${position}-${index}`} data-testid="similar-query-step"
@@ -925,6 +1084,61 @@ export default function App() {
                       </div>
                     ) : similarResults && !similarLoading ? (
                       <p className="similar-empty">No other images are available for this query.</p>
+                    ) : null}
+                      </>
+                    )}
+                  </section>
+                )}
+                {duplicateOpen && run.source_granularity === "whole_image" && (
+                  <section className="duplicate-panel" data-testid="duplicate-panel" aria-label="Duplicate image review">
+                    <div className="similar-panel-heading">
+                      <div><strong>Duplicate and split leakage review</strong><small>Candidate pairs only; no automatic deletion or quality decision</small></div>
+                      <span>{activeModelId}</span>
+                      <button type="button" aria-label="Close duplicate review" onClick={() => setDuplicateOpen(false)}>×</button>
+                    </div>
+                    <div className="duplicate-controls">
+                      <label><span>Method</span><select aria-label="Duplicate method" value={duplicateMethod}
+                        onChange={(event) => { setDuplicateMethod(event.target.value as "phash" | "embedding"); setDuplicateResults(null); }}>
+                        <option value="phash">Perceptual hash (strict)</option>
+                        <option value="embedding">Embedding (semantic)</option>
+                      </select></label>
+                      {duplicateMethod === "phash" ? (
+                        <label><span>Hamming ≤</span><input aria-label="Perceptual hash threshold" type="number" min={0} max={16}
+                          value={phashThreshold} onChange={(event) => { setPhashThreshold(Number(event.target.value)); setDuplicateResults(null); }} /></label>
+                      ) : (
+                        <label><span>Cosine distance ≤</span><input aria-label="Embedding distance threshold" type="number" min={0} max={0.5} step={0.01}
+                          value={embeddingThreshold} onChange={(event) => { setEmbeddingThreshold(Number(event.target.value)); setDuplicateResults(null); }} /></label>
+                      )}
+                      <label className="duplicate-cross-split"><input aria-label="Only cross split" type="checkbox" checked={duplicateCrossSplit}
+                        onChange={(event) => { setDuplicateCrossSplit(event.target.checked); setDuplicateResults(null); }} />Only cross split · leakage candidates</label>
+                      <button type="button" data-testid="scan-duplicates" onClick={() => void scanDuplicates()}
+                        disabled={duplicateLoading}>{duplicateLoading ? "Scanning…" : "Scan duplicates"}</button>
+                    </div>
+                    {duplicateLoading && <div className="similar-loading" role="status">Scanning this run…</div>}
+                    {duplicateError && <div className="alert alert-error" role="alert">{duplicateError}</div>}
+                    {duplicateResults && (
+                      <div className="duplicate-results-summary" data-testid="duplicate-results-summary">
+                        Found {duplicateResults.total_pairs} pair candidates · showing {Math.min(50, duplicateResults.pairs.length)} · manual review only
+                      </div>
+                    )}
+                    {duplicateResults?.pairs.length ? (
+                      <div className="duplicate-pairs" data-testid="duplicate-pairs">
+                        {duplicateResults.pairs.slice(0, 50).map((pair, index) => (
+                          <article className="duplicate-pair" key={`${pair.left.index}-${pair.right.index}`} data-testid="duplicate-pair">
+                            <button type="button" aria-label={`Review left ${pair.left.filename}`} onClick={() => setSelectedIndex(pair.left.index)}>
+                              <img src={api.runImageUrl(job?.run_id || "", pair.left.index)} alt="" loading="lazy" />
+                              <span>{pair.left.label}｜{pair.left.filename} · {pair.left.split}</span>
+                            </button>
+                            <div className="duplicate-pair-distance"><small>Pair {index + 1}</small><strong>d={duplicateResults.method === "phash" ? Math.round(pair.distance) : pair.distance.toFixed(4)}</strong></div>
+                            <button type="button" aria-label={`Review right ${pair.right.filename}`} onClick={() => setSelectedIndex(pair.right.index)}>
+                              <img src={api.runImageUrl(job?.run_id || "", pair.right.index)} alt="" loading="lazy" />
+                              <span>{pair.right.label}｜{pair.right.filename} · {pair.right.split}</span>
+                            </button>
+                          </article>
+                        ))}
+                      </div>
+                    ) : duplicateResults && !duplicateLoading ? (
+                      <p className="similar-empty">No duplicate candidates match these settings.</p>
                     ) : null}
                   </section>
                 )}

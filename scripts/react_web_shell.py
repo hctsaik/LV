@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, Response
 from starlette.staticfiles import StaticFiles
 
-from _utils import available_models, load_model
+from _utils import available_models, load_model, load_text_encoder, supports_text_query
 from react_compare import CompareCancelled, CompareInputError, project_comparison, run_image_comparison
 from react_visualize import JobCancelled, VisualizationInputError, run_visualization
 
@@ -77,6 +77,20 @@ class CreateSimilarSearch(BaseModel):
     k: int = Field(default=9, ge=1, le=100_000)
 
 
+class CreateTextSearch(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    query: str = Field(min_length=1, max_length=512)
+    k: int = Field(default=9, ge=1, le=100_000)
+
+
+class CreateDuplicateScan(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    method: Literal["phash", "embedding"] = "phash"
+    cross_split_only: bool = False
+    phash_threshold: int = Field(default=4, ge=0, le=16)
+    embedding_threshold: float = Field(default=0.05, ge=0, le=0.5)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -120,19 +134,13 @@ def _job_view(job: _Job) -> dict:
     }
 
 
-def _similar_search(run: dict, model_id: str, query_index: int, k: int) -> dict:
-    """Rank whole-image records by exact cosine distance from one run record."""
+def _run_embedding_matrix(run: dict, model_id: str) -> np.ndarray:
+    """Read one whole-image model matrix from its run-bound app cache."""
     records = run.get("records", [])
-    if k < 1:
-        raise HTTPException(status_code=422, detail={
-            "code": "INVALID_RESULT_COUNT",
-            "message": "The number of similar images must be at least one.",
-            "request_id": uuid.uuid4().hex,
-        })
     if run.get("source_granularity") != "whole_image":
         raise HTTPException(status_code=409, detail={
-            "code": "SIMILARITY_UNAVAILABLE",
-            "message": "Image similarity is available for whole-image runs. Run whole-image analysis first.",
+            "code": "WHOLE_IMAGE_RUN_REQUIRED",
+            "message": "This search is available for whole-image runs. Run whole-image analysis first.",
             "request_id": uuid.uuid4().hex,
         })
     if model_id not in run.get("models", []):
@@ -141,15 +149,6 @@ def _similar_search(run: dict, model_id: str, query_index: int, k: int) -> dict:
             "message": "Run the analysis with this feature model before searching across models.",
             "request_id": uuid.uuid4().hex,
         })
-    if not 0 <= query_index < len(records):
-        raise HTTPException(status_code=422, detail={
-            "code": "INVALID_QUERY_INDEX",
-            "message": "The selected query image is outside this run.",
-            "request_id": uuid.uuid4().hex,
-        })
-    if len(records) < 2:
-        return {"model_id": model_id, "query_index": query_index, "results": []}
-
     try:
         expected_shape = tuple(int(value) for value in run["embedding_shapes"][model_id])
     except (KeyError, TypeError, ValueError):
@@ -208,6 +207,202 @@ def _similar_search(run: dict, model_id: str, query_index: int, k: int) -> dict:
             "message": "The feature cache contains invalid vectors. Run the analysis again.",
             "request_id": uuid.uuid4().hex,
         })
+    return matrix
+
+
+def _rank_cosine(matrix: np.ndarray, query_vector: np.ndarray, k: int,
+                 excluded_index: int | None = None) -> list[tuple[int, float]]:
+    matrix = np.asarray(matrix, dtype=np.float32)
+    query_vector = np.asarray(query_vector, dtype=np.float32).reshape(-1)
+    if matrix.ndim != 2 or query_vector.shape[0] != matrix.shape[1]:
+        raise HTTPException(status_code=422, detail={
+            "code": "QUERY_DIMENSION_MISMATCH",
+            "message": "The query vector is incompatible with this model's image features.",
+            "request_id": uuid.uuid4().hex,
+        })
+    query_norm = float(np.linalg.norm(query_vector))
+    row_norms = np.linalg.norm(matrix, axis=1)
+    if (not np.isfinite(query_vector).all() or query_norm <= 0
+            or not np.isfinite(matrix).all() or np.any(row_norms <= 0)):
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_QUERY_VECTOR",
+            "message": "The query encoder returned an invalid feature vector.",
+            "request_id": uuid.uuid4().hex,
+        })
+    cosine = (matrix @ query_vector) / (row_norms * query_norm)
+    distances = np.clip(1.0 - cosine.astype(np.float64), 0.0, 2.0)
+    candidate_count = len(matrix) - (1 if excluded_index is not None else 0)
+    indices = sorted(
+        (index for index in range(len(matrix)) if index != excluded_index),
+        key=lambda index: (float(distances[index]), index),
+    )[: min(k, max(0, candidate_count))]
+    return [(index, float(distances[index])) for index in indices]
+
+
+def _similar_search(run: dict, model_id: str, query_index: int, k: int) -> dict:
+    """Rank whole-image records by exact cosine distance from one run record."""
+    records = run.get("records", [])
+    if k < 1:
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_RESULT_COUNT",
+            "message": "The number of similar images must be at least one.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if run.get("source_granularity") != "whole_image":
+        raise HTTPException(status_code=409, detail={
+            "code": "WHOLE_IMAGE_RUN_REQUIRED",
+            "message": "Image similarity is available for whole-image runs. Run whole-image analysis first.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if model_id not in run.get("models", []):
+        raise HTTPException(status_code=404, detail={
+            "code": "MODEL_NOT_IN_RUN",
+            "message": "Run the analysis with this feature model before searching across models.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if not 0 <= query_index < len(records):
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_QUERY_INDEX",
+            "message": "The selected query image is outside this run.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if len(records) < 2:
+        return {"model_id": model_id, "query_index": query_index, "results": []}
+
+    matrix = _run_embedding_matrix(run, model_id)
+    ranked = _rank_cosine(matrix, matrix[query_index], k, excluded_index=query_index)
+    return {
+        "model_id": model_id,
+        "query_index": query_index,
+        "results": [
+            {**records[index], "distance": distance}
+            for index, distance in ranked
+        ],
+    }
+
+
+def _text_search(run: dict, model_id: str, query: str, k: int,
+                 text_encoder: Callable[[str], np.ndarray]) -> dict:
+    query = query.strip()
+    if not query:
+        raise HTTPException(status_code=422, detail={
+            "code": "EMPTY_TEXT_QUERY",
+            "message": "Enter a text query before searching.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if len(query) > 512:
+        raise HTTPException(status_code=422, detail={
+            "code": "TEXT_QUERY_TOO_LONG",
+            "message": "The text query must be 512 characters or fewer.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if not supports_text_query(model_id):
+        raise HTTPException(status_code=409, detail={
+            "code": "TEXT_QUERY_UNAVAILABLE",
+            "message": "Text search requires a Chinese-CLIP model included in this run.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if model_id not in run.get("models", []):
+        raise HTTPException(status_code=404, detail={
+            "code": "MODEL_NOT_IN_RUN",
+            "message": "Run the analysis with this text-capable model before searching.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if k < 1:
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_RESULT_COUNT",
+            "message": "The number of search results must be at least one.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if not run.get("records"):
+        return {"model_id": model_id, "query": query, "results": []}
+    try:
+        query_vector = text_encoder(query)
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail={
+            "code": "TEXT_MODEL_UNAVAILABLE",
+            "message": "The selected local text model is unavailable.",
+            "request_id": uuid.uuid4().hex,
+        }) from None
+    except Exception:
+        logger.exception("LV React text query failed (model=%s)", model_id)
+        raise HTTPException(status_code=503, detail={
+            "code": "TEXT_QUERY_FAILED",
+            "message": "The local text query could not be encoded. Check the worker log and retry.",
+            "request_id": uuid.uuid4().hex,
+        }) from None
+    matrix = _run_embedding_matrix(run, model_id)
+    ranked = _rank_cosine(matrix, query_vector, k)
+    records = run["records"]
+    return {
+        "model_id": model_id,
+        "query": query,
+        "results": [
+            {**records[index], "distance": distance}
+            for index, distance in ranked
+        ],
+    }
+
+
+def _duplicate_scan(run: dict, request: CreateDuplicateScan) -> dict:
+    records = run.get("records", [])
+    if run.get("source_granularity") != "whole_image":
+        raise HTTPException(status_code=409, detail={
+            "code": "WHOLE_IMAGE_RUN_REQUIRED",
+            "message": "Duplicate review is available for whole-image runs. Run whole-image analysis first.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if len(records) < 2:
+        return {
+            "model_id": request.model_id,
+            "method": request.method,
+            "cross_split_only": request.cross_split_only,
+            "total_pairs": 0,
+            "pairs": [],
+        }
+    splits = [str(record.get("split", "")) for record in records]
+    if request.method == "phash":
+        phashes = run.get("_phashes", [])
+        if len(phashes) != len(records):
+            raise HTTPException(status_code=409, detail={
+                "code": "PHASH_CACHE_UNAVAILABLE",
+                "message": "Perceptual hashes are unavailable for this run. Run the analysis again.",
+                "request_id": uuid.uuid4().hex,
+            })
+        from interaction import find_duplicate_pairs_phash
+
+        pairs = find_duplicate_pairs_phash(
+            phashes,
+            max_hamming=request.phash_threshold,
+            splits=splits,
+            cross_split_only=request.cross_split_only,
+        )
+    else:
+        from interaction import find_duplicate_pairs_embedding
+
+        matrix = _run_embedding_matrix(run, request.model_id)
+        pairs = find_duplicate_pairs_embedding(
+            matrix,
+            max_distance=request.embedding_threshold,
+            splits=splits,
+            cross_split_only=request.cross_split_only,
+        )
+    return {
+        "model_id": request.model_id,
+        "method": request.method,
+        "cross_split_only": request.cross_split_only,
+        "total_pairs": len(pairs),
+        "pairs": [
+            {
+                "left": records[left],
+                "right": records[right],
+                "distance": distance,
+            }
+            for left, right, distance in pairs
+        ],
+    }
     cosine = (matrix @ matrix[query_index]) / (norms * norms[query_index])
     distances = np.clip(1.0 - cosine.astype(np.float64), 0.0, 2.0)
     ranked = sorted(
@@ -230,17 +425,21 @@ def create_app(
     model_loader: Callable[[str], Callable] | None = None,
     object_model_loader: Callable[[str, dict], Callable] | None = None,
     comparison_runner: Callable[..., dict] | None = None,
+    text_encoder_loader: Callable[[str], Callable[[str], np.ndarray]] | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
     loader = model_loader or load_model
     object_loader = object_model_loader
     if object_loader is None and model_loader is not None:
         object_loader = lambda model_id, _policy: loader(model_id)
+    text_loader = text_encoder_loader or load_text_encoder
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
     app.state.runs = {}
     app.state.compare_jobs = {}
     app.state.compare_runs = {}
+    app.state.text_encoders = {}
+    app.state.text_vectors = {}
     app.state.compare_projection_active = False
     app.state.lock = threading.RLock()
 
@@ -659,6 +858,82 @@ def create_app(
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": 'attachment; filename="similar_group.csv"'},
         )
+
+    def get_text_encoder(model_id: str) -> Callable[[str], np.ndarray]:
+        with app.state.lock:
+            encoder = app.state.text_encoders.get(model_id)
+        if encoder is not None:
+            return encoder
+        try:
+            encoder = text_loader(model_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=503, detail={
+                "code": "TEXT_MODEL_UNAVAILABLE",
+                "message": "The selected local text model is unavailable.",
+                "request_id": uuid.uuid4().hex,
+            }) from None
+        except Exception:
+            logger.exception("LV React could not load text model (model=%s)", model_id)
+            raise HTTPException(status_code=503, detail={
+                "code": "TEXT_MODEL_UNAVAILABLE",
+                "message": "The selected local text model could not be loaded. Check the worker log.",
+                "request_id": uuid.uuid4().hex,
+            }) from None
+        with app.state.lock:
+            return app.state.text_encoders.setdefault(model_id, encoder)
+
+    def encode_text_query(model_id: str, query: str) -> np.ndarray:
+        with app.state.lock:
+            cached = app.state.text_vectors.get(model_id)
+            if cached is not None and cached[0] == query:
+                return cached[1]
+        vector = np.asarray(get_text_encoder(model_id)(query), dtype=np.float32).reshape(-1)
+        with app.state.lock:
+            app.state.text_vectors[model_id] = (query, vector)
+        return vector
+
+    @app.post("/api/v1/runs/{run_id}/text-search")
+    def search_by_text(run_id: str, request: CreateTextSearch) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+        return _text_search(
+            run, request.model_id, request.query, request.k,
+            lambda query: encode_text_query(request.model_id, query),
+        )
+
+    @app.get("/api/v1/runs/{run_id}/text-search.csv")
+    def export_text_search_csv(run_id: str, model_id: str, query: str, k: int = 9) -> Response:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+        result = _text_search(
+            run, model_id, query, k,
+            lambda text: encode_text_query(model_id, text),
+        )
+        ordered_indices = [row["index"] for row in result["results"]]
+        records_with_paths = [
+            {**record, "path": run["image_paths"][index]}
+            for index, record in enumerate(run["records"])
+        ]
+        from interaction import records_to_csv
+
+        content = records_to_csv(records_with_paths, ordered_indices)
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="text_search.csv"'},
+        )
+
+    @app.post("/api/v1/runs/{run_id}/duplicates")
+    def scan_duplicates(run_id: str, request: CreateDuplicateScan) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+        return _duplicate_scan(run, request)
 
     @app.post("/api/v1/runs/{run_id}/blocks")
     def create_run_blocks(run_id: str, request: CreateRunBlocks) -> dict:
