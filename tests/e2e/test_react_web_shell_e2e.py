@@ -1637,7 +1637,7 @@ def test_lv_web_03_img_01_visible_coverage_projection_box_selection_and_clear(
 def test_lv_web_03_img_01_real_model_visible_streamlit_sparsity_parity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """The visible React coverage run preserves the legacy high-dimensional sparsity values."""
+    """The visible React coverage run preserves legacy PCA and high-dimensional sparsity values."""
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
 
@@ -1688,6 +1688,57 @@ def test_lv_web_03_img_01_real_model_visible_streamlit_sparsity_parity(
             assert run["embedding_shape"] == [4, 384]
             assert {record["label"] for record in run["records"]} == {"apple", "banana"}
             assert {record["split"] for record in run["records"]} == {"train", "test"}
+
+            # Use the actual Streamlit projection helper as the numerical oracle.
+            # Reset its session cache so this comparison is bound to this model run.
+            import app as legacy_app
+
+            monkeypatch.setattr(legacy_app.st, "session_state", {})
+            legacy_2d, _ = legacy_app._cov_projection(
+                vectors, None, "pca", 2, f"img01-real-{run_id}", "",
+            )
+            legacy_3d, _ = legacy_app._cov_projection(
+                vectors, None, "pca", 3, f"img01-real-{run_id}", "",
+            )
+            react_2d = np.asarray(
+                [[point["x"], point["y"]] for point in run["points"]],
+            )
+            np.testing.assert_allclose(react_2d, legacy_2d, rtol=1e-5, atol=1e-5)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as projection_3d_response:
+                page.get_by_test_id("coverage-dimension-3d").click()
+            projection_3d = projection_3d_response.value.json()
+            assert projection_3d["dimension"] == 3
+            react_3d = np.asarray([
+                [point["x"], point["y"], point["z"]]
+                for point in projection_3d["points"]
+            ])
+            np.testing.assert_allclose(react_3d, legacy_3d, rtol=1e-5, atol=1e-5)
+            expect(page.get_by_test_id("coverage-dimension-3d")).to_have_attribute(
+                "aria-pressed", "true",
+            )
+            expect(page.locator(
+                "[data-testid='coverage-plot'] [data-testid='coverage-plot-3d']",
+            )).to_be_visible()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as projection_2d_response:
+                page.get_by_test_id("coverage-dimension-2d").click()
+            projection_2d = projection_2d_response.value.json()
+            react_2d_switched = np.asarray([
+                [point["x"], point["y"]]
+                for point in projection_2d["points"]
+            ])
+            np.testing.assert_allclose(react_2d_switched, legacy_2d, rtol=1e-5, atol=1e-5)
+            expect(page.get_by_test_id("coverage-dimension-2d")).to_have_attribute(
+                "aria-pressed", "true",
+            )
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
 
             # Streamlit's _cov_sparsity delegates to this legacy distance helper.
             expected_default = compute_outlier_scores(
