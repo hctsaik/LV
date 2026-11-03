@@ -23,6 +23,7 @@ import {
   type ActiveLearningRound,
   type JobStatus,
   type ModelOption,
+  type ObjectPolicyAutotuneResult,
   type ProjectionMethod,
   type RankingMetric,
   type RankingResult,
@@ -54,6 +55,10 @@ const projectionOptions: { value: ProjectionMethod; label: string }[] = [
 
 function pause(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function objectPolicyLabel(policy: ComparisonObjectPolicy) {
+  return "pad" + Math.round(policy.pad * 100) + "_r" + policy.target_res + "_" + policy.head;
 }
 
 function colorMap(points: EmbeddingPoint[]) {
@@ -282,6 +287,14 @@ export default function App() {
   const [analysisMode, setAnalysisMode] = useState<"classifier" | "detector">("classifier");
   const [analysisUnit, setAnalysisUnit] = useState<VisualizeUnit>("image");
   const [objectPolicy, setObjectPolicy] = useState<ComparisonObjectPolicy>({ pad: 0.12, target_res: 224, head: "cls" });
+  const [objectPolicySubmitting, setObjectPolicySubmitting] = useState(false);
+  const [objectPolicyJob, setObjectPolicyJob] = useState<JobStatus | null>(null);
+  const [objectPolicyTuneResult, setObjectPolicyTuneResult] = useState<{
+    jobId: string;
+    scope: string;
+    result: ObjectPolicyAutotuneResult;
+  } | null>(null);
+  const [objectPolicyProfileName, setObjectPolicyProfileName] = useState("");
   const [classNamesDraft, setClassNamesDraft] = useState("");
   const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "class_similarity" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "evaluation" | "anomaly" | "fewshot">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
@@ -888,6 +901,119 @@ export default function App() {
     setNotice("");
   }
 
+  function effectiveFolders() {
+    const selected = [...folders];
+    const draft = folderDraft.trim();
+    if (draft && !selected.includes(draft)) selected.push(draft);
+    return selected;
+  }
+
+  function objectPolicyScope(selectedFolders: string[], modelId: string) {
+    return JSON.stringify({
+      folders: selectedFolders,
+      modelId,
+      classNames: classNamesDraft.split(",").map((name) => name.trim()).filter(Boolean),
+    });
+  }
+
+  const objectPolicyTuning = objectPolicySubmitting || (objectPolicyJob !== null
+    && ["queued", "running", "cancelling"].includes(objectPolicyJob.state));
+  const visibleObjectPolicyResult = objectPolicyTuneResult
+    && objectPolicyTuneResult.scope === objectPolicyScope(effectiveFolders(), selectedModelIds[0] || "")
+    ? objectPolicyTuneResult.result
+    : null;
+
+  async function runObjectPolicyAutotune() {
+    const selectedFolders = effectiveFolders();
+    const modelId = selectedModelIds[0];
+    if (!selectedFolders.length) {
+      setError("Choose an image folder before tuning object policy.");
+      return;
+    }
+    if (!modelId) {
+      setError("Choose an installed model before tuning object policy.");
+      return;
+    }
+    const classNames = classNamesDraft.split(",").map((name) => name.trim()).filter(Boolean);
+    setError("");
+    setNotice("");
+    setObjectPolicyTuneResult(null);
+    setObjectPolicyJob(null);
+    setObjectPolicySubmitting(true);
+    setObjectPolicyProfileName(selectedFolders[0].split(/[\\/]/).filter(Boolean).at(-1) || "object-policy");
+    try {
+      const created = await api.createObjectPolicyAutotuneJob({
+        folders: selectedFolders,
+        folderGrantIds: api.folderGrantIds(selectedFolders),
+        classNames,
+        modelId,
+      });
+      setObjectPolicyJob({
+        job_id: created.job_id,
+        state: "queued",
+        phase: "queued",
+        done: 0,
+        total: 0,
+        percent: 0,
+        message: "Waiting to start",
+        run_id: null,
+        error: null,
+        can_cancel: true,
+      });
+      let latest: JobStatus | null = null;
+      for (let attempt = 0; attempt < 18_000; attempt += 1) {
+        latest = await api.job(created.job_id);
+        setObjectPolicyJob(latest);
+        if (["completed", "failed", "cancelled"].includes(latest.state)) break;
+        await pause(350);
+      }
+      if (!latest || !["completed", "failed", "cancelled"].includes(latest.state)) {
+        throw new Error("Object policy tuning is taking too long. Cancel it and retry with a smaller dataset.");
+      }
+      if (latest.state === "failed") throw new Error(latest.error?.message || "Object policy tuning failed.");
+      if (latest.state === "cancelled") {
+        setNotice("Object policy tuning cancelled.");
+        return;
+      }
+      if (!latest.result) throw new Error("The worker completed without returning tuning results.");
+      setObjectPolicyTuneResult({
+        jobId: created.job_id,
+        scope: objectPolicyScope(selectedFolders, modelId),
+        result: latest.result,
+      });
+      setNotice("Object policy tuning completed. Review the candidate scores before applying a policy.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Object policy tuning failed.");
+    } finally {
+      setObjectPolicySubmitting(false);
+    }
+  }
+
+  async function cancelObjectPolicyAutotune() {
+    if (!objectPolicyJob?.job_id) return;
+    try {
+      await api.cancel(objectPolicyJob.job_id);
+      setObjectPolicyJob((current) => current
+        ? { ...current, state: "cancelling", message: "Cancellation requested" }
+        : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not cancel object policy tuning.");
+    }
+  }
+
+  async function saveObjectPolicyProfile() {
+    if (!objectPolicyTuneResult) return;
+    try {
+      const saved = await api.saveObjectPolicyProfile(
+        objectPolicyTuneResult.jobId,
+        objectPolicyProfileName,
+      );
+      setNotice("Saved object policy profile “" + saved.name + "”.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not save the object policy profile.");
+    }
+  }
+
   async function chooseFolder() {
     setError("");
     if (!window.cimHost?.chooseFile) {
@@ -1467,7 +1593,7 @@ export default function App() {
               aria-label="Analysis mode"
               value={analysisMode}
               onChange={(event) => changeAnalysisMode(event.target.value as "classifier" | "detector")}
-              disabled={busy}
+              disabled={busy || objectPolicyTuning}
             >
               <option value="classifier">Image Classifier</option>
               <option value="detector">Object Detector (whole image)</option>
@@ -1493,7 +1619,7 @@ export default function App() {
                     setLabelFilter("all");
                     setSplitFilter("all");
                   }}
-                  disabled={busy}
+                  disabled={busy || objectPolicyTuning}
                 >
                   <option value="image">Whole image</option>
                   <option value="object">Each annotated object</option>
@@ -1510,7 +1636,7 @@ export default function App() {
                       step="0.01"
                       value={objectPolicy.pad}
                       onChange={(event) => setObjectPolicy((current) => ({ ...current, pad: Number(event.target.value) }))}
-                      disabled={busy}
+                      disabled={busy || objectPolicyTuning}
                     />
                     <label className="field-label" htmlFor="object-resolution">Crop resolution</label>
                     <select
@@ -1518,7 +1644,7 @@ export default function App() {
                       aria-label="Object crop resolution"
                       value={objectPolicy.target_res}
                       onChange={(event) => setObjectPolicy((current) => ({ ...current, target_res: Number(event.target.value) as ComparisonObjectPolicy["target_res"] }))}
-                      disabled={busy}
+                      disabled={busy || objectPolicyTuning}
                     >
                       {[168, 196, 224, 280, 336, 392, 448].map((resolution) => <option key={resolution} value={resolution}>{resolution}px</option>)}
                     </select>
@@ -1528,12 +1654,110 @@ export default function App() {
                       aria-label="Object embedding head"
                       value={objectPolicy.head}
                       onChange={(event) => setObjectPolicy((current) => ({ ...current, head: event.target.value as ComparisonObjectPolicy["head"] }))}
-                      disabled={busy}
+                      disabled={busy || objectPolicyTuning}
                     >
                       <option value="cls">CLS token</option>
                       <option value="meanpool">Mean pool</option>
                     </select>
-                    <div className="field-note">Each YOLO box is cropped with the selected policy; embeddings are cached by image content and box.</div>
+                    <div className="field-note">Each YOLO box uses this crop policy. Autotune scores six candidates by macro kNN class purity using the first selected feature model.</div>
+                    <button
+                      className="secondary-action"
+                      type="button"
+                      data-testid="object-policy-autotune"
+                      disabled={busy || objectPolicyTuning || !connected || !effectiveFolders().length || !selectedModelIds.length}
+                      onClick={runObjectPolicyAutotune}
+                    >
+                      {objectPolicyTuning ? "Tuning object policy…" : "Find best object policy"}
+                    </button>
+                    {objectPolicyTuning && (
+                      <div className="progress-card" data-testid="object-policy-autotune-progress" role="status">
+                        <div className="progress-row">
+                          <span>{objectPolicyJob?.message || "Preparing object policy search"}</span>
+                          <strong>{Math.round(objectPolicyJob?.percent || 0)}%</strong>
+                        </div>
+                        <div className="progress-track">
+                          <div className="progress-fill" style={{ width: Math.max(0, Math.min(100, objectPolicyJob?.percent || 0)) + "%" }} />
+                        </div>
+                        <button
+                          className="cancel-button"
+                          type="button"
+                          disabled={!objectPolicyJob?.job_id}
+                          onClick={cancelObjectPolicyAutotune}
+                        >
+                          Cancel tuning
+                        </button>
+                      </div>
+                    )}
+                    {visibleObjectPolicyResult && objectPolicyTuneResult && (
+                      <div className="object-policy-results" data-testid="object-policy-autotune-results">
+                        <div className="field-note">
+                          {visibleObjectPolicyResult.fingerprint.n_objects.toLocaleString()} labeled objects · {visibleObjectPolicyResult.fingerprint.n_classes} classes · median short side {Math.round(visibleObjectPolicyResult.fingerprint.size_q[1] || 0)} px
+                        </div>
+                        {visibleObjectPolicyResult.similar_profile && (
+                          <div className="alert alert-info" data-testid="object-policy-profile-suggestion" role="status">
+                            Similar saved profile: {visibleObjectPolicyResult.similar_profile.name} ({visibleObjectPolicyResult.similar_profile.similarity.toFixed(2)}).
+                            <button
+                              className="secondary-action"
+                              type="button"
+                              data-testid="object-policy-apply-profile"
+                              onClick={() => {
+                                setObjectPolicy(visibleObjectPolicyResult.similar_profile!.policy);
+                                setNotice("Applied the similar saved profile. Run analysis to use it.");
+                              }}
+                            >
+                              Apply saved profile
+                            </button>
+                          </div>
+                        )}
+                        <div className="object-policy-table-wrap">
+                          <table className="object-policy-table">
+                            <thead><tr><th>Policy</th><th>Macro</th><th>&lt;32</th><th>32–96</th><th>96–224</th><th>&gt;224</th></tr></thead>
+                            <tbody>
+                              {visibleObjectPolicyResult.rows.map((row) => {
+                                const pct = (value: number | null) => value === null ? "—" : (value * 100).toFixed(1) + "%";
+                                return <tr key={objectPolicyLabel(row.policy)} data-testid="object-policy-candidate">
+                                  <td>{objectPolicyLabel(row.policy)}</td>
+                                  <td>{pct(row.macro_purity)}</td>
+                                  <td>{pct(row.buckets["<32"]?.purity ?? null)}</td>
+                                  <td>{pct(row.buckets["32-96"]?.purity ?? null)}</td>
+                                  <td>{pct(row.buckets["96-224"]?.purity ?? null)}</td>
+                                  <td>{pct(row.buckets[">224"]?.purity ?? null)}</td>
+                                </tr>;
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div className="field-note">Higher macro kNN purity is better. This weak-label tuning signal is not a model-quality guarantee.</div>
+                        <button
+                          className="secondary-action"
+                          type="button"
+                          data-testid="object-policy-apply-best"
+                          onClick={() => {
+                            setObjectPolicy(visibleObjectPolicyResult.best_policy);
+                            setNotice("Applied recommended policy " + objectPolicyLabel(visibleObjectPolicyResult.best_policy) + ". Run analysis to use it.");
+                          }}
+                        >
+                          Apply recommended {objectPolicyLabel(visibleObjectPolicyResult.best_policy)}
+                        </button>
+                        <label className="field-label" htmlFor="object-policy-profile-name">Profile name</label>
+                        <input
+                          id="object-policy-profile-name"
+                          aria-label="Object policy profile name"
+                          value={objectPolicyProfileName}
+                          maxLength={128}
+                          onChange={(event) => setObjectPolicyProfileName(event.target.value)}
+                        />
+                        <button
+                          className="secondary-action"
+                          type="button"
+                          data-testid="object-policy-save-profile"
+                          disabled={!objectPolicyProfileName.trim()}
+                          onClick={saveObjectPolicyProfile}
+                        >
+                          Save recommended policy as profile
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
                 <label className="field-label field-label-spaced" htmlFor="detector-class-names">Class names fallback</label>
@@ -1544,7 +1768,7 @@ export default function App() {
                   value={classNamesDraft}
                   onChange={(event) => setClassNamesDraft(event.target.value)}
                   placeholder="Used only when classes.txt is unavailable"
-                  disabled={busy}
+                  disabled={busy || objectPolicyTuning}
                 />
                 <div className="field-note">A dataset classes.txt takes priority. Enter comma-separated names only when the dataset has no class file.</div>
               </>
@@ -1553,7 +1777,7 @@ export default function App() {
 
           <section className="control-section">
             <div className="section-heading"><span className="step-number">01</span><h2>Image folders</h2></div>
-            <button className="host-picker" type="button" onClick={chooseFolder}>
+            <button className="host-picker" type="button" onClick={chooseFolder} disabled={busy || objectPolicyTuning}>
               <span className="folder-icon" aria-hidden="true">▱</span>
               Choose folder from device
               <span className="picker-hint">Native</span>
@@ -1567,8 +1791,9 @@ export default function App() {
                 onKeyDown={(event) => event.key === "Enter" && addFolder()}
                 placeholder="Paste a local folder path"
                 autoComplete="off"
+                disabled={busy || objectPolicyTuning}
               />
-              <button type="button" className="add-folder" onClick={() => addFolder()} aria-label="Add folder">+</button>
+              <button type="button" className="add-folder" onClick={() => addFolder()} aria-label="Add folder" disabled={busy || objectPolicyTuning}>+</button>
             </div>
             {folders.length > 0 && (
               <ul className="folder-list" aria-label="Selected folders">
@@ -1576,7 +1801,7 @@ export default function App() {
                   <li key={folder} title={folder}>
                     <span className="folder-chip-dot" />
                     <span className="folder-chip-name">{folder.split(/[\\/]/).filter(Boolean).at(-1) || folder}</span>
-                    <button type="button" aria-label={"Remove " + folder} onClick={() => setFolders((current) => current.filter((item) => item !== folder))}>×</button>
+                    <button type="button" aria-label={"Remove " + folder} onClick={() => setFolders((current) => current.filter((item) => item !== folder))} disabled={busy || objectPolicyTuning}>×</button>
                   </li>
                 ))}
               </ul>
@@ -1595,7 +1820,7 @@ export default function App() {
                     data-testid={"model-choice-" + model.model_id}
                     aria-label={"Model " + model.name}
                     checked={selectedModelIds.includes(model.model_id)}
-                    disabled={loadingModels || busy}
+                    disabled={loadingModels || busy || objectPolicyTuning}
                     onChange={() => toggleModel(model.model_id)}
                   />
                   <span>{model.name}</span>
@@ -1656,7 +1881,7 @@ export default function App() {
           {error && <div className="alert alert-error" role="alert">{error}</div>}
           {notice && <div className="alert alert-info" role="status">{notice}</div>}
 
-          <button className="run-button" type="button" onClick={runAnalysis} disabled={busy || !connected || loadingModels || !selectedModelIds.length || !selectedMethods.length}>
+          <button className="run-button" type="button" onClick={runAnalysis} disabled={busy || objectPolicyTuning || !connected || loadingModels || !selectedModelIds.length || !selectedMethods.length}>
             <span aria-hidden="true">{busy ? "◌" : "▶"}</span>
             {busy ? "Analysis running" : "Run analysis"}
           </button>

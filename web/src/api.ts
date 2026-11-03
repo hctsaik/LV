@@ -12,6 +12,28 @@ export type ComparisonObjectPolicy = {
   head: "cls" | "meanpool";
 };
 
+export type ObjectPolicyAutotuneResult = {
+  rows: Array<{
+    policy: ComparisonObjectPolicy;
+    macro_purity: number | null;
+    purity: number;
+    k: number;
+    buckets: Record<string, { n: number; purity: number | null }>;
+  }>;
+  best_policy: ComparisonObjectPolicy;
+  fingerprint: {
+    n_objects: number;
+    n_classes: number;
+    size_q: number[];
+    ar_q: number[];
+  };
+  similar_profile: {
+    name: string;
+    similarity: number;
+    policy: ComparisonObjectPolicy;
+  } | null;
+};
+
 export type JobStatus = {
   job_id: string;
   state: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
@@ -21,6 +43,7 @@ export type JobStatus = {
   percent: number;
   message: string;
   run_id: string | null;
+  result?: ObjectPolicyAutotuneResult | null;
   error: { code: string; message: string; request_id: string } | null;
   can_cancel: boolean;
 };
@@ -1555,6 +1578,25 @@ export const api = {
         umap_rebuild: options.umapRebuild || false,
       }),
     }),
+  createObjectPolicyAutotuneJob: (input: {
+    folders: string[];
+    folderGrantIds: Array<string | null>;
+    classNames: string[];
+    modelId: string;
+  }) => request<{ job_id: string; state: string }>("/api/v1/object-policy/autotune/jobs", {
+    method: "POST",
+    body: JSON.stringify({
+      folders: input.folders,
+      folder_grant_ids: input.folderGrantIds,
+      class_names: input.classNames,
+      model_id: input.modelId,
+    }),
+  }),
+  saveObjectPolicyProfile: (jobId: string, name: string) =>
+    request<{ name: string; policy: ComparisonObjectPolicy }>(
+      "/api/v1/object-policy/autotune/jobs/" + encodeURIComponent(jobId) + "/profile",
+      { method: "POST", body: JSON.stringify({ name }) },
+    ),
   rememberFolderGrant: (path: string, grantId: string) => {
     nativeFolderGrants.set(path, grantId);
   },

@@ -157,6 +157,17 @@ class CreateVisualizationJob(BaseModel):
     umap_rebuild: bool = False
 
 
+class CreateObjectPolicyAutotuneJob(BaseModel):
+    folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+    model_id: str = Field(min_length=1, max_length=128)
+
+
+class SaveObjectPolicyProfileRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
 class CreateClassSimilarityJob(BaseModel):
     model_id: str = Field(min_length=1, max_length=128)
     k: int = Field(default=5, ge=1, le=20)
@@ -320,7 +331,11 @@ def _resolve_nativeapp_folder_list(
 
 
 def _resolve_request_folders(
-    request: CreateVisualizationJob | CreateDetectionEvaluationRequest,
+    request: (
+        CreateVisualizationJob
+        | CreateObjectPolicyAutotuneJob
+        | CreateDetectionEvaluationRequest
+    ),
 ) -> list[str]:
     return _resolve_nativeapp_folder_list(request.folders, request.folder_grant_ids)
 
@@ -806,6 +821,20 @@ class _Job:
 
 
 @dataclass
+class _ObjectPolicyAutotuneJob:
+    job_id: str
+    request: CreateObjectPolicyAutotuneJob
+    state: str = "queued"
+    phase: str = "queued"
+    done: int = 0
+    total: int = 0
+    message: str = "Waiting to start"
+    result: dict | None = None
+    error: dict | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+@dataclass
 class _ClassSimilarityJob:
     job_id: str
     run_id: str
@@ -950,7 +979,16 @@ class _AnomalyScoreJob:
     error: dict | None = None
 
 
-def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob | _GroupDiffJob) -> dict:
+def _job_view(
+    job: (
+        _Job
+        | _ObjectPolicyAutotuneJob
+        | _ComparisonJob
+        | _CoverageJob
+        | _CoverageCandidateJob
+        | _GroupDiffJob
+    ),
+) -> dict:
     return {
         "job_id": job.job_id,
         "state": job.state,
@@ -959,7 +997,8 @@ def _job_view(job: _Job | _ComparisonJob | _CoverageJob | _CoverageCandidateJob 
         "total": job.total,
         "percent": (job.done / job.total * 100.0) if job.total else 0.0,
         "message": job.message,
-        "run_id": job.run_id,
+        "run_id": getattr(job, "run_id", None),
+        "result": getattr(job, "result", None),
         "error": job.error,
         "can_cancel": job.state in {"queued", "running", "cancelling"} and not isinstance(job, _GroupDiffJob),
     }
@@ -1041,6 +1080,7 @@ def create_app(
         object_loader = lambda model_id, **_kwargs: loader(model_id)
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
+    app.state.object_policy_jobs = {}
     app.state.class_similarity_jobs = {}
     app.state.runs = {}
     app.state.current_run_id = None
@@ -1089,6 +1129,7 @@ def create_app(
     def has_active_job() -> bool:
         jobs = (
             list(app.state.jobs.values())
+            + list(app.state.object_policy_jobs.values())
             + list(app.state.class_similarity_jobs.values())
             + list(app.state.comparison_jobs.values())
             + list(app.state.coverage_jobs.values())
@@ -2947,6 +2988,206 @@ def create_app(
             app.state.diagnostic_heads.clear()
         threading.Thread(target=execute, args=(job,), daemon=True, name=f"lv-web-{job_id[:8]}").start()
         return {"job_id": job_id, "state": job.state}
+
+    def execute_object_policy_job(job: _ObjectPolicyAutotuneJob) -> None:
+        try:
+            import object_eval as oe
+
+            folders = [Path(folder) for folder in job.request.folders]
+            images = [image for folder in folders for image in oe.list_images(folder)]
+            if not images:
+                with app.state.lock:
+                    job.state, job.phase, job.message = "failed", "failed", "找不到可用的圖片"
+                    job.error = {
+                        "code": "OBJECT_POLICY_NO_IMAGES",
+                        "message": "The selected folder contains no readable image files.",
+                        "request_id": job.job_id,
+                    }
+                return
+            class_names = oe.classes_for(folders[0]) or job.request.class_names or None
+            candidate_count = len(oe.DEFAULT_CANDIDATES)
+
+            with app.state.lock:
+                job.state, job.phase, job.message = "running", "fingerprint", "正在檢查物件標註"
+                job.total = candidate_count
+
+            def update_progress(ci: int, count: int, policy: dict, done: int, total: int) -> None:
+                if job.cancel_event.is_set():
+                    raise JobCancelled()
+                with app.state.lock:
+                    job.phase = "embedding"
+                    job.total = max(1, int(count) * max(1, int(total)))
+                    job.done = min(job.total, max(0, int(ci) * max(1, int(total)) + int(done)))
+                    job.message = (
+                        f"[{ci + 1}/{count}] {oe.policy_tag(policy)} · 物件 {done}/{total}"
+                    )[:240]
+
+            rows, best_policy, fingerprint = oe.run_autotune(
+                images,
+                class_names,
+                model=job.request.model_id,
+                cache_dir=oe.dataset_cache_dir(folders[0], "object_crops") / "_autotune",
+                progress=update_progress,
+                model_loader=object_loader,
+            )
+            if job.cancel_event.is_set():
+                raise JobCancelled()
+            if not rows or best_policy is None:
+                with app.state.lock:
+                    job.state, job.phase, job.message = "failed", "failed", "資料中沒有可評估的標註物件"
+                    job.error = {
+                        "code": "OBJECT_POLICY_NO_OBJECTS",
+                        "message": "No labeled objects were found. Check the YOLO labels and class names.",
+                        "request_id": job.job_id,
+                    }
+                return
+
+            profile_path = app.state.curation_store.path.parent / "object_policy_profiles.json"
+            def usable_profiles(items: list[dict]) -> dict[str, dict]:
+                normalized = {}
+                for item in items:
+                    if not isinstance(item, dict) or not item.get("name"):
+                        continue
+                    fingerprint = item.get("fingerprint")
+                    if not isinstance(fingerprint, dict):
+                        continue
+                    size_q, ar_q = fingerprint.get("size_q"), fingerprint.get("ar_q")
+                    if not isinstance(size_q, list) or len(size_q) != 3:
+                        continue
+                    if not isinstance(ar_q, list) or len(ar_q) != 3:
+                        continue
+                    try:
+                        size_q = [float(value) for value in size_q]
+                        ar_q = [float(value) for value in ar_q]
+                        if not all(math.isfinite(value) for value in size_q + ar_q):
+                            continue
+                        policy = ComparisonObjectPolicy.model_validate(item.get("policy")).model_dump()
+                        name = str(item["name"]).strip()
+                        if not name:
+                            continue
+                        normalized[name] = {
+                            **item,
+                            "name": name,
+                            "fingerprint": {
+                                "n_objects": int(fingerprint["n_objects"]),
+                                "n_classes": int(fingerprint["n_classes"]),
+                                "size_q": size_q,
+                                "ar_q": ar_q,
+                            },
+                            "policy": policy,
+                        }
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                return normalized
+
+            profiles_by_name = usable_profiles(oe.load_profiles(profile_path))
+            legacy_profile_path = Path(oe.PROFILES_PATH)
+            if legacy_profile_path.resolve() != profile_path.resolve():
+                legacy_profiles = usable_profiles(oe.load_profiles(legacy_profile_path))
+                profiles_by_name = legacy_profiles | profiles_by_name
+            try:
+                profile, similarity = oe.match_profile(fingerprint, list(profiles_by_name.values()))
+            except (KeyError, TypeError, ValueError):
+                logger.info("Ignoring unreadable LV object policy profiles")
+                profile, similarity = None, 0.0
+            suggested_profile = (
+                {
+                    "name": str(profile["name"]),
+                    "similarity": float(similarity),
+                    "policy": ComparisonObjectPolicy.model_validate(profile["policy"]).model_dump(),
+                }
+                if profile and similarity >= 0.6 else None
+            )
+            result = {
+                "rows": rows,
+                "best_policy": best_policy,
+                "fingerprint": fingerprint,
+                "similar_profile": suggested_profile,
+            }
+            with app.state.lock:
+                job.result = result
+                job.done = job.total
+                job.state, job.phase, job.message = "completed", "completed", "自動設定搜尋完成"
+        except JobCancelled:
+            with app.state.lock:
+                job.state, job.phase, job.message = "cancelled", "cancelled", "已取消自動設定搜尋"
+        except (ValueError, FileNotFoundError):
+            logger.info("LV object policy autotune input rejected (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "自動設定搜尋失敗"
+                job.error = {
+                    "code": "OBJECT_POLICY_INVALID_INPUT",
+                    "message": "The image folder, labels, or class names could not be read.",
+                    "request_id": job.job_id,
+                }
+        except Exception:
+            logger.exception("LV object policy autotune failed (job=%s)", job.job_id)
+            with app.state.lock:
+                job.state, job.phase, job.message = "failed", "failed", "自動設定搜尋失敗"
+                job.error = {
+                    "code": "OBJECT_POLICY_AUTOTUNE_FAILED",
+                    "message": "Object policy tuning failed. Check the local worker log and model installation.",
+                    "request_id": job.job_id,
+                }
+
+    @app.post("/api/v1/object-policy/autotune/jobs", status_code=202)
+    def create_object_policy_job(request: CreateObjectPolicyAutotuneJob) -> dict:
+        if request.model_id not in set(catalog()):
+            raise HTTPException(status_code=422, detail="選取的模型未安裝")
+        resolved_folders = _resolve_request_folders(request)
+        request = request.model_copy(update={
+            "folders": resolved_folders,
+            "folder_grant_ids": [],
+        })
+        job_id = uuid.uuid4().hex
+        job = _ObjectPolicyAutotuneJob(job_id=job_id, request=request)
+        with app.state.lock:
+            if has_active_job():
+                raise HTTPException(status_code=409, detail={
+                    "code": "JOB_ALREADY_RUNNING",
+                    "message": "Wait for the active analysis to finish before tuning object policy.",
+                    "request_id": job_id,
+                })
+            app.state.object_policy_jobs[job_id] = job
+        threading.Thread(
+            target=execute_object_policy_job,
+            args=(job,),
+            daemon=True,
+            name=f"lv-object-policy-{job_id[:8]}",
+        ).start()
+        return {"job_id": job_id, "state": job.state}
+
+    @app.post("/api/v1/object-policy/autotune/jobs/{job_id}/profile")
+    def save_object_policy_profile(job_id: str, request: SaveObjectPolicyProfileRequest) -> dict:
+        with app.state.lock:
+            job = app.state.object_policy_jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Object policy tuning result not found")
+            if job.state != "completed" or not job.result:
+                raise HTTPException(status_code=409, detail="Complete an object policy search before saving a profile")
+            result = copy.deepcopy(job.result)
+        name = request.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="Profile name cannot be empty")
+        import object_eval as oe
+
+        profile_path = app.state.curation_store.path.parent / "object_policy_profiles.json"
+        try:
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+            oe.save_profile(
+                name,
+                result["fingerprint"],
+                result["best_policy"],
+                result["rows"][0],
+                path=profile_path,
+            )
+        except Exception as exc:
+            logger.exception("LV object policy profile could not be saved")
+            raise HTTPException(
+                status_code=500,
+                detail="Could not save the object policy profile in the app cache",
+            ) from exc
+        return {"name": name, "policy": result["best_policy"]}
 
     def execute_anomaly_model_job(job: _AnomalyModelJob) -> None:
         try:
@@ -5097,7 +5338,7 @@ def create_app(
     @app.get("/api/v1/jobs/{job_id}")
     def get_job(job_id: str) -> dict:
         with app.state.lock:
-            job = app.state.jobs.get(job_id)
+            job = app.state.jobs.get(job_id) or app.state.object_policy_jobs.get(job_id)
             if job is None:
                 raise HTTPException(status_code=404, detail="Job not found")
             return _job_view(job)
@@ -5105,7 +5346,7 @@ def create_app(
     @app.delete("/api/v1/jobs/{job_id}", status_code=202)
     def cancel_job(job_id: str) -> dict:
         with app.state.lock:
-            job = app.state.jobs.get(job_id)
+            job = app.state.jobs.get(job_id) or app.state.object_policy_jobs.get(job_id)
             if job is None:
                 raise HTTPException(status_code=404, detail="Job not found")
             if job.state not in {"queued", "running", "cancelling"}:
