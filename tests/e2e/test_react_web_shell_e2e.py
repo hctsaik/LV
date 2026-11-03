@@ -3393,7 +3393,7 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
 def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Visible object-level React flow uses the pinned DINOv2 model on real crops."""
+    """Pinned real-model object analysis can hand selected crops into Curation."""
     models_dir = _pinned_dinov2_models_dir(tmp_path)
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
@@ -3454,11 +3454,40 @@ def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
                 ("03.png", "stain", 0),
                 ("04.png", "class_8", 0),
             ]
-            page.get_by_test_id("embedding-point").nth(2).click()
+            page.get_by_label("Filter by class").select_option(label="stain")
+            stain_points = page.get_by_test_id("embedding-point")
+            expect(stain_points).to_have_count(2)
+            stain_points.nth(0).click()
             expect(page.get_by_test_id("selected-image-name")).to_have_text("02.png")
             expect(page.get_by_test_id("selected-object-index")).to_have_text("2")
             expect(page.get_by_test_id("selected-object-bbox")).to_be_visible()
             expect(page.get_by_test_id("selected-image")).to_have_js_property("naturalWidth", 32)
+
+            stain_points.nth(1).click()
+            expect(page.get_by_test_id("selection-count")).to_have_text("2 selected")
+            page.get_by_test_id("add-selection-to-curation").click()
+            expect(page.locator(".alert-info")).to_contain_text(
+                "Added 2 item(s) to curation; skipped 0 duplicate(s)."
+            )
+            curation = page.request.get(base_url + "/api/v1/curation/items").json()
+            assert curation["total"] == 2
+            assert [
+                (item["filename"], item["label"], item["level"], item["obj_index"], item["bbox"])
+                for item in curation["items"]
+            ] == [
+                ("02.png", "stain", "object", 1, run["records"][2]["bbox"]),
+                ("03.png", "stain", "object", 0, run["records"][3]["bbox"]),
+            ]
+            assert all("path" not in item and "image_path" not in item for item in curation["items"])
+
+            page.get_by_test_id("open-curation").click()
+            expect(page.get_by_test_id("curation-item")).to_have_count(2)
+            item_headings = page.locator(".curation-item-heading strong")
+            expect(item_headings.nth(0)).to_have_text("02.png")
+            expect(item_headings.nth(1)).to_have_text("03.png")
+            item_metadata = page.locator(".curation-item-meta")
+            expect(item_metadata.nth(0)).to_contain_text("stain · train · manual · object 2")
+            expect(item_metadata.nth(1)).to_contain_text("stain · test · manual · object 1")
             browser.close()
     finally:
         if server is not None:

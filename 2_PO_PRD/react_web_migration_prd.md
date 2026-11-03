@@ -39,7 +39,7 @@ LV 是成熟的本機影像分析 App。現有 Streamlit 畫面把資料選擇�
 
 首個垂直流程涵蓋 Image Classifier 整圖模式：選取資料夾、模型與投影，執行 embedding、切換 2D／3D 與類別／split 篩選，並選點讀回對應影像。其 4 張影像 fixture 避免原 Streamlit 小樣本規則把 PCA 投影降成一維。
 
-後續實作加入 Object Detector 整圖與物件級模式：整圖按 YOLO `labels/` class ID 標記影像；物件級則每個 YOLO bbox 各自裁切、抽 embedding 並保留原圖索引，兩種模式都以資料集旁 `classes.txt` 優先於手動類別名稱。物件級可調整 crop padding、解析度與 embedding head，快取依來源影像內容、框、模型與 policy 隔離。固定 DINOv2-small 的可見 React 真模型流程在 Windows ARM64 通過整圖 4×384 及物件級 5×384；UI 可按類別篩選並讀回原圖框選。尚未完成與 Streamlit 基準的數值逐項比較、object candidate handoff、完整 2D／3D 物件流程及 NativeApp host bridge 驗收。固定 UMAP 參考座標、其他 Visualize 巢狀操作及其餘 LV-WEB case 仍各自保持未完成。
+後續實作加入 Object Detector 整圖與物件級模式：整圖按 YOLO `labels/` class ID 標記影像；物件級則每個 YOLO bbox 各自裁切、抽 embedding 並保留原圖索引，兩種模式都以資料集旁 `classes.txt` 優先於手動類別名稱。物件級可調整 crop padding、解析度與 embedding head，快取依來源影像內容、框、模型與 policy 隔離。固定 DINOv2-small 的可見 React 真模型流程在 Windows ARM64 通過整圖 4×384 及物件級 5×384；UI 可按類別篩選並讀回原圖框選。object candidate handoff 已有 fixture 與真實 DINOv2 可見 React 流程，會核對 Curation 中的物件索引、bbox 與不含本機路徑的回應；它尚未證明與 Streamlit 完整數值逐項比較、完整 2D／3D 物件流程、NativeApp host bridge，也不代表整個 LV 遷移完成。固定 UMAP 參考座標、其他 Visualize 巢狀操作及其餘 LV-WEB case 仍各自保持未完成。
 
 ## 完成門檻
 
