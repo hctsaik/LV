@@ -1447,6 +1447,160 @@ def test_lv_web_01_search_01_similar_images_chain_model_switch_and_csv(
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_search_01_real_model_visible_streamlit_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Real DINOv2 React search matches Streamlit neighbors, distances, and CSV."""
+    import app as legacy_app
+
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
+    dataset = _fixture(tmp_path / "similar-real")
+    source_hashes = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*.png")
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "similar-real-cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+    )
+    server = server_thread = None
+    similar_responses: list[dict] = []
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+
+            def capture_similar(response):
+                if (
+                    response.ok
+                    and response.request.method == "POST"
+                    and urlparse(response.url).path.endswith("/similar")
+                ):
+                    similar_responses.append(response.json())
+
+            page.on("response", capture_similar)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text(
+                "Completed", timeout=180_000
+            )
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            run_id = next(iter(application.state.runs))
+            with application.state.lock:
+                raw_embeddings = application.state.raw_embeddings[run_id]["dinov2_vits14"].copy()
+                run = application.state.runs[run_id]
+            assert raw_embeddings.shape == (4, 384)
+            assert np.isfinite(raw_embeddings).all() and np.any(raw_embeddings != 0)
+
+            def assert_visible_search_matches_streamlit(query_index: int) -> list[int]:
+                class ExactCosineIndex:
+                    """Deterministic exact adapter for the optional HNSW query seam."""
+
+                    def set_ef(self, _value: int) -> None:
+                        return None
+
+                    def knn_query(self, query: np.ndarray, k: int):
+                        vectors = np.asarray(raw_embeddings, dtype=np.float32)
+                        query_vector = np.asarray(query, dtype=np.float32).reshape(-1)
+                        norms = np.linalg.norm(vectors, axis=1)
+                        denominator = norms * np.linalg.norm(query_vector)
+                        similarities = np.zeros(len(vectors), dtype=np.float32)
+                        np.divide(
+                            vectors @ query_vector,
+                            denominator,
+                            out=similarities,
+                            where=denominator > 0,
+                        )
+                        distances = np.maximum(
+                            0.0, 1.0 - np.clip(similarities, -1.0, 1.0)
+                        )
+                        indices = np.arange(len(vectors))
+                        order = np.lexsort((indices, distances))[:k]
+                        return order.reshape(1, -1), distances[order].reshape(1, -1)
+
+                expected_indices, expected_distances = legacy_app.find_similar_indices(
+                    raw_embeddings,
+                    query_index,
+                    k=len(raw_embeddings) - 1,
+                    nn_index=ExactCosineIndex(),
+                )
+                payload = next(
+                    item for item in reversed(similar_responses)
+                    if item["query_index"] == query_index
+                )
+                assert payload["model_id"] == "dinov2_vits14"
+                actual_indices = [item["index"] for item in payload["results"]]
+                actual_distances = [item["distance"] for item in payload["results"]]
+                assert actual_indices == expected_indices
+                np.testing.assert_allclose(
+                    actual_distances, expected_distances, rtol=1e-6, atol=1e-6
+                )
+
+                panel = page.get_by_test_id("similar-panel")
+                rows = panel.get_by_test_id("similar-result")
+                expect(rows).to_have_count(len(expected_indices))
+                visible_indices = [int(row.get_attribute("data-index")) for row in rows.all()]
+                assert visible_indices == expected_indices
+                visible_distances = [
+                    row.locator(".similar-result-info span").inner_text().rsplit("d=", 1)[1]
+                    for row in rows.all()
+                ]
+                assert visible_distances == [f"{distance:.4f}" for distance in expected_distances]
+                return expected_indices
+
+            page.get_by_test_id("embedding-point").nth(0).click()
+            page.get_by_test_id("similar-start").click()
+            panel = page.get_by_test_id("similar-panel")
+            expect(panel.get_by_test_id("similar-status")).to_contain_text("3 result(s)")
+            first_query = int(page.get_by_test_id("embedding-point").nth(0).get_attribute("data-index"))
+            first_indices = assert_visible_search_matches_streamlit(first_query)
+
+            expected_records = [
+                {**record, "path": path}
+                for record, path in zip(run["records"], run["image_paths"], strict=True)
+            ]
+            expected_csv = legacy_app.records_to_csv(
+                expected_records, [first_query, *first_indices]
+            )
+            with page.expect_download() as download_info:
+                page.get_by_test_id("similar-export").click()
+            actual_csv = Path(download_info.value.path()).read_text(encoding="utf-8")
+            assert actual_csv == expected_csv
+
+            next_query = first_indices[0]
+            previous_response_count = len(similar_responses)
+            next_filename = run["records"][next_query]["filename"]
+            panel.get_by_role("button", name=f"Use {next_filename} as query").click()
+            expect(panel).to_contain_text(f"Query: {next_filename}")
+            deadline = time.monotonic() + 15
+            while len(similar_responses) <= previous_response_count and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert len(similar_responses) > previous_response_count
+            assert_visible_search_matches_streamlit(next_query)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*.png")
+    }, "real-model similar-image search changed its source images"
+
+
 def test_lv_web_01_search_02_text_and_duplicate_review_visible_journey(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
