@@ -2899,6 +2899,181 @@ def test_lv_web_03_obj_01_visible_object_coverage_filters_blocks_and_crop_readba
     }
 
 
+def test_lv_web_03_obj_01_real_dinov2_visible_streamlit_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Real DINO object crops, projection, sparsity, and filtering match Streamlit."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    import app as legacy_app
+    from visualize_embeddings import discover_images
+
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
+    folders, source_hashes = _object_coverage_fixture(tmp_path / "object-coverage-real")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "object-coverage-real-cache"))
+    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
+    weights_hash = _sha256_file(weights)
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+        object_model_loader=lambda model_id, **kwargs: load_model(
+            model_id, models_dir=models_dir, **kwargs,
+        ),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(20_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            page.get_by_label("Analysis unit").select_option("object")
+            page.get_by_label("Projection method").select_option("pca")
+            for folder in folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+            expect(page.get_by_label("Feature model")).to_have_value("dinov2_vits14")
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text(
+                "Completed", timeout=300_000,
+            )
+            expect(page.get_by_test_id("coverage-point")).to_have_count(8)
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("8")
+
+            with application.state.lock:
+                assert len(application.state.coverage_runs) == 1
+                run_id, stored_run = next(iter(application.state.coverage_runs.items()))
+                run = dict(stored_run)
+                react_vectors = application.state.coverage_embeddings[run_id].copy()
+            assert run["unit"] == "object"
+            assert run["object_policy"] == {"pad": 0.12, "target_res": 224, "head": "cls"}
+            assert react_vectors.shape == (8, 384)
+            assert np.isfinite(react_vectors).all()
+            assert np.all(np.linalg.norm(react_vectors, axis=1) > 0)
+
+            class_names = ["alpha", "beta"]
+            legacy_source_records = discover_images(folders, class_names)
+            monkeypatch.setattr(
+                legacy_app.st, "session_state", {},
+            )
+            monkeypatch.setattr(
+                legacy_app,
+                "load_model",
+                lambda model_id, **kwargs: load_model(
+                    model_id, models_dir=models_dir, **kwargs,
+                ),
+            )
+            legacy_records, legacy_vectors, _legacy_token = legacy_app._crop_and_embed_objects(
+                legacy_source_records,
+                "dinov2_vits14",
+                class_names,
+                0.12,
+                base_token="react-web-real-object-coverage",
+            )
+            assert len(legacy_records) == len(run["records"]) == 8
+            np.testing.assert_allclose(react_vectors, legacy_vectors, rtol=1e-6, atol=1e-7)
+            for expected, actual in zip(legacy_records, run["records"], strict=True):
+                assert actual["filename"] == expected["image_path"].name
+                assert actual["label"] == expected["label"]
+                assert actual["class_id"] == expected["class_id"]
+                assert actual["obj_index"] == expected["obj_index"]
+                assert actual["score"] == pytest.approx(expected["score"], abs=1e-7)
+                assert actual["short_px"] == expected["short_px"]
+                np.testing.assert_allclose(actual["bbox"], expected["bbox"], rtol=0, atol=1e-7)
+
+            monkeypatch.setattr(legacy_app.st, "session_state", {})
+            legacy_2d, _ = legacy_app._cov_projection(
+                legacy_vectors, None, "pca", 2, f"objcov-real-{run_id}", "",
+            )
+            react_2d = np.asarray([[point["x"], point["y"]] for point in run["points"]])
+            np.testing.assert_allclose(react_2d, legacy_2d, rtol=1e-5, atol=1e-5)
+            from interaction import sparsity_scores
+
+            expected_sparsity = sparsity_scores(legacy_vectors, k=run["k"])
+            np.testing.assert_allclose(run["sparsity"], expected_sparsity, rtol=1e-7, atol=1e-8)
+            public_run = page.request.get(
+                f"{base_url}/api/v1/coverage/runs/{run_id}",
+            ).json()
+            assert "image_paths" not in public_run
+            assert "image_path" not in str(public_run)
+
+            page.get_by_test_id("coverage-object-class").select_option("alpha")
+            page.get_by_test_id("coverage-min-short-px").fill("10")
+            page.get_by_test_id("coverage-confidence-min").fill("0.8")
+            page.get_by_test_id("coverage-confidence-max").fill("0.95")
+            with page.expect_response(
+                lambda response: response.url.endswith("/object-view")
+                and response.request.method == "POST" and response.ok,
+            ) as object_view_response:
+                page.get_by_test_id("coverage-apply-object-filters").click()
+            object_view = object_view_response.value.json()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            expect(page.get_by_test_id("coverage-image-count")).to_have_text("4")
+
+            monkeypatch.setattr(
+                legacy_app.st,
+                "session_state",
+                {"obj_conf_range": (0.8, 0.95), "obj_min_short_px": 10},
+            )
+            legacy_indices = [
+                index for index in legacy_app._obj_view_indices(legacy_records)
+                if legacy_records[index]["label"] == "alpha"
+            ]
+            assert [point["index"] for point in object_view["points"]] == legacy_indices
+            assert [point["filename"] for point in object_view["points"]] == [
+                legacy_records[index]["image_path"].name for index in legacy_indices
+            ]
+            for point, index in zip(object_view["points"], legacy_indices, strict=True):
+                legacy_record = legacy_records[index]
+                assert point["label"] == legacy_record["label"] == "alpha"
+                assert point["class_id"] == legacy_record["class_id"]
+                assert point["obj_index"] == legacy_record["obj_index"]
+                assert point["short_px"] == legacy_record["short_px"]
+                assert point["score"] == pytest.approx(legacy_record["score"], abs=1e-7)
+                np.testing.assert_allclose(point["bbox"], legacy_record["bbox"], rtol=0, atol=1e-7)
+            legacy_filtered = legacy_vectors[legacy_indices]
+            legacy_filtered_labels = [legacy_records[index]["label"] for index in legacy_indices]
+            expected_filtered_sparsity = sparsity_scores(
+                legacy_filtered, k=object_view["k"],
+            )
+            np.testing.assert_allclose(
+                object_view["sparsity"], expected_filtered_sparsity, rtol=1e-7, atol=1e-8,
+            )
+            monkeypatch.setattr(legacy_app.st, "session_state", {})
+            expected_filtered_2d, _ = legacy_app._cov_projection(
+                legacy_filtered,
+                None,
+                "pca",
+                2,
+                f"objcov-real-filtered-{run_id}",
+                "",
+            )
+            react_filtered_2d = np.asarray([
+                [point["x"], point["y"]] for point in object_view["points"]
+            ])
+            np.testing.assert_allclose(
+                react_filtered_2d, expected_filtered_2d, rtol=1e-5, atol=1e-5,
+            )
+            assert legacy_filtered_labels == [point["label"] for point in object_view["points"]]
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for path in source_hashes
+    }, "real-model object coverage changed source images, labels, or classes"
+    assert _sha256_file(weights) == weights_hash
+
+
 def test_lv_web_03_ref_01_visible_candidate_pool_reference_and_curation_journey(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
