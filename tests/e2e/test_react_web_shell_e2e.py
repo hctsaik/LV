@@ -2903,6 +2903,112 @@ def test_lv_web_03_obj_01_visible_object_coverage_filters_blocks_and_crop_readba
     }
 
 
+def test_lv_web_03_obj_01_crop_policy_controls_match_manual_and_autotune_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Coverage policy controls reach the worker and autotune updates the next run."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    folders, source_hashes = _object_coverage_fixture(tmp_path / "object-policy-controls")
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "object-policy-controls-cache"))
+
+    def object_loader(_model_id: str, **_kwargs):
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            vector[4] = crop.height / 100.0
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: lambda _path: np.array([1.0] + [0.0] * 383, dtype=np.float32),
+        object_model_loader=object_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(20_000)
+            coverage_requests = []
+            page.on(
+                "request",
+                lambda request: coverage_requests.append(request.post_data_json)
+                if request.url.endswith("/api/v1/coverage/jobs") and request.method == "POST"
+                else None,
+            )
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            page.get_by_label("Analysis unit").select_option("object")
+            expect(page.get_by_test_id("coverage-object-policy")).to_be_visible()
+            for folder in folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+
+            page.get_by_test_id("coverage-object-pad").fill("0.22")
+            page.get_by_test_id("coverage-object-resolution").select_option("280")
+            page.get_by_test_id("coverage-object-head").select_option("meanpool")
+            page.get_by_test_id("coverage-object-policy-apply").click()
+            expect(page.get_by_test_id("coverage-object-policy-active")).to_contain_text(
+                "Active policy: pad 0.22 · 280px · meanpool."
+            )
+
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text(
+                "Completed", timeout=60_000,
+            )
+            manual_policy = {"pad": 0.22, "target_res": 280, "head": "meanpool"}
+            assert coverage_requests[-1]["object_policy"] == manual_policy
+            with application.state.lock:
+                first_run = next(iter(application.state.coverage_runs.values()))
+                assert first_run["object_policy"] == manual_policy
+
+            page.get_by_test_id("coverage-object-policy-autotune").click()
+            expect(page.get_by_text(
+                "Applied the best object crop policy. Run coverage analysis to use it."
+            )).to_be_visible(timeout=120_000)
+            active_policy_text = page.get_by_test_id("coverage-object-policy-active").inner_text()
+            import re
+
+            matched = re.search(
+                r"Active policy: pad ([0-9.]+) · ([0-9]+)px · (cls|meanpool)",
+                active_policy_text,
+            )
+            assert matched, active_policy_text
+            best_policy = {
+                "pad": float(matched.group(1)),
+                "target_res": int(matched.group(2)),
+                "head": matched.group(3),
+            }
+
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text(
+                "Completed", timeout=60_000,
+            )
+            assert coverage_requests[-1]["object_policy"] == best_policy
+            with application.state.lock:
+                latest_run = list(application.state.coverage_runs.values())[-1]
+                assert latest_run["object_policy"] == best_policy
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for path in source_hashes
+    }
+
+
 def test_lv_web_03_obj_01_real_dinov2_visible_streamlit_parity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
