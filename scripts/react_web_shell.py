@@ -6481,7 +6481,7 @@ def create_app(
                     "warnings": list(result.warnings),
                 })
             else:
-                from gradcam_explain import token_gradcam_map
+                from gradcam_explain import target_positive_norm, token_gradcam_map
 
                 result = token_gradcam_map(
                     explain_request,
@@ -6491,7 +6491,7 @@ def create_app(
                 )
                 raw_scores = np.asarray(result.raw_patch_scores, dtype=np.float32)
                 if request.display_mode == "positive":
-                    display_scores = max_norm(np.clip(raw_scores, 0.0, None))
+                    display_scores = target_positive_norm(raw_scores)
                 else:
                     display_scores = np.asarray(result.display_patch_scores, dtype=np.float32)
                 payload.update({

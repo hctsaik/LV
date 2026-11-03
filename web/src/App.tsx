@@ -67,6 +67,16 @@ function colorMap(points: EmbeddingPoint[]) {
   return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
 }
 
+function evidenceGridColor(value: number, scoreMode: DiagnosticExplanationResult["score_mode"]) {
+  const alpha = 0.08 + Math.abs(value) * 0.82;
+  if (scoreMode !== "signed") return `rgba(204, 54, 45, ${alpha})`;
+
+  const endpoint: [number, number, number] = value < 0 ? [42, 99, 183] : [204, 54, 45];
+  const strength = Math.abs(value);
+  const [red, green, blue] = endpoint.map((channel) => Math.round(255 - (255 - channel) * strength));
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+}
+
 function DiagnosticEvidenceGrid({ result }: { result: DiagnosticExplanationResult }) {
   const [rows, columns] = result.grid;
   return <div
@@ -78,14 +88,10 @@ function DiagnosticEvidenceGrid({ result }: { result: DiagnosticExplanationResul
   >
     {result.display_scores.flatMap((line, row) => line.map((score, column) => {
       const value = Number.isFinite(score) ? Math.max(-1, Math.min(1, score)) : 0;
-      const opacity = 0.08 + Math.abs(value) * 0.82;
-      const color = result.score_mode === "signed" && value < 0
-        ? `rgba(42, 99, 183, ${opacity})`
-        : `rgba(204, 54, 45, ${opacity})`;
       return <span
         key={`${row}-${column}`}
         title={`Patch ${row + 1}, ${column + 1}: ${value.toFixed(4)}`}
-        style={{ backgroundColor: color }}
+        style={{ backgroundColor: evidenceGridColor(value, result.score_mode) }}
       />;
     }))}
   </div>;
@@ -1559,7 +1565,9 @@ export default function App() {
                         src={`data:image/png;base64,${diagnosticExplanation.overlay_png_base64}`}
                         alt={`${diagnosticExplanation.method} evidence overlay`}
                       />
-                      <figcaption>Patch evidence overlay · not a segmentation mask</figcaption>
+                      <figcaption>{diagnosticExplanation.method === "gradcam" && diagnosticExplanation.score_mode === "signed"
+                        ? "Signed evidence: blue lowers target–reference margin, white is neutral, red raises it; not a segmentation mask"
+                        : "Patch evidence overlay · not a segmentation mask"}</figcaption>
                     </figure>
                   </div>
                   <div className="diagnostic-grid-panel">

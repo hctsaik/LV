@@ -82,12 +82,51 @@ class GradCAMResult:
 
 
 def signed_norm(scores: np.ndarray) -> np.ndarray:
-    """Symmetric [-1, 1] normalization that never invents positive evidence."""
+    """Robust symmetric display scaling that preserves sign and flat maps.
+
+    A single extreme patch must not make a weak, diffuse explanation look
+    strong.  The 99th percentile supplies one shared positive/negative scale;
+    near-flat maps and non-finite values render neutral.  Raw scores remain
+    unchanged for evidence exports and audits.
+    """
     s = np.asarray(scores, dtype=np.float32)
-    scale = float(np.abs(s).max()) if s.size else 0.0
-    if scale <= 0:
+    finite = np.where(np.isfinite(s), s, 0.0)
+    values = np.abs(finite[finite != 0])
+    if values.size == 0:
         return np.zeros_like(s, dtype=np.float32)
-    return (s / scale).astype(np.float32)
+    scale = float(np.percentile(values, 99.0))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        return np.zeros_like(s, dtype=np.float32)
+    if values.size >= 4 and float(values.max()) <= float(np.median(values)) * 1.10:
+        return np.zeros_like(s, dtype=np.float32)
+    out = np.clip(finite / scale, -1.0, 1.0)
+    out[np.abs(out) < 0.05] = 0.0
+    return out.astype(np.float32)
+
+
+def target_positive_norm(
+    scores: np.ndarray,
+    *,
+    scale_percentile: float = 95.0,
+    min_relative: float = 0.20,
+) -> np.ndarray:
+    """Normalize positive target evidence without amplifying flat maps."""
+    s = np.asarray(scores, dtype=np.float32)
+    positive = np.clip(np.where(np.isfinite(s), s, 0.0), 0.0, None)
+    values = positive[positive > 0]
+    if values.size == 0:
+        return np.zeros_like(positive, dtype=np.float32)
+    q = float(np.clip(scale_percentile, 50.0, 100.0))
+    scale = float(np.percentile(values, q))
+    median = float(np.percentile(values, 50.0))
+    maximum = float(values.max())
+    if not np.isfinite(scale) or scale <= 1e-12:
+        return np.zeros_like(positive, dtype=np.float32)
+    if values.size >= 4 and maximum <= median * 1.10:
+        return np.zeros_like(positive, dtype=np.float32)
+    out = np.clip(positive / scale, 0.0, 1.0)
+    out[out < float(np.clip(min_relative, 0.0, 1.0))] = 0.0
+    return out.astype(np.float32)
 
 
 def _target_index(classes: list, target: str | int | None) -> tuple[int, str]:
