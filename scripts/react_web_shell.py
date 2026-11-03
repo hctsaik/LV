@@ -71,6 +71,12 @@ class CreateBlockProjection(BaseModel):
     indices: list[int] = Field(min_length=1, max_length=100_000)
 
 
+class CreateSimilarSearch(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    query_index: int = Field(ge=0)
+    k: int = Field(default=9, ge=1, le=100_000)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -111,6 +117,110 @@ def _job_view(job: _Job) -> dict:
         "run_id": job.run_id,
         "error": job.error,
         "can_cancel": job.state in {"queued", "running", "cancelling"},
+    }
+
+
+def _similar_search(run: dict, model_id: str, query_index: int, k: int) -> dict:
+    """Rank whole-image records by exact cosine distance from one run record."""
+    records = run.get("records", [])
+    if k < 1:
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_RESULT_COUNT",
+            "message": "The number of similar images must be at least one.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if run.get("source_granularity") != "whole_image":
+        raise HTTPException(status_code=409, detail={
+            "code": "SIMILARITY_UNAVAILABLE",
+            "message": "Image similarity is available for whole-image runs. Run whole-image analysis first.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if model_id not in run.get("models", []):
+        raise HTTPException(status_code=404, detail={
+            "code": "MODEL_NOT_IN_RUN",
+            "message": "Run the analysis with this feature model before searching across models.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if not 0 <= query_index < len(records):
+        raise HTTPException(status_code=422, detail={
+            "code": "INVALID_QUERY_INDEX",
+            "message": "The selected query image is outside this run.",
+            "request_id": uuid.uuid4().hex,
+        })
+    if len(records) < 2:
+        return {"model_id": model_id, "query_index": query_index, "results": []}
+
+    try:
+        expected_shape = tuple(int(value) for value in run["embedding_shapes"][model_id])
+    except (KeyError, TypeError, ValueError):
+        expected_shape = ()
+    if len(expected_shape) != 2 or expected_shape[0] != len(records) or expected_shape[1] <= 0:
+        raise HTTPException(status_code=409, detail={
+            "code": "EMBEDDING_CACHE_UNAVAILABLE",
+            "message": "The feature cache for this model is unavailable. Run the analysis again.",
+            "request_id": uuid.uuid4().hex,
+        })
+
+    matrix = np.empty(expected_shape, dtype=np.float32)
+    seen_indices: set[int] = set()
+    cache_error = False
+    for source in run.get("_embedding_sources", {}).get(model_id, []):
+        try:
+            indices = [int(value) for value in source.get("indices", [])]
+            keys = [str(value) for value in source.get("keys", [])]
+        except (TypeError, ValueError):
+            cache_error = True
+            break
+        if len(indices) != len(keys) or len(set(indices)) != len(indices):
+            cache_error = True
+            break
+        try:
+            with np.load(str(source["cache_path"]), allow_pickle=False) as cache:
+                cache_keys = [str(key) for key in cache["keys"].tolist()]
+                cache_rows = {key: row for row, key in enumerate(cache_keys)}
+                embeddings = np.asarray(cache["embeddings"], dtype=np.float32)
+                if (embeddings.ndim != 2 or embeddings.shape[0] != len(cache_keys)
+                        or embeddings.shape[1] != expected_shape[1]):
+                    cache_error = True
+                    break
+                for index, key in zip(indices, keys):
+                    if (index < 0 or index >= len(records) or index in seen_indices
+                            or key not in cache_rows):
+                        cache_error = True
+                        break
+                    matrix[index] = embeddings[cache_rows[key]]
+                    seen_indices.add(index)
+        except (OSError, KeyError, ValueError, TypeError):
+            cache_error = True
+        if cache_error:
+            break
+    if cache_error or seen_indices != set(range(len(records))):
+        raise HTTPException(status_code=409, detail={
+            "code": "EMBEDDING_CACHE_UNAVAILABLE",
+            "message": "The feature cache for this model is unavailable. Run the analysis again.",
+            "request_id": uuid.uuid4().hex,
+        })
+
+    norms = np.linalg.norm(matrix, axis=1)
+    if not np.isfinite(matrix).all() or np.any(norms <= 0):
+        raise HTTPException(status_code=409, detail={
+            "code": "INVALID_EMBEDDING_CACHE",
+            "message": "The feature cache contains invalid vectors. Run the analysis again.",
+            "request_id": uuid.uuid4().hex,
+        })
+    cosine = (matrix @ matrix[query_index]) / (norms * norms[query_index])
+    distances = np.clip(1.0 - cosine.astype(np.float64), 0.0, 2.0)
+    ranked = sorted(
+        (index for index in range(len(records)) if index != query_index),
+        key=lambda index: (float(distances[index]), index),
+    )[: min(k, len(records) - 1)]
+    return {
+        "model_id": model_id,
+        "query_index": query_index,
+        "results": [
+            {**records[index], "distance": float(distances[index])}
+            for index in ranked
+        ],
     }
 
 
@@ -520,6 +630,35 @@ def create_app(
                 key: value for key, value in run.items()
                 if key != "image_paths" and not key.startswith("_")
             }
+
+    @app.post("/api/v1/runs/{run_id}/similar")
+    def search_similar(run_id: str, request: CreateSimilarSearch) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+        return _similar_search(run, request.model_id, request.query_index, request.k)
+
+    @app.get("/api/v1/runs/{run_id}/similar.csv")
+    def export_similar_csv(run_id: str, model_id: str, query_index: int, k: int = 9) -> Response:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+        result = _similar_search(run, model_id, query_index, k)
+        ordered_indices = [query_index, *[row["index"] for row in result["results"]]]
+        records_with_paths = [
+            {**record, "path": run["image_paths"][index]}
+            for index, record in enumerate(run["records"])
+        ]
+        from interaction import records_to_csv
+
+        content = records_to_csv(records_with_paths, ordered_indices)
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="similar_group.csv"'},
+        )
 
     @app.post("/api/v1/runs/{run_id}/blocks")
     def create_run_blocks(run_id: str, request: CreateRunBlocks) -> dict:

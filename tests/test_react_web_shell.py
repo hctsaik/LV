@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import os
 import time
 from pathlib import Path
@@ -107,6 +109,99 @@ def test_case_lv_web_01_ic_01_discovery(classifier_fixture, monkeypatch, tmp_pat
     assert run["embedding_nonzero"] is True
     assert len(run["points"]) == 4
     assert all(np.isfinite([point["x"], point["y"]]).all() for point in run["points"])
+
+
+def test_case_lv_web_01_search_01_similarity_reorders_by_model_and_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SEARCH-01: nearest images sort by cosine distance and recompute per model."""
+    folder = tmp_path / "train" / "classA"
+    folder.mkdir(parents=True)
+    filenames = ["a_query.png", "b_near_a.png", "c_near_b.png", "d_far.png"]
+    colors = [(220, 35, 45), (210, 40, 50), (35, 65, 215), (30, 200, 70)]
+    for filename, color in zip(filenames, colors):
+        Image.new("RGB", (32, 32), color).save(folder / filename)
+
+    vectors = {
+        "model_a": {
+            "a_query.png": [1.0, 0.0, 0.0],
+            "b_near_a.png": [0.99, 0.1, 0.0],
+            "c_near_b.png": [0.0, 1.0, 0.0],
+            "d_far.png": [0.0, 0.0, 1.0],
+        },
+        "model_b": {
+            "a_query.png": [1.0, 0.0, 0.0],
+            "b_near_a.png": [0.0, 1.0, 0.0],
+            "c_near_b.png": [0.99, 0.1, 0.0],
+            "d_far.png": [0.0, 0.0, 1.0],
+        },
+    }
+
+    def model_loader(model_id: str):
+        return lambda path: np.asarray(vectors[model_id][path.name], dtype=np.float32)
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    client = TestClient(create_app(
+        model_catalog=lambda: ["model_a", "model_b"],
+        model_loader=model_loader,
+    ))
+    created = client.post("/api/v1/visualize/jobs", json={
+        "folders": [str(tmp_path / "train")],
+        "model_ids": ["model_a", "model_b"],
+        "methods": ["pca"],
+    })
+    assert created.status_code == 202, created.text
+    job_id = created.json()["job_id"]
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        status = client.get(f"/api/v1/jobs/{job_id}").json()
+        if status["state"] in {"completed", "failed", "cancelled"}:
+            break
+        time.sleep(0.02)
+    assert status["state"] == "completed", status
+    run_id = status["run_id"]
+    run = client.get(f"/api/v1/runs/{run_id}").json()
+    query_index = next(row["index"] for row in run["records"] if row["filename"] == "a_query.png")
+
+    model_a = client.post(f"/api/v1/runs/{run_id}/similar", json={
+        "model_id": "model_a", "query_index": query_index, "k": 3,
+    })
+    model_b = client.post(f"/api/v1/runs/{run_id}/similar", json={
+        "model_id": "model_b", "query_index": query_index, "k": 3,
+    })
+    assert model_a.status_code == model_b.status_code == 200
+    result_a = model_a.json()["results"]
+    result_b = model_b.json()["results"]
+    assert [row["filename"] for row in result_a][0] == "b_near_a.png"
+    assert [row["filename"] for row in result_b][0] == "c_near_b.png"
+    assert set(result_a[0]) == {"index", "filename", "split", "label", "distance"}
+    assert all(row["index"] != query_index for row in result_a + result_b)
+    for rows in (result_a, result_b):
+        distances = [row["distance"] for row in rows]
+        assert distances == sorted(distances)
+        assert all(np.isfinite(distance) and 0 <= distance <= 2 for distance in distances)
+
+    export = client.get(f"/api/v1/runs/{run_id}/similar.csv", params={
+        "model_id": "model_b", "query_index": query_index, "k": 3,
+    })
+    assert export.status_code == 200
+    csv_rows = list(csv.reader(io.StringIO(export.text)))
+    assert csv_rows[0] == ["index", "filename", "path", "label", "split"]
+    assert len(csv_rows) == 1 + 1 + len(result_b)
+    assert csv_rows[1][1] == "a_query.png"
+    assert [row[1] for row in csv_rows[2:]][0] == "c_near_b.png"
+    assert (folder / "a_query.png").is_file()
+
+    unavailable_model = client.post(f"/api/v1/runs/{run_id}/similar", json={
+        "model_id": "not-in-run", "query_index": query_index, "k": 3,
+    })
+    invalid_export_count = client.get(f"/api/v1/runs/{run_id}/similar.csv", params={
+        "model_id": "model_b", "query_index": query_index, "k": 0,
+    })
+    assert unavailable_model.status_code == 404
+    assert unavailable_model.json()["code"] == "MODEL_NOT_IN_RUN"
+    assert invalid_export_count.status_code == 422
+    assert invalid_export_count.json()["code"] == "INVALID_RESULT_COUNT"
 
 
 def test_case_lv_web_01_ic_01_selected_image_is_run_bound(

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import os
+import csv
 import hashlib
+import io
+import os
 import re
 import socket
 import threading
@@ -583,6 +585,116 @@ def test_lv_web_02_img_01_visible_compare_contract(tmp_path: Path, monkeypatch: 
             server_thread.join(timeout=10)
 
     assert all(path.read_bytes() == content for path, content in source_bytes.items())
+
+
+def test_lv_web_01_search_01_visible_chain_cross_model_and_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """SEARCH-01: visible search sorts, pivots, recomputes per model, and exports."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    from playwright.sync_api import expect, sync_playwright
+
+    folder = tmp_path / "train" / "classA"
+    folder.mkdir(parents=True)
+    filenames = ["a_query.png", "b_near_a.png", "c_near_b.png", "d_far.png"]
+    colors = [(220, 35, 45), (210, 40, 50), (35, 65, 215), (30, 200, 70)]
+    source_bytes = {}
+    for filename, color in zip(filenames, colors):
+        image_path = folder / filename
+        Image.new("RGB", (32, 32), color).save(image_path)
+        source_bytes[image_path] = image_path.read_bytes()
+
+    vectors = {
+        "model_a": {
+            "a_query.png": [1.0, 0.0, 0.0],
+            "b_near_a.png": [0.99, 0.1, 0.0],
+            "c_near_b.png": [0.0, 1.0, 0.0],
+            "d_far.png": [0.0, 0.0, 1.0],
+        },
+        "model_b": {
+            "a_query.png": [1.0, 0.0, 0.0],
+            "b_near_a.png": [0.0, 1.0, 0.0],
+            "c_near_b.png": [0.99, 0.1, 0.0],
+            "d_far.png": [0.0, 0.0, 1.0],
+        },
+    }
+
+    def model_loader(model_id: str):
+        return lambda path: np.asarray(vectors[model_id][path.name], dtype=np.float32)
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "lv-cache"))
+    application = create_app(
+        model_catalog=lambda: ["model_a", "model_b"],
+        model_loader=model_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+            search_payloads = []
+
+            def capture_response(response):
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                    if response.request.method == "POST" and response.url.endswith("/similar"):
+                        search_payloads.append(response.json())
+                    elif response.request.method == "GET":
+                        run_payloads.append(response.json())
+
+            page.on("response", capture_response)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-model_b").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_label("Image folder").fill(str(tmp_path / "train"))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            assert run_payloads
+            run = run_payloads[-1]
+            query_index = next(row["index"] for row in run["records"] if row["filename"] == "a_query.png")
+            pivot_index = next(row["index"] for row in run["records"] if row["filename"] == "b_near_a.png")
+
+            page.get_by_test_id("embedding-point").nth(query_index).click()
+            page.get_by_test_id("find-similar").click()
+            expect(page.get_by_test_id("similar-results")).to_be_visible()
+            expect(page.get_by_test_id("similar-result")).to_have_count(3)
+            expect(page.get_by_test_id("similar-result").first).to_contain_text("b_near_a.png")
+            expect(page.get_by_test_id("similar-result").first).to_contain_text("d=")
+
+            page.get_by_role("button", name="Search from b_near_a.png").click()
+            expect(page.get_by_test_id("similar-query-step")).to_have_count(2)
+            page.get_by_label("Display model").select_option("model_b")
+            expect(page.get_by_test_id("similar-model")).to_have_text("model_b")
+            expect(page.get_by_test_id("similar-result").first).to_contain_text("c_near_b.png")
+            assert any(payload["model_id"] == "model_b" for payload in search_payloads)
+
+            export = page.get_by_test_id("similar-export")
+            expect(export).to_have_attribute("href", re.compile(r"model_id=model_b.*query_index=" + str(pivot_index)))
+            with page.expect_download() as download:
+                export.click()
+            rows = list(csv.reader(io.StringIO(Path(download.value.path()).read_text(encoding="utf-8"))))
+            assert len(rows) == 1 + 1 + 3
+            assert rows[1][1] == "b_near_a.png"
+            assert rows[2][1] == "c_near_b.png"
+
+            page.get_by_role("button", name="Query step 1: a_query.png").click()
+            expect(page.get_by_test_id("similar-query-step")).to_have_count(1)
+            page.get_by_role("button", name="Close similar search").click()
+            expect(page.get_by_test_id("similar-panel")).to_have_count(0)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert {path: path.read_bytes() for path in source_bytes} == source_bytes
+    assert {path for path in (tmp_path / "train").rglob("*") if path.is_file()} == set(source_bytes)
 
 
 def test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d(

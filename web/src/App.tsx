@@ -7,6 +7,7 @@ import {
   type JobStatus,
   type ModelOption,
   type ProjectionMethod,
+  type SimilarSearch,
   type VisualizationRun,
 } from "./api";
 import Compare from "./Compare";
@@ -156,6 +157,12 @@ export default function App() {
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [similarOpen, setSimilarOpen] = useState(false);
+  const [similarChain, setSimilarChain] = useState<number[]>([]);
+  const [similarK, setSimilarK] = useState(9);
+  const [similarResults, setSimilarResults] = useState<SimilarSearch | null>(null);
+  const [similarLoading, setSimilarLoading] = useState(false);
+  const [similarError, setSimilarError] = useState("");
   const [showYoloOverlay, setShowYoloOverlay] = useState(true);
   const [viewerImageMode, setViewerImageMode] = useState<"selected" | "source">("selected");
   const [blockCount, setBlockCount] = useState(12);
@@ -222,6 +229,7 @@ export default function App() {
     [selectedIndices, currentView],
   );
   const viewerPosition = selectedIndex === null ? -1 : selectionGalleryIndices.indexOf(selectedIndex);
+  const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
 
   useEffect(() => {
     const runId = job?.run_id;
@@ -269,6 +277,30 @@ export default function App() {
       });
     return () => { active = false; };
   }, [dimension, run, job?.run_id, selectedBlock, currentView, activeModelId]);
+
+  useEffect(() => {
+    const runId = job?.run_id;
+    if (!similarOpen || !runId || !run || run.source_granularity !== "whole_image" || similarQueryIndex === null) {
+      setSimilarResults(null);
+      setSimilarLoading(false);
+      setSimilarError("");
+      return;
+    }
+    let active = true;
+    setSimilarResults(null);
+    setSimilarLoading(true);
+    setSimilarError("");
+    api.searchSimilar(runId, activeModelId, similarQueryIndex, similarK)
+      .then((result) => active && setSimilarResults(result))
+      .catch((reason: unknown) => {
+        if (active) {
+          setSimilarResults(null);
+          setSimilarError(reason instanceof Error ? reason.message : "Unable to search similar images.");
+        }
+      })
+      .finally(() => active && setSimilarLoading(false));
+    return () => { active = false; };
+  }, [similarOpen, similarQueryIndex, similarK, activeModelId, run, job?.run_id]);
 
   function addFolder(value = folderDraft) {
     const path = value.trim();
@@ -330,6 +362,9 @@ export default function App() {
     setError("");
     setNotice("");
     setRun(null);
+    setSimilarOpen(false);
+    setSimilarChain([]);
+    setSimilarResults(null);
     setSelectedIndex(null);
     setSelectedIndices([]);
     setViewerImageMode("selected");
@@ -412,6 +447,28 @@ export default function App() {
   function selectPoint(index: number, additive = false) {
     setSelectedIndex(index);
     setSelectedIndices((current) => additive ? [...new Set([...current, index])] : [index]);
+  }
+
+  function startSimilarSearch(index = selectedIndex ?? selectedIndices[0]) {
+    if (!run || run.source_granularity !== "whole_image" || index === undefined || index === null) return;
+    setSimilarK(Math.min(9, Math.max(1, run.records.length - 1)));
+    setSimilarChain([index]);
+    setSimilarOpen(true);
+  }
+
+  function continueSimilarSearch(index: number) {
+    setSimilarChain((current) => current[current.length - 1] === index ? current : [...current, index]);
+  }
+
+  function truncateSimilarSearch(position: number) {
+    setSimilarChain((current) => current.slice(0, position + 1));
+  }
+
+  function closeSimilarSearch() {
+    setSimilarOpen(false);
+    setSimilarChain([]);
+    setSimilarResults(null);
+    setSimilarError("");
   }
 
   function navigateViewer(offset: number) {
@@ -730,6 +787,13 @@ export default function App() {
                     <button type="button" data-testid="dimension-2d" aria-pressed={dimension === 2} onClick={() => setDimension(2)}>2D</button>
                     <button type="button" data-testid="dimension-3d" aria-pressed={dimension === 3} onClick={() => setDimension(3)}>3D</button>
                   </div>
+                  {run.source_granularity === "whole_image" && (
+                    <button type="button" className="find-similar-button" data-testid="find-similar"
+                      disabled={selectedIndex === null && selectedIndices.length === 0}
+                      onClick={() => startSimilarSearch()}>
+                      Find similar
+                    </button>
+                  )}
                 </div>
                 {currentRecords.length ? (
                   <ScatterPlot
@@ -821,6 +885,49 @@ export default function App() {
                     <p>Select one or more points to see matching thumbnails here.</p>
                   )}
                 </section>
+                {similarOpen && similarQueryIndex !== null && run.source_granularity === "whole_image" && (
+                  <section className="similar-panel" data-testid="similar-panel" aria-label="Similar images">
+                    <div className="similar-panel-heading">
+                      <div><strong>Find similar images</strong><small>Recomputed with the active feature model</small></div>
+                      <span data-testid="similar-model">{activeModelId}</span>
+                      <button type="button" aria-label="Close similar search" onClick={closeSimilarSearch}>×</button>
+                    </div>
+                    <div className="similar-query-chain" aria-label="Query history">
+                      {similarChain.map((index, position) => (
+                        <button type="button" key={`${position}-${index}`} data-testid="similar-query-step"
+                          aria-label={`Query step ${position + 1}: ${run.records[index]?.filename || index}`}
+                          onClick={() => truncateSimilarSearch(position)}>
+                          #{index + 1} {run.records[index]?.filename || `Image ${index + 1}`}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="similar-panel-toolbar">
+                      <label><span>Results</span><input aria-label="Similar result count" type="number" min={1}
+                        max={Math.max(1, run.records.length - 1)} value={similarK}
+                        onChange={(event) => setSimilarK(Math.max(1, Math.min(Number(event.target.value) || 1, run.records.length - 1)))} /></label>
+                      {similarResults && <a data-testid="similar-export" download="similar_group.csv"
+                        href={api.similarCsvUrl(job?.run_id || "", activeModelId, similarQueryIndex, similarK)}>
+                        Export query + results CSV
+                      </a>}
+                    </div>
+                    {similarLoading && <div className="similar-loading" role="status">Searching this run with {activeModelId}…</div>}
+                    {similarError && <div className="alert alert-error" role="alert">{similarError}</div>}
+                    {similarResults?.results.length ? (
+                      <div className="similar-results" data-testid="similar-results">
+                        {similarResults.results.map((record) => (
+                          <article className="similar-result" key={record.index} data-testid="similar-result" data-index={record.index}>
+                            <img src={api.runImageUrl(job?.run_id || "", record.index)} alt="" loading="lazy" />
+                            <div><strong>{record.label}｜{record.filename}</strong><small>Cosine distance · d={record.distance.toFixed(4)}</small></div>
+                            <button type="button" aria-label={`Search from ${record.filename}`}
+                              onClick={() => continueSimilarSearch(record.index)}>Use as next query</button>
+                          </article>
+                        ))}
+                      </div>
+                    ) : similarResults && !similarLoading ? (
+                      <p className="similar-empty">No other images are available for this query.</p>
+                    ) : null}
+                  </section>
+                )}
               </section>
 
               <aside className="detail-card">

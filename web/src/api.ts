@@ -84,6 +84,12 @@ export type BlockProjection = {
   projection_source: "embedding_pca" | "projection";
   points: BlockProjectionPoint[];
 };
+export type SimilarResult = RunRecord & { distance: number };
+export type SimilarSearch = {
+  model_id: string;
+  query_index: number;
+  results: SimilarResult[];
+};
 
 export type ComparePoint = {
   group: "a" | "b";
@@ -192,6 +198,16 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ model_id: modelId, method, indices }),
   }),
+  searchSimilar: (runId: string, modelId: string, queryIndex: number, k: number) =>
+    request<SimilarSearch>("/api/v1/runs/" + encodeURIComponent(runId) + "/similar", {
+      method: "POST",
+      body: JSON.stringify({ model_id: modelId, query_index: queryIndex, k }),
+    }),
+  similarCsvUrl: (runId: string, modelId: string, queryIndex: number, k: number) => {
+    const base = window.NATIVEAPP_LOCAL_API || "";
+    const query = new URLSearchParams({ model_id: modelId, query_index: String(queryIndex), k: String(k) });
+    return base + "/api/v1/runs/" + encodeURIComponent(runId) + "/similar.csv?" + query.toString();
+  },
   createCompareJob: (foldersA: string[], foldersB: string[], modelId: string) =>
     request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
       method: "POST",
