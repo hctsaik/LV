@@ -91,6 +91,13 @@ class CreateDuplicateScan(BaseModel):
     embedding_threshold: float = Field(default=0.05, ge=0, le=0.5)
 
 
+class CreateRanking(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    criterion: Literal["outlier", "disagreement", "filename", "spatial"]
+    indices: list[int] | None = Field(default=None, max_length=100_000)
+    method: str = Field(default="pca", min_length=1, max_length=16)
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -829,6 +836,82 @@ def create_app(
                 key: value for key, value in run.items()
                 if key != "image_paths" and not key.startswith("_")
             }
+
+    @app.post("/api/v1/runs/{run_id}/rankings")
+    def rank_run_images(run_id: str, request: CreateRanking) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+        records = run.get("records", [])
+        if request.model_id not in run.get("models", []):
+            raise HTTPException(status_code=404, detail={
+                "code": "MODEL_NOT_IN_RUN",
+                "message": "Run the analysis with this feature model before ranking its records.",
+                "request_id": uuid.uuid4().hex,
+            })
+
+        indices = request.indices
+        if indices is not None:
+            if any(index < 0 or index >= len(records) for index in indices):
+                raise HTTPException(status_code=422, detail={
+                    "code": "INVALID_RECORD_INDEX",
+                    "message": "A ranking record index is outside this run.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            indices = list(dict.fromkeys(indices))
+
+        criterion = request.criterion
+        if indices is None and criterion in {"filename", "spatial"}:
+            # The legacy unselected grid always falls back to outlier Top-N.
+            criterion = "outlier"
+        metric_scores = run.get("_ranking_scores", {}).get(request.model_id, {})
+        scores = metric_scores.get(criterion) if criterion in {"outlier", "disagreement"} else None
+        if indices is None:
+            if scores is None:
+                return {
+                    "model_id": request.model_id,
+                    "criterion": request.criterion,
+                    "effective_criterion": criterion,
+                    "available": False,
+                    "total": len(records),
+                    "items": [],
+                }
+            order = [int(index) for index in np.argsort(np.asarray(scores))[::-1][:50]]
+        elif criterion in {"outlier", "disagreement"}:
+            if scores is None:
+                # Streamlit falls back to spatial order when score arrays do not exist.
+                criterion = "spatial"
+            else:
+                order = sorted(indices, key=lambda index: -float(scores[index]))
+        if indices is not None and criterion == "filename":
+            order = sorted(indices, key=lambda index: str(records[index].get("filename", "")))
+        elif indices is not None and criterion == "spatial":
+            from interaction import spatial_order
+
+            view = next((item for item in run.get("views", [])
+                         if item.get("model_id") == request.model_id
+                         and item.get("method") == request.method), None)
+            if view is None or len(view.get("points", [])) != len(records):
+                raise HTTPException(status_code=404, detail={
+                    "code": "VIEW_NOT_IN_RUN",
+                    "message": "The selected projection is unavailable for this ranking.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            coords = np.asarray([[point["x"], point["y"]] for point in view["points"]], dtype=float)
+            order = spatial_order(coords, indices)
+
+        return {
+            "model_id": request.model_id,
+            "criterion": request.criterion,
+            "effective_criterion": criterion,
+            "available": True,
+            "total": len(records) if indices is None else len(indices),
+            "items": [
+                {"index": index, "score": float(scores[index]) if scores is not None else None}
+                for index in order
+            ],
+        }
 
     @app.post("/api/v1/runs/{run_id}/similar")
     def search_similar(run_id: str, request: CreateSimilarSearch) -> dict:

@@ -111,7 +111,7 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             run_payloads = []
 
             def capture_run(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if response.request.method == "GET" and "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)
@@ -220,7 +220,7 @@ def test_lv_web_01_ic_03_fixed_umap_frame_keeps_old_images_visible(
             run_payloads: list[dict] = []
 
             def capture_run(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if response.request.method == "GET" and "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)
@@ -817,6 +817,130 @@ def test_lv_web_01_search_02_visible_text_and_duplicate_leakage_review(
     assert {path for path in root.rglob("*") if path.is_file()} == set(source_bytes)
 
 
+def test_lv_web_01_rank_01_visible_ranked_gallery_and_viewer_navigation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """RANK-01: ranking criteria order a visible gallery and drive its viewer."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    from playwright.sync_api import expect, sync_playwright
+
+    root = tmp_path / "ranked-dataset"
+    vectors: dict[str, np.ndarray] = {}
+    source_bytes = {}
+    for index, angle in enumerate((0.0, 0.25, 0.9, 1.5, 2.2, 2.8, 3.7, 5.1)):
+        split = "train" if index < 6 else "val"
+        label = "apple" if index < 4 else "banana"
+        folder = root / split / label
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"image-{index:02}.png"
+        Image.new("RGB", (48, 48), (20 + index * 20, 80, 160)).save(path)
+        source_bytes[path] = path.read_bytes()
+        vectors[path.name] = np.asarray([
+            np.cos(angle), np.sin(angle), 0.15 * (index % 3), 0.05 * index + 0.1,
+        ], dtype=np.float32)
+
+    def embed(path: Path) -> np.ndarray:
+        return vectors[path.name]
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "lv-cache"))
+    application = create_app(
+        model_catalog=lambda: ["rank-test"],
+        model_loader=lambda _model: embed,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads: list[dict] = []
+            rank_payloads: list[dict] = []
+            page.on("response", lambda response: run_payloads.append(response.json())
+                    if response.request.method == "GET" and "/api/v1/runs/" in response.url
+                    and "/images/" not in response.url and response.ok else None)
+            page.on("response", lambda response: rank_payloads.append(response.json())
+                    if response.request.method == "POST" and response.url.endswith("/rankings")
+                    and response.ok else None)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (root / "train", root / "val"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("ranked-review-item")).to_have_count(8)
+            expect(page.get_by_test_id("ranking-status")).to_contain_text("top 8 by outlier score")
+            assert run_payloads and rank_payloads
+
+            initial_order = [int(page.get_by_test_id("ranked-review-item").nth(i).get_attribute("data-index"))
+                             for i in range(8)]
+            assert initial_order == [item["index"] for item in rank_payloads[-1]["items"]]
+            page.get_by_test_id("ranked-review-item").first.click()
+            expect(page.get_by_test_id("viewer-position")).to_have_text("1 / 8")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(
+                run_payloads[-1]["records"][initial_order[0]]["filename"]
+            )
+            page.get_by_role("button", name="Next ranked image").click()
+            expect(page.get_by_test_id("viewer-position")).to_have_text("2 / 8")
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(
+                run_payloads[-1]["records"][initial_order[1]]["filename"]
+            )
+
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/rankings"), timeout=10_000,
+            ) as rank_response:
+                page.get_by_label("Rank review images").select_option("disagreement")
+            assert rank_response.value.json()["criterion"] == "disagreement"
+            expect(page.get_by_test_id("ranking-status")).to_contain_text("label disagreement")
+            expect(page.get_by_test_id("ranked-review-item")).to_have_count(8)
+            visible_order = [int(page.get_by_test_id("ranked-review-item").nth(i).get_attribute("data-index"))
+                             for i in range(8)]
+            assert visible_order == [item["index"] for item in rank_payloads[-1]["items"]]
+            expect(page.get_by_text("not a mislabel verdict")).to_be_visible()
+
+            train_index = next(row["index"] for row in run_payloads[-1]["records"]
+                               if row["split"] == "train")
+            val_index = next(row["index"] for row in run_payloads[-1]["records"]
+                             if row["split"] == "val")
+            page.locator(f'[data-testid="embedding-point"][data-index="{train_index}"]').click()
+            page.locator(f'[data-testid="embedding-point"][data-index="{val_index}"]').click(modifiers=["Shift"])
+            expect(page.get_by_test_id("selection-summary")).to_have_text("Selected 2 images")
+            page.get_by_label("Filter by split").select_option(label="val")
+            expect(page.get_by_test_id("ranking-status")).to_contain_text("Selected 2 · showing 1/1")
+            expect(page.get_by_test_id("ranked-review-item")).to_have_count(1)
+            assert int(page.get_by_test_id("ranked-review-item").first.get_attribute("data-index")) == val_index
+            page.get_by_label("Filter by split").select_option(label="All splits")
+            expect(page.get_by_test_id("ranked-review-item")).to_have_count(2)
+
+            with page.expect_response(
+                lambda response: response.request.method == "POST"
+                and response.url.endswith("/rankings"), timeout=10_000,
+            ) as filename_response:
+                page.get_by_label("Rank review images").select_option("filename")
+            assert filename_response.value.json()["criterion"] == "filename"
+            selected_indices = [train_index, val_index]
+            expected_filename_order = sorted(
+                selected_indices,
+                key=lambda index: run_payloads[-1]["records"][index]["filename"],
+            )
+            expect(page.get_by_test_id("ranked-review-item")).to_have_count(2)
+            assert [int(page.get_by_test_id("ranked-review-item").nth(i).get_attribute("data-index"))
+                    for i in range(2)] == expected_filename_order
+            expect(page.get_by_test_id("selection-summary")).to_have_text("Selected 2 images")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert {path: path.read_bytes() for path in source_bytes} == source_bytes
+    assert {path for path in root.rglob("*") if path.is_file()} == set(source_bytes)
+
+
 def test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -872,7 +996,7 @@ def test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d(
             run_payloads = []
 
             def capture_run(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if response.request.method == "GET" and "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)
@@ -984,7 +1108,7 @@ def test_lv_web_01_view_01_selection_gallery_yolo_navigation_and_mode_isolation(
             run_payloads = []
 
             def capture_run(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if response.request.method == "GET" and "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)
@@ -1099,7 +1223,7 @@ def test_lv_web_01_od_01_detector_whole_image_and_class_priority(
             run_payloads = []
 
             def capture_run(response):
-                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                if response.request.method == "GET" and "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
                     run_payloads.append(response.json())
 
             page.on("response", capture_run)

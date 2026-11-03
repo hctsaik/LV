@@ -11,6 +11,7 @@ import numpy as np
 from sklearn.decomposition import PCA
 
 from _utils import extract_embeddings, load_model, yaml_class_names
+from interaction import compute_label_disagreement, compute_outlier_scores
 from label_formats import folder_has_annotations
 from manifest import (
     manifest_path_for,
@@ -31,6 +32,26 @@ class VisualizationInputError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+def _compute_rank_scores(
+    embeddings_by_model: dict[str, np.ndarray], labels: Sequence[str],
+) -> dict[str, dict[str, list[float]]]:
+    """Cache Streamlit's exact review scores without exposing feature vectors."""
+    if len(labels) < 3:
+        return {}
+    k = min(5, len(labels) - 1)
+    results: dict[str, dict[str, list[float]]] = {}
+    for model_id, embeddings in embeddings_by_model.items():
+        results[model_id] = {
+            "outlier": compute_outlier_scores(
+                embeddings, embeddings, k=k, candidates_in_reference=True,
+            ).astype(float).tolist(),
+            "disagreement": compute_label_disagreement(
+                embeddings, labels, k=k,
+            ).astype(float).tolist(),
+        }
+    return results
 
 
 def _is_under(path: Path, folder: Path) -> bool:
@@ -374,6 +395,9 @@ def _run_object_visualization(
         raise VisualizationInputError("PROJECTION_UNAVAILABLE", "No selected projection could be computed.")
 
     primary = views[0]
+    ranking_scores = _compute_rank_scores(
+        embeddings_by_model, [str(row["label"]) for row in ordered_objects],
+    )
     return {
         "source_mode": "object_detector",
         "source_granularity": "object",
@@ -395,6 +419,7 @@ def _run_object_visualization(
         "image_paths": [Path(row["image_path"]).resolve() for row in ordered_objects],
         "_object_policy": policy,
         "_embedding_sources": {name: [] for name in model_names},
+        "_ranking_scores": ranking_scores,
     }
 
 
@@ -661,6 +686,9 @@ def run_visualization(
 
     primary = views[0]
     base_warnings = ([f"Skipped {len(unreadable)} unreadable image(s)."] if unreadable else [])
+    ranking_scores = _compute_rank_scores(
+        embeddings_by_model, [str(record["label"]) for record in records],
+    )
     return {
         "source_mode": mode,
         "source_granularity": "whole_image",
@@ -681,6 +709,7 @@ def run_visualization(
         "image_paths": [Path(record["path"]).resolve() for record in records],
         "_embedding_sources": embedding_sources,
         "_phashes": [phash_by_path.get(str(Path(record["path"]).resolve())) for record in records],
+        "_ranking_scores": ranking_scores,
     }
 
 

@@ -103,6 +103,16 @@ export type DuplicateScan = {
   total_pairs: number;
   pairs: DuplicatePair[];
 };
+export type RankingCriterion = "outlier" | "disagreement" | "filename" | "spatial";
+export type RankedIndex = { index: number; score: number | null };
+export type ImageRanking = {
+  model_id: string;
+  criterion: RankingCriterion;
+  effective_criterion: RankingCriterion;
+  available: boolean;
+  total: number;
+  items: RankedIndex[];
+};
 
 export type ComparePoint = {
   group: "a" | "b";
@@ -242,6 +252,18 @@ export const api = {
       cross_split_only: options.crossSplitOnly,
       phash_threshold: options.phashThreshold,
       embedding_threshold: options.embeddingThreshold,
+    }),
+  }),
+  rankImages: (
+    runId: string,
+    options: { modelId: string; criterion: RankingCriterion; indices: number[] | null; method: ProjectionMethod },
+  ) => request<ImageRanking>("/api/v1/runs/" + encodeURIComponent(runId) + "/rankings", {
+    method: "POST",
+    body: JSON.stringify({
+      model_id: options.modelId,
+      criterion: options.criterion,
+      indices: options.indices,
+      method: options.method,
     }),
   }),
   createCompareJob: (foldersA: string[], foldersB: string[], modelId: string) =>

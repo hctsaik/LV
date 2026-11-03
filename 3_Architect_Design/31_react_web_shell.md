@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的 React UI/API 邊界與分期切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽、Object Detector 整圖／物件級切片、selection viewer 與整圖相似查詢；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
+> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽、Object Detector 整圖／物件級切片、selection viewer、整圖相似／文字／重複查詢與離群／分歧排名複查；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
 
 ## 1. 邊界
 
@@ -23,6 +23,7 @@
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
+| `POST /api/v1/runs/{run_id}/rankings` | 依 run/model 對未選取資料或選取 indices 排序 | 回 record index 與可用分數；可按離群度、標籤分歧、檔名或目前投影的空間順序排列，不回 embedding、cache path 或來源路徑 |
 | `POST /api/v1/runs/{run_id}/blocks` | 對目前投影的可見 record indices 執行 KMeans | K（4–30）、非空 block membership 與 3D centers；不足樣本時降低 effective K |
 | `POST /api/v1/runs/{run_id}/block-projection` | 將選定 block 的原始 embedding 投影到 2D | 只回 record index 與 PCA 座標；cache 路徑及 embedding 不回給 UI |
 | `POST /api/v1/runs/{run_id}/similar` | 以 run record 搜尋相似整圖 | 指定模型、query index、K；回傳距離升冪的候選 index／metadata／cosine distance，不回 embedding 或來源路徑 |
@@ -92,6 +93,13 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 - Run-scoped phashes and embedding caches remain private to the worker. The visible UI can select either side of a pair to inspect it in the image viewer. Persistent curation/cart handoff remains in `LV-WEB-01-CART-01`.
 - `test_case_lv_web_01_search_02_text_search_and_duplicate_leakage_review` and `test_lv_web_01_search_02_visible_text_and_duplicate_leakage_review` use injected deterministic vectors and a train/val byte-copy fixture. They cover text order/pivot/export, phash and embedding pair detection, split filtering and unchanged source files. The existing Streamlit `test_q_text_to_image_search` is conditional on Chinese-CLIP weights; this machine has no local weights, so real-model text-ranking parity remains unverified.
 
+### LV-WEB-01-RANK-01 — Outlier and label-disagreement review
+
+- Whole-image and object-level runs compute both scores per model with the legacy formulas: `k=min(5, N-1)`, mean cosine distance to self-excluded nearest neighbors for outlier score, and the fraction of differently labeled neighbors for label disagreement. Scores stay in worker-private run state; the ranking endpoint returns only run record indices and the requested score.
+- With no selected points, the gallery shows the top 50 by outlier score by default; choosing label disagreement changes that order. Spatial and filename choices with no selection retain the legacy outlier fallback. With selected points, the selected records are limited by the active split and sorted by the selected criterion; spatial order uses the current projection's 12 horizontal bands. The separate selected-thumbnail wall and selected set remain unchanged.
+- The ranked gallery opens the image viewer in rank order so previous/next follows the displayed rank list. Both scores are explicitly described as manual review cues, never as quality or mislabel verdicts. Runs with fewer than three records do not invent score rankings.
+- `test_case_lv_web_01_rank_01_metrics_and_review_orders_match_streamlit` and `test_lv_web_01_rank_01_visible_ranked_gallery_and_viewer_navigation` use deterministic vectors to compare both score orders, filename/spatial order, visible criterion switching, viewer navigation, and unchanged source files. Real-model score parity and NativeApp grants／ARM64 remain unverified.
+
 ### LV-WEB-02-IMG-01 — Image-level Compare Distributions
 
 - 兩側各接受一至 32 個資料夾；同一側依選取順序合併，重複路徑／圖片去重。每個根資料夾先使用 `compare_distributions.get_image_paths` 的直接 JPG／JPEG／PNG 全域排序；若該根沒有直接圖片，才遞迴搜尋子資料夾並略過 embedding、crop、thumbnail cache。壞檔略過並顯示警告。
@@ -109,7 +117,7 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 
 ## 5. React 驗收契約
 
-**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01 / LV-WEB-01-OD-02 / LV-WEB-01-VIEW-01 / LV-WEB-01-SEARCH-01 / LV-WEB-01-SEARCH-02**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
+**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01 / LV-WEB-01-OD-02 / LV-WEB-01-VIEW-01 / LV-WEB-01-SEARCH-01 / LV-WEB-01-SEARCH-02 / LV-WEB-01-RANK-01**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
 
 - 選 fixture 資料夾、DINOv2-small、PCA，按 Run；UI 顯示 4 個點，API 向量 shape 為 4×384 且值有限、非零。PCA 維度遵循原 Streamlit 主流程 `min(3, max(1, n-2))`，小於 2 維時補零軸。
 - IC-02 對每個選取模型分別驗證 embedding cache、shape 和點索引一致；切換已產生的投影及 2D／3D 後，類別／split 與每個點的原始影像對應不變。UMAP 跨 run 固定參考座標另由 IC-03 驗收。
@@ -122,6 +130,7 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 - VIEW-01：Shift-click 後 selected set 與 thumbnail-wall record index 一致；縮圖順序沿用 Streamlit spatial order；點縮圖後前／後導覽仍依同一 index 序列。YOLO overlay 切換須更新影像且跨圖保留設定；來源 bytes 不變。切換 Image Classifier／Object Detector 再切回時不重現舊 run、selection 或 viewer。API overlay bytes test 與可見 E2E 使用 deterministic features。
 - SEARCH-01：從選取影像啟動查詢，結果不含 query 且 cosine distance 升冪；使用候選續查後可回到前一個 query；切換已在 run 中計算的 model 後，保留 query chain 並按新模型重新排序。CSV 第一筆資料是目前 query，後續資料和 React 結果順序一致；圖片來源 bytes 不變。API 與可見 E2E 使用 deterministic vectors，尚未證明真實模型排序或 NativeApp parity。
 - SEARCH-02：Chinese-CLIP 文字查詢回傳與固定文字向量一致的前 K 張，繁體 query 由文字塔正規化；文字結果可以啟動 SEARCH-01 image chain，CSV 只包含候選。phash／embedding duplicate pair 須依 distance 和 index 穩定排序；cross-split 只回不同 split 的候選對；兩側可回讀，來源不被改寫。deterministic API/UI 通過；本機無 Chinese-CLIP 權重，真實模型 parity、NativeApp grants 與 CART-01 handoff 待驗。
+- RANK-01：以 legacy `compute_outlier_scores` 與 `compute_label_disagreement` 的同一 k 和 self-exclusion 規則對照數值；驗證無選取時 Top-50 預設／分歧切換、選取集 split filter、檔名與 12-band spatial 順序，並確認排名卡與上一張／下一張共用顯示順序。確認排名不改變 selected set、來源 bytes 不變，分數提示只供人工複查。deterministic API 與可見 UI E2E 通過；真模型數值 parity、NativeApp grants／ARM64 待驗。
 - 模型缺失、空資料夾和取消須呈現可恢復狀態；不回報成功或改用假的 backend。worker 關閉與 NativeApp lifecycle 由 AC6 驗收。
 - 新 worker PID 讀取相同 run 若有持久結果時必須一致；尚未列入保存語義的暫存 run 不宣稱跨重啟持久。
 

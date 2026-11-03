@@ -6,8 +6,10 @@ import {
   type BlockProjection,
   type DuplicateScan,
   type JobStatus,
+  type ImageRanking,
   type ModelOption,
   type ProjectionMethod,
+  type RankingCriterion,
   type SimilarSearch,
   type TextSearch,
   type VisualizationRun,
@@ -26,6 +28,12 @@ const projectionOptions: { value: ProjectionMethod; label: string }[] = [
   { value: "lda", label: "LDA (supervised)" },
   { value: "sumap", label: "Supervised UMAP" },
 ];
+const rankingSortNames: Record<RankingCriterion, string> = {
+  spatial: "spatial order",
+  outlier: "outlier score",
+  disagreement: "label disagreement",
+  filename: "filename",
+};
 
 function pause(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -159,6 +167,12 @@ export default function App() {
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [rankingSort, setRankingSort] = useState<RankingCriterion>("outlier");
+  const [ranking, setRanking] = useState<ImageRanking | null>(null);
+  const [rankingLoading, setRankingLoading] = useState(false);
+  const [rankingError, setRankingError] = useState("");
+  const [rankingLimit, setRankingLimit] = useState(60);
+  const [rankViewerMode, setRankViewerMode] = useState(false);
   const [similarOpen, setSimilarOpen] = useState(false);
   const [textSearchMode, setTextSearchMode] = useState(false);
   const [similarChain, setSimilarChain] = useState<number[]>([]);
@@ -245,8 +259,50 @@ export default function App() {
     () => currentView ? spatialSelectionOrder(selectedIndices, currentView.points) : [],
     [selectedIndices, currentView],
   );
-  const viewerPosition = selectedIndex === null ? -1 : selectionGalleryIndices.indexOf(selectedIndex);
+  const rankingRequestIndices = useMemo(() => selectedIndices.length
+    ? selectedIndices.filter((index) => splitFilter === "all" || run?.records[index]?.split === splitFilter)
+    : null, [selectedIndices, splitFilter, run]);
+  const rankingRequestCriterion: RankingCriterion = rankingRequestIndices === null &&
+    (rankingSort === "filename" || rankingSort === "spatial") ? "outlier" : rankingSort;
+  const rankedIndices = useMemo(() => ranking?.items.map((item) => item.index) || [], [ranking]);
+  const rankingShownIndices = useMemo(() => rankingRequestIndices === null
+    ? rankedIndices.slice(0, 50)
+    : rankedIndices.slice(0, Math.min(rankingLimit, 240)), [rankingRequestIndices, rankedIndices, rankingLimit]);
+  const viewerIndices = rankViewerMode ? rankingShownIndices : selectionGalleryIndices;
+  const viewerPosition = selectedIndex === null ? -1 : viewerIndices.indexOf(selectedIndex);
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
+
+  useEffect(() => {
+    const runId = job?.run_id;
+    if (!runId || !run || !currentView) {
+      setRanking(null);
+      setRankingLoading(false);
+      setRankingError("");
+      return;
+    }
+    let active = true;
+    setRanking(null);
+    setRankingLoading(true);
+    setRankingError("");
+    api.rankImages(runId, {
+      modelId: activeModelId,
+      criterion: rankingRequestCriterion,
+      indices: rankingRequestIndices,
+      method: currentView.method,
+    })
+      .then((result) => active && setRanking(result))
+      .catch((reason: unknown) => {
+        if (active) setRankingError(reason instanceof Error ? reason.message : "Unable to rank review candidates.");
+      })
+      .finally(() => active && setRankingLoading(false));
+    return () => { active = false; };
+  }, [job?.run_id, run, currentView, activeModelId, rankingRequestCriterion, rankingRequestIndices, splitFilter]);
+
+  useEffect(() => {
+    if (rankViewerMode && selectedIndex !== null && !rankingShownIndices.includes(selectedIndex)) {
+      setRankViewerMode(false);
+    }
+  }, [rankViewerMode, selectedIndex, rankingShownIndices]);
 
   useEffect(() => {
     const runId = job?.run_id;
@@ -425,6 +481,11 @@ export default function App() {
     setDuplicateResults(null);
     setSelectedIndex(null);
     setSelectedIndices([]);
+    setRankingSort("outlier");
+    setRanking(null);
+    setRankingError("");
+    setRankingLimit(60);
+    setRankViewerMode(false);
     setViewerImageMode("selected");
     setShowYoloOverlay(true);
     setSelectedBlockId(null);
@@ -505,6 +566,7 @@ export default function App() {
   function selectPoint(index: number, additive = false) {
     setSelectedIndex(index);
     setSelectedIndices((current) => additive ? [...new Set([...current, index])] : [index]);
+    setRankViewerMode(false);
   }
 
   function startSimilarSearch(index = selectedIndex ?? selectedIndices[0]) {
@@ -575,7 +637,7 @@ export default function App() {
   }
 
   function navigateViewer(offset: number) {
-    const target = selectionGalleryIndices[viewerPosition + offset];
+    const target = viewerIndices[viewerPosition + offset];
     if (target !== undefined) setSelectedIndex(target);
   }
 
@@ -583,15 +645,18 @@ export default function App() {
     if (!indices.length) return;
     setSelectedIndices((current) => [...new Set([...current, ...indices])]);
     setSelectedIndex(indices[indices.length - 1]);
+    setRankViewerMode(false);
   }
 
   function clearSelection() {
     setSelectedIndex(null);
     setSelectedIndices([]);
+    setRankViewerMode(false);
   }
 
   function closeViewer() {
     setSelectedIndex(null);
+    setRankViewerMode(false);
   }
 
   return (
@@ -987,7 +1052,7 @@ export default function App() {
                             data-index={index}
                             aria-label={"View " + record.filename + (record.object_index === undefined ? "" : ", object " + (record.object_index + 1))}
                             aria-pressed={selectedIndex === index}
-                            onClick={() => setSelectedIndex(index)}
+                            onClick={() => { setSelectedIndex(index); setRankViewerMode(false); }}
                           >
                             <img src={api.runImageUrl(job?.run_id || "", index)} alt="" loading="lazy" />
                             <span>{record.label}｜{record.filename}{record.object_index === undefined ? "" : ` · object ${record.object_index + 1}`}</span>
@@ -997,6 +1062,71 @@ export default function App() {
                     </div>
                   ) : (
                     <p>Select one or more points to see matching thumbnails here.</p>
+                  )}
+                </section>
+                <section className="ranking-gallery" data-testid="ranking-gallery" aria-label="Ranked review candidates">
+                  <div className="ranking-gallery-heading">
+                    <div><strong>Ranked review</strong><small>Review cues only; scores are not image-quality judgments.</small></div>
+                    <label><span>Sort</span><select aria-label="Rank review images" value={rankingSort}
+                      onChange={(event) => { setRankingSort(event.target.value as RankingCriterion); setRankingLimit(60); }}>
+                      <option value="spatial">Spatial order</option>
+                      <option value="outlier">Outlier score</option>
+                      <option value="disagreement">Label disagreement</option>
+                      <option value="filename">Filename</option>
+                    </select></label>
+                  </div>
+                  {rankingLoading && <p className="ranking-status" role="status">Calculating review order for {activeModelId}…</p>}
+                  {rankingError && <p className="ranking-status ranking-error" role="alert">{rankingError}</p>}
+                  {!rankingLoading && !rankingError && ranking && !ranking.available && (
+                    <p className="ranking-status" data-testid="ranking-status">At least 3 records are required to rank a run.</p>
+                  )}
+                  {ranking?.available && (
+                    <>
+                      <p className="ranking-status" data-testid="ranking-status">
+                        {rankingRequestIndices === null
+                          ? `No selection · top ${rankingShownIndices.length} by ${rankingSortNames[ranking.effective_criterion]}`
+                          : `Selected ${selectedIndices.length} · showing ${rankingShownIndices.length}/${ranking.total} · ${ranking.effective_criterion === "spatial" && rankingSort !== "spatial" ? "scores unavailable; spatial order used" : "sorted by " + rankingSortNames[ranking.effective_criterion]}`}
+                        {rankingRequestIndices !== null && ranking.total > 240 && rankingShownIndices.length >= 240 ? " · showing first 240" : ""}
+                      </p>
+                      {ranking.effective_criterion === "outlier" && (
+                        <p className="ranking-note">Higher mean cosine distance to nearest neighbors means more isolated; use it as a review cue, not a quality verdict.</p>
+                      )}
+                      {ranking.effective_criterion === "disagreement" && (
+                        <p className="ranking-note">Higher share of differently labeled nearest neighbors is a review cue, not a mislabel verdict.</p>
+                      )}
+                      {rankingShownIndices.length ? (
+                        <div className="ranking-gallery-grid">
+                          {rankingShownIndices.map((index, position) => {
+                            const record = run.records[index];
+                            return (
+                              <button
+                                key={index}
+                                type="button"
+                                className={"selection-gallery-item" + (rankViewerMode && selectedIndex === index ? " selection-gallery-item-active" : "")}
+                                data-testid="ranked-review-item"
+                                data-index={index}
+                                data-rank={position + 1}
+                                aria-label={`Review ranked candidate ${position + 1}: ${record.filename}`}
+                                aria-pressed={rankViewerMode && selectedIndex === index}
+                                onClick={() => { setSelectedIndex(index); setRankViewerMode(true); }}
+                              >
+                                <img src={api.runImageUrl(job?.run_id || "", index, {
+                                  overlay: run.source_mode === "object_detector" && showYoloOverlay,
+                                  view: run.source_granularity === "object" ? viewerImageMode : "selected",
+                                })} alt="" loading="lazy" />
+                                <span>{record.label}｜{record.filename}{record.object_index === undefined ? "" : ` · object ${record.object_index + 1}`}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ) : <p className="ranking-status">No records match this split.</p>}
+                      {rankingRequestIndices !== null && ranking.total > rankingShownIndices.length && rankingShownIndices.length < 240 && (
+                        <button type="button" className="ranking-more" data-testid="ranking-load-more"
+                          onClick={() => setRankingLimit((current) => Math.min(current + 60, 240))}>
+                          Load more (+60)
+                        </button>
+                      )}
+                    </>
                   )}
                 </section>
                 {similarOpen && run.source_granularity === "whole_image" && (
@@ -1125,12 +1255,12 @@ export default function App() {
                       <div className="duplicate-pairs" data-testid="duplicate-pairs">
                         {duplicateResults.pairs.slice(0, 50).map((pair, index) => (
                           <article className="duplicate-pair" key={`${pair.left.index}-${pair.right.index}`} data-testid="duplicate-pair">
-                            <button type="button" aria-label={`Review left ${pair.left.filename}`} onClick={() => setSelectedIndex(pair.left.index)}>
+                            <button type="button" aria-label={`Review left ${pair.left.filename}`} onClick={() => { setSelectedIndex(pair.left.index); setRankViewerMode(false); }}>
                               <img src={api.runImageUrl(job?.run_id || "", pair.left.index)} alt="" loading="lazy" />
                               <span>{pair.left.label}｜{pair.left.filename} · {pair.left.split}</span>
                             </button>
                             <div className="duplicate-pair-distance"><small>Pair {index + 1}</small><strong>d={duplicateResults.method === "phash" ? Math.round(pair.distance) : pair.distance.toFixed(4)}</strong></div>
-                            <button type="button" aria-label={`Review right ${pair.right.filename}`} onClick={() => setSelectedIndex(pair.right.index)}>
+                            <button type="button" aria-label={`Review right ${pair.right.filename}`} onClick={() => { setSelectedIndex(pair.right.index); setRankViewerMode(false); }}>
                               <img src={api.runImageUrl(job?.run_id || "", pair.right.index)} alt="" loading="lazy" />
                               <span>{pair.right.label}｜{pair.right.filename} · {pair.right.split}</span>
                             </button>
@@ -1149,9 +1279,9 @@ export default function App() {
                 {selectedRecord && run ? (
                   <>
                     <div className="viewer-navigation">
-                      <button type="button" aria-label="Previous selected image" onClick={() => navigateViewer(-1)} disabled={viewerPosition <= 0}>‹</button>
-                      <span data-testid="viewer-position">{viewerPosition >= 0 ? `${viewerPosition + 1} / ${selectionGalleryIndices.length}` : "—"}</span>
-                      <button type="button" aria-label="Next selected image" onClick={() => navigateViewer(1)} disabled={viewerPosition < 0 || viewerPosition >= selectionGalleryIndices.length - 1}>›</button>
+                      <button type="button" aria-label={rankViewerMode ? "Previous ranked image" : "Previous selected image"} onClick={() => navigateViewer(-1)} disabled={viewerPosition <= 0}>‹</button>
+                      <span data-testid="viewer-position">{viewerPosition >= 0 ? `${viewerPosition + 1} / ${viewerIndices.length}` : "—"}</span>
+                      <button type="button" aria-label={rankViewerMode ? "Next ranked image" : "Next selected image"} onClick={() => navigateViewer(1)} disabled={viewerPosition < 0 || viewerPosition >= viewerIndices.length - 1}>›</button>
                       <button type="button" className="viewer-close" aria-label="Close image viewer" onClick={closeViewer}>×</button>
                     </div>
                     {run.source_granularity === "object" && (

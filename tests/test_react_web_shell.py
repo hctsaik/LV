@@ -329,6 +329,85 @@ def test_case_lv_web_01_search_02_text_search_and_duplicate_leakage_review(
     assert {path for path in root.rglob("*") if path.is_file()} == set(image_bytes)
 
 
+def test_case_lv_web_01_rank_01_metrics_and_review_orders_match_streamlit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """RANK-01: scores and selected-record orders preserve the Streamlit rules."""
+    from interaction import compute_label_disagreement, compute_outlier_scores, spatial_order
+
+    root = tmp_path / "rank-dataset"
+    vectors: dict[str, np.ndarray] = {}
+    for index, angle in enumerate((0.0, 0.25, 0.9, 1.5, 2.2, 2.8, 3.7, 5.1)):
+        split = "train" if index < 6 else "val"
+        label = "apple" if index < 4 else "banana"
+        folder = root / split / label
+        folder.mkdir(parents=True, exist_ok=True)
+        filename = f"image-{index:02}.png"
+        Image.new("RGB", (32, 32), (20 + index * 20, 80, 160)).save(folder / filename)
+        vectors[filename] = np.asarray([
+            np.cos(angle), np.sin(angle), 0.15 * (index % 3), 0.05 * index + 0.1,
+        ], dtype=np.float32)
+
+    def embed(path: Path) -> np.ndarray:
+        return vectors[path.name]
+
+    with _client(monkeypatch, tmp_path, embedder=embed, models=["rank-model"]) as client:
+        job = _run(client, [root / "train", root / "val"], model="rank-model")
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        run = client.get(f"/api/v1/runs/{run_id}").json()
+        outlier = client.post(f"/api/v1/runs/{run_id}/rankings", json={
+            "model_id": "rank-model", "criterion": "outlier",
+        })
+        disagreement = client.post(f"/api/v1/runs/{run_id}/rankings", json={
+            "model_id": "rank-model", "criterion": "disagreement",
+        })
+        selected_ids = [6, 2, 4, 1]
+        selected_outlier = client.post(f"/api/v1/runs/{run_id}/rankings", json={
+            "model_id": "rank-model", "criterion": "outlier", "indices": selected_ids,
+        })
+        selected_disagreement = client.post(f"/api/v1/runs/{run_id}/rankings", json={
+            "model_id": "rank-model", "criterion": "disagreement", "indices": selected_ids,
+        })
+        by_filename = client.post(f"/api/v1/runs/{run_id}/rankings", json={
+            "model_id": "rank-model", "criterion": "filename", "indices": selected_ids,
+        })
+        spatial = client.post(f"/api/v1/runs/{run_id}/rankings", json={
+            "model_id": "rank-model", "criterion": "spatial", "indices": selected_ids,
+            "method": "pca",
+        })
+        invalid_index = client.post(f"/api/v1/runs/{run_id}/rankings", json={
+            "model_id": "rank-model", "criterion": "outlier", "indices": [999],
+        })
+
+    assert "_ranking_scores" not in run and "_embedding_sources" not in run
+    records = run["records"]
+    matrix = np.stack([vectors[record["filename"]] for record in records])
+    labels = [record["label"] for record in records]
+    k = min(5, len(records) - 1)
+    expected_outlier = compute_outlier_scores(matrix, matrix, k=k, candidates_in_reference=True)
+    expected_disagreement = compute_label_disagreement(matrix, labels, k=k)
+    for response in (outlier, disagreement, selected_outlier, selected_disagreement, by_filename, spatial):
+        assert response.status_code == 200, response.text
+    assert [item["index"] for item in outlier.json()["items"]] == np.argsort(expected_outlier)[::-1][:50].tolist()
+    assert [item["index"] for item in disagreement.json()["items"]] == np.argsort(expected_disagreement)[::-1][:50].tolist()
+    assert np.allclose([item["score"] for item in outlier.json()["items"]],
+                       expected_outlier[[item["index"] for item in outlier.json()["items"]]])
+    assert [item["index"] for item in selected_outlier.json()["items"]] == sorted(
+        selected_ids, key=lambda index: -float(expected_outlier[index]),
+    )
+    assert [item["index"] for item in selected_disagreement.json()["items"]] == sorted(
+        selected_ids, key=lambda index: -float(expected_disagreement[index]),
+    )
+    assert [item["index"] for item in by_filename.json()["items"]] == sorted(
+        selected_ids, key=lambda index: records[index]["filename"],
+    )
+    coords = np.asarray([[point["x"], point["y"]] for point in run["views"][0]["points"]])
+    assert [item["index"] for item in spatial.json()["items"]] == spatial_order(coords, selected_ids)
+    assert invalid_index.status_code == 422
+    assert invalid_index.json()["code"] == "INVALID_RECORD_INDEX"
+
+
 def test_case_lv_web_01_ic_01_selected_image_is_run_bound(
     classifier_fixture, monkeypatch, tmp_path
 ):
@@ -878,6 +957,9 @@ def test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback(
         assert job["state"] == "completed", job
         run = client.get(f"/api/v1/runs/{job['run_id']}").json()
         crop_response = client.get(f"/api/v1/runs/{job['run_id']}/images/0")
+        ranking_response = client.post(f"/api/v1/runs/{job['run_id']}/rankings", json={
+            "model_id": "dinov2_vits14", "criterion": "outlier",
+        })
 
     assert run["source_mode"] == "object_detector"
     assert run["source_granularity"] == "object"
@@ -892,6 +974,9 @@ def test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback(
     assert len(crop_sizes) == 4
     assert crop_response.status_code == 200
     assert crop_response.headers["content-type"].startswith("image/jpeg")
+    assert ranking_response.status_code == 200, ranking_response.text
+    assert ranking_response.json()["available"] is True
+    assert len(ranking_response.json()["items"]) == 4
     from io import BytesIO
     crop = Image.open(BytesIO(crop_response.content))
     assert crop.size == crop_sizes[0]
