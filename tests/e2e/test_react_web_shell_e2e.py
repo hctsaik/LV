@@ -4252,6 +4252,34 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
     folders = _detector_fixture(tmp_path / "detector-object-fixture")
+    selected_image = folders[0] / "images" / "02.png"
+    selected_yolo = folders[0] / "labels" / "02.txt"
+    selected_sidecar = selected_image.with_suffix(".json")
+    labelme_annotation = {
+        "version": "5.5.0",
+        "flags": {},
+        "shapes": [{
+            "label": "reviewed-defect",
+            "points": [[3.0, 4.0], [12.0, 16.0]],
+            "group_id": None,
+            "shape_type": "rectangle",
+            "flags": {},
+        }],
+        "imagePath": "02.png",
+        "imageData": None,
+        "imageHeight": 32,
+        "imageWidth": 32,
+    }
+    selected_sidecar.write_text(json.dumps(labelme_annotation), encoding="utf-8")
+    source_hashes = {
+        path.relative_to(folders[0].parent.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for folder in folders
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+    source_image_bytes = selected_image.read_bytes()
+    source_yolo_lines = selected_yolo.read_text(encoding="utf-8").splitlines()
+    source_sidecar_bytes = selected_sidecar.read_bytes()
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
 
     def object_loader(_model_id: str, **_kwargs):
@@ -4361,6 +4389,51 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             item_metadata = page.locator(".curation-item-meta")
             expect(item_metadata.nth(0)).to_contain_text("stain · train · manual · object 2")
             expect(item_metadata.nth(1)).to_contain_text("stain · test · manual · object 1")
+
+            subset_dir = tmp_path / "visible-object-subset"
+            page.get_by_label("Subset destination folder").fill(str(subset_dir))
+            page.get_by_test_id("curation-subset-preview-button").click()
+            expect(page.get_by_test_id("curation-subset-preview")).to_contain_text(
+                "Preflight: 2 available · 2 unique · 0 duplicate(s) · 0 missing"
+            )
+            expect(page.get_by_test_id("curation-subset-preview")).to_contain_text(
+                "2 YOLO label file(s) · 2 object selection(s)"
+            )
+            page.get_by_test_id("curation-subset-export-button").click()
+            expect(page.locator(".alert-info")).to_contain_text(
+                "YOLO subset exported: 2 image(s)"
+            )
+
+            exported_train_image = subset_dir / "images" / "train" / "02.png"
+            exported_test_image = subset_dir / "images" / "test" / "03.png"
+            exported_train_label = subset_dir / "labels" / "train" / "02.txt"
+            exported_test_label = subset_dir / "labels" / "test" / "03.txt"
+            exported_sidecar = exported_train_image.with_suffix(".json")
+            assert exported_train_image.read_bytes() == source_image_bytes
+            assert exported_test_image.read_bytes() == (folders[1] / "images" / "03.png").read_bytes()
+            assert exported_sidecar.read_bytes() == source_sidecar_bytes
+            assert len(exported_train_label.read_text(encoding="utf-8").splitlines()) == len(source_yolo_lines) == 2
+            assert len(exported_test_label.read_text(encoding="utf-8").splitlines()) == 1
+
+            with (subset_dir / "manifest.csv").open(encoding="utf-8", newline="") as handle:
+                manifest_rows = list(csv.DictReader(handle))
+            assert {row["dst"] for row in manifest_rows} == {
+                "images/train/02.png", "images/test/03.png",
+            }
+            assert {row["object_ids"] for row in manifest_rows} == {"0", "1"}
+            assert all(row["level"] == "object" for row in manifest_rows)
+            lineage = json.loads((subset_dir / "lineage.json").read_text(encoding="utf-8"))
+            assert "skew" in lineage["warning"].lower()
+            assert sorted(lineage["sha256_list"]) == sorted(
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (selected_image, folders[1] / "images" / "03.png")
+            )
+            assert source_hashes == {
+                path.relative_to(folders[0].parent.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for folder in folders
+                for path in folder.rglob("*")
+                if path.is_file()
+            }
             browser.close()
     finally:
         if server is not None:
