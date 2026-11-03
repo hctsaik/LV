@@ -126,6 +126,10 @@ export default function App() {
   const [activeMethod, setActiveMethod] = useState<ProjectionMethod>("sumap");
   const [dimension, setDimension] = useState<2 | 3>(2);
   const [datasetMode, setDatasetMode] = useState<"image_classifier" | "object_detector">("image_classifier");
+  const [detectorGranularity, setDetectorGranularity] = useState<"whole_image" | "object">("whole_image");
+  const [objectPad, setObjectPad] = useState(0.12);
+  const [objectTargetRes, setObjectTargetRes] = useState<168 | 196 | 224 | 280 | 336 | 392 | 448>(224);
+  const [objectHead, setObjectHead] = useState<"cls" | "meanpool">("cls");
   const [selectedClassesFile, setSelectedClassesFile] = useState<{ name: string; text: string } | null>(null);
   const [manualClassNames, setManualClassNames] = useState("apple,banana,orange");
   const [folders, setFolders] = useState<string[]>([]);
@@ -199,7 +203,7 @@ export default function App() {
 
   useEffect(() => {
     const runId = job?.run_id;
-    if (dimension !== 3 || !run || !runId || !currentView || !currentRecords.length) {
+    if (dimension !== 3 || run?.source_mode !== "image_classifier" || !runId || !currentView || !currentRecords.length) {
       setBlocks(null);
       setBlockProjection(null);
       setBlocksLoading(false);
@@ -230,7 +234,7 @@ export default function App() {
 
   useEffect(() => {
     const runId = job?.run_id;
-    if (dimension !== 3 || !runId || !selectedBlock || !currentView) {
+    if (dimension !== 3 || run?.source_mode !== "image_classifier" || !runId || !selectedBlock || !currentView) {
       setBlockProjection(null);
       return;
     }
@@ -242,7 +246,7 @@ export default function App() {
         if (active) setBlocksError(reason instanceof Error ? reason.message : "Unable to open this KMeans block.");
       });
     return () => { active = false; };
-  }, [dimension, job?.run_id, selectedBlock, currentView, activeModelId]);
+  }, [dimension, run, job?.run_id, selectedBlock, currentView, activeModelId]);
 
   function addFolder(value = folderDraft) {
     const path = value.trim();
@@ -319,8 +323,10 @@ export default function App() {
         umapReference,
         rebuildUmapReference,
         mode: datasetMode,
+        granularity: datasetMode === "object_detector" ? detectorGranularity : "whole_image",
         classesFileText: selectedClassesFile?.text ?? null,
         classNames: manualClassNames.split(",").map((name) => name.trim()).filter(Boolean),
+        objectPolicy: { pad: objectPad, target_res: objectTargetRes, head: objectHead },
       });
       setJob({
         job_id: created.job_id,
@@ -475,10 +481,65 @@ export default function App() {
               }}
             >
               <option value="image_classifier">Image Classifier</option>
-              <option value="object_detector">Object Detector · whole image</option>
+              <option value="object_detector">Object Detector</option>
             </select>
             {datasetMode === "object_detector" && (
               <div className="detector-class-controls" data-testid="detector-class-controls">
+                <label className="field-label" htmlFor="detector-granularity">Detection granularity</label>
+                <select
+                  id="detector-granularity"
+                  aria-label="Detection granularity"
+                  data-testid="detector-granularity"
+                  value={detectorGranularity}
+                  disabled={busy}
+                  onChange={(event) => {
+                    setDetectorGranularity(event.target.value as "whole_image" | "object");
+                    setRun(null);
+                    setJob(null);
+                    clearSelection();
+                  }}
+                >
+                  <option value="whole_image">Whole image</option>
+                  <option value="object">Per object (YOLO boxes)</option>
+                </select>
+                {detectorGranularity === "object" && (
+                  <div className="object-policy-controls" data-testid="object-policy-controls">
+                    <label className="field-label field-label-spaced" htmlFor="object-pad">BBox padding (0–0.50)</label>
+                    <input
+                      id="object-pad"
+                      aria-label="BBox padding"
+                      type="number"
+                      min="0"
+                      max="0.5"
+                      step="0.01"
+                      value={objectPad}
+                      disabled={busy}
+                      onChange={(event) => setObjectPad(Number(event.target.value))}
+                    />
+                    <label className="field-label field-label-spaced" htmlFor="object-target-res">Object input size</label>
+                    <select
+                      id="object-target-res"
+                      aria-label="Object input size"
+                      value={objectTargetRes}
+                      disabled={busy}
+                      onChange={(event) => setObjectTargetRes(Number(event.target.value) as typeof objectTargetRes)}
+                    >
+                      {[168, 196, 224, 280, 336, 392, 448].map((size) => <option key={size} value={size}>{size}px</option>)}
+                    </select>
+                    <label className="field-label field-label-spaced" htmlFor="object-head">Object feature head</label>
+                    <select
+                      id="object-head"
+                      aria-label="Object feature head"
+                      value={objectHead}
+                      disabled={busy}
+                      onChange={(event) => setObjectHead(event.target.value as "cls" | "meanpool")}
+                    >
+                      <option value="cls">CLS token</option>
+                      <option value="meanpool">Mean pool</option>
+                    </select>
+                    <div className="field-note">Each labeled box becomes one point. Padding is clamped to 8–64 source pixels per side.</div>
+                  </div>
+                )}
                 <label className="field-label field-label-spaced" htmlFor="classes-file">Classes file</label>
                 <input
                   id="classes-file"
@@ -596,10 +657,10 @@ export default function App() {
             <div>
               <div className="eyebrow">ANALYSIS CANVAS</div>
               <h2>{run ? "Embedding distribution" : "Your workspace is ready"}</h2>
-              <p>{run && currentView ? run.records.length.toLocaleString() + " images · " + activeModelId + " · " + currentView.method.toUpperCase() : "Choose a folder and run an analysis to see your collection."}</p>
+              <p>{run && currentView ? run.records.length.toLocaleString() + (run.source_granularity === "object" ? " objects" : " images") + " · " + activeModelId + " · " + currentView.method.toUpperCase() : "Choose a folder and run an analysis to see your collection."}</p>
               {run?.source_mode === "object_detector" && (
                 <small data-testid="dataset-mode-indicator">
-                  Object Detector · {run.class_names.length} classes · {run.class_source.replaceAll("_", " ")}
+                  Object Detector · {run.source_granularity === "object" ? "object-level" : "whole-image"} · {run.class_names.length} classes · {run.class_source.replaceAll("_", " ")}
                 </small>
               )}
             </div>
@@ -620,7 +681,7 @@ export default function App() {
             <div className="result-grid">
               <section className="plot-card">
                 <div className="plot-toolbar">
-                  <div className="plot-title"><span className="chart-glyph" aria-hidden="true">⊙</span><div><strong>Image embeddings</strong><small>Click a point to inspect its source</small></div></div>
+                  <div className="plot-title"><span className="chart-glyph" aria-hidden="true">⊙</span><div><strong>{run.source_granularity === "object" ? "Object embeddings" : "Image embeddings"}</strong><small>Click a point to inspect its source</small></div></div>
                   <div className="filters">
                     <label><span>Model</span><select aria-label="Display model" value={activeModelId} onChange={(event) => selectActiveModel(event.target.value)}>{run.models.map((model) => <option key={model}>{model}</option>)}</select></label>
                     <label><span>Method</span><select aria-label="Display method" value={currentView.method} onChange={(event) => setActiveMethod(event.target.value as ProjectionMethod)}>{activeViews.map((view) => <option key={view.method} value={view.method}>{projectionOptions.find((option) => option.value === view.method)?.label || view.method}</option>)}</select></label>
@@ -644,7 +705,7 @@ export default function App() {
                     viewKey={activeModelId + "-" + currentView.method + "-" + splitFilter + "-" + labelFilter}
                   />
                 ) : <div className="empty-filter">No images match these filters.</div>}
-                {dimension === 3 && (
+                {dimension === 3 && run.source_mode === "image_classifier" && (
                   <section className="block-explorer" data-testid="block-explorer" aria-label="KMeans block explorer">
                     <div className="block-explorer-heading">
                       <div><strong>Explore KMeans blocks</strong><small>Choose a 3D block, then add points with a 2D box or lasso.</small></div>
@@ -691,20 +752,23 @@ export default function App() {
                   {labels.map((label) => <span key={label}><i style={{ background: colorMap(currentView.points).get(label) || labelColors[0] }} />{label}</span>)}
                   <span className="legend-separator" />
                   <small>● train　■ test　◆ valid</small>
-                  <span data-testid="selection-summary" className="selection-summary">Selected {selectedIndices.length} images</span>
+                  <span data-testid="selection-summary" className="selection-summary">Selected {selectedIndices.length} {run.source_granularity === "object" ? "objects" : "images"}</span>
                   {selectedIndices.length > 0 && <button type="button" className="clear-selection" onClick={clearSelection}>Clear selection</button>}
                 </div>
               </section>
 
               <aside className="detail-card">
-                <div className="detail-card-heading"><div><div className="eyebrow">IMAGE DETAIL</div><h3>{selectedRecord ? "Selected image" : "Select a point"}</h3></div><span className="detail-count">{selectedRecord ? "#" + (selectedRecord.index + 1) : "—"}</span></div>
+                <div className="detail-card-heading"><div><div className="eyebrow">{run.source_granularity === "object" ? "OBJECT DETAIL" : "IMAGE DETAIL"}</div><h3>{selectedRecord ? (run.source_granularity === "object" ? "Selected object" : "Selected image") : "Select a point"}</h3></div><span className="detail-count">{selectedRecord ? "#" + (selectedRecord.index + 1) : "—"}</span></div>
                 {selectedRecord && run ? (
                   <>
                     <div className="image-preview"><img data-testid="selected-image" src={"/api/v1/runs/" + encodeURIComponent(job?.run_id || "") + "/images/" + selectedRecord.index} alt={selectedRecord.filename} /></div>
-                    <div className="image-name" data-testid="selected-image-name" title={selectedRecord.filename}>{selectedRecord.filename}</div>
+                    <div className="image-name" data-testid="selected-image-name" title={selectedRecord.filename}>{selectedRecord.filename}{selectedRecord.object_index !== undefined ? ` · object ${selectedRecord.object_index + 1}` : ""}</div>
                     <div className="metadata-list">
                       <div><span>Class</span><strong>{selectedRecord.label}</strong></div>
                       <div><span>Split</span><strong>{selectedRecord.split}</strong></div>
+                      {selectedRecord.object_index !== undefined && <div><span>Object</span><strong data-testid="selected-object-number">{selectedRecord.object_index + 1}</strong></div>}
+                      {selectedRecord.bbox && <div><span>BBox (cx, cy, w, h)</span><strong data-testid="selected-object-bbox">{selectedRecord.bbox.map((value) => value.toFixed(3)).join(", ")}</strong></div>}
+                      {selectedRecord.score !== undefined && selectedRecord.score !== null && <div><span>Score</span><strong>{selectedRecord.score.toFixed(3)}</strong></div>}
                       <div><span>Model</span><strong>{activeModelId}</strong></div>
                       <div><span>Method</span><strong>{currentView.method.toUpperCase()}</strong></div>
                     </div>

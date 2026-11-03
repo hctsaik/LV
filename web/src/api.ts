@@ -24,6 +24,16 @@ export type RunRecord = {
   filename: string;
   split: string;
   label: string;
+  object_index?: number;
+  class_id?: number | null;
+  bbox?: [number, number, number, number];
+  score?: number | null;
+};
+
+export type ObjectPolicy = {
+  pad: number;
+  target_res: 168 | 196 | 224 | 280 | 336 | 392 | 448;
+  head: "cls" | "meanpool";
 };
 
 export type EmbeddingPoint = RunRecord & { x: number; y: number; z: number };
@@ -39,8 +49,10 @@ export type VisualizationView = {
 
 export type VisualizationRun = {
   source_mode: "image_classifier" | "object_detector";
+  source_granularity: "whole_image" | "object";
   class_names: string[];
   class_source: "classifier_folders" | "selected_classes_file" | "auto_classes_txt" | "auto_data_yaml" | "manual";
+  object_policy?: ObjectPolicy;
   model_id: string;
   method: ProjectionMethod;
   records: RunRecord[];
@@ -120,8 +132,10 @@ export const api = {
       umapReference?: boolean;
       rebuildUmapReference?: boolean;
       mode?: "image_classifier" | "object_detector";
+      granularity?: "whole_image" | "object";
       classesFileText?: string | null;
       classNames?: string[];
+      objectPolicy?: ObjectPolicy;
     } = {},
   ) =>
     request<{ job_id: string; state: string }>("/api/v1/visualize/jobs", {
@@ -131,8 +145,10 @@ export const api = {
         model_ids: modelIds,
         methods,
         mode: options.mode ?? "image_classifier",
+        granularity: options.granularity ?? "whole_image",
         classes_file_text: options.classesFileText ?? null,
         class_names: options.classNames ?? [],
+        object_policy: options.objectPolicy ?? { pad: 0.12, target_res: 224, head: "cls" },
         umap_reference: options.umapReference ?? false,
         rebuild_umap_reference: options.rebuildUmapReference ?? false,
       }),

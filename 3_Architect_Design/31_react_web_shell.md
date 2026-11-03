@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的 React UI/API 邊界與分期切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽，以及 Object Detector 整圖切片；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
+> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽，以及 Object Detector 整圖／物件級切片；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
 
 ## 1. 邊界
 
@@ -19,7 +19,7 @@
 |---|---|---|
 | `GET /api/v1/health` | worker readiness | API 版本、模型目錄狀態、可用模型數 |
 | `GET /api/v1/models` | 讀取模型清單 | model ID、名稱、可用狀態；不載入所有權重 |
-| `POST /api/v1/visualize/jobs` | 建立 Image Classifier 或 Object Detector 整圖 run | job ID、queued 狀態；detector 可帶所選類別檔文字或手動類別名稱 |
+| `POST /api/v1/visualize/jobs` | 建立 Image Classifier／Object Detector 的整圖或物件級 run | job ID、queued 狀態；detector 可帶粒度、object policy 與類別來源 |
 | `GET /api/v1/jobs/{job_id}` | 讀進度／完成／錯誤 | phase、done、total、可取消狀態、結果 ID |
 | `DELETE /api/v1/jobs/{job_id}` | 要求取消 | cancellation state；運算於目前影像完成後停止 |
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
@@ -58,6 +58,14 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 - 多模型、投影方法、split/class filter、點選與來源影像回讀沿用 Image Classifier run contract。API 對外回傳 resolved class names/source 類型，不回傳所選類別檔路徑或本機影像路徑。
 - `test_case_lv_web_01_od_01_detector_whole_image_class_sources_and_models` 與 `test_lv_web_01_od_01_detector_whole_image_and_class_priority` 使用 deterministic features，證明類別優先序、多模型 API/UI、可見錯誤及來源檔案不變；尚未證明真實模型數值 parity 或 NativeApp host 流程。
 
+### LV-WEB-01-OD-02 — Object Detector object-level embeddings
+
+- Object Detector 可選 whole image 或 object 粒度。Object 粒度沿用 `discover_yolo_objects` 的 image-then-box 順序，每個有效標註框成為一筆 record；class ID 依已解析的類別名稱映射。未發現標註物件時回 `NO_OBJECTS`。
+- Object embedding 沿用 `object_eval.embed_objects`，在原圖上以 bbox 裁切；policy 欄位為 `pad`（0–0.5，預設 0.12）、`target_res`（168／196／224／280／336／392／448，預設 224）與 `head`（`cls`／`meanpool`，預設 `cls`）。每邊 padding 依物件長邊換算並限制在 8–64 原圖像素。
+- embedding cache 寫入 `LV_CACHE_DIR` 下按來源資料夾、policy 與 model 分開的 app-owned 路徑。key 包含來源圖片 SHA-256、物件順序、class ID 與 bbox；不寫回來源資料夾。run 對外只提供穩定 record index、檔名、split、label、object index、bbox 與 score，不提供原圖路徑或 cache path。
+- class filter 與 2D／3D 檢視沿用 run record index，切換時選取對應同一候選物件。選取物件的圖片 route 依 run index 從來源圖即時計算相同 padding crop；3D KMeans block explorer 僅用於 Image Classifier，避免對不同的 object embedding contract 暗示支援。
+- `test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback` 與 `test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d` 使用 deterministic features，覆蓋 policy 傳遞、bbox crop、候選順序、類別 filter、2D／3D、選取讀回及來源 bytes 不變；不構成真實模型數值 parity 或 NativeApp host 證據。
+
 ### LV-WEB-02-IMG-01 — Image-level Compare Distributions
 
 - 兩側各接受一至 32 個資料夾；同一側依選取順序合併，重複路徑／圖片去重。每個根資料夾先使用 `compare_distributions.get_image_paths` 的直接 JPG／JPEG／PNG 全域排序；若該根沒有直接圖片，才遞迴搜尋子資料夾並略過 embedding、crop、thumbnail cache。壞檔略過並顯示警告。
@@ -75,7 +83,7 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 
 ## 5. React 驗收契約
 
-**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
+**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01 / LV-WEB-01-OD-02**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
 
 - 選 fixture 資料夾、DINOv2-small、PCA，按 Run；UI 顯示 4 個點，API 向量 shape 為 4×384 且值有限、非零。PCA 維度遵循原 Streamlit 主流程 `min(3, max(1, n-2))`，小於 2 維時補零軸。
 - IC-02 對每個選取模型分別驗證 embedding cache、shape 和點索引一致；切換已產生的投影及 2D／3D 後，類別／split 與每個點的原始影像對應不變。UMAP 跨 run 固定參考座標另由 IC-03 驗收。
@@ -84,6 +92,7 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 - IC-03：開啟固定 UMAP 參考系後，首次執行建立 reference；相同資料重跑時舊點座標不變；加入新圖片時舊點仍不變且新點由既有 reducer 轉換；手動重建會在下一次執行重 fit。驗證 reference 僅寫入隔離 `LV_CACHE_DIR`，來源 fixture 不含 `umap_ref.pkl`。目前 deterministic feature 與可見 React E2E 證明 UI/API/UMAP reducer 流程，尚未證明真實模型的數值 parity 或 NativeApp host 流程。
 - IC-04：在可見 3D chart 檢查 KMeans center labels；選定非空 block 後，2D box/lasso 把命中的 record indices 加入既有多選；確認切 2D／3D 後選取數和 record 身分一致，Clear selection 才清除；block API 不回原始向量或 cache path。`test_case_lv_web_01_ic_04_kmeans_blocks_and_embedding_drilldown` 與 `test_lv_web_01_ic_04_kmeans_block_selection_round_trips_across_dimensions` 使用 deterministic features，證明 React/API 接線與既有 PCA/KMeans 行為，尚未證明真實模型或 NativeApp parity。
 - OD-01：固定 YOLO fixture 中，所選類別檔優先於資料集 `classes.txt`；清除所選檔後，自動類別優先於手動輸入；無自動或手動類別時顯示明確錯誤。以兩個模型驗證各 model/method view 的 record order、label/split 和點選讀回一致，並核對來源 image、labels、classes bytes 不變。`test_case_lv_web_01_od_01_detector_whole_image_class_sources_and_models` 和可見 `test_lv_web_01_od_01_detector_whole_image_and_class_priority` 使用 deterministic features；真實模型數值 parity 與 NativeApp OS picker/worker lifecycle 仍待驗。
+- OD-02：固定 YOLO fixture 中逐筆比對 image-then-box record 順序、class ID/name、bbox、score 與 split；驗證指定 padding／解析度／head 進入 embedder，預覽 crop 與相同 bbox policy 一致。class filter 與 2D／3D 切換後保持候選 index 和選取 identity；核對 source image、labels、classes bytes 不變。`test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback` 與可見 `test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d` 使用 deterministic features；真實模型數值 parity 與 NativeApp OS picker/worker lifecycle 仍待驗。
 - 模型缺失、空資料夾和取消須呈現可恢復狀態；不回報成功或改用假的 backend。worker 關閉與 NativeApp lifecycle 由 AC6 驗收。
 - 新 worker PID 讀取相同 run 若有持久結果時必須一致；尚未列入保存語義的暫存 run 不宣稱跨重啟持久。
 
@@ -91,4 +100,4 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 
 ## 6. 未涵蓋
 
-Object Detector 整圖／物件粒度、Compare 物件級旅程、資料集變更與撤銷、其它工具各自的散點／縮圖／handoff 交互、另外八個頂層工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。
+Compare 物件級旅程、資料集變更與撤銷、其它工具各自的散點／縮圖／handoff 交互、另外八個頂層工具及巢狀工作流，均留在後續 case；本設計不縮小全產品 PRD 範圍。

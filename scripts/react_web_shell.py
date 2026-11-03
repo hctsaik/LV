@@ -26,6 +26,12 @@ API_VERSION = "1"
 logger = logging.getLogger("lv.react_web")
 
 
+class CreateObjectPolicy(BaseModel):
+    pad: float = Field(default=0.12, ge=0, le=0.5)
+    target_res: Literal[168, 196, 224, 280, 336, 392, 448] = 224
+    head: Literal["cls", "meanpool"] = "cls"
+
+
 class CreateVisualizationJob(BaseModel):
     folders: list[str] = Field(min_length=1, max_length=32)
     model_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -33,8 +39,10 @@ class CreateVisualizationJob(BaseModel):
     model_ids: list[str] = Field(default_factory=list, max_length=8)
     methods: list[str] = Field(default_factory=list, max_length=5)
     mode: Literal["image_classifier", "object_detector"] = "image_classifier"
+    granularity: Literal["whole_image", "object"] = "whole_image"
     classes_file_text: str | None = Field(default=None, max_length=128_000)
     class_names: list[str] = Field(default_factory=list, max_length=512)
+    object_policy: CreateObjectPolicy = Field(default_factory=CreateObjectPolicy)
     umap_reference: bool = False
     rebuild_umap_reference: bool = False
 
@@ -110,10 +118,14 @@ def create_app(
     *,
     model_catalog: Callable[[], list[str]] | None = None,
     model_loader: Callable[[str], Callable] | None = None,
+    object_model_loader: Callable[[str, dict], Callable] | None = None,
     comparison_runner: Callable[..., dict] | None = None,
 ) -> FastAPI:
     catalog = model_catalog or available_models
     loader = model_loader or load_model
+    object_loader = object_model_loader
+    if object_loader is None and model_loader is not None:
+        object_loader = lambda model_id, _policy: loader(model_id)
     app = FastAPI(title="VisualLatent Local API", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.jobs = {}
     app.state.runs = {}
@@ -196,8 +208,15 @@ def create_app(
                 model_names=selected_models,
                 methods=selected_methods,
                 mode=job.request.mode,
+                granularity=job.request.granularity,
                 classes_file_text=job.request.classes_file_text,
                 manual_class_names=job.request.class_names,
+                object_policy=(
+                    job.request.object_policy.model_dump()
+                    if hasattr(job.request.object_policy, "model_dump")
+                    else job.request.object_policy.dict()
+                ),
+                object_model_loader=object_loader,
                 umap_reference=job.request.umap_reference,
                 rebuild_umap_reference=job.request.rebuild_umap_reference,
                 model_loader=loader,
@@ -624,11 +643,35 @@ def create_app(
             if index < 0 or index >= len(paths):
                 raise HTTPException(status_code=404, detail="Image not found")
             path = paths[index]
+            is_object = run.get("source_granularity") == "object"
+            object_record = run["records"][index] if is_object else None
         try:
-            content = path.read_bytes()
+            if is_object and object_record is not None:
+                from io import BytesIO
+
+                from interaction import crop_bbox
+                from object_eval import _adaptive_pad_px
+                from safe_io import safe_open_image
+
+                image = safe_open_image(path)
+                if image is None:
+                    raise OSError("The source image is unreadable")
+                bbox = object_record["bbox"]
+                policy = run["_object_policy"]
+                crop = crop_bbox(
+                    image,
+                    *bbox,
+                    pad_px=_adaptive_pad_px(bbox, *image.size, policy["pad"]),
+                )
+                output = BytesIO()
+                crop.convert("RGB").save(output, format="JPEG", quality=90)
+                content = output.getvalue()
+                media_type = "image/jpeg"
+            else:
+                content = path.read_bytes()
+                media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         except OSError as exc:
             raise HTTPException(status_code=404, detail="Image is no longer available") from exc
-        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         return Response(content=content, media_type=media_type, headers={"Cache-Control": "no-store"})
 
     static_dir = Path(__file__).resolve().parent.parent / "web" / "dist"

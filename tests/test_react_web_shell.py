@@ -52,12 +52,20 @@ def _fake_embedder(calls: list[str] | None = None):
     return embed
 
 
-def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, embedder=None, models=None):
+def _client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    embedder=None,
+    models=None,
+    object_model_loader=None,
+):
     cache_root = tmp_path.parent / f"{tmp_path.name}-lv-cache"
     monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
     return TestClient(create_app(
         model_catalog=lambda: models if models is not None else ["dinov2_vits14"],
         model_loader=lambda _model: embedder or _fake_embedder(),
+        object_model_loader=object_model_loader,
     ))
 
 
@@ -580,3 +588,106 @@ def test_case_lv_web_01_od_01_detector_whole_image_class_sources_and_models(
             for record in discover_images(folders, ["good", "rotten"])} == {
         (row["filename"], row["split"], row["label"]) for row in auto_run["records"]
     }
+
+
+def test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback(
+    monkeypatch, tmp_path
+):
+    """Object runs crop each bbox, apply the chosen policy and preserve row identity."""
+    root = tmp_path / "detector-objects"
+    root.mkdir()
+    (root / "classes.txt").write_text("good\nbad\n", encoding="utf-8")
+    folders = [root / "train", root / "val"]
+    image_specs = [
+        (folders[0], "train-01.png", (220, 35, 45)),
+        (folders[1], "val-01.png", (35, 180, 70)),
+    ]
+    for folder, filename, color in image_specs:
+        images, labels = folder / "images", folder / "labels"
+        labels.mkdir(parents=True)
+        image_path = images / filename
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.new("RGB", (100, 60), color)
+        image.paste((35, 65, 215), (40, 0, 70, 60))
+        image.save(image_path)
+        rows = (
+            "0 0.20 0.50 0.20 0.40\n"
+            "1 0.72 0.50 0.30 0.60\n"
+            "0 0.48 0.50 0.12 0.20\n"
+            if folder == folders[0]
+            else "1 0.50 0.50 0.50 0.50\n"
+        )
+        (labels / f"{image_path.stem}.txt").write_text(rows, encoding="utf-8")
+    source_before = {
+        path: path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    model_calls: list[tuple[str, dict]] = []
+    crop_sizes: list[tuple[int, int]] = []
+
+    def object_loader(model_id: str, policy: dict):
+        model_calls.append((model_id, dict(policy)))
+
+        def embed(crop: Image.Image) -> np.ndarray:
+            assert isinstance(crop, Image.Image)
+            crop_sizes.append(crop.size)
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            vector[4] = crop.height / 100.0
+            return vector
+
+        return embed
+
+    policy = {"pad": 0.25, "target_res": 336, "head": "meanpool"}
+    with _client(
+        monkeypatch,
+        tmp_path,
+        object_model_loader=object_loader,
+    ) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder) for folder in folders],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["pca"],
+            "mode": "object_detector",
+            "granularity": "object",
+            "object_policy": policy,
+        })
+        assert job["state"] == "completed", job
+        run = client.get(f"/api/v1/runs/{job['run_id']}").json()
+        crop_response = client.get(f"/api/v1/runs/{job['run_id']}/images/0")
+
+    assert run["source_mode"] == "object_detector"
+    assert run["source_granularity"] == "object"
+    assert run["object_policy"] == policy
+    assert [row["label"] for row in run["records"]] == ["good", "bad", "good", "bad"]
+    assert [row["object_index"] for row in run["records"]] == [0, 1, 2, 0]
+    assert [row["index"] for row in run["points"]] == [0, 1, 2, 3]
+    assert [row["filename"] for row in run["records"]] == [
+        "train-01.png", "train-01.png", "train-01.png", "val-01.png"
+    ]
+    assert model_calls == [("dinov2_vits14", policy)]
+    assert len(crop_sizes) == 4
+    assert crop_response.status_code == 200
+    assert crop_response.headers["content-type"].startswith("image/jpeg")
+    from io import BytesIO
+    crop = Image.open(BytesIO(crop_response.content))
+    assert crop.size == crop_sizes[0]
+    assert crop.width < 100 and crop.height < 60
+    assert {path: path.read_bytes() for path in source_before} == source_before
+    assert {path for path in root.rglob("*") if path.is_file()} == set(source_before)
+
+
+def test_case_lv_web_01_od_02_rejects_invalid_object_policy(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(tmp_path)],
+            "model_ids": ["dinov2_vits14"],
+            "mode": "object_detector",
+            "granularity": "object",
+            "object_policy": {"pad": 0.8, "target_res": 224, "head": "cls"},
+        })
+    assert response.status_code == 422
+    assert response.json()["code"] == "INVALID_REQUEST"

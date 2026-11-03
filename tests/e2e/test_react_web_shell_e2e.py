@@ -584,6 +584,115 @@ def test_lv_web_02_img_01_visible_compare_contract(tmp_path: Path, monkeypatch: 
     assert all(path.read_bytes() == content for path, content in source_bytes.items())
 
 
+def test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Visible React OD-02 flow preserves object order through filters and dimensions."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    from playwright.sync_api import expect, sync_playwright
+
+    dataset = tmp_path / "object-dataset"
+    folder = dataset / "train"
+    images, labels = folder / "images", folder / "labels"
+    labels.mkdir(parents=True)
+    (dataset / "classes.txt").write_text("good\nbad\n", encoding="utf-8")
+    image_path = images / "objects.png"
+    image_path.parent.mkdir(parents=True)
+    source = Image.new("RGB", (96, 64), (220, 35, 45))
+    source.paste((35, 65, 215), (40, 0, 72, 64))
+    source.save(image_path)
+    label_path = labels / "objects.txt"
+    label_path.write_text(
+        "0 0.20 0.50 0.22 0.50\n"
+        "1 0.72 0.50 0.30 0.70\n"
+        "0 0.48 0.50 0.12 0.20\n",
+        encoding="utf-8",
+    )
+    source_bytes = {path: path.read_bytes() for path in (image_path, label_path, dataset / "classes.txt")}
+    loader_calls: list[tuple[str, dict]] = []
+
+    def object_loader(model_id: str, policy: dict):
+        loader_calls.append((model_id, dict(policy)))
+
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = crop.width / 100.0
+            vector[4] = crop.height / 100.0
+            return vector
+
+        return embed
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "lv-cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        object_model_loader=object_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+
+            def capture_run(response):
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                    run_payloads.append(response.json())
+
+            page.on("response", capture_run)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Dataset mode").select_option("object_detector")
+            page.get_by_label("Detection granularity").select_option("object")
+            page.get_by_label("BBox padding").fill("0.25")
+            page.get_by_label("Object input size").select_option("336")
+            page.get_by_label("Object feature head").select_option("meanpool")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_label("Image folder").fill(str(folder))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(3)
+            expect(page.get_by_test_id("dataset-mode-indicator")).to_contain_text("object-level")
+            assert run_payloads
+            assert run_payloads[-1]["source_granularity"] == "object"
+            assert run_payloads[-1]["object_policy"] == {
+                "pad": 0.25, "target_res": 336, "head": "meanpool"
+            }
+            assert [record["label"] for record in run_payloads[-1]["records"]] == ["good", "bad", "good"]
+            assert [record["object_index"] for record in run_payloads[-1]["records"]] == [0, 1, 2]
+            assert loader_calls == [("dinov2_vits14", {"pad": 0.25, "target_res": 336, "head": "meanpool"})]
+
+            page.get_by_label("Filter by class").select_option(label="bad")
+            expect(page.get_by_test_id("embedding-point")).to_have_count(1)
+            page.get_by_label("Filter by class").select_option(label="All classes")
+            page.get_by_test_id("embedding-point").nth(1).click()
+            expect(page.get_by_test_id("selected-object-number")).to_have_text("2")
+            expect(page.get_by_test_id("selected-image-name")).to_contain_text("objects.png · object 2")
+            preview = page.get_by_test_id("selected-image")
+            expect(preview).to_be_visible()
+            expect(preview).to_have_js_property("naturalWidth", 51)
+            expect(page.get_by_test_id("selected-object-bbox")).to_have_text("0.720, 0.500, 0.300, 0.700")
+            page.get_by_test_id("dimension-3d").click()
+            expect(page.locator("[data-testid='embedding-plot-3d'] .js-plotly-plot")).to_be_visible(timeout=60_000)
+            expect(page.get_by_test_id("block-explorer")).to_have_count(0)
+            expect(page.get_by_test_id("selected-object-number")).to_have_text("2")
+            page.get_by_test_id("dimension-2d").click()
+            expect(page.get_by_test_id("selected-object-number")).to_have_text("2")
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert {path: path.read_bytes() for path in source_bytes} == source_bytes
+    assert {path for path in dataset.rglob("*") if path.is_file()} == set(source_bytes)
+
+
 def test_lv_web_01_od_01_detector_whole_image_and_class_priority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

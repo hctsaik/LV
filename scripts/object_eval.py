@@ -25,6 +25,7 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -175,11 +176,18 @@ def match_profile(fingerprint: dict, profiles=None):
 
 # ── embedding + metrics ──────────────────────────────────────────────────────
 def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
-                  progress=None):
+                  progress=None, cache_keys: Sequence[str] | None = None,
+                  embedder_factory: Callable[[str, dict], Callable] | None = None):
     """Embed each object from an in-memory full-res crop under ``policy``.
     Returns (emb [N,D], short_px [N]). Caches to npz keyed by object identity.
     ``progress(done, total)`` is called per object (once at total on a cache hit)."""
-    keys = [f"{Path(m['image_path']).stem}__{m['obj_index']}" for m in meta]
+    keys = (
+        list(cache_keys)
+        if cache_keys is not None
+        else [f"{Path(m['image_path']).stem}__{m['obj_index']}" for m in meta]
+    )
+    if len(keys) != len(meta):
+        raise ValueError("cache_keys must contain one key for every object")
     # incremental + checkpoint: reuse already-computed objects (key = stem__obj),
     # save every 200 → a crash resumes from the last checkpoint, and adding data
     # only computes the new objects (not the whole set).
@@ -222,8 +230,15 @@ def embed_objects(meta, model, policy, *, cache_path: Path | None = None,
         if k in cached_emb:
             continue
         if embed_fn is None:
-            embed_fn = load_model(model, keep_aspect=True,
-                                  target_res=policy["target_res"], head=policy["head"])
+            if embedder_factory is None:
+                embed_fn = load_model(
+                    model,
+                    keep_aspect=True,
+                    target_res=policy["target_res"],
+                    head=policy["head"],
+                )
+            else:
+                embed_fn = embedder_factory(model, policy)
         ip = m["image_path"]
         if str(ip) != cur_ip:
             cur = safe_open_image(ip)   # 壞圖/超大圖回 None → 該物件補零保索引對齊
