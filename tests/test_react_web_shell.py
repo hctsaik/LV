@@ -2848,6 +2848,51 @@ def test_case_lv_web_01_cart_01_curation_round_trip_and_worker_reopen(
         assert restarted.get("/api/v1/curation/items").json() == {"items": [], "total": 0}
 
 
+def test_case_lv_web_01_cart_01_scored_candidate_keeps_first_provenance(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """Panel candidates retain finite review scores and do not overwrite first provenance."""
+    with _client(monkeypatch, tmp_path) as client:
+        job = _run(client, classifier_fixture["folders"])
+        run_id = job["run_id"]
+        scores = {"0": 0.125, "1": 0.875}
+        added = client.post(
+            f"/api/v1/runs/{run_id}/curation/items",
+            json={"indices": [0, 1], "source": "search", "scores": scores},
+        )
+        assert added.status_code == 201, added.text
+        first_items = added.json()["items"]
+        assert [(item["source"], item["score"]) for item in first_items] == [
+            ("search", 0.125), ("search", 0.875),
+        ]
+
+        unselected_score = client.post(
+            f"/api/v1/runs/{run_id}/curation/items",
+            json={"indices": [0], "source": "duplicate", "scores": {"1": 1.0}},
+        )
+        non_finite_score = client.post(
+            f"/api/v1/runs/{run_id}/curation/items",
+            content='{"indices":[0],"scores":{"0":Infinity}}',
+            headers={"content-type": "application/json"},
+        )
+        assert unselected_score.status_code == 422
+        assert unselected_score.json()["code"] == "CURATION_SCORE_INDEX_NOT_SELECTED"
+        assert non_finite_score.status_code == 422
+        assert non_finite_score.json()["code"] == "CURATION_SCORE_NOT_FINITE"
+
+        duplicate = client.post(
+            f"/api/v1/runs/{run_id}/curation/items",
+            json={"indices": [0], "source": "similar", "scores": {"0": 9.0}},
+        )
+        assert (duplicate.json()["added"], duplicate.json()["skipped"]) == (0, 1)
+        assert [(item["source"], item["score"]) for item in duplicate.json()["items"]] == [
+            ("search", 0.125), ("search", 0.875),
+        ]
+        csv_response = client.get("/api/v1/curation.csv")
+        rows = list(csv.DictReader(StringIO(csv_response.text.lstrip("\ufeff"))))
+        assert [float(row["score"]) for row in rows] == [0.125, 0.875]
+
+
 def test_case_lv_web_01_cart_01_object_records_keep_object_identity(
     monkeypatch, tmp_path
 ):

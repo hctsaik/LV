@@ -640,13 +640,17 @@ export default function App() {
     setSelectedIndex(null);
   }
 
-  async function addSelectedToCuration() {
-    if (!job?.run_id || !selectedIndices.length || addingToCuration) return;
+  async function addRecordsToCuration(
+    indices: number[],
+    source: string,
+    scores: Record<number, number> = {},
+  ) {
+    if (!job?.run_id || !indices.length || addingToCuration) return;
     setAddingToCuration(true);
     setError("");
     setNotice("");
     try {
-      const result = await api.addCuration(job.run_id, selectedIndices);
+      const result = await api.addCuration(job.run_id, indices, source, "", scores);
       setCurationCount(result.total);
       setNotice(`Added ${result.added} item(s) to curation; skipped ${result.skipped} duplicate(s).`);
     } catch (reason) {
@@ -654,6 +658,10 @@ export default function App() {
     } finally {
       setAddingToCuration(false);
     }
+  }
+
+  async function addSelectedToCuration() {
+    await addRecordsToCuration(selectedIndices, "manual");
   }
 
   function moveSelectedImage(direction: -1 | 1) {
@@ -1936,6 +1944,15 @@ export default function App() {
                                     >
                                       ↻
                                     </button>
+                                    <button
+                                      type="button"
+                                      className="result-curation-button"
+                                      data-testid={`curate-similar-${index}`}
+                                      disabled={addingToCuration || !job?.run_id}
+                                      onClick={() => void addRecordsToCuration([index], "similar", { [index]: distance })}
+                                    >
+                                      Add to Curation
+                                    </button>
                                   </article>
                                 );
                               })}
@@ -2016,6 +2033,15 @@ export default function App() {
                                   <strong title={record.filename}>{record.filename}</strong>
                                   <small>{record.label} · {record.split} · d={distance.toFixed(4)}</small>
                                   <button type="button" aria-label={`Use ${record.filename} as visual search query`} onClick={() => startSimilarSearch(index)}>Find similar images</button>
+                                  <button
+                                    type="button"
+                                    className="result-curation-button"
+                                    data-testid={`curate-text-${index}`}
+                                    disabled={addingToCuration || !job?.run_id}
+                                    onClick={() => void addRecordsToCuration([index], "search", { [index]: distance })}
+                                  >
+                                    Add to Curation
+                                  </button>
                                 </article>
                               );
                             })}
@@ -2081,6 +2107,19 @@ export default function App() {
                                     );
                                   })}
                                   <span className="duplicate-distance">d={duplicateMethod === "phash" ? distance : distance.toFixed(4)}</span>
+                                  <button
+                                    type="button"
+                                    className="result-curation-button"
+                                    data-testid={`curate-duplicate-${left_index}-${right_index}`}
+                                    disabled={addingToCuration || !job?.run_id}
+                                    onClick={() => void addRecordsToCuration(
+                                      [left_index, right_index],
+                                      "duplicate",
+                                      { [left_index]: distance, [right_index]: distance },
+                                    )}
+                                  >
+                                    Add pair to Curation
+                                  </button>
                                 </article>
                               );
                             })}
@@ -2194,6 +2233,15 @@ export default function App() {
                                 <span className="ranked-result-number">#{rank}</span>
                                 <strong title={record.filename}>{record.filename}</strong>
                                 <small>{record.label} · {record.split} · {score.toFixed(4)}</small>
+                              </button>
+                              <button
+                                type="button"
+                                className="result-curation-button"
+                                data-testid={`curate-ranked-${index}`}
+                                disabled={addingToCuration || !job?.run_id}
+                                onClick={() => void addRecordsToCuration([index], rankingMetric, { [index]: score })}
+                              >
+                                Add to Curation
                               </button>
                             </article>
                           );

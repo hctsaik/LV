@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 import tempfile
@@ -736,6 +737,7 @@ class DuplicateLabelingHandoffRequest(DuplicateScanRequest):
 class AddCurationRequest(BaseModel):
     indices: list[int] = Field(min_length=1, max_length=10000)
     source: str = Field(default="manual", min_length=1, max_length=128)
+    scores: dict[int, float] = Field(default_factory=dict)
     reason: str = Field(default="", max_length=2000)
 
 
@@ -7156,6 +7158,19 @@ def create_app(
                     "message": "A selected record is not part of this run.",
                     "request_id": uuid.uuid4().hex,
                 })
+            selected_indices = set(request.indices)
+            if any(index not in selected_indices for index in request.scores):
+                raise HTTPException(status_code=422, detail={
+                    "code": "CURATION_SCORE_INDEX_NOT_SELECTED",
+                    "message": "A curation score must refer to a selected record.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            if any(not math.isfinite(score) for score in request.scores.values()):
+                raise HTTPException(status_code=422, detail={
+                    "code": "CURATION_SCORE_NOT_FINITE",
+                    "message": "Curation scores must be finite numbers.",
+                    "request_id": uuid.uuid4().hex,
+                })
             entries = []
             for index in dict.fromkeys(request.indices):
                 record = records[index]
@@ -7181,7 +7196,7 @@ def create_app(
                     "split": str(record.get("split", "")),
                     "sha256": digest.hexdigest(),
                     "source": request.source,
-                    "score": None,
+                    "score": request.scores.get(index),
                     "reason": request.reason.strip(),
                     "level": run.get("unit", "image"),
                 }

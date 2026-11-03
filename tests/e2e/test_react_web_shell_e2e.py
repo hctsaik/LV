@@ -1024,10 +1024,11 @@ def test_lv_web_01_rank_01_visible_ranking_viewer_and_csv(
             expect(page.get_by_test_id("ranking-workspace")).to_be_visible()
             rows = page.get_by_test_id("ranked-result")
             expect(rows).to_have_count(4)
+            run_id = next(iter(application.state.runs))
             assert "not determine image quality" in page.get_by_test_id("ranking-interpretation").inner_text()
 
             outlier_names = page.locator("[data-testid='ranked-result'] strong").all_inner_texts()
-            rows.first.get_by_role("button").click()
+            rows.first.locator("button[aria-label^='Open rank']").click()
             expect(page.get_by_test_id("selected-image-name")).to_have_text(outlier_names[0])
             expect(page.get_by_test_id("selected-image-navigation")).to_contain_text("1 / 4 ranked")
             page.get_by_role("button", name="Next ranked image").click()
@@ -1038,7 +1039,16 @@ def test_lv_web_01_rank_01_visible_ranking_viewer_and_csv(
             expect(page.get_by_test_id("ranking-status")).to_contain_text("highest first")
             expect(page.get_by_test_id("ranked-result")).to_have_count(4)
             disagreement_names = page.locator("[data-testid='ranked-result'] strong").all_inner_texts()
-            page.get_by_test_id("ranked-result").first.get_by_role("button").click()
+            first_disagreement = page.get_by_test_id("ranked-result").first
+            curated_index = int(first_disagreement.get_attribute("data-index"))
+            displayed_score = float(first_disagreement.locator("small").inner_text().split("·")[-1].strip())
+            page.get_by_test_id(f"curate-ranked-{curated_index}").click()
+            expect(page.locator(".alert-info")).to_contain_text("Added 1 item(s) to curation")
+            curation = page.request.get(base_url + "/api/v1/curation/items").json()
+            ranked_item = next(item for item in curation["items"] if item["index"] == curated_index)
+            assert ranked_item["source"] == "disagreement"
+            assert ranked_item["score"] == pytest.approx(displayed_score, abs=0.00005)
+            page.get_by_test_id("ranked-result").first.locator("button[aria-label^='Open rank']").click()
             expect(page.get_by_test_id("selected-image-name")).to_have_text(disagreement_names[0])
             page.get_by_role("button", name="Next ranked image").click()
             expect(page.get_by_test_id("selected-image-name")).to_have_text(disagreement_names[1])
@@ -1214,6 +1224,7 @@ def test_lv_web_01_search_01_similar_images_chain_model_switch_and_csv(
             page.get_by_role("button", name="Run analysis").click()
             expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
             expect(page.get_by_test_id("embedding-point")).to_have_count(5)
+            run_id = next(iter(application.state.runs))
 
             page.get_by_test_id("embedding-point").nth(0).click()
             page.get_by_test_id("similar-start").click()
@@ -1229,6 +1240,23 @@ def test_lv_web_01_search_01_similar_images_chain_model_switch_and_csv(
             expect(panel.get_by_test_id("similar-result")).to_have_count(4)
             switched_order = [int(item.get_attribute("data-index")) for item in panel.get_by_test_id("similar-result").all()]
             assert switched_order == [2, 4, 3, 0]
+
+            curated_index = switched_order[0]
+            expected_search = page.request.post(
+                base_url + f"/api/v1/runs/{run_id}/similar",
+                data={"model_id": "fixture-model-b", "query_index": 1, "k": 4},
+            )
+            assert expected_search.status == 200
+            expected_score = next(
+                item["distance"] for item in expected_search.json()["results"]
+                if item["index"] == curated_index
+            )
+            page.get_by_test_id(f"curate-similar-{curated_index}").click()
+            expect(page.locator(".alert-info")).to_contain_text("Added 1 item(s) to curation")
+            curation = page.request.get(base_url + "/api/v1/curation/items").json()
+            similar_item = next(item for item in curation["items"] if item["index"] == curated_index)
+            assert similar_item["source"] == "similar"
+            assert similar_item["score"] == pytest.approx(expected_score)
 
             with page.expect_download() as download_info:
                 page.get_by_test_id("similar-export").click()
@@ -1308,12 +1336,25 @@ def test_lv_web_01_search_02_text_and_duplicate_review_visible_journey(
             page.get_by_role("button", name="Run analysis").click()
             expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
             expect(page.get_by_test_id("embedding-point")).to_have_count(4)
+            run_id = next(iter(application.state.runs))
 
             page.get_by_label("Chinese-CLIP text query").fill("反光樣本")
             page.get_by_role("button", name="Search images").click()
             expect(page.get_by_test_id("text-search-result")).to_have_count(4)
             text_order = [int(item.get_attribute("data-index")) for item in page.get_by_test_id("text-search-result").all()]
             assert text_order == [0, 3, 1, 2]
+            text_scores = page.request.post(
+                base_url + f"/api/v1/runs/{run_id}/text-search",
+                data={"model_id": "chinese-clip-fixture", "query": "反光樣本", "k": 4},
+            ).json()["results"]
+            page.get_by_test_id("curate-text-1").click()
+            expect(page.locator(".alert-info")).to_contain_text("Added 1 item(s) to curation")
+            text_curation = page.request.get(base_url + "/api/v1/curation/items").json()
+            text_item = next(item for item in text_curation["items"] if item["index"] == 1)
+            assert text_item["source"] == "search"
+            assert text_item["score"] == pytest.approx(
+                next(item["distance"] for item in text_scores if item["index"] == 1)
+            )
             with page.expect_download() as text_download:
                 page.get_by_test_id("text-search-export").click()
             text_rows = list(csv.reader(Path(text_download.value.path()).read_text(encoding="utf-8").splitlines()))
@@ -1332,6 +1373,21 @@ def test_lv_web_01_search_02_text_and_duplicate_review_visible_journey(
             page.get_by_label("Duplicate method").select_option("embedding")
             page.get_by_role("button", name="Scan candidates").click()
             expect(page.get_by_test_id("duplicate-result")).to_have_count(1)
+            expected_pairs = page.request.post(
+                base_url + f"/api/v1/runs/{run_id}/duplicates",
+                data={
+                    "method": "embedding", "model_id": "chinese-clip-fixture",
+                    "max_distance": 0.05, "cross_split_only": True,
+                },
+            ).json()["results"]
+            page.get_by_test_id("curate-duplicate-0-3").click()
+            expect(page.locator(".alert-info")).to_contain_text("Added 2 item(s) to curation")
+            duplicate_curation = page.request.get(base_url + "/api/v1/curation/items").json()
+            duplicate_items = {item["index"]: item for item in duplicate_curation["items"]}
+            expected_distance = expected_pairs[0]["distance"]
+            assert duplicate_items[0]["source"] == duplicate_items[3]["source"] == "duplicate"
+            assert duplicate_items[0]["score"] == duplicate_items[3]["score"] == pytest.approx(expected_distance)
+            assert duplicate_items[1]["source"] == "search"
             with page.expect_download() as duplicate_download:
                 page.get_by_test_id("duplicate-export").click()
             duplicate_rows = list(csv.reader(Path(duplicate_download.value.path()).read_text(encoding="utf-8").splitlines()))

@@ -1886,10 +1886,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  addCuration: (runId: string, indices: number[], source = "manual", reason = "") =>
+  addCuration: (
+    runId: string,
+    indices: number[],
+    source = "manual",
+    reason = "",
+    scores: Record<number, number> = {},
+  ) =>
     request<AddCurationResponse>("/api/v1/runs/" + encodeURIComponent(runId) + "/curation/items", {
       method: "POST",
-      body: JSON.stringify({ indices, source, reason }),
+      body: JSON.stringify({ indices, source, reason, scores }),
     }),
   setCurationReason: (itemIds: string[], reason: string) =>
     request<CurationItemsResponse & { updated: number }>("/api/v1/curation/items/reason", {

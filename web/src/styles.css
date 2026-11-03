@@ -149,6 +149,7 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .similar-result-info strong { font-weight: 700; }
 .similar-result-info span { color: #96a0af; }
 .similar-result > button { width: 23px; height: 23px; border: 1px solid #e1e7ef; border-radius: 4px; background: #f8fafd; color: #57749e; font-size: 13px; cursor: pointer; }
+.similar-result > .result-curation-button { grid-column: 2 / -1; justify-self: start; width: auto; height: 24px; padding: 0 8px; font-size: 8px; }
 .similar-export-button { min-height: 28px; margin-top: 8px; font-size: 9px; }
 .similar-export-button:disabled { cursor: wait; opacity: .55; }
 .detail-empty { display: flex; flex: 1; flex-direction: column; align-items: center; justify-content: center; padding: 20px 12px; text-align: center; }
@@ -488,6 +489,9 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .search-tool-card button:hover:not(:disabled) { border-color: #b8c9e0; background: #eaf1fa; }
 .search-status { margin-top: 9px; color: #8290a3; font-size: 9px; line-height: 1.5; }
 .search-error { margin-top: 8px; color: #a44949; font-size: 9px; line-height: 1.45; }
+.result-curation-button { min-height: 24px; border: 1px solid #dbe4f0; border-radius: 4px; padding: 0 8px; background: #f7f9fc; color: #49658e; font-size: 8px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.result-curation-button:hover:not(:disabled) { border-color: #b8c9e0; background: #eef3fa; }
+.result-curation-button:disabled { cursor: wait; opacity: .55; }
 .text-search-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 7px; max-height: 305px; margin-top: 8px; overflow: auto; }
 .text-search-result { display: grid; align-content: start; gap: 4px; min-width: 0; padding: 6px; border: 1px solid #e8ecf2; border-radius: 5px; background: #fff; }
 .text-search-result img { width: 100%; aspect-ratio: 1; border-radius: 4px; object-fit: cover; background: #f1f3f6; }
@@ -512,6 +516,7 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .duplicate-image strong, .duplicate-image small { overflow: hidden; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .duplicate-image small { color: #96a0af; }
 .duplicate-distance { color: #8290a3; font-size: 8px; white-space: nowrap; }
+.duplicate-pair > .result-curation-button { grid-column: 1 / -1; justify-self: start; }
 .ranking-workspace { margin-top: 18px; padding: 16px; border: 1px solid #e5e9ef; border-radius: 9px; background: #fff; box-shadow: 0 4px 14px #25385808; }
 .ranking-criterion { display: grid; gap: 5px; color: #79869a; font-size: 9px; }
 .ranking-criterion select { min-width: 175px; height: 31px; border: 1px solid #dfe4ec; border-radius: 5px; padding: 0 8px; background: #fff; color: #34425b; font-size: 10px; }
@@ -524,6 +529,7 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .ranked-result-number { color: #5877a0; font-size: 8px; font-weight: 800; }
 .ranked-result strong, .ranked-result small { min-width: 0; overflow: hidden; color: #576780; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .ranked-result small { color: #96a0af; }
+.ranked-result > .result-curation-button { display: inline-flex; align-items: center; width: auto; min-height: 24px; margin: 0 6px 6px; }
 .ranking-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 9px; }
 .ranking-actions button { min-height: 28px; border: 1px solid #dbe4f0; border-radius: 6px; padding: 0 10px; background: #f2f6fb; color: #49658e; font-size: 9px; font-weight: 700; cursor: pointer; }
 .ranking-actions button:hover { border-color: #b8c9e0; background: #eaf1fa; }
