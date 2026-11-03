@@ -7,7 +7,7 @@
 > **🏁 AL Loop Infrastructure(M15–M18)已完成(2026-07-12)**:主動學習迴圈四段(選樣 → 送標 →
 > 回讀 → 評估)閉合。六模組 `pool_registry` / `round_ledger` / `gt_pred_diff` / `hybrid_sampler` /
 > `probe_eval` / `heatmap_to_boxes` / `readback_store` 全數落地,gate 全 GREEN + 真實 E2E 23/23 併跑綠。
-> **目前無進行中的里程碑**(最新完成:M22 於 2026-07-19 立案並當日完成)。
+> **目前無進行中的里程碑**(最新完成:M23 於 2026-09-15 完成)。
 > 新能力請由新 `/user` 需求起輪;候選清單見 M20 決策日誌。
 >
 > ⚠️ **編號注意:本 repo 有兩條平行的里程碑/模組編號線**(2026-07-12 併軌時的既成事實,PO 決定不追溯重編):
@@ -36,6 +36,18 @@
 > **M9(大資料 GUI 可用性,設計中)** + **M10(離線監看服務,M9 綠後開)**。皆受 appetite 約束的新能力增量。
 
 ## 里程碑
+- **M23 — 類別相似度分布＋Threshold 候選＋人工評估 PR(Visualize 標錯面板擴充)** —
+  ✅ **完成**(2026-09-15: T0–T10。單元 66 GREEN + 真實 Streamlit E2E **8/8**
+  AC13 舊混淆／疑似標錯／相似／購物車、AC14 image N=24 與 object N=16 來源 listing+內容 hash 不變、
+  AC07 證據+清除勾選、AC10 購物車新增／重加略過、AC16 精確門檻 0.123456、
+  AC18 pointer 按住時候選數已變、AC33 軸縮放不改候選、AC34 改圖 stale。
+  不新增頂層工具、不復活灰帶、不自動改標、不寫來源資料集)。
+  模組:31 `class_similarity`(A)、32 `class_similarity_records`(B)、33 `class_similarity_export`(A)、
+  34 `class_similarity_threshold`(A)、M31 GUI 接線(B)。
+  需求 [1_user_needs/class_similarity_review.md](1_user_needs/class_similarity_review.md);
+  PRD [2_PO_PRD/class_similarity_review_prd.md](2_PO_PRD/class_similarity_review_prd.md);
+  OpenSpec `openspec/changes/add-class-similarity-review/`。
+  工作區既有未提交 explainability／FP／YOLO 變更必須保留。
 - **M22 — 晶圓空間簽名分析(wafer map 缺陷空間模式,第 12 工具「🧭 晶圓地圖」)** —
   📴 **已下架**(2026-07-19 使用者裁決「不適用」:工具列移除、分頁不可達;
   引擎 29/30 與單元測試保留在庫,E2E 標 skip;復用=掛回 tool_switch+解 skip)—
@@ -350,6 +362,9 @@ AL Loop 相依無環:09→08;10→{label_formats, interaction};11→{interaction
 
 ## 決策日誌(append-only)
 > 每次反向閘門退回、模組增刪、需求被砍,追加一行:日期 / 從哪層退到哪層(或 決策) / 一句為什麼。
+- (2026-09-15) **M23 完成**:類別相似度分布＋Threshold＋人工評估 PR 接進 Visualize 標錯面板。
+  單元 66 + E2E 8/8(含 AC18 pointer-held)。預覽 mask 跟 draft;expander 加 key 以免 rerun 收合。
+  不復活灰帶、不寫來源。工作區既有 explainability／FP／YOLO 未提交變更保留未 commit。
 - (2026-06-22) 框架初始化(規格疊加模式):實作進 scripts/、測試進 tests/、E2E 重用既有 harness;
   不寫會撞壞既有測試的根 conftest。原因:這是成熟 GUI repo,非 greenfield。
 - (2026-06-22) 需求定案:壞=同物件的好/壞(A);patch 級為主、可切物件級(Could);要熱力圖;

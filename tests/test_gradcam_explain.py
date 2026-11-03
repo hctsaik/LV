@@ -13,7 +13,12 @@ from PIL import Image
 from _tiny_vit import TinyExplainer, TinyViT
 from dino_explain import ExplainRequest
 from dino_head import train_head
-from gradcam_explain import GradCAMError, signed_norm, token_gradcam_map
+from gradcam_explain import (
+    GradCAMError,
+    signed_norm,
+    target_positive_norm,
+    token_gradcam_map,
+)
 from head_adapter import attach_provenance
 
 
@@ -70,6 +75,10 @@ def test_gradcam_shape_and_nonzero_cls():
     assert float(np.abs(r.raw_patch_scores).sum()) > 0
     assert np.isfinite(r.raw_patch_scores).all()
     assert float(np.abs(r.display_patch_scores).max()) == pytest.approx(1.0)
+    assert r.attribution_method == "token_gradient_product"
+    assert r.global_channel_scores.shape == (4, 4)
+    assert r.token_gradient_product_scores.shape == (4, 4)
+    assert np.allclose(r.raw_patch_scores, r.token_gradient_product_scores)
     assert r.reference_class == "neg"
     assert r.target_mode == "contrastive_margin"
     assert r.target_score == pytest.approx(
@@ -77,6 +86,17 @@ def test_gradcam_shape_and_nonzero_cls():
     assert r.faithfulness["status"] in {
         "supported", "weak", "no_positive_evidence",
     }
+
+
+def test_gradcam_can_select_standard_global_channel_baseline():
+    expl = TinyExplainer(TinyViT())
+    head = _head_for(expl)
+    r = token_gradcam_map(
+        _req(), head, target_class="pos", explainer=expl,
+        run_faithfulness=False, attribution_method="global_channel",
+    )
+    assert r.attribution_method == "global_channel"
+    assert np.allclose(r.raw_patch_scores, r.global_channel_scores)
 
 
 def test_gradcam_meanpool_shape():
@@ -88,6 +108,18 @@ def test_gradcam_meanpool_shape():
         _req(pooling="meanpool"), head, target_class="neg", explainer=expl)
     assert r.raw_patch_scores.shape == (4, 4)
     assert r.pooling == "meanpool"
+
+
+def test_gradcam_meanpool_token_attribution_is_not_normalization_zero():
+    expl = TinyExplainer(TinyViT())
+    head = _head_for(expl)
+    head = attach_provenance(head, pooling="meanpool")
+    r = token_gradcam_map(
+        _req(pooling="meanpool"), head, target_class="neg", explainer=expl,
+        run_faithfulness=False,
+    )
+    assert float(np.abs(r.token_gradient_product_scores).sum()) > 1e-8
+    assert np.isfinite(r.token_gradient_product_scores).all()
 
 
 def test_rejects_normal_and_unknown():
@@ -131,3 +163,25 @@ def test_signed_normalization_never_turns_negative_only_cam_positive():
     display = signed_norm(np.array([[-4.0, -2.0, 0.0]], dtype=np.float32))
     assert display.min() == pytest.approx(-1.0)
     assert display.max() == pytest.approx(0.0)
+
+
+def test_target_positive_display_removes_rival_evidence_and_low_tail():
+    raw = np.array([[-4.0, -0.1, 0.0, 0.05, 1.0]], dtype=np.float32)
+    display = target_positive_norm(raw)
+    assert np.all(display >= 0.0)
+    assert display[0, 0] == pytest.approx(0.0)
+    assert display[0, 1] == pytest.approx(0.0)
+    assert display[0, 3] == pytest.approx(0.0)
+    assert display[0, 4] == pytest.approx(1.0)
+
+
+def test_target_positive_display_does_not_paint_flat_map():
+    raw = np.full((4, 4), 0.3, dtype=np.float32)
+    assert np.all(target_positive_norm(raw) == 0.0)
+
+
+def test_target_positive_display_keeps_a_single_clear_patch():
+    raw = np.zeros((4, 4), dtype=np.float32)
+    raw[1, 2] = 1.0
+    display = target_positive_norm(raw)
+    assert display[1, 2] == pytest.approx(1.0)

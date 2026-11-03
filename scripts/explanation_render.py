@@ -116,7 +116,11 @@ def render_grid(base, grid: tuple[int, int], *, color=(255, 255, 255),
 def metadata_dict(result: Any) -> dict:
     """JSON 可序列化的 provenance（不含影像 pixels）。"""
     d = result if isinstance(result, dict) else getattr(result, "as_dict", lambda: {})()
-    skip = {"raw_patch_scores", "display_patch_scores", "input_image", "extras"}
+    skip = {
+        "raw_patch_scores", "display_patch_scores", "target_display_patch_scores",
+        "global_channel_scores", "token_gradient_product_scores",
+        "input_image", "extras",
+    }
     out = {}
     for k, v in d.items():
         if k in skip:

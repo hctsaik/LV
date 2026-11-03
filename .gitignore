@@ -10,6 +10,8 @@ pyvenv.cfg
 **/tracing/
 .venv/
 .pycache_local/
+# Isolated verification roots; shared OS pytest retention can remove live suites.
+.pytest-*/
 .DS_Store
 CLAUDE.md
 
@@ -46,6 +48,9 @@ output/curation_log.jsonl
 
 # throwaway prototypes
 scratch/
+
+# Isolated model runtimes (rebuild with scripts/setup_model_runtime.py)
+.runtimes/
 
 # e2e debug run logs (ad-hoc harness/migration runs; regenerated)
 tests/e2e/_*.log

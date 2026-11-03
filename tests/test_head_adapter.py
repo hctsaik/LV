@@ -93,6 +93,28 @@ def test_attached_provenance_allows_when_recipe_matches():
     assert ok3 is False
 
 
+def test_provenance_allows_explicit_resolution_probe_only():
+    X, y = _data()
+    head = attach_provenance(
+        train_head(X, y),
+        model_id="dinov2_vits14", checkpoint_id="abc", embedding_dim=D,
+        keep_aspect=False, target_res=224, pooling="cls", l2norm=True,
+        scope="whole_image", pad=None,
+    )
+    recipe = {
+        "model_id": "dinov2_vits14", "checkpoint_id": "abc",
+        "embedding_dim": D, "keep_aspect": False, "target_res": 336,
+        "pooling": "cls", "l2norm": True, "scope": "whole_image",
+        "pad": None,
+    }
+    ok, _ = head_can_gradcam(head, recipe)
+    assert ok is False
+    ok_probe, reason_probe = head_can_gradcam(
+        head, recipe, allow_target_res_override=True,
+    )
+    assert ok_probe, reason_probe
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("scope", "object_crop"), ("l2norm", False), ("pad", 0.12)],

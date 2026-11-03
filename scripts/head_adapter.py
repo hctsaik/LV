@@ -187,7 +187,20 @@ def _as_bool(value: Any) -> bool:
     return bool(value)
 
 
-def head_can_gradcam(head: dict, recipe: dict | None = None) -> tuple[bool, str]:
+def head_can_gradcam(
+    head: dict,
+    recipe: dict | None = None,
+    *,
+    allow_target_res_override: bool = False,
+) -> tuple[bool, str]:
+    """Validate that a classifier head is safe to explain.
+
+    A higher-resolution explanation is an explicit opt-in.  The classifier
+    provenance still has to match model, checkpoint, pooling, scope, and
+    normalization; only the spatial sampling resolution may differ.  Keeping
+    this switch explicit prevents a UI control from silently explaining a
+    different embedding recipe than the one that produced the prediction.
+    """
     missing = missing_provenance_keys(head)
     if missing:
         return False, (
@@ -208,6 +221,8 @@ def head_can_gradcam(head: dict, recipe: dict | None = None) -> tuple[bool, str]
         ):
             # ``pad=None`` is an intentional whole-image recipe value, so it
             # must be compared rather than being treated as unspecified.
+            if k == "target_res" and allow_target_res_override:
+                continue
             if k not in recipe or (k != "pad" and recipe[k] in (None, "")):
                 continue
             same = (_as_bool(p.get(k)) == _as_bool(recipe[k])

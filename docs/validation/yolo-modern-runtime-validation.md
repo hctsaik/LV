@@ -1,0 +1,30 @@
+# Isolated YOLO runtime validation
+
+The legacy `.venv` remains on Ultralytics 8.3.203. The modern environment is created independently at `.runtimes/yolo-modern-8.4.142` with Ultralytics 8.4.142 and the same Torch 2.6.0 / Torchvision 0.21.0 versions. It does not inherit or modify the legacy environment's packages.
+
+The first package import reported a schema update to the shared Ultralytics user-settings file. No before-import snapshot was available, so unchanged settings are not claimed. The setup command and every modern worker now set a separate `YOLO_CONFIG_DIR` under the modern environment. The user-settings file was not reset.
+
+Run `.venv/Scripts/python.exe scripts/setup_model_runtime.py` from the repository. The command installs the repository's resolved `requirements-yolo-modern.lock.txt` when available, runs `pip check`, verifies the imported Ultralytics version, and publishes `runtime-ready.json` only after those checks succeed. The resolved lock is retained in both the repository and environment. Failed or partial installations remain unavailable in the model UI. The setup command is safe to retry. The recorded dependency resolution targets Windows x64 / Python 3.11; other platforms require their own validation.
+
+| Registry ID | Environment | Scope |
+|---|---|---|
+| `legacy-8.3.203` | `.venv` | Existing DINO and verified original YOLOv5 / Ultralytics v8 / 11 workflows |
+| `modern-8.4.142` | `.runtimes/yolo-modern-8.4.142` | Modern Detect adapters; actual family, head, output contract and gradient capability must pass inspection |
+
+The uploaded profile stores a runtime ID, never an executable path. A missing ID preserves legacy behavior. Inspection offers an explicit head choice or retention of the checkpoint's existing head; capabilities show the actual inspected result. Changing a head creates a separate inference recipe. ONNX deployment and paired PyTorch gradient recipes remain separate.
+
+Case jobs launch only registry-owned interpreters. Cross-runtime comparisons use a fixed local inference protocol that loads one model per subprocess and reuses it for repeated images. No callable names or executable paths are accepted by that protocol. Worker environments exclude the other environment's `site-packages`, and child workers exit when their parent disappears. Execution provenance remains attached to the results.
+
+Validation completed so far:
+
+- Runtime ID closure, missing/partial environments, dependency path isolation, immutable profile revision selection and controlled proxy dispatch.
+- Existing job completion, deduplication, cancellation, recovery and profile persistence, including final readiness refinements and export metadata limitations: 21 focused tests passed in 8.19 seconds (`.pytest-modern-runtime-final-unit`).
+- Controlled AppTest of explicit modern runtime/head selection and profile persistence, plus runtime unit coverage: 7 passed in 28.63 seconds (`.pytest-modern-runtime-selection`). These UI fixtures do not substitute for model execution.
+- Modern installation completed with `pip check` reporting no broken requirements; actual imports reported Ultralytics 8.4.142 and Torch 2.6.0+cpu. Probes confirmed the legacy 8.3.203 package originates in `.venv`, and modern 8.4.142 originates in `.runtimes`. The effective modern settings directory was verified inside that environment.
+- Real subprocess RPC and package-origin gates: 2 passed in 8.91 seconds (`.pytest-modern-runtime-real-rpc`). Repeated ONNX inference reused the worker, matched the base runtime numerically, retained execution provenance, rejected unsupported RPC operations, and closed the subprocess.
+- Real mixed-runtime paired evaluation: 1 passed in 10.53 seconds (`.pytest-modern-real-paired-r2`), comparing a base-environment ONNX model with a real modern YOLOv8 fixture on two explicitly labelled test images. Both model identities and runtime provenance were retained, and no RPC child remained afterward. This validates execution and accounting, not a trained model's accuracy or improvement.
+- Real browser upload → explicit runtime/head inspection → profile → image trial → case → signed Grad-CAM → saved evidence passed for both YOLO26 heads. One-to-many passed in `.pytest-yolo-modern-browser-1`; one-to-one passed in the focused `.pytest-yolo-modern-browser-one2one-r2` run (110.00 seconds). The first combined run's second test stopped on a test synchronization error: the previous inspection's caption satisfied a general wait before the new inspection finished. The corrected test waits for the requested head's actual result; the application did not expose a premature save form. Source hashes, V3 native target identity, actual head/runtime and forward parity were checked. These use numerical architecture fixtures, not trained accuracy demonstrations. Saved [one-to-many screenshot](yolo-modern-runtime/one_to_many.png), [trace](yolo-modern-runtime/one_to_many.json), [one-to-one screenshot](yolo-modern-runtime/one_to_one.png), and [trace](yolo-modern-runtime/one_to_one.json) preserve the acceptance evidence.
+- Visual review then found that a successful first save retained the earlier unsaved-summary hint. The save handler now reloads the case immediately and carries a single-use success notice across the rerun. `test_attribution_save_refresh.py`: 1 passed in 4.33 seconds (`.pytest-cam-save-refresh-final`), verifying the first save removes the hint, immediately exposes the actual summary UI, and never republishes on a later rerun. The screenshots above predate this small refresh correction; this gate uses a controlled completed job and actual assessment renderer, without repeating model computation.
+- Cohort bridge identity and missing-measurement gates: 3 passed in 0.34 seconds (`.pytest-modern-cohort-class`), covering stable layer grouping across native candidate offsets and separate scalar, class and preprocessing partitions.
+
+Runtime IDs alone do not establish model correctness, export parity, box-regression explanation, or NMS-decision explanation. Those require their own tested contracts and evidence.

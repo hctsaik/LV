@@ -25,7 +25,7 @@ from explanation_render import (
     render_grid,
     render_overlay,
 )
-from gradcam_explain import GradCAMError, token_gradcam_map
+from gradcam_explain import GradCAMError, target_positive_norm, token_gradcam_map
 from head_adapter import (
     attach_provenance,
     head_can_gradcam,
@@ -53,9 +53,35 @@ _CAPABILITY_ORDER = ("attention", "gradcam", "anomaly")
 _AUTO_TARGET = "（實際 top-1，自動）"
 _MIN_ACTIONABLE_MARGIN = 0.05
 _MIN_ACTIONABLE_OOF_BAL_ACC = 0.60
+# DINOv2 patch size is fixed at 14 px. These expose genuinely different
+# native grids (16x16, 24x24, 32x32), not just an enlarged 16x16 heatmap.
+_GRADCAM_RES_OPTIONS = (224, 336, 448)
 _NORMAL_BANK_ERROR = "目前沒有對應的 patch Normal Bank 結果"
 _ANOMALY_BUILD_STEP = "① 建模 / 載入模型"
 _ANOMALY_APPLY_STEP = "② 套用偵測"
+
+
+def _resolution_head_key(
+    model_id: str, scope: str, resolution: int, pooling: str = "cls",
+) -> str:
+    """Identify one exact-resolution, session-only classifier head.
+
+    The key deliberately includes the preprocessing scope and pooling mode.
+    A 336 head trained on object crops is not interchangeable with a 336 head
+    trained on whole images, even when the backbone and class list match.
+    """
+    return "|".join((str(model_id), str(scope), str(pooling), str(int(resolution))))
+
+
+def _resolution_head_registry() -> dict[str, dict]:
+    """Return the in-memory registry used by both explanation UIs."""
+    value = st.session_state.setdefault("explain_session_heads", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _resolution_embedding_registry() -> dict[str, np.ndarray]:
+    value = st.session_state.setdefault("explain_session_embeddings", {})
+    return value if isinstance(value, dict) else {}
 
 
 def _gradcam_guidance(result) -> list[dict[str, str]]:
@@ -380,6 +406,73 @@ def _train_session_head(records, embeddings, model_id: str, prep: dict):
     return attach_provenance(head, **rec)
 
 
+def _train_resolution_head(
+    records: list[dict], model_id: str, scope: str, resolution: int,
+    source_recipe: dict | None = None,
+) -> tuple[dict, np.ndarray]:
+    """Train an exact-resolution frozen-backbone head in the current session.
+
+    Visualize historically passed only its 224 embeddings into this panel.
+    That made 336/448 behave as a spatial probe against the wrong head.  When
+    the user explicitly selects another resolution, rebuild the full dataset
+    embeddings at that resolution and fit only the linear session head.  No
+    cache/artifact path is supplied, so this action is intentionally foreground
+    and ephemeral.
+    """
+    from _utils import load_model
+
+    source = dict(source_recipe or {})
+    scope = str(scope or "whole_image")
+    pooling = str(source.get("pooling") or source.get("head") or "cls")
+    keep_aspect = bool(source.get("keep_aspect", scope == "object_crop"))
+    recipe = {
+        "model_id": str(model_id),
+        "scope": scope,
+        "keep_aspect": keep_aspect,
+        "target_res": int(resolution),
+        "pooling": pooling,
+        "pad": source.get("pad"),
+    }
+    labels = [str(r.get("label") or "") for r in records]
+    if len(set(labels)) < 2:
+        raise ExplainError("目前資料少於兩個類別，無法訓練 exact-resolution session head")
+
+    embed_fn = load_model(
+        str(model_id), keep_aspect=keep_aspect,
+        target_res=int(resolution), head=pooling,
+    )
+    vectors: list[np.ndarray] = []
+    progress = st.progress(
+        0.0,
+        text=f"建立 {int(resolution)}×{int(resolution)} embeddings 0/{len(records)}",
+    )
+    try:
+        for index, record in enumerate(records, start=1):
+            image, _prep = _prepare_scope(record, scope, recipe)
+            try:
+                vectors.append(np.asarray(embed_fn(image), dtype=np.float32))
+            finally:
+                image.close()
+            progress.progress(
+                index / max(len(records), 1),
+                text=(f"建立 {int(resolution)}×{int(resolution)} embeddings "
+                      f"{index}/{len(records)}"),
+            )
+    finally:
+        progress.empty()
+    if not vectors:
+        raise ExplainError("目前資料沒有可用影像，無法建立 exact-resolution head")
+
+    embeddings = np.stack(vectors).astype(np.float32)
+    head = _train_session_head(records, embeddings, str(model_id), recipe)
+    return attach_provenance(
+        head,
+        target_res=int(resolution),
+        exact_resolution=True,
+        resolution_mode="exact_head",
+    ), embeddings
+
+
 def _display_original(r: dict, fallback: Image.Image) -> Image.Image:
     return _open_full(r) or fallback
 
@@ -404,7 +497,9 @@ def _run_attention(r, model_id, scope, method, head_index, embedding_recipe=None
     return attention_map(req), _display_original(r, img), prep
 
 
-def _gradcam_preflight(r, model_id, scope, head) -> tuple[bool, str]:
+def _gradcam_preflight(
+    r, model_id, scope, head, analysis_target_res: int | None = None,
+) -> tuple[bool, str]:
     if not isinstance(head, dict):
         return False, "沒有可微分分類 head"
     try:
@@ -413,17 +508,30 @@ def _gradcam_preflight(r, model_id, scope, head) -> tuple[bool, str]:
         _img, prep = _prepare_scope(r, scope, provenance_of(head))
     except ExplainError as exc:
         return False, str(exc)
+    head_res = int(provenance_of(head).get("target_res") or prep["target_res"])
+    analysis_res = int(analysis_target_res or prep["target_res"])
+    prep["target_res"] = analysis_res
     rec = _recipe_now(model_id, prep)
     rec["scope"] = scope
     rec["l2norm"] = bool(head.get("l2norm", True))
-    return head_can_gradcam(head, rec)
+    return head_can_gradcam(
+        head, rec, allow_target_res_override=(analysis_res != head_res),
+    )
 
 
-def _run_gradcam(r, model_id, scope, head, target):
-    ok, reason = _gradcam_preflight(r, model_id, scope, head)
+def _run_gradcam(
+    r, model_id, scope, head, target, attribution_method,
+    analysis_target_res: int | None = None,
+):
+    ok, reason = _gradcam_preflight(
+        r, model_id, scope, head, analysis_target_res=analysis_target_res,
+    )
     if not ok:
         raise GradCAMError(reason)
     img, prep = _prepare_scope(r, scope, provenance_of(head))
+    head_res = int(provenance_of(head).get("target_res") or prep["target_res"])
+    analysis_res = int(analysis_target_res or prep["target_res"])
+    prep["target_res"] = analysis_res
     req = ExplainRequest(
         image=img,
         source_id=_source_id(r),
@@ -437,7 +545,10 @@ def _run_gradcam(r, model_id, scope, head, target):
         crop_bbox_px=prep["crop_bbox_px"],
         pad=prep["pad"],
     )
-    return token_gradcam_map(req, head, target_class=target), _display_original(r, img), prep
+    return token_gradcam_map(
+        req, head, target_class=target, attribution_method=attribution_method,
+        allow_target_res_override=(analysis_res != head_res),
+    ), _display_original(r, img), prep
 
 
 def _try_anomaly_map(r) -> tuple | None:
@@ -496,6 +607,8 @@ def _head_signature(head: dict | None) -> dict | None:
 def _result_signature(
     *, kind: str, r: dict, model_id: str, scope: str, method: str | None = None,
     head_index: int | None = None, target: Any = None, head: dict | None = None,
+    attribution_method: str | None = None,
+    analysis_target_res: int | None = None,
     embedding_recipe: dict | None = None, context_token: Any = None,
 ) -> dict:
     return {
@@ -506,6 +619,8 @@ def _result_signature(
         "method": method,
         "head_index": head_index,
         "target": None if target is None else str(target),
+        "attribution_method": attribution_method,
+        "analysis_target_res": analysis_target_res,
         "head": _head_signature(head),
         "embedding_recipe": _recipe_signature(embedding_recipe),
         "context_token": None if context_token is None else str(context_token),
@@ -544,12 +659,18 @@ def _process_pending(
             }
         elif kind == "gradcam":
             result, orig, prep = _run_gradcam(
-                r, model_id, pend["scope"], classifier_head, pend["target"])
+                r, model_id, pend["scope"], classifier_head, pend["target"],
+                pend.get("attribution_method", "token_gradient_product"),
+                pend.get("analysis_target_res"),
+            )
             st.session_state[f"{prefix}_result"] = {
                 "kind": "gradcam", "result": result, "orig": orig, "prep": prep,
                 "signature": _result_signature(
                     kind="gradcam", r=r, model_id=model_id, scope=pend["scope"],
                     target=pend["target"], head=classifier_head,
+                    attribution_method=pend.get(
+                        "attribution_method", "token_gradient_product"),
+                    analysis_target_res=pend.get("analysis_target_res"),
                     context_token=context_token,
                 ),
             }
@@ -607,6 +728,7 @@ def _downloads(prefix: str, image: Image.Image, meta: dict) -> None:
 
 def _show_result(
     prefix: str, opacity: float, show_grid: bool, current_signature: dict,
+    *, gradcam_display_mode: str = "signed",
 ) -> None:
     packed = st.session_state.get(f"{prefix}_result")
     if not packed:
@@ -632,24 +754,49 @@ def _show_result(
         return
 
     result = packed["result"]
-    scores = result.display_patch_scores
-    cmap = "blue_white_red" if kind == "gradcam" else "viridis"
+    if kind == "gradcam" and gradcam_display_mode == "target_positive":
+        scores = getattr(result, "target_display_patch_scores", None)
+        if scores is None:
+            scores = target_positive_norm(result.raw_patch_scores)
+        cmap = "copper"
+        signed = False
+    else:
+        scores = result.display_patch_scores
+        cmap = "blue_white_red" if kind == "gradcam" else "viridis"
+        signed = kind == "gradcam"
     overlay = render_overlay(
         result.input_image, scores, alpha=opacity, cmap=cmap,
-        signed=(kind == "gradcam"),
+        signed=signed,
     )
     if show_grid:
         overlay = render_grid(overlay, result.grid)
         inp_g = render_grid(result.input_image, result.grid)
     else:
         inp_g = result.input_image
-    cap = CAPTION_GRADCAM if kind == "gradcam" else CAPTION_ATTENTION
+    if kind == "gradcam" and gradcam_display_mode == "target_positive":
+        cap = "Grad-CAM target 正向熱區（低訊號已抑制；不是瑕疵分割）"
+    else:
+        cap = CAPTION_GRADCAM if kind == "gradcam" else CAPTION_ATTENTION
     c1, c2, c3 = st.columns(3)
     c1.image(packed["orig"], use_container_width=True, caption=CAPTION_ORIGINAL)
     c2.image(inp_g, use_container_width=True, caption=CAPTION_INPUT)
     c3.image(overlay, use_container_width=True, caption=cap)
     for warning in result.warnings:
         st.caption(f"⚠ {warning}")
+    if kind == "gradcam":
+        method_name = (
+            "token-wise gradient×activation"
+            if getattr(result, "attribution_method", "global_channel")
+            == "token_gradient_product"
+            else "standard Grad-CAM（global channel）"
+        )
+        st.caption(f"歸因方法：{method_name}；這是分類證據，不是 crack segmentation。")
+    if kind == "gradcam":
+        head_res = getattr(result, "head_target_res", None)
+        res_note = f"{result.target_res}→{result.grid[0]}×{result.grid[1]} patch"
+        if head_res not in (None, result.target_res):
+            res_note += f"（head 原生 {head_res}；高解析 probe）"
+        st.caption(f"分析解析度：{res_note}；patch=14px。")
     meta = _add_input_metadata(metadata_dict(result), packed.get("prep"))
     if kind == "gradcam":
         st.info(
@@ -740,6 +887,26 @@ def render_explainability_panel(
     # later rerun.
     if classifier_head is None and session_head_key:
         classifier_head = st.session_state.get(session_head_key)
+    # Keep exact heads/embeddings by recipe, rather than replacing the
+    # caller-owned 224 arrays.  The registry is session-only and is shared by
+    # the standalone diagnostics workspace and this legacy inline panel.
+    resolution_heads = _resolution_head_registry()
+    resolution_embeddings = _resolution_embedding_registry()
+    if isinstance(classifier_head, dict):
+        _head_prov = provenance_of(classifier_head)
+        _head_res = int(_head_prov.get("target_res") or 224)
+        _head_scope = str(_head_prov.get("scope") or "whole_image")
+        _head_pooling = str(_head_prov.get("pooling") or "cls")
+        _head_key = _resolution_head_key(
+            model_name, _head_scope, _head_res, _head_pooling)
+        resolution_heads[_head_key] = classifier_head
+        if session_embeddings is not None:
+            try:
+                if len(session_embeddings) == len(session_records or []):
+                    resolution_embeddings[_head_key] = np.asarray(
+                        session_embeddings, dtype=np.float32)
+            except TypeError:
+                pass
     dino_ok = str(model_name).startswith("dinov2")
     has_crop = _has_object_crop(record)
     scope_opts = ["object_crop", "whole_image"] if has_crop else ["whole_image"]
@@ -794,6 +961,8 @@ def render_explainability_panel(
         method = "last_layer_head_mean"
         head_index = None
         target = None
+        attribution_method = "token_gradient_product"
+        analysis_target_res = None
         classes: list = []
         gradcam_ready = False
         needs_normal_bank_guide = False
@@ -823,12 +992,98 @@ def render_explainability_panel(
                 else:
                     st.warning("此 inspector 沒有可微分分類 head；不能把 anomaly map 當 Grad-CAM。")
             else:
+                head_prov = provenance_of(classifier_head)
+                head_res = int(head_prov.get("target_res") or 224)
+                res_options = sorted(set(_GRADCAM_RES_OPTIONS) | {head_res})
+                analysis_target_res = st.selectbox(
+                    "Grad-CAM 分析解析度",
+                    res_options,
+                    index=res_options.index(head_res),
+                    key=f"{prefix}_gradcam_res_v1",
+                    format_func=lambda value: (
+                        f"{value}×{value}（{value // 14}×{value // 14} patch）"
+                    ),
+                    help=(
+                        "DINOv2 patch=14px；224/336/448 對應 16×16/24×24/32×32。"
+                        "選取非目前 head 的解析度時，會用完整 session 資料重建對應 head。"
+                    ),
+                )
+                selected_pooling = str(
+                    head_prov.get("pooling") or
+                    (embedding_recipe or {}).get("pooling") or "cls"
+                )
+                head_scope = str(head_prov.get("scope") or "whole_image")
+                needs_exact_head = (
+                    int(analysis_target_res) != head_res
+                    or head_scope != scope
+                    or str(head_prov.get("pooling") or "cls") != selected_pooling
+                )
+                if needs_exact_head:
+                    exact_key = _resolution_head_key(
+                        model_name, scope, int(analysis_target_res), selected_pooling)
+                    exact_head = resolution_heads.get(exact_key)
+                    if exact_head is None:
+                        can_rebuild = (
+                            session_head_key is not None
+                            and session_records is not None
+                            and len({str(x.get("label") or "") for x in session_records}) >= 2
+                        )
+                        if can_rebuild:
+                            st.info(
+                                f"首次選取 {int(analysis_target_res)}×{int(analysis_target_res)}："
+                                "正在以完整 session 資料建立同解析度分類 head（backbone 凍結）。"
+                            )
+                            try:
+                                exact_head, exact_embeddings = _train_resolution_head(
+                                    session_records, model_name, scope,
+                                    int(analysis_target_res),
+                                    {**dict(embedding_recipe or {}), "scope": scope},
+                                )
+                            except Exception as exc:
+                                exact_head = None
+                                st.error(
+                                    f"{int(analysis_target_res)}×{int(analysis_target_res)} head 建立失敗："
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+                            else:
+                                resolution_heads[exact_key] = exact_head
+                                resolution_embeddings[exact_key] = exact_embeddings
+                                st.session_state[f"{prefix}_info"] = (
+                                    f"已建立 {int(analysis_target_res)}×{int(analysis_target_res)} "
+                                    "exact-resolution session head；未使用 224 head 替代。"
+                                )
+                        else:
+                            st.warning(
+                                f"選取 {int(analysis_target_res)}×{int(analysis_target_res)} 需要同解析度分類 head；"
+                                "目前情境沒有完整 session 資料可訓練，因此不會退回使用 "
+                                f"{head_res}×{head_res} head。"
+                            )
+                    if exact_head is not None:
+                        classifier_head = exact_head
+                        head_prov = provenance_of(classifier_head)
+                        head_res = int(head_prov.get("target_res") or analysis_target_res)
+                        if session_head_key:
+                            st.session_state[session_head_key] = classifier_head
+                    else:
+                        # A mismatched head must never be presented as an exact
+                        # 336/448 explanation.  Disable the action for this run.
+                        classifier_head = None
+                else:
+                    # Reuse a previously built exact head (including a 224
+                    # base head) when the user switches back to that recipe.
+                    exact_key = _resolution_head_key(
+                        model_name, scope, int(analysis_target_res), selected_pooling)
+                    cached_head = resolution_heads.get(exact_key)
+                    if cached_head is not None:
+                        classifier_head = cached_head
+                        head_prov = provenance_of(classifier_head)
                 gradcam_ready, reason = _gradcam_preflight(
-                    record, model_name, scope, classifier_head)
+                    record, model_name, scope, classifier_head,
+                    analysis_target_res=analysis_target_res)
                 if not gradcam_ready:
                     st.warning(reason)
                 classes = [
-                    c for c in classifier_head.get("classes", [])
+                    c for c in (classifier_head or {}).get("classes", [])
                     if not is_forbidden_target(c)
                 ]
                 target_key = f"{prefix}_target"
@@ -846,6 +1101,23 @@ def render_explainability_panel(
                 st.caption(
                     "預設解釋實際 top-1。手選非 top-1 會明確標成反事實假說；"
                     "正常／Unknown 不是分類頭類別。"
+                )
+                attribution_label = st.selectbox(
+                    "Grad-CAM 歸因方法",
+                    [
+                        "token-wise gradient×activation（建議聚焦）",
+                        "standard Grad-CAM（global channel 對照）",
+                    ],
+                    key=f"{prefix}_attribution_method",
+                    help=(
+                        "前者逐 patch 計算一階 gradient×activation，通常較能保留局部訊號；"
+                        "後者是標準 global-channel Grad-CAM，保留作研究對照。"
+                    ),
+                )
+                attribution_method = (
+                    "global_channel"
+                    if attribution_label.startswith("standard Grad-CAM")
+                    else "token_gradient_product"
                 )
         else:
             method = "anomaly"
@@ -872,6 +1144,8 @@ def render_explainability_panel(
             elif mode == "分類理由（Grad-CAM）":
                 st.session_state[f"{prefix}_pending"] = {
                     "kind": "gradcam", "scope": scope, "target": target,
+                    "attribution_method": attribution_method,
+                    "analysis_target_res": analysis_target_res,
                 }
             else:
                 st.session_state[f"{prefix}_pending"] = {"kind": "anomaly", "scope": scope}
@@ -893,8 +1167,22 @@ def render_explainability_panel(
             help=help_txt, on_click=_queue_analyze,
         )
 
+        gradcam_display_mode = "signed"
+        if mode == "分類理由（Grad-CAM）":
+            display_label = st.selectbox(
+                "Grad-CAM 顯示",
+                [
+                    "target/reference signed 對比（建議）",
+                    "target 正向熱區（進階；隱藏 reference）",
+                ],
+                key=f"{prefix}_gradcam_display_v2",
+            )
+            gradcam_display_mode = (
+                "target_positive" if display_label.startswith("target 正向")
+                else "signed"
+            )
         opacity = st.slider("overlay opacity", 0.0, 1.0, 0.45, 0.05,
-                             key=f"{prefix}_opacity")
+                             key=f"{prefix}_opacity_v3")
         show_grid = st.checkbox("顯示 patch grid", value=False, key=f"{prefix}_grid")
         kind = ("attention" if mode == "DINO Attention"
                 else "gradcam" if mode == "分類理由（Grad-CAM）" else "anomaly")
@@ -906,6 +1194,11 @@ def render_explainability_panel(
                 head_index=head_index if kind == "attention" else None,
                 target=target if kind == "gradcam" else None,
                 head=classifier_head if kind == "gradcam" else None,
+                attribution_method=(
+                    attribution_method if kind == "gradcam" else None),
+                analysis_target_res=(
+                    analysis_target_res if kind == "gradcam" else None),
                 embedding_recipe=embedding_recipe, context_token=context_token,
             ),
+            gradcam_display_mode=gradcam_display_mode,
         )

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-Hant">
+<meta charset="utf-8">
+<style>
+body{margin:0;font:13px system-ui;color:#234;background:transparent}
+.wrap{padding:2px 4px 6px}
+input[type=range]{width:100%;accent-color:#126bb0}
+</style>
+<div class="wrap">
+  <input id="s" type="range" min="-2" max="2" step="0.01" value="0" data-testid="cs-threshold-slider">
+</div>
+<script>
+function send(type, extra){window.parent.postMessage({isStreamlitMessage:true,type,...extra},'*')}
+function emit(value){send('streamlit:setComponentValue',{value:{...value,nonce:Date.now()+Math.random()},dataType:'json'})}
+const s=document.getElementById('s');
+let seq=0, lastSent=0, pending=null, pointerDown=false;
+function body(kind){
+  seq += 1;
+  return {kind, value: Number(s.value), seq, pointer_down: pointerDown};
+}
+s.addEventListener('pointerdown', ()=>{pointerDown=true});
+s.addEventListener('pointerup', ()=>{pointerDown=false});
+s.addEventListener('pointercancel', ()=>{pointerDown=false});
+s.addEventListener('input', ()=>{
+  const now=Date.now();
+  const msg=body('preview');
+  if(now-lastSent>=200){ emit(msg); lastSent=now; pending=null; }
+  else pending=msg;
+});
+s.addEventListener('change', ()=>{
+  pending=null;
+  emit(body('commit'));
+});
+setInterval(()=>{
+  if(pending && Date.now()-lastSent>=200){ emit(pending); lastSent=Date.now(); pending=null; }
+}, 40);
+window.addEventListener('message', e=>{
+  if(e.source!==window.parent || e.data.type!=='streamlit:render') return;
+  const args=e.data.args||{};
+  if(typeof args.value==='number' && !pointerDown && document.activeElement!==s){
+    const shown=Math.round(Number(args.value)*100)/100;
+    if(Math.abs(Number(s.value)-shown)>1e-9) s.value=String(shown);
+  }
+  send('streamlit:setFrameHeight',{height:36});
+});
+send('streamlit:componentReady',{apiVersion:1});
+send('streamlit:setFrameHeight',{height:36});
+</script>
+</html>

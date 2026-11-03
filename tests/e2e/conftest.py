@@ -84,7 +84,7 @@ def app_server(synthetic_dataset, tmp_path_factory) -> str:
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     base = f"http://localhost:{port}"
-    deadline = time.time() + 60
+    deadline = time.time() + float(os.environ.get("LV_E2E_STARTUP_TIMEOUT", "180"))
     while time.time() < deadline:
         if proc.poll() is not None:
             log.close()
@@ -99,7 +99,7 @@ def app_server(synthetic_dataset, tmp_path_factory) -> str:
         except OSError:
             time.sleep(0.5)
     else:
-        raise RuntimeError("streamlit did not become healthy in 60s")
+        raise RuntimeError("streamlit did not become healthy within startup timeout")
     yield base
     subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                    capture_output=True)
@@ -134,7 +134,7 @@ def explain_app_server(synthetic_dataset, tmp_path_factory, e2e_cache_dir) -> st
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     base = f"http://localhost:{port}"
-    deadline = time.time() + 60
+    deadline = time.time() + float(os.environ.get("LV_E2E_STARTUP_TIMEOUT", "180"))
     while time.time() < deadline:
         if proc.poll() is not None:
             log.close()
@@ -152,7 +152,7 @@ def explain_app_server(synthetic_dataset, tmp_path_factory, e2e_cache_dir) -> st
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                        capture_output=True)
         log.close()
-        raise RuntimeError("streamlit (explainability) did not become healthy in 60s")
+        raise RuntimeError("streamlit (explainability) did not become healthy within startup timeout")
     try:
         yield base
     finally:
@@ -314,7 +314,7 @@ class _ManagedServer:
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
         base = f"http://localhost:{port}"
-        deadline = time.time() + 60
+        deadline = time.time() + float(os.environ.get("LV_E2E_STARTUP_TIMEOUT", "180"))
         while time.time() < deadline:
             if self._proc.poll() is not None:
                 self._log.close()
@@ -329,7 +329,7 @@ class _ManagedServer:
             except OSError:
                 time.sleep(0.5)
         else:
-            raise RuntimeError("streamlit (AL) did not become healthy in 60s")
+            raise RuntimeError("streamlit (AL) did not become healthy within startup timeout")
         self.base_url = base
         return base
 

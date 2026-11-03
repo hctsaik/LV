@@ -4,6 +4,10 @@ A Streamlit web app for visualising and comparing image dataset distributions us
 
 > 📖 **怎麼使用？** 新手先看 **[使用指南](docs/usage_guide.md)**（逐工具教學）＋ **[五工具總覽圖](docs/tools_overview.html)**；完整文件索引見 **[文件中心](docs/index.html)**。
 
+**誤逮報案查案：** 工具列的 **誤逮案件** 支援案件續查、逐區域覆核、LV 正常／瑕疵／歷史案例對照、證據說明與 Active Learning 覆核包。詳見 [誤逮案件工作台指南](docs/false-positive-case-workspace.md)。
+
+**外部模型完整流程：** 已支援 ONNX 分類／常見 YOLO 輸出的本機推論、歷史重播比對、對照實驗、人工完整覆核的訓練 ZIP，以及固定資料集新舊模型評估。安裝 `requirements-external-models.txt`，再看 [外部模型接入與評估指南](docs/external-model-investigation.md)。
+
 ## Features
 
 | Tool | Description |
@@ -173,6 +177,18 @@ python scripts/compare_distributions.py \
 ---
 
 ## Run tests
+
+External-model false-positive investigations now provide reusable model uploads,
+YOLOv5/v8/11 Grad-CAM and isolated YOLO12/26 runtimes, image/annotation import, case evidence, portable replies,
+reviewed training handoff, persistent jobs, and workspace backup/restore.
+See the [workflow and supported formats](docs/yolo-case-diagnostics.md) and
+[measured verification record](docs/yolo-case-implementation-report.md).
+
+Question-aware summaries, geometry-matched multi-fill controls, independent-image/group accounting,
+and paired effort/quality observations are described in the
+[evidence validation record](docs/validation/explanation-evidence-validation.md).
+The [implementation report](docs/yolo-explanation-improvements-report.md) links the runtime,
+browser, legacy-compatibility and evidence checks.
 
 ```bash
 pytest tests/ -v

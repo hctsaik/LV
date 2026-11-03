@@ -74,20 +74,78 @@ class GradCAMResult:
     original_size: tuple[int, int] | None
     input_image: Image.Image
     timing_s: float
+    # Resolution used to fit the classifier head.  It may differ from the
+    # analysis resolution only through the explicit high-resolution probe.
+    head_target_res: int | None = None
+    # Optional keeps compatibility with results produced before the target-
+    # only display was added; the UI computes it from raw scores when absent.
+    target_display_patch_scores: np.ndarray | None = None
+    attribution_method: str = "token_gradient_product"
+    global_channel_scores: np.ndarray | None = None
+    token_gradient_product_scores: np.ndarray | None = None
     warnings: tuple[str, ...] = WARNINGS
-    schema_version: int = 2
+    schema_version: int = 3
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
 
 
 def signed_norm(scores: np.ndarray) -> np.ndarray:
-    """Symmetric [-1, 1] normalization that never invents positive evidence."""
+    """Robust symmetric display normalization that preserves CAM sign.
+
+    A per-image maximum makes a weak, diffuse map look like a confident one.
+    q99 gives isolated peaks room to saturate while leaving the raw signed map
+    untouched for export and auditing.  Near-flat maps are rendered neutral.
+    """
     s = np.asarray(scores, dtype=np.float32)
-    scale = float(np.abs(s).max()) if s.size else 0.0
-    if scale <= 0:
+    values = np.abs(s[np.isfinite(s)])
+    values = values[values > 0]
+    if values.size == 0:
         return np.zeros_like(s, dtype=np.float32)
-    return (s / scale).astype(np.float32)
+    scale = float(np.percentile(values, 99.0))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        return np.zeros_like(s, dtype=np.float32)
+    if values.size >= 4 and float(values.max()) <= float(np.median(values)) * 1.10:
+        return np.zeros_like(s, dtype=np.float32)
+    out = np.clip(s / scale, -1.0, 1.0)
+    out[np.abs(out) < 0.05] = 0.0
+    return out.astype(np.float32)
+
+
+def target_positive_norm(
+    scores: np.ndarray,
+    *,
+    scale_percentile: float = 95.0,
+    min_relative: float = 0.20,
+) -> np.ndarray:
+    """Normalize only positive target evidence for an optional UI overlay.
+
+    ``signed_norm`` is useful for comparing target and rival evidence, but its
+    per-image max normalization makes a weak, diffuse CAM look like a strong
+    heatmap.  The target-only view keeps ReLU semantics, uses a high quantile
+    as the display scale, and suppresses the low-signal tail.  A nearly flat
+    positive map is treated as no localized evidence instead of painting the
+    whole image.
+    """
+    s = np.asarray(scores, dtype=np.float32)
+    positive = np.clip(s, 0.0, None)
+    values = positive[positive > 0]
+    if values.size == 0:
+        return np.zeros_like(positive, dtype=np.float32)
+    q = float(np.clip(scale_percentile, 50.0, 100.0))
+    scale = float(np.percentile(values, q))
+    median = float(np.percentile(values, 50.0))
+    maximum = float(values.max())
+    if not np.isfinite(scale) or scale <= 1e-12:
+        return np.zeros_like(positive, dtype=np.float32)
+    # A flat map contains no useful spatial ranking.  Do not turn it into a
+    # full-frame red overlay merely because it has a non-zero gradient.
+    if values.size >= 4 and maximum <= median * 1.10:
+        return np.zeros_like(positive, dtype=np.float32)
+    out = np.clip(positive / scale, 0.0, 1.0)
+    floor = float(np.clip(min_relative, 0.0, 1.0))
+    out[out < floor] = 0.0
+    return out.astype(np.float32)
 
 
 def _target_index(classes: list, target: str | int | None) -> tuple[int, str]:
@@ -178,6 +236,8 @@ def token_gradcam_map(
     explainer=None,
     adapter: FrozenLogisticHead | None = None,
     run_faithfulness: bool = True,
+    attribution_method: str = "token_gradient_product",
+    allow_target_res_override: bool = False,
 ) -> GradCAMResult:
     import torch
     import torch.nn.functional as F
@@ -212,7 +272,10 @@ def token_gradcam_map(
         recipe["checkpoint_id"] = checkpoint_identity(pth)
     if model_dim not in (None, ""):
         recipe["embedding_dim"] = int(model_dim)
-    ok, reason = head_can_gradcam(head, recipe)
+    ok, reason = head_can_gradcam(
+        head, recipe,
+        allow_target_res_override=allow_target_res_override,
+    )
     if not ok:
         raise GradCAMError(reason)
     adapter = adapter or from_sklearn_head(head)
@@ -239,6 +302,7 @@ def token_gradcam_map(
     handle_f = None
     if hasattr(model, "norm") and pooling == "meanpool":
         handle_f = model.norm.register_forward_hook(_final_hook)
+    normalized_patch_tokens = None
     try:
         tensor = tensor.detach().requires_grad_(False)
         feats = model.forward_features(tensor) if hasattr(model, "forward_features") else None
@@ -249,8 +313,13 @@ def token_gradcam_map(
             if full is None:
                 raise GradCAMError("沒有抓到 final-norm token activation")
             patch_tok = full[:, start:, :]
-            patch_n = F.normalize(patch_tok, dim=-1)
-            emb = patch_n.mean(dim=1)
+            # The derivative with respect to patch_tok is orthogonal to each
+            # token because L2 normalization is scale invariant. Retain the
+            # gradient after normalization so token-wise attribution does not
+            # collapse to an almost-zero map for meanpool.
+            normalized_patch_tokens = F.normalize(patch_tok, dim=-1)
+            normalized_patch_tokens.retain_grad()
+            emb = normalized_patch_tokens.mean(dim=1)
         else:
             emb = feats["x_norm_clstoken"]
             if acts.get("pre") is None:
@@ -276,26 +345,43 @@ def token_gradcam_map(
             gfull = acts["final"].grad
             if gfull is None:
                 raise GradCAMError("meanpool patch token 梯度為 None")
-            activation = acts["final"].detach()[:, start:, :]
-            gradient = gfull[:, start:, :]
+            activation_global = acts["final"].detach()[:, start:, :]
+            gradient_global = gfull[:, start:, :]
+            if normalized_patch_tokens is None or normalized_patch_tokens.grad is None:
+                raise GradCAMError("meanpool normalized patch token gradient is None")
+            activation_token = normalized_patch_tokens.detach()
+            gradient_token = normalized_patch_tokens.grad
         else:
             g = acts["pre"].grad
             if g is None:
                 raise GradCAMError("pre-attention token 梯度為 None")
-            activation = acts["pre"].detach()[:, start:, :]
-            gradient = g[:, start:, :]
-        # Classical Grad-CAM: average the target gradient over spatial tokens
-        # per channel, then use those channel weights to score each token.
-        channel_weights = gradient.mean(dim=1, keepdim=True)
-        cam = (activation * channel_weights).sum(dim=-1)[0]
-        if not torch.isfinite(cam).all():
+            activation_global = acts["pre"].detach()[:, start:, :]
+            gradient_global = g[:, start:, :]
+            activation_token = activation_global
+            gradient_token = gradient_global
+        # Keep both attribution families from the same backward pass.  The
+        # global-channel map is classical Grad-CAM; token-wise gradient x
+        # activation is often more local for ViT patch tokens, but has a
+        # different interpretation and is labelled as such in the UI.
+        channel_weights = gradient_global.mean(dim=1, keepdim=True)
+        global_cam = (activation_global * channel_weights).sum(dim=-1)[0]
+        token_cam = (activation_token * gradient_token).sum(dim=-1)[0]
+        if not torch.isfinite(global_cam).all() or not torch.isfinite(token_cam).all():
             raise GradCAMError("Grad-CAM 含 NaN/Inf")
+        method = str(attribution_method or "token_gradient_product")
+        if method not in {"token_gradient_product", "global_channel"}:
+            raise GradCAMError(
+                f"未知 attribution_method={method}；可用 token_gradient_product/global_channel"
+            )
+        cam = token_cam if method == "token_gradient_product" else global_cam
         if float(cam.abs().sum()) == 0.0:
             raise GradCAMError("指定 target 的梯度為零，拒出圖")
         gh, gw = grid
         if cam.numel() != gh * gw:
             raise GradCAMError(f"CAM 長度 {int(cam.numel())} ≠ grid {gh}×{gw}")
         raw = cam.detach().float().cpu().numpy().reshape(gh, gw).astype(np.float32)
+        global_raw = global_cam.detach().float().cpu().numpy().reshape(gh, gw).astype(np.float32)
+        token_raw = token_cam.detach().float().cpu().numpy().reshape(gh, gw).astype(np.float32)
         target_score = float(score.detach().cpu())
         prob_np = probs[0].detach().float().cpu().numpy()
         ranking = np.argsort(prob_np)[::-1]
@@ -318,12 +404,23 @@ def token_gradcam_map(
         ) if run_faithfulness else {"available": False, "status": "not_run"}
     )
     diagnostics = dict(head.get("explain_diagnostics") or {})
+    head_provenance = dict(head.get("explain_provenance") or {})
+    head_target_res = head_provenance.get("target_res")
+    if head_target_res not in (None, ""):
+        head_target_res = int(head_target_res)
+    if head_target_res is not None and head_target_res != int(request.target_res):
+        diagnostics["resolution_override"] = {
+            "head_target_res": head_target_res,
+            "analysis_target_res": int(request.target_res),
+            "warning": "classifier head 保持原訓練解析度；較高解析度只作 spatial probe",
+        }
     sample_oof = dict((diagnostics.get("samples") or {}).get(request.source_id) or {}) or None
     diagnostics.pop("samples", None)
 
     return GradCAMResult(
         raw_patch_scores=raw,
         display_patch_scores=signed_norm(raw),
+        target_display_patch_scores=target_positive_norm(raw),
         grid=grid,
         patch_size=patch,
         target_class=lab,
@@ -357,5 +454,9 @@ def token_gradcam_map(
         original_size=request.original_size or _pil_rgb(request.image).size,
         input_image=proc,
         timing_s=time.perf_counter() - t0,
+        head_target_res=head_target_res,
+        attribution_method=method,
+        global_channel_scores=global_raw,
+        token_gradient_product_scores=token_raw,
         warnings=WARNINGS,
     )

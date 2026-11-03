@@ -1,0 +1,13 @@
+# Controlled explanation workflow validation
+
+Validated 2026-09-06 for `improve-yolo-explanation-evidence-and-compatibility`.
+
+`tests/test_explanation_summary.py`, `tests/test_explanation_summary_page.py`, and existing `tests/test_investigation_materials.py`: **19 passed in 6.58s**, after the summary/reply changes. The checks cover legacy/unavailable controls, contradictory fill direction, question scope, human-review references, invalidated modification hashes, historical targets, immutable selected cohort snapshots, preserved engineer drafts, and actual form persistence. After adding the cohort descriptive-table display, the summary plus AppTest files passed **9 tests in 17.73s**, including the real table's unique-image/group counts and descriptive mean.
+
+`tests/e2e/test_investigation_materials_e2e.py -k controlled_evidence_review_and_reply`: **1 passed, 7 deselected in 81.42s**. Dedicated output root: `.pytest-explanation-browser-v1`. A saved CAM and four checksummed modified-image results were deliberately seeded; this test did **not** execute inference or establish Grad-CAM effectiveness. Chromium actually selected the saved evidence, displayed the modified images, recorded the explicit all-images preservation review, saved engineer-written reply text, and downloaded HTML. Assertions checked the bound review hashes, controlled observation status, evidence IDs, heatmap embedding, historical-replay limitation, and absence of local/private paths.
+
+The [successful reply screenshot](controlled-evidence-reply-browser.png) is retained. The browser server completed fixture teardown and pytest exited 0. These tests establish workflow wiring and conservative claims, not production root-cause accuracy, independent cohort effectiveness, or measured engineer effort savings.
+
+Final cross-module review found that a previously verified cohort declaration could survive a later truth/ROI correction. `snapshot_cohort` now binds human-review evidence ID, target identity and source hash when saving, then rechecks those at batch submission. A mismatch freezes an unverified payload with a reason while retaining the original historical declaration. Two actual AppTests inspect submitted payloads after truth and ROI changes; the full focused summary/AppTest gate passed **11 tests in 9.23s**. User-facing summary enums are translated; the structured schema retains the original values.
+
+Compilation of the changed summary, reply, data/workspace UI, unit/AppTest, and browser test modules passed. No model/runtime coverage is implied by this document; those gates are maintained separately.

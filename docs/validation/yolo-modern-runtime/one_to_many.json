@@ -1,0 +1,85 @@
+{
+  "fixture_scope": "Artificial numerical checkpoint; not trained-model efficacy",
+  "fixture_sha256": "0cafeba5867c1fb5ca559e87420fb6e486b85f9ef341d98cc35331197ee9f170",
+  "source_unchanged": true,
+  "runtime_config": {
+    "backend": "pytorch_yolo",
+    "class_agnostic_nms": false,
+    "class_names": [
+      "scratch",
+      "dent"
+    ],
+    "color": "RGB",
+    "coordinates": "pixels",
+    "family": "yolo26",
+    "head_path": "one_to_many",
+    "input_layout": "NCHW",
+    "input_name": "",
+    "input_size": [
+      64,
+      64
+    ],
+    "interpolation": "bilinear",
+    "max_detections": 300,
+    "mean": [
+      0,
+      0,
+      0
+    ],
+    "model_version": "",
+    "nms": null,
+    "nms_iou": 0.45,
+    "normal_classes": [],
+    "output_format": "yolo_v8",
+    "output_name": "",
+    "pad_value": 114,
+    "resize": "letterbox",
+    "runtime_id": "modern-8.4.142",
+    "runtime_release": "8.4.142",
+    "scale": 0.00392156862745098,
+    "score_activation": "none",
+    "std": [
+      1,
+      1,
+      1
+    ],
+    "threshold": 0.0
+  },
+  "target": {
+    "box": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
+    "class_index": 0,
+    "class_name": "scratch",
+    "execution": {
+      "head_path": "one_to_many",
+      "output_contract": {
+        "agnostic_topk": false,
+        "export": false,
+        "export_format": null,
+        "format": "xywh_classes",
+        "head_path": "one_to_many",
+        "max_det": 300
+      },
+      "runtime_id": "modern-8.4.142",
+      "runtime_release": "8.4.142"
+    },
+    "input_sha256": "d93004728688da7f081140eeec11a07cd2fcf42d14221e39fb95385253c2c2ce",
+    "model_sha256": "0cafeba5867c1fb5ca559e87420fb6e486b85f9ef341d98cc35331197ee9f170",
+    "native_candidate_index": 81,
+    "output_index": 81,
+    "scalar": "confidence",
+    "schema_version": 3
+  },
+  "status": "ok",
+  "forward_parity": {
+    "atol": 1e-06,
+    "rtol": 1e-05,
+    "status": "matched"
+  },
+  "source_sha256": "91ad12aab31b51e8157be0548b9f8a28b65690c5cef91b1406b0d07bbfaa06f9",
+  "compute_id": "936b32bdbb0ac31372e8fe39c9a5c5ef15857edc54381f8538f876afc8cc1cd9"
+}

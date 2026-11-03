@@ -11,6 +11,7 @@ from explain_ui import (
     _gradcam_guidance,
     _gradcam_preflight,
     _normal_bank_guide_state,
+    _resolution_head_key,
     _source_id,
     _train_session_head,
 )
@@ -19,6 +20,15 @@ from explain_ui import (
 def test_anomaly_object_source_ids_do_not_collapse_same_image():
     base = {"path": "same.jpg", "image_path": "same.jpg", "bbox": (0.5, 0.5, 0.2, 0.2)}
     assert _source_id({**base, "obj_index": 0}) != _source_id({**base, "obj_index": 1})
+
+
+def test_exact_resolution_head_key_keeps_scope_and_pooling_separate():
+    assert _resolution_head_key("dinov2_vits14", "whole_image", 336) != (
+        _resolution_head_key("dinov2_vits14", "object_crop", 336)
+    )
+    assert _resolution_head_key("dinov2_vits14", "whole_image", 336, "cls") != (
+        _resolution_head_key("dinov2_vits14", "whole_image", 336, "meanpool")
+    )
 
 
 def test_session_head_preflight_matches_its_visualize_input(tmp_path):
@@ -43,6 +53,11 @@ def test_session_head_preflight_matches_its_visualize_input(tmp_path):
     assert head["explain_diagnostics"]["kind"] == "sample_stratified_oof"
     ok, reason = _gradcam_preflight(records[0], "dinov2_vits14", "whole_image", head)
     assert ok, reason
+    ok_hi, reason_hi = _gradcam_preflight(
+        records[0], "dinov2_vits14", "whole_image", head,
+        analysis_target_res=336,
+    )
+    assert ok_hi, reason_hi
 
 
 def test_shared_panel_reports_context_capabilities(tmp_path):

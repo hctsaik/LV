@@ -113,6 +113,9 @@ def test_oof_audit_reports_generalization_and_per_sample_result():
     assert audit["available"] is True
     assert audit["balanced_accuracy"] >= 0.95
     assert audit["macro_f1"] >= 0.95
+    assert set(audit["per_class"]) == {str(label) for label in np.unique(y)}
+    first_label = str(np.unique(y)[0])
+    assert audit["per_class"][first_label]["support"] == int((y == first_label).sum())
     assert set(audit["samples"]) == set(source_ids)
     assert audit["samples"]["sample-0"]["actual"] == y[0]
     assert "非 grouped holdout" in audit["limitations"]

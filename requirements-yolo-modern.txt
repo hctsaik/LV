@@ -1,0 +1,17 @@
+# Independent worker environment; never install into LV's legacy .venv.
+ultralytics==8.4.142
+torch==2.6.0
+torchvision==0.21.0
+numpy==2.2.3
+pillow==11.1.0
+opencv-python==4.11.0.86
+scipy==1.17.1
+matplotlib==3.10.6
+onnx==1.22.0
+onnxruntime==1.29.0
+psutil==7.1.0
+PyYAML==6.0.3
+requests==2.34.2
+ultralytics-thop==2.1.6
+# Bounded numerical acceptance gates run inside this same pinned environment.
+pytest==9.0.3

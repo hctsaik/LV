@@ -20,6 +20,8 @@ from sklearn.manifold import TSNE
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from app_storage_paths import read_jsonl_logs, resolve_output_dir
+
 from _utils import (
     available_models,
     extract_embeddings,
@@ -76,7 +78,7 @@ from interaction import (  # noqa: F401  (parse_folder_paths re-exported for tes
     yolo_label_path_for,
     zip_selected_images,
 )
-from manifest import rel_key, set_embedding_refs, update_manifest, write_manifest
+from manifest import file_sha256, rel_key, set_embedding_refs, update_manifest, write_manifest
 import labeling_handoff as LH  # unified LV → Labeling hand-over (framework-free)
 from completeness import (
     STATE_EMPTY,
@@ -478,7 +480,9 @@ _GRID_CAP = 240           # DOM ceiling agreed in the UX review
 _DEFAULT_TOP_OUTLIERS = 50
 _SCATTERGL_THRESHOLD = 2000   # 點數超過此值，2D 散點改 WebGL（render 體質 #2）
 
-_USAGE_LOG = Path(__file__).parent.parent / "output" / "usage_log.jsonl"
+_SOURCE_OUTPUT_DIR = Path(__file__).parent.parent / "output"
+_LV_OUTPUT_DIR = resolve_output_dir(_SOURCE_OUTPUT_DIR, os.environ)
+_USAGE_LOG = _LV_OUTPUT_DIR / "usage_log.jsonl"
 
 
 def _fmt_classes(names: list[str], max_show: int = 10) -> str:
@@ -860,22 +864,15 @@ def _log_usage(event: str, **fields) -> None:
         pass
 
 
-_CURATION_LOG = Path(__file__).parent.parent / "output" / "curation_log.jsonl"
+_CURATION_LOG = _LV_OUTPUT_DIR / "curation_log.jsonl"
+_LEGACY_CURATION_LOG = _SOURCE_OUTPUT_DIR / "curation_log.jsonl"
 
 
 def _load_curation_log() -> list[dict]:
-    """Read the on-disk curation log (most recent first). Survives restart."""
-    if not _CURATION_LOG.exists():
-        return []
-    out = []
-    for line in _CURATION_LOG.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return list(reversed(out))
+    """Read Store and legacy curation records, newest first, across restarts."""
+    return read_jsonl_logs((
+        _LEGACY_CURATION_LOG, _CURATION_LOG,
+    ), newest_first=True)
 
 
 def _append_curation_entry(records: list[dict], indices: list[int],
@@ -924,6 +921,940 @@ def _set_active_image(idx: int | None, ctx: list[int] | None = None) -> None:
     st.session_state["viz_active_image"] = idx
     if ctx is not None:
         st.session_state["viz_viewer_ctx"] = ctx
+
+
+def _diagnostics_source_path(record: dict) -> Path | None:
+    """Return the original source for a Visualize record.
+
+    Object records expose a cached crop in ``path`` and the immutable source
+    image in ``image_path``.  The diagnostics handoff must retain the latter
+    so a future page can reconstruct the same crop without copying the crop
+    or embedding arrays into session state.
+    """
+    value = record.get("image_path") or record.get("path")
+    if not value:
+        return None
+    return Path(value).resolve()
+
+
+def _diagnostics_manifest_entry(source_path: Path | None, record: dict) -> dict:
+    manifest = st.session_state.get("viz_manifest") or {}
+    if source_path is not None:
+        entry = manifest.get(str(source_path))
+        if isinstance(entry, dict):
+            return entry
+    # Object-level Visualize runs intentionally have no image manifest.  Do
+    # not mistake the cached JPEG crop for a source manifest entry.
+    crop_path = record.get("path")
+    if crop_path:
+        entry = manifest.get(str(Path(crop_path).resolve()))
+        if isinstance(entry, dict):
+            return entry
+    return {}
+
+
+def _diagnostics_source_sha(source_path: Path | None, entry: dict) -> str:
+    sha = str(entry.get("sha256") or "")
+    if sha or source_path is None or not source_path.is_file():
+        return sha
+    try:
+        return file_sha256(source_path)
+    except OSError:
+        return ""
+
+
+def _diagnostics_dataset_fingerprint(records: list[dict]) -> str:
+    """Build a content-based reference fingerprint without storing image data."""
+    seen: set[str] = set()
+    items: list[dict[str, str]] = []
+    for record in records:
+        source_path = _diagnostics_source_path(record)
+        if source_path is None:
+            continue
+        key = str(source_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = _diagnostics_manifest_entry(source_path, record)
+        items.append({
+            "path": key,
+            "sha256": _diagnostics_source_sha(source_path, entry),
+        })
+    payload = json.dumps(sorted(items, key=lambda item: item["path"]),
+                         ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _diagnostics_head_ref(head: dict | None) -> dict | None:
+    """Return a small stable head reference, never the sklearn model object."""
+    if not isinstance(head, dict):
+        return None
+    clf = head.get("model")
+    payload: dict = {
+        "classes": [str(x) for x in (head.get("classes") or [])],
+        "dim": int(head.get("dim") or 0),
+        "l2norm": bool(head.get("l2norm", True)),
+        "temperature": head.get("temperature"),
+        "provenance": dict(head.get("explain_provenance") or {}),
+    }
+    # Hash only model parameters; never put coefficients in the handoff.
+    for name in ("coef_", "intercept_"):
+        value = getattr(clf, name, None)
+        if value is not None:
+            arr = np.asarray(value, dtype=np.float32)
+            payload[name] = {
+                "shape": list(arr.shape),
+                "sha256": hashlib.sha256(arr.tobytes()).hexdigest(),
+            }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         default=str, separators=(",", ":"))
+    return {
+        "kind": "session_head",
+        "digest": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        "classes": payload["classes"],
+        "provenance": payload["provenance"],
+    }
+
+
+def _diagnostics_resolution_key(
+    model_id: str, scope: str, resolution: int, pooling: str = "cls",
+) -> str:
+    """Recipe key for an exact, session-only resolution head."""
+    return "|".join((str(model_id), str(scope), str(pooling), str(int(resolution))))
+
+
+def _diagnostics_head_registry() -> dict[str, dict]:
+    """Return the session-only exact-head registry without persisting models."""
+    value = st.session_state.setdefault("explain_session_heads", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _diagnostics_embedding_registry() -> dict[str, np.ndarray]:
+    value = st.session_state.setdefault("explain_session_embeddings", {})
+    return value if isinstance(value, dict) else {}
+
+
+def _diagnostics_context_for_head(
+    context: dict, head: dict, *, recipe: dict | None = None,
+) -> dict:
+    """Attach a head reference and derive a canonical context identity."""
+    updated = dict(context)
+    head_ref = _diagnostics_head_ref(head) or {}
+    updated["head_ref"] = head_ref
+    updated["head_digest"] = head_ref.get("digest")
+    updated["head_provenance"] = dict(head.get("explain_provenance") or {})
+    if recipe:
+        updated["embedding_recipe"] = dict(recipe)
+    try:
+        from explain_context import context_contract
+        updated.update(context_contract(updated).to_dict())
+    except (ImportError, TypeError, ValueError):
+        pass
+    identity_payload = {
+        key: value for key, value in updated.items()
+        if key not in {"context_id", "created_at", "record_index_at_handoff"}
+    }
+    try:
+        from explain_contracts import canonical_json
+        encoded = canonical_json(identity_payload)
+    except (ImportError, TypeError, ValueError):
+        encoded = json.dumps(identity_payload, ensure_ascii=False, sort_keys=True,
+                             default=str, separators=(",", ":"))
+    updated["context_id"] = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return updated
+
+
+def _diagnostics_record_key(record: dict, source_sha: str, scope: str) -> str:
+    try:
+        from explain_contracts import stable_record_key
+        if len(str(source_sha)) == 64:
+            bbox = record.get("bbox")
+            if bbox is None:
+                return stable_record_key(str(source_sha))
+            return stable_record_key(
+                str(source_sha),
+                object_index=int(record.get("obj_index") or 0),
+                bbox_normalized=[float(value) for value in bbox],
+                crop_policy=scope,
+            )
+    except (ImportError, TypeError, ValueError):
+        pass
+    bbox = record.get("bbox")
+    normalized_bbox = None
+    if bbox is not None:
+        try:
+            normalized_bbox = [round(float(value), 8) for value in bbox]
+        except (TypeError, ValueError):
+            normalized_bbox = [str(value) for value in bbox]
+    payload = {
+        "scope": scope,
+        "source_sha256": source_sha,
+        "object_index": record.get("obj_index"),
+        "bbox_normalized": normalized_bbox,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_visualize_diagnostics_context(record: dict, index: int,
+                                         model_name: str) -> dict:
+    """Build a reference-only ExplainContextV1 handoff from Visualize.
+
+    This compatibility bridge intentionally lives in ``app.py`` until the
+    versioned context module lands.  It stores paths and stable identities
+    only; source pixels, embeddings, classifier objects, and bank vectors
+    remain in their existing session/cache owners.
+    """
+    source_path = _diagnostics_source_path(record)
+    entry = _diagnostics_manifest_entry(source_path, record)
+    source_sha = _diagnostics_source_sha(source_path, entry)
+    is_object = record.get("bbox") is not None and record.get("obj_index") is not None
+    scope = "object_crop" if is_object else "whole_image"
+    granularity = "yolo_object" if is_object else "classifier_image"
+    source_dimensions: list[int] | None = None
+    if source_path is not None and source_path.is_file():
+        image = safe_open_image(source_path, mode=None)
+        if image is not None:
+            source_dimensions = [int(image.width), int(image.height)]
+            image.close()
+
+    if is_object:
+        policy = dict(st.session_state.get("viz_object_policy") or {})
+        recipe = {
+            "model_id": model_name,
+            "scope": scope,
+            "source_granularity": granularity,
+            "keep_aspect": True,
+            "target_res": int(policy.get("target_res", 224)),
+            "pooling": str(policy.get("head", "cls")),
+            "pad": float(policy.get("pad", 0.12)),
+        }
+    else:
+        recipe = {
+            "model_id": model_name,
+            "scope": scope,
+            "source_granularity": granularity,
+            "keep_aspect": False,
+            "target_res": 224,
+            "pooling": "cls",
+            "pad": None,
+        }
+    head = st.session_state.get("explain_session_head")
+    head_ref = _diagnostics_head_ref(head)
+    embedding_ref = None
+    refs = entry.get("embedding_refs") if isinstance(entry, dict) else None
+    if isinstance(refs, dict) and model_name in refs:
+        embedding_ref = {"model_id": model_name, "row": refs[model_name]}
+    dataset_roots = sorted({str(Path(folder).resolve()) for folder in
+                            (st.session_state.get("viz_folder_list") or [])})
+    dataset_fingerprint = _diagnostics_dataset_fingerprint(
+        st.session_state.get("viz_records") or [record])
+    generation = str(st.session_state.get("viz_data_token") or "")
+    record_key = _diagnostics_record_key(record, source_sha, scope)
+    context_payload = {
+        "schema": "ExplainContextV1",
+        "context_version": 1,
+        "origin_tool": "visualize",
+        "origin_view": "viewer",
+        "origin_generation": generation,
+        "record_key": record_key,
+        "source_path": str(source_path) if source_path is not None else "",
+        "source_relative_path": str(record.get("path") or ""),
+        "source_sha256": source_sha,
+        "source_dimensions": source_dimensions,
+        "dataset_root_identity": dataset_roots,
+        "dataset_fingerprint": dataset_fingerprint,
+        "manifest_ref": {"path": str(record.get("path") or ""),
+                          "entry": entry.get("path")} if entry else None,
+        "scope": scope,
+        "source_granularity": granularity,
+        "object_index": record.get("obj_index") if is_object else None,
+        "bbox_normalized": ([round(float(value), 8) for value in record["bbox"]]
+                             if is_object else None),
+        "bbox_pixel": None,
+        "crop_policy": (dict(st.session_state.get("viz_object_policy") or {})
+                        if is_object else None),
+        "label": str(record.get("label") or ""),
+        "split": str(record.get("split") or ""),
+        "model_id": str(model_name),
+        "checkpoint_id": (head_ref or {}).get("provenance", {}).get("checkpoint_id", "")
+        if head_ref else "",
+        "embedding_recipe": recipe,
+        "embedding_ref": embedding_ref,
+        "head_ref": head_ref,
+        "head_digest": (head_ref or {}).get("digest", "") if head_ref else None,
+        # Existing checkpoint_identity is path/size/mtime based.  Keep it as
+        # a display-only checkpoint_id; only a real SHA-256 is a digest.
+        "checkpoint_digest": (
+            (head_ref or {}).get("provenance", {}).get("checkpoint_id", "")
+            if len(str((head_ref or {}).get("provenance", {}).get("checkpoint_id", ""))) == 64
+            else None
+        ) if head_ref else None,
+        "mask_ref": None,
+        "normal_bank_ref": None,
+        "engine_schema_version": "1",
+        "record_index_at_handoff": int(index),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    # Canonicalize the reference through ExplainContextV1 before it enters
+    # session state.  The app may retain display-only provenance fields, but
+    # compatibility and compute identities always use this shared contract.
+    try:
+        from explain_context import context_contract
+        context_payload.update(context_contract(context_payload).to_dict())
+    except (ImportError, TypeError, ValueError):
+        # Keep the legacy bridge usable during a partial deployment; the page
+        # will classify a non-contract context as incompatible rather than
+        # silently reusing an explanation.
+        pass
+
+    # ``created_at`` is display provenance, not identity.  Excluding it keeps
+    # repeated handoffs for the same generation/record content-addressed.
+    identity_payload = {
+        key: value for key, value in context_payload.items()
+        if key not in {"context_id", "created_at", "record_index_at_handoff"}
+    }
+    try:
+        from explain_contracts import canonical_json
+        context_json = canonical_json(identity_payload)
+    except (ImportError, TypeError, ValueError):
+        context_json = json.dumps(identity_payload, ensure_ascii=False, sort_keys=True,
+                                  default=str, separators=(",", ":"))
+    context_payload["context_id"] = hashlib.sha256(
+        context_json.encode("utf-8")).hexdigest()
+    return context_payload
+
+
+def _open_visualize_diagnostics(index: int, model_name: str) -> None:
+    st.session_state.pop("investigation_diagnostic", None)
+    st.query_params.pop("diagnostic_case", None)
+    st.query_params.pop("diagnostic_item", None)
+    records = st.session_state.get("viz_records") or []
+    if not (0 <= int(index) < len(records)):
+        st.session_state["explain_page_error"] = "目前 Visualize 選取已不存在，請重新選圖。"
+        return
+    # A handoff starts a new diagnostic context.  Never carry a classifier
+    # head, resolution embeddings, rendered result, or research authorization
+    # from the previous image/dataset generation: the same model id alone is
+    # not sufficient provenance for reusing any of them.
+    for key in (
+        "explain_session_head",
+        "explain_session_heads",
+        "explain_session_embeddings",
+        "diag_result",
+        "diag_result_spec",
+        "diag_analysis_res",
+        "diag_head_build_failed",
+        "diag_research_authorized",
+        "diag_selected_target",
+    ):
+        st.session_state.pop(key, None)
+    context = _build_visualize_diagnostics_context(records[int(index)], int(index), model_name)
+    st.session_state["explain_page_context"] = context
+    st.session_state.pop("explain_page_error", None)
+    st.session_state["tool_switch"] = "Model Diagnostics"
+    # The viewer is a fragment; the flag is consumed by _render_right_panel so
+    # the top-level segmented control changes on an app-scope rerun.
+    st.session_state["_explain_app_rerun"] = True
+
+
+def _diagnostics_context_status_legacy(context: dict) -> tuple[str, str]:
+    if not isinstance(context, dict):
+        return "incompatible", "診斷 context 格式無法辨識。"
+    current_generation = str(st.session_state.get("viz_data_token") or "")
+    expected_generation = str(context.get("origin_generation") or "")
+    if expected_generation and current_generation and expected_generation != current_generation:
+        return "stale", "Visualize 已產生新的資料 generation；此結果只能作 historical/stale。"
+    source = Path(str(context.get("source_path") or ""))
+    if not source.is_file():
+        return "stale", "原始影像不存在或已不可讀。"
+    expected_sha = str(context.get("source_sha256") or "")
+    if expected_sha:
+        try:
+            if file_sha256(source) != expected_sha:
+                return "stale", "原始影像內容 SHA-256 已改變。"
+        except OSError:
+            return "stale", "無法重新驗證原始影像 SHA-256。"
+    return "current", "目前 context 與 Visualize 來源一致。"
+
+
+def _model_diagnostics_ui_legacy() -> None:
+    """Top-level diagnostics shell; the full page is loaded lazily later."""
+    st.subheader("Model Diagnostics")
+    context = st.session_state.get("explain_page_context")
+    if not isinstance(context, dict):
+        st.info("請先在 Visualize Embeddings 選取影像，再按「在模型診斷開啟」。")
+        st.caption("尚未開始 inference；此頁不會因進入、切換 tab 或調整顯示設定而自動開始昂貴推論。")
+        return
+
+    status, status_reason = _diagnostics_context_status(context)
+    if status == "stale":
+        st.warning(f"⚠ Context stale：{status_reason}")
+    elif status == "incompatible":
+        st.error(f"Context incompatible：{status_reason}")
+    else:
+        st.success(f"Context current：{status_reason}")
+    st.markdown("#### Context reference")
+    c1, c2, c3 = st.columns(3)
+    c1.caption(f"Dataset fingerprint：`{str(context.get('dataset_fingerprint') or '')[:12]}`")
+    c1.caption(f"Image：`{Path(str(context.get('source_path') or '')).name or '—'}`")
+    c1.caption(f"Label / split：`{context.get('label') or '—'}` / `{context.get('split') or '—'}`")
+    c2.caption(f"Model：`{context.get('model_id') or '—'}`")
+    c2.caption(f"Scope：`{context.get('scope') or '—'}`")
+    c2.caption(f"Record key：`{str(context.get('record_key') or '')[:12]}`")
+    c3.caption(f"Head：{'available' if context.get('head_ref') else 'unavailable'}")
+    c3.caption("Mask：unavailable（resolver 尚未完成）")
+    c3.caption("Normal Bank：unavailable（尚未交接）")
+    st.caption("Head validation：尚未在此頁執行；Attribution：尚未執行；Localization：unverified。")
+    if not context.get("result_status"):
+        st.caption("尚未開始 inference / OOF / faithfulness；頁面進入不會自動執行。")
+    if st.session_state.pop("explain_page_error", None):
+        st.error("Visualize context 建立失敗，請重新選圖。")
+
+    # The page is intentionally optional during the route/handoff slice.  Do
+    # not import it at app startup, and do not hide unrelated import errors.
+    try:
+        from explain_page import render_model_diagnostics
+    except ModuleNotFoundError as exc:
+        if exc.name != "explain_page":
+            raise
+        st.info("模型診斷 workspace 尚未載入；目前先完成 context handoff 與狀態驗證。")
+        st.caption("尚未開始 inference / OOF / faithfulness；請在後續頁面明確按下分析。")
+        return
+    render_model_diagnostics(
+        context,
+        mask_status="unavailable",
+        normal_bank_status="unavailable",
+        result_status=("stale" if status == "stale" else context.get("result_status")),
+    )
+
+
+# Use the shared versioned compatibility matrix for the active route.  The
+# legacy implementation above remains available only to old imported callers.
+def _diagnostics_context_status(context: dict) -> tuple[str, str]:
+    if not isinstance(context, dict):
+        return "incompatible", "context reference is not a mapping"
+    source = Path(str(context.get("source_path") or ""))
+    if not source.is_file():
+        return "stale", "source image is missing"
+    current = dict(context)
+    current["origin_generation"] = str(st.session_state.get("viz_data_token") or "")
+    try:
+        current["source_sha256"] = file_sha256(source)
+    except OSError:
+        return "stale", "source SHA-256 cannot be recomputed"
+    try:
+        from explain_context import check_compatibility, context_contract
+        compatibility = check_compatibility(
+            context_contract(context), context_contract(current))
+        if compatibility.incompatible:
+            return "incompatible", f"incompatible fields: {compatibility.reason}"
+        if compatibility.stale:
+            return "stale", f"stale fields: {compatibility.reason}"
+    except (ImportError, TypeError, ValueError):
+        if (context.get("origin_generation") and
+                current["origin_generation"] != context.get("origin_generation")):
+            return "stale", "Visualize generation changed"
+        if (context.get("source_sha256") and
+                current["source_sha256"] != context.get("source_sha256")):
+            return "stale", "source SHA-256 changed"
+    return "current", "context matches the current Visualize source"
+
+
+# The route above is kept as a compatibility fallback for old sessions.  This
+# implementation is defined afterwards so the dispatcher resolves the richer
+# selected-sample workspace without changing the existing Visualize fragment.
+def _model_diagnostics_record(context: dict) -> tuple[dict | None, int | None]:
+    records = st.session_state.get("viz_records") or []
+    expected_key = str(context.get("record_key") or "")
+    expected_source = str(context.get("source_path") or "")
+    expected_sha = str(context.get("source_sha256") or "")
+    expected_object = context.get("object_index")
+    expected_bbox = context.get("bbox_normalized")
+    matches: list[tuple[int, dict]] = []
+    for i, candidate in enumerate(records):
+        source_path = _diagnostics_source_path(candidate)
+        if expected_source and str(source_path or "") != expected_source:
+            continue
+        entry = _diagnostics_manifest_entry(source_path, candidate)
+        source_sha = _diagnostics_source_sha(source_path, entry)
+        if expected_sha and source_sha and expected_sha != source_sha:
+            continue
+        if expected_object is not None and candidate.get("obj_index") != expected_object:
+            continue
+        if expected_bbox is not None:
+            try:
+                bbox = [round(float(x), 8) for x in (candidate.get("bbox") or [])]
+                wanted = [round(float(x), 8) for x in expected_bbox]
+            except (TypeError, ValueError):
+                continue
+            if bbox != wanted:
+                continue
+        candidate_key = _diagnostics_record_key(
+            candidate, source_sha or expected_sha,
+            "object_crop" if candidate.get("bbox") is not None else "whole_image",
+        ) if (source_sha or expected_sha) else ""
+        if expected_key and candidate_key != expected_key:
+            continue
+        matches.append((i, candidate))
+    if matches:
+        return matches[0][1], matches[0][0]
+    # A legacy context may not contain a content key.  Use its handoff index
+    # only as a last-resort compatibility path, never for a keyed context.
+    try:
+        index = int(context.get("record_index_at_handoff"))
+    except (TypeError, ValueError):
+        index = -1
+    if not expected_key and 0 <= index < len(records):
+        return records[index], index
+    return None, None
+
+
+def _model_diagnostics_prediction(
+    context: dict, record: dict | None, index: int | None, head: dict | None,
+    embeddings_override: np.ndarray | None = None,
+) -> dict:
+    """Build prediction evidence from an existing session head only.
+
+    Reading one already-materialised embedding is cheap and deterministic; it
+    is intentionally not a model inference on page entry.  The foundation
+    model is loaded only by the explicit Grad-CAM action below.
+    """
+    prediction: dict = {"actual_label": context.get("label") or ""}
+    if not isinstance(head, dict) or record is None or index is None:
+        return prediction
+    model_id = str(context.get("model_id") or "")
+    raw_by_model = st.session_state.get("viz_raw_embeddings") or {}
+    raw = embeddings_override if embeddings_override is not None else raw_by_model.get(model_id)
+    if raw is None or not (0 <= int(index) < len(raw)):
+        return prediction
+    try:
+        from dino_head import predict_head
+        pred, conf, probabilities = predict_head(
+            head, np.asarray(raw[int(index)])[None, :])
+        probs = np.asarray(probabilities[0], dtype=float)
+        classes = [str(x) for x in head.get("classes", [])]
+        if not classes:
+            classes = [str(x) for x in getattr(head.get("model"), "classes_", [])]
+        order = np.argsort(probs)[::-1]
+        top = int(order[0]) if order.size else 0
+        runner = int(order[1]) if order.size > 1 else top
+        source_id = str(record.get("image_path") or record.get("path") or "")
+        if record.get("bbox") is not None and record.get("obj_index") is not None:
+            source_id += f"#{record.get('obj_index')}"
+        diagnostics = dict(head.get("explain_diagnostics") or {})
+        sample = dict((diagnostics.get("samples") or {}).get(source_id) or {})
+        prediction.update({
+            "current_top1": str(pred[0]),
+            "current_probability": float(conf[0]),
+            "runner_up": classes[runner] if classes else "",
+            "runner_up_probability": float(probs[runner]) if probs.size else None,
+            "margin": float(probs[top] - probs[runner]) if probs.size > 1 else None,
+            "calibrated": bool(
+                (head.get("calibration_provenance") or {}).get("held_out")
+            ),
+            "oof": {
+                "available": bool(sample),
+                "predicted": sample.get("predicted"),
+                "probability": sample.get("confidence"),
+            },
+        })
+    except (ImportError, TypeError, ValueError, IndexError):
+        return prediction
+    return prediction
+
+
+def _model_diagnostics_display_builder(
+    packed: dict, *, display_mode: str,
+) -> callable:
+    """Return a render-only callback for the standalone page."""
+    def _build(opacity: float, show_grid: bool) -> dict:
+        from explanation_render import render_grid, render_overlay
+
+        result = packed["result"]
+        signed = display_mode == "signed"
+        if signed:
+            scores = result.display_patch_scores
+            cmap = "blue_white_red"
+        else:
+            scores = result.target_display_patch_scores
+            cmap = "copper"
+        overlay = render_overlay(
+            result.input_image, scores, alpha=float(opacity), cmap=cmap,
+            signed=signed,
+        )
+        model_input = result.input_image
+        if show_grid:
+            overlay = render_grid(overlay, result.grid)
+            model_input = render_grid(model_input, result.grid)
+        return {
+            "source_image": packed["orig"],
+            "model_input": model_input,
+            "overlay": overlay,
+        }
+    return _build
+
+
+def _model_diagnostics_ui() -> None:
+    """Render the reference-only, explicit-action diagnostics workspace."""
+    from explain_service import external_context
+    if external_context(st.session_state, st.query_params):
+        from investigation_workspace import render_detector_diagnostics
+        render_detector_diagnostics()
+        return
+    # Keep the route import-lazy while the standalone page is being migrated;
+    # unrelated Visualize/Compare tools must remain usable if this optional
+    # module is temporarily absent from a deployment.
+    try:
+        from explain_page import render_model_diagnostics
+    except ModuleNotFoundError as exc:
+        if exc.name != "explain_page":
+            raise
+        st.subheader("Model Diagnostics")
+        st.info("診斷 workspace 尚未部署；請先從 Visualize 建立 context reference。")
+        st.caption("尚未開始 inference / OOF / faithfulness。")
+        return
+
+    st.title("模型診斷")
+    context = st.session_state.get("explain_page_context")
+    if not isinstance(context, dict):
+        st.info("請先到 Visualize 執行資料分析，再選取一張圖片按「分析這張圖」。")
+        st.caption("尚未開始模型推論；進入頁面不會自動執行分析。")
+        return
+
+    sample_name = Path(str(context.get("source_path") or "")).name or "目前樣本"
+    st.markdown(f"#### 分析樣本：`{sample_name}`")
+    st.caption("流程：選擇解析度 → 準備對應分類模型 → 產生分類證據熱圖 → 解讀可靠度")
+
+    status, status_reason = _diagnostics_context_status(context)
+    if status == "stale":
+        st.warning(f"Context stale：{status_reason}")
+    elif status == "incompatible":
+        st.error(f"Context incompatible：{status_reason}")
+    else:
+        st.success(f"Context current：{status_reason}")
+
+    record, index = _model_diagnostics_record(context)
+    model_id = str(context.get("model_id") or _DEFAULT_MODEL)
+    scope = str(context.get("scope") or "whole_image")
+    head_registry = _diagnostics_head_registry()
+    embedding_registry = _diagnostics_embedding_registry()
+    records = st.session_state.get("viz_records") or []
+    raw_embeddings = (st.session_state.get("viz_raw_embeddings") or {}).get(model_id)
+    stale = status != "current"
+
+    # Resolution is selected before any classifier head is built.  A missing
+    # 224/336/448 head is a normal per-resolution state, not a reason to hide
+    # the selector or force an unnecessary 224 training job.
+    resolutions = [224, 336, 448]
+    saved_res = st.session_state.get("diag_analysis_res", 224)
+    try:
+        saved_res = int(saved_res)
+    except (TypeError, ValueError):
+        saved_res = 224
+    if saved_res not in resolutions:
+        saved_res = 224
+    st.markdown("### 1. 選擇解析度與準備模型")
+    st.caption(
+        "先選要看的 patch 精細度；每個解析度都有自己的 embeddings 與分類 head。"
+    )
+    analysis_res = int(st.selectbox(
+        "分析精細度", resolutions, index=resolutions.index(saved_res),
+        format_func=lambda value: f"{value}×{value}（{value // 14}×{value // 14} patch）",
+        key="diag_analysis_res",
+    ))
+
+    selected_key = _diagnostics_resolution_key(model_id, scope, analysis_res)
+    head = None
+    embeddings = embedding_registry.get(selected_key)
+    if not stale:
+        candidate = head_registry.get(selected_key)
+        candidate_prov = (candidate.get("explain_provenance") or {}) if isinstance(candidate, dict) else {}
+        if candidate is not None and int(candidate_prov.get("target_res") or 224) == analysis_res:
+            head = candidate
+        if embeddings is None and analysis_res == 224 and raw_embeddings is not None:
+            embeddings = raw_embeddings
+
+    page_context = dict(context)
+    if not stale and head is None:
+        failed_key = st.session_state.get("diag_head_build_failed")
+        if failed_key == selected_key:
+            st.warning(
+                f"{analysis_res}×{analysis_res} 分類模型上次建立失敗；按主操作可重試。"
+            )
+        else:
+            st.info(
+                f"尚未建立 {analysis_res}×{analysis_res} 分類模型；"
+                "按一次主操作會建立模型並分析此圖。"
+            )
+
+    if head is not None and not stale:
+        page_context = _diagnostics_context_for_head(
+            context, head, recipe=dict(head.get("explain_provenance") or {}))
+        context = page_context
+        prepared_res = int(
+            (head.get("explain_provenance") or {}).get("target_res") or analysis_res
+        )
+        st.success(
+            f"分類模型已準備：{prepared_res}×{prepared_res}。可產生該解析度的分類證據熱圖。"
+        )
+    else:
+        page_context = dict(context)
+        page_context["head_ref"] = None
+        page_context["head_digest"] = None
+        page_context["head_provenance"] = {}
+
+    attribution_method = "global_channel"
+    display_mode = "signed"
+    if head is not None and not stale:
+        with st.expander("進階選項（研究用途）", expanded=False):
+            method_label = st.selectbox(
+                "歸因方法",
+                ["Canonical signed Grad-CAM（預設）",
+                 "Experimental token-wise gradient×activation"],
+                key="diag_attribution_method",
+            )
+            attribution_method = "token_gradient_product" if method_label.startswith("Experimental") else "global_channel"
+            display_label = st.selectbox(
+                "熱圖顯示",
+                ["Target / reference signed（藍白紅）", "Target positive only（僅正向）"],
+                key="diag_display_mode",
+            )
+            display_mode = "target_positive" if display_label.startswith("Target positive") else "signed"
+
+    # Rebuild all evidence views after a resolution-specific head has been
+    # selected or trained; otherwise prediction evidence could still read the
+    # previous 224 embeddings.
+    if head is not None:
+        page_context = _diagnostics_context_for_head(
+            context, head, recipe=dict(head.get("explain_provenance") or {}))
+        context = page_context
+    prediction = _model_diagnostics_prediction(
+        page_context, record, index, head, embeddings_override=embeddings,
+    )
+    head_audit = (dict(head.get("explain_diagnostics") or {}) if head else {
+        "available": False,
+        "explicit_state": "not_ready" if status == "current" else "incompatible_or_stale",
+        "kind": "unavailable",
+    })
+    target_options = [str(x) for x in (head.get("classes") or [])] if head else []
+
+    # This is the compute identity; render-only mode (palette/opacity/grid)
+    # deliberately does not participate and therefore cannot trigger model
+    # recomputation.
+    packed = st.session_state.get("diag_result")
+    packed_spec = st.session_state.get("diag_result_spec")
+    selected_target_for_spec = st.session_state.get("diag_selected_target")
+    current_top1_for_spec = str(
+        (prediction or {}).get("current_top1")
+        or (prediction or {}).get("predicted_class")
+        or ""
+    )
+    # A default selector value equal to current top-1 is semantically the
+    # auto-top-1 target.  Normalize it back to the committed empty target so
+    # the first combined run remains current after a render-only rerun.
+    if (
+        isinstance(packed_spec, (tuple, list)) and len(packed_spec) >= 2
+        and not str(packed_spec[1] or "")
+        and str(selected_target_for_spec or "") == current_top1_for_spec
+    ):
+        selected_target_for_spec = ""
+    # The first combined prepare+analyze click can compute auto-top-1 before
+    # the newly-built head exposes its class selector.  Reuse the committed
+    # result target on subsequent render-only reruns unless the user explicitly
+    # changes the target; opacity/grid must never make a result look stale.
+    if not selected_target_for_spec and isinstance(packed_spec, (tuple, list)) and len(packed_spec) >= 2:
+        selected_target_for_spec = packed_spec[1]
+    spec = (str(context.get("context_id") or context.get("record_key") or ""),
+            str(selected_target_for_spec or ""), int(analysis_res), attribution_method)
+    display_builder = None
+    result_status = "stale" if stale else None
+    if isinstance(packed, dict) and packed_spec == spec and not stale:
+        display_builder = _model_diagnostics_display_builder(packed, display_mode=display_mode)
+        result_status = "current"
+        if packed.get("compute_key"):
+            st.caption(f"Compute key：`{str(packed['compute_key'])[:16]}`")
+
+    # The diagnostics workspace deliberately exposes one primary action.  A
+    # missing resolution-specific head changes that action's label, but never
+    # creates a second training button or trains as a side effect of selection.
+    failed_key = st.session_state.get("diag_head_build_failed")
+    if head is None:
+        primary_action_label = (
+            f"重試：建立 {analysis_res}×{analysis_res} 模型並分析此圖"
+            if failed_key == selected_key
+            else f"建立 {analysis_res}×{analysis_res} 模型並分析此圖"
+        )
+    elif display_builder is None:
+        primary_action_label = (
+            "使用新設定重新分析此圖"
+            if isinstance(packed, dict) else "分析此圖"
+        )
+    else:
+        primary_action_label = None
+
+    actions = render_model_diagnostics(
+        page_context,
+        head_audit=head_audit,
+        prediction=prediction,
+        faithfulness=(packed.get("result").faithfulness if isinstance(packed, dict) else None),
+        mask_status="unavailable",
+        normal_bank_status="unavailable",
+        result_status=result_status,
+        selected_target=(
+            str(st.session_state.get("diag_selected_target") or "") or None
+        ),
+        target_options=target_options,
+        display_builder=display_builder,
+        primary_action_label=primary_action_label,
+        primary_action_key="diag_analyze",
+        show_title=False,
+    )
+    if actions.selected_target:
+        st.session_state["diag_selected_target"] = actions.selected_target
+
+    if actions.attribution_requested and record is not None and not stale:
+        # A single click may first prepare the exact-resolution head and then
+        # immediately continue into Grad-CAM.  This keeps the state machine
+        # honest: selection is render-only; this click owns all computation.
+        if head is None:
+            can_train = record is not None and (
+                (analysis_res == 224 and raw_embeddings is not None
+                 and len(raw_embeddings) == len(records))
+                or (analysis_res != 224 and len(records) >= 2)
+            )
+            if not can_train:
+                st.error(
+                    "目前資料不足以建立所選解析度的分類模型；"
+                    "請確認至少有兩個類別與完整 embeddings。"
+                )
+                st.session_state["diag_head_build_failed"] = selected_key
+            else:
+                try:
+                    with st.status(
+                        f"分析進度：準備 {analysis_res}×{analysis_res} 分類模型",
+                        expanded=True,
+                    ) as progress:
+                        progress.write("1/2 建立該解析度 embeddings 與分類 head")
+                        if analysis_res == 224:
+                            from explain_ui import _train_session_head
+                            recipe = dict(context.get("embedding_recipe") or {})
+                            recipe.setdefault("scope", context.get("scope") or "whole_image")
+                            recipe.setdefault("keep_aspect", False)
+                            recipe.setdefault("target_res", 224)
+                            recipe.setdefault("pooling", "cls")
+                            recipe.setdefault("pad", None)
+                            trained_head = _train_session_head(
+                                records, raw_embeddings, model_id, recipe)
+                            trained_embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+                        else:
+                            from explain_ui import _train_resolution_head
+                            trained_head, trained_embeddings = _train_resolution_head(
+                                records, model_id, scope, analysis_res,
+                                source_recipe=dict(context.get("embedding_recipe") or {}),
+                            )
+                        head_registry[selected_key] = trained_head
+                        embedding_registry[selected_key] = trained_embeddings
+                        st.session_state["explain_session_head"] = trained_head
+                        st.session_state.pop("diag_head_build_failed", None)
+                        recipe = dict(trained_head.get("explain_provenance") or {})
+                        context = _diagnostics_context_for_head(
+                            context, trained_head, recipe=recipe)
+                        st.session_state["explain_page_context"] = context
+                        page_context = context
+                        head = trained_head
+                        embeddings = trained_embeddings
+                        st.session_state.pop("diag_result", None)
+                        st.session_state.pop("diag_result_spec", None)
+                        progress.write("2/2 分類模型已準備，接著產生此圖證據")
+                        progress.update(
+                            label=f"已準備 {analysis_res}×{analysis_res} 分類模型",
+                            state="complete", expanded=False,
+                        )
+                except Exception as exc:
+                    head = None
+                    embeddings = None
+                    st.session_state["diag_head_build_failed"] = selected_key
+                    st.error(
+                        f"{analysis_res}×{analysis_res} 分類模型建立失敗："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        if head is not None:
+            try:
+                from explain_service import run_dino_gradcam as _run_gradcam
+                target = actions.selected_target or None
+                with st.status("分析進度：產生 Signed Grad-CAM", expanded=True) as progress:
+                    progress.write("計算 target/reference signed attribution")
+                    packed_result, original, prep = _run_gradcam(
+                        record, model_id, str(context.get("scope") or "whole_image"), head,
+                        target, attribution_method, analysis_res,
+                    )
+                    progress.update(
+                        label="分析完成：已產生分類證據熱圖",
+                        state="complete", expanded=False,
+                    )
+                run_contract = None
+                compute_identity = ""
+                try:
+                    from explain_contracts import ExplainRunSpecV1, deterministic_compute_key
+                    from explain_context import context_contract
+                    provenance = dict(head.get("explain_provenance") or {})
+                    run_contract_obj = ExplainRunSpecV1(
+                        kind="gradcam",
+                        scope=str(context.get("scope") or "whole_image"),
+                        target_spec=target or "auto_top1",
+                        attribution_method=(
+                            "canonical_signed_gradcam"
+                            if attribution_method == "global_channel"
+                            else "experimental_token_wise_attribution"
+                        ),
+                        analysis_target_res=int(analysis_res),
+                        pooling=str(provenance.get("pooling") or "cls"),
+                        keep_aspect=bool(provenance.get("keep_aspect", False)),
+                        crop_policy=context.get("crop_policy") or "full_frame",
+                        faithfulness_profile="single_sample_smoke",
+                        head_digest=str(page_context.get("head_digest") or "") or None,
+                        embedding_recipe=dict(context.get("embedding_recipe") or {}),
+                    )
+                    run_contract = run_contract_obj.to_dict()
+                    compute_identity = deterministic_compute_key(
+                        context_contract(page_context), run_contract_obj)
+                except (ImportError, TypeError, ValueError):
+                    # Older sessions may not have a content-addressable head
+                    # digest; the result remains session-only and uncacheable.
+                    pass
+                if not compute_identity:
+                    # Keep render-only reruns visibly tied to the same run even
+                    # for legacy sessions whose contract helpers are absent.
+                    # This fallback is session-local and includes only inputs
+                    # that define the computation (never opacity or patch grid).
+                    fallback_identity = {
+                        "context_id": str(
+                            context.get("context_id") or context.get("record_key") or ""
+                        ),
+                        "head_digest": str(page_context.get("head_digest") or ""),
+                        "target": str(target or "auto_top1"),
+                        "analysis_target_res": int(analysis_res),
+                        "attribution_method": attribution_method,
+                    }
+                    compute_identity = hashlib.sha256(
+                        json.dumps(
+                            fallback_identity, sort_keys=True, ensure_ascii=False
+                        ).encode("utf-8")
+                    ).hexdigest()
+                st.session_state["diag_result"] = {
+                    "result": packed_result, "orig": original, "prep": prep,
+                    "run_spec": run_contract, "compute_key": compute_identity,
+                }
+                st.session_state["diag_result_spec"] = (
+                    str(context.get("context_id") or context.get("record_key") or ""),
+                    str(target or ""), int(analysis_res), attribution_method,
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Grad-CAM 執行失敗：{type(exc).__name__}: {exc}")
 
 
 def _start_query(idx: int) -> None:
@@ -3313,6 +4244,15 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
                 records, [idx], source="viewer", task=LH.TASK_RELABEL,
                 label="📤 送 Labeling", key=f"viz_slot_to_lbl_{idx}",
                 original_labels={idx: r.get("label", "")})
+        _viz_model = st.session_state.get("viz_model_select") or _DEFAULT_MODEL
+        st.button(
+            "🧪 在 Model Diagnostics 開啟",
+            key="viz_slot_model_diagnostics",
+            use_container_width=True,
+            on_click=_open_visualize_diagnostics,
+            args=(idx, _viz_model),
+            help="只交接目前影像的 reference 與 provenance；不複製影像或 embedding。",
+        )
         man = st.session_state.get("viz_manifest", {}).get(str(p.resolve()))
         if man:  # 資料合約可追溯性
             with st.popover("📄 Manifest", use_container_width=True):
@@ -3325,7 +4265,6 @@ def _render_viewer_slot(records: list[dict], ctx_default: list[int]) -> None:
                     st.caption("embedding refs：" +
                                "、".join(f"{m} → 列 {r}" for m, r in refs.items()))
         from explain_ui import render_explainability_panel
-        _viz_model = st.session_state.get("viz_model_select") or _DEFAULT_MODEL
         render_explainability_panel(
             r, model_name=_viz_model, key_prefix="viz_explain",
             classifier_head=st.session_state.get("explain_session_head"),
@@ -4509,6 +5448,7 @@ _SOURCE_LABEL = {
     "duplicate": "重複/洩漏", "sampling": "多樣性選樣", "outlier": "離群",
     "disagreement": "標籤分歧", "sparse": "稀疏盲區", "gap_filler": "補洞候選",
     "gray": "灰帶", "quiz": "考卷爭議", "quiz_disputed": "考卷低一致",
+    "class_similarity": "類別相似度",
 }
 
 
@@ -4660,7 +5600,22 @@ _MODE_CLEAR_KEYS = (
     "_bucket1_rows",
     "viz_explain_result", "viz_explain_pending", "viz_explain_error", "viz_explain_info",
     "anomaly_explain_result", "anomaly_explain_pending", "anomaly_explain_error",
-    "anomaly_explain_info", "explain_session_head", "_anomaly_inspector_patch_feats",
+    "anomaly_explain_info", "explain_session_head", "explain_session_heads",
+    "explain_session_embeddings", "_anomaly_inspector_patch_feats",
+    # Diagnostics context intentionally survives tool navigation so it can be
+    # rendered as stale after a new Visualize generation.  Derived results and
+    # research authorization do not survive that generation boundary.
+    "diag_result", "diag_result_spec", "diag_selected_target",
+    "diag_research_authorized", "diag_analysis_res",
+    "diag_attribution_method", "diag_display_mode",
+    "cs_status", "cs_prepared", "cs_result", "cs_analysis_key", "cs_fingerprint",
+    "cs_local_selected_ids", "cs_inspect_id", "cs_metric", "cs_visible_classes",
+    "cs_axis_mode", "cs_draft_policy", "cs_committed_preview", "cs_request_seq",
+    "cs_evaluation", "cs_frozen_policy", "cs_table_page", "cs_panel_mode",
+    "cs_heldout_used_ids", "cs_purpose", "cs_stale_reason", "cs_last_num",
+    "cs_preview_state", "cs_compute_count", "cs_confusion_filter",
+    "cs_select_gen", "cs_only_candidates", "cs_only_neg_margin",
+    "viz_embedding_generation",
 )
 
 _DEMO_DIR = Path(__file__).parent.parent / "demo" / "coco8"
@@ -4729,6 +5684,8 @@ def _restore_mode_snapshot() -> None:
         else:
             st.session_state[k] = v
     st.session_state["viz_folder_list"] = snap["folders"]
+    st.session_state["cs_widget_generation"] = int(
+        st.session_state.get("cs_widget_generation") or 0) + 1
 
 
 def _render_quick_start() -> None:
@@ -5022,10 +5979,106 @@ def _render_object_policy_ui(folders: list[Path]) -> None:
             st.rerun()
 
 
+def _reset_class_similarity_state() -> None:
+    for k in (
+        "cs_status", "cs_prepared", "cs_result", "cs_analysis_key", "cs_fingerprint",
+        "cs_local_selected_ids", "cs_inspect_id", "cs_draft_policy",
+        "cs_committed_preview", "cs_request_seq", "cs_evaluation",
+        "cs_frozen_policy", "cs_preview_state", "cs_stale_reason",
+    ):
+        st.session_state.pop(k, None)
+    st.session_state["cs_widget_generation"] = int(
+        st.session_state.get("cs_widget_generation") or 0) + 1
+
+
+def _invalidate_class_similarity(reason: str) -> None:
+    if st.session_state.get("cs_status") in {"ready", "computing"}:
+        st.session_state["cs_status"] = "stale"
+        st.session_state["cs_stale_reason"] = reason
+    st.session_state["cs_widget_generation"] = int(
+        st.session_state.get("cs_widget_generation") or 0) + 1
+
+
+def _bind_embedding_generation(records, *, level: str, model: str, recipe: dict,
+                               manifest=None) -> dict:
+    from class_similarity_records import canonical_path, file_sha256
+    hashes = {}
+    if level == "image" and manifest:
+        for rec in records:
+            p = rec.get("path")
+            if p is None:
+                continue
+            key = canonical_path(p)
+            entry = manifest.get(str(Path(p).resolve())) or {}
+            hashes[key] = entry.get("sha256")
+    else:
+        for rec in records:
+            src = rec.get("image_path") or rec.get("path")
+            if src in (None, ""):
+                continue
+            key = canonical_path(src)
+            if key in hashes:
+                continue
+            try:
+                hashes[key] = file_sha256(src)
+            except OSError:
+                hashes[key] = None
+    return {
+        "level": level, "model": model, "recipe": recipe,
+        "source_hashes": hashes,
+        "verified": bool(hashes) and all(hashes.values()),
+    }
+
+
+def _consume_cs_action(action, records, data_token) -> None:
+    if not action:
+        return
+    typ = action.get("type")
+    if typ in {"sync_selection", "add_candidates_to_selection"}:
+        sel = st.session_state.get("viz_selection") or {"token": data_token, "indices": []}
+        if sel.get("token") != data_token:
+            sel = {"token": data_token, "indices": []}
+        merged = list(dict.fromkeys(list(sel.get("indices") or []) + list(action.get("ids") or [])))
+        st.session_state["viz_selection"] = {"token": data_token, "indices": merged}
+        st.toast(f"已合併 {len(action.get('ids') or [])} 筆至 LV 選取")
+    elif typ == "add_to_cart":
+        added, skipped = _add_to_export(
+            records, action.get("ids") or [], source="class_similarity",
+            scores=action.get("scores"), reason=action.get("reason") or "")
+        st.toast(f"購物車新增 {added}，略過 {skipped}（既有項目不更新證據）")
+
+
 def _render_label_quality(records, raw, model, data_token) -> None:
-    """🩹 標錯偵測:每類別混淆/分離度 + 疑似標錯清單(現標→建議標)。
-    全部在 384 維算(neighbor_confusion),不受 2D/3D 投影擠壓影響。"""
+    """🩹 標錯偵測:既有混淆熱圖／疑似標錯 + 類別相似度分布。"""
     import object_eval as oe
+    import class_similarity_ui as csui
+
+    panel = st.radio(
+        "檢視", [csui.PANEL_CONF, csui.PANEL_BAD, csui.PANEL_SIM],
+        horizontal=True, key="cs_panel_mode",
+    )
+    if panel == csui.PANEL_SIM:
+        level = "object" if st.session_state.get("viz_unit") == "物件" else "image"
+        viz_mode = st.session_state.get("viz_mode") or "Image Classifier"
+        pol = st.session_state.get("viz_object_policy") or {}
+        recipe = {
+            "level": level,
+            "D": int(np.asarray(raw).shape[1]) if raw is not None else None,
+            "resolution": int(pol.get("target_res") or 224),
+            "pooling": str(pol.get("head") or "cls"),
+            "crop_policy": dict(pol) if level == "object" else "none",
+        }
+        gens = st.session_state.get("viz_embedding_generation") or {}
+        generation = gens.get(model) if isinstance(gens, dict) else gens
+        ctx = {
+            "level": level, "viz_mode": viz_mode, "embedding_recipe": recipe,
+            "generation": generation,
+            "manifest": st.session_state.get("viz_manifest") or {},
+            "model_weights_id": "unknown", "thumb_fn": _thumb_or_none, "k": 5,
+        }
+        action = csui.render_panel(records, raw, model, data_token, ctx)
+        _consume_cs_action(action, records, data_token)
+        return
 
     labels = [r.get("label", "") for r in records]
     if len(records) < 3 or len(set(labels)) < 2:
@@ -5040,9 +6093,7 @@ def _render_label_quality(records, raw, model, data_token) -> None:
     counts, per = res["counts"], res["per_object"]
     C = len(classes)
 
-    tab_conf, tab_bad = st.tabs(["🔀 類別混淆 / 分離度", "🩹 疑似標錯"])
-
-    with tab_conf:
+    if panel == csui.PANEL_CONF:
         z = (conf * 100).round(1)
         hm = go.Figure(go.Heatmap(
             z=z, x=classes, y=classes, colorscale="Blues", zmin=0, zmax=100,
@@ -5068,8 +6119,9 @@ def _render_label_quality(records, raw, model, data_token) -> None:
         st.markdown("**最常混淆的方向(標為 A 的鄰居常是 B)**")
         for a, b, v in pairs[:8]:
             st.write(f"- {a} → {b}:{v * 100:.0f}%")
+        return
 
-    with tab_bad:
+    if panel == csui.PANEL_BAD:
         cand = sorted((p for p in per if p["mismatch"]),
                       key=lambda p: p["suggested_frac"], reverse=True)
         st.caption(f"共 {len(cand)} 個物件的鄰居多數是別類(現標→建議標),越上面越可疑。")
@@ -5430,7 +6482,10 @@ def _visualize_embeddings_ui() -> None:
             st.session_state["viz_label_disagreement"] = label_disagreement
             st.session_state.pop("viz_dup_result", None)
             st.session_state["viz_data_token"] = data_token
-            for key in ("explain_session_head", "viz_explain_result", "viz_explain_pending",
+            for key in ("explain_session_head", "explain_session_heads",
+                        "explain_session_embeddings", "diag_analysis_res",
+                        "diag_attribution_method", "diag_display_mode",
+                        "viz_explain_result", "viz_explain_pending",
                         "viz_explain_error", "viz_explain_info"):
                 st.session_state.pop(key, None)
             st.session_state["viz_nn_index"] = {}
@@ -5442,6 +6497,18 @@ def _visualize_embeddings_ui() -> None:
             st.session_state["viz_grid_limit"] = _GRID_BATCH
             st.session_state.pop("_viz_mode_snapshot", None)
             st.session_state["viz_unit"] = "物件"
+            obj_recipe = {
+                "level": "object", "pad": active_policy.get("pad"),
+                "resolution": active_policy.get("target_res"),
+                "pooling": active_policy.get("head"),
+                "crop_policy": dict(active_policy),
+            }
+            st.session_state["viz_embedding_generation"] = {
+                m: _bind_embedding_generation(records, level="object", model=m,
+                                              recipe=obj_recipe)
+                for m in o_raw
+            }
+            _reset_class_similarity_state()
             st.toast(f"完成：{len(records)} 物件 × {len(selected_models)} 模型", icon="✅")
             st.rerun()
 
@@ -5614,7 +6681,10 @@ def _visualize_embeddings_ui() -> None:
         st.session_state["viz_label_disagreement"] = label_disagreement
         st.session_state.pop("viz_dup_result", None)
         st.session_state["viz_data_token"] = uuid.uuid4().hex
-        for key in ("explain_session_head", "viz_explain_result", "viz_explain_pending",
+        for key in ("explain_session_head", "explain_session_heads",
+                    "explain_session_embeddings", "diag_analysis_res",
+                    "diag_attribution_method", "diag_display_mode",
+                    "viz_explain_result", "viz_explain_pending",
                     "viz_explain_error", "viz_explain_info"):
             st.session_state.pop(key, None)
         st.session_state["viz_nn_index"] = {}
@@ -5629,6 +6699,14 @@ def _visualize_embeddings_ui() -> None:
         st.session_state.pop("_viz_mode_snapshot", None)
         st.session_state.pop("_viz_umap_rebuild", None)
         st.session_state["viz_unit"] = "張影像"
+        img_recipe = {"level": "image", "resolution": 224, "pooling": "cls",
+                      "crop_policy": "none"}
+        st.session_state["viz_embedding_generation"] = {
+            m: _bind_embedding_generation(records, level="image", model=m,
+                                          recipe=img_recipe, manifest=manifest_lookup)
+            for m in raw_per_model
+        }
+        _reset_class_similarity_state()
         # 匯出清單以 image path 為鍵，跨 Run 仍有效 — 刻意不清
         st.toast(f"完成：{len(records)} 張影像 × {len(selected_models)} 模型", icon="✅")
 
@@ -5889,7 +6967,8 @@ def _visualize_embeddings_ui() -> None:
                 disabled=not _nsel, help="取消框選",
                 on_click=_clear_selection, args=(scatter_key,))
 
-        with st.expander("🩹 標錯偵測 / 類別混淆（全 384 維，不受 2D 擠壓影響）"):
+        with st.expander("🩹 標錯偵測 / 類別混淆（原始高維特徵，不受 2D 擠壓影響）",
+                         key="viz_label_quality"):
             _raw = st.session_state.get("viz_raw_embeddings", {}).get(selected_model)
             if _raw is not None:
                 _render_label_quality(records, _raw, selected_model, data_token)
@@ -8717,6 +9796,7 @@ def _render_readback_section(pending: list[dict]) -> None:
         changes = LH.apply_readback(row["dir"], records)
         st.session_state["readback_last_changes"] = changes
         _record_readback_bookkeeping(row, changes)
+        _invalidate_class_similarity("Labeling 讀回已套用，請重新計算類別相似度")
 
     changes = st.session_state.get("readback_last_changes")
     if changes is not None:
@@ -10820,7 +11900,8 @@ def main() -> None:
     # 單行工具列取代舊的 st.title + sidebar Tool radio——把首屏高度還給工作區
     brand_col, switch_col, help_col = st.columns([2, 3, 1], gap="medium")
     brand_col.markdown("#### Dataset Analysis Tools")
-    st.session_state.setdefault("tool_switch", "Visualize Embeddings")
+    st.session_state.setdefault("tool_switch", "Model Diagnostics" if st.query_params.get("diagnostic_case")
+                                else "誤逮案件" if st.query_params.get("inv_case") else "Visualize Embeddings")
     # 隱藏的工具不進工具列；session 殘留指向它們（或舊名「匯出子集」）時先正規化，
     # 否則 segmented_control 拿到非選項值會報錯。
     if st.session_state.get("tool_switch") == "匯出子集":
@@ -10830,10 +11911,11 @@ def main() -> None:
         # 🩺/🧭:2026-07-19 使用者裁決下架(不適用);殘留 session 值正規化
         st.session_state["tool_switch"] = "Visualize Embeddings"
     with switch_col:
-        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🔧 瑕疵偵測 · 🧪 差異探索　　📦 匯出　　📥 標註回饋")
+        st.caption("🔍 資料探索／覆蓋： Visualize · Compare · 完整度　　🧪 Model Diagnostics · 誤逮案件　　🔧 瑕疵偵測 · 🧪 差異探索　　📦 匯出　　📥 標註回饋")
         tool = st.segmented_control(
             "Tool", ["Visualize Embeddings", "Compare Distributions",
-                     "完整度熱力圖", "瑕疵偵測", "🎯 以樣搜樣", "🧪 差異探索",
+                     "完整度熱力圖", "Model Diagnostics", "誤逮案件", "瑕疵偵測",
+                     "🎯 以樣搜樣", "🧪 差異探索",
                      "匯出", "📥 標註回饋"],
             key="tool_switch", label_visibility="collapsed",
             on_change=_expand_sidebar,  # 點工具分頁 → 左側設定列自動回來
@@ -10841,6 +11923,7 @@ def main() -> None:
     with help_col, st.popover("✨ 功能地圖", use_container_width=True):
         st.markdown(
             "##### 🧭 六個工具的關係（先探索、再行動）\n"
+            "- **誤逮案件**＝接收報案 → 逐區域覆核 → 正常／瑕疵／歷史對照 → 證據說明 → AL 待覆核批次\n"
             "- **🔍 資料探索／覆蓋**（看資料夠不夠、像不像；不改資料）：\n"
             "  · **Visualize**＝框選看圖、標籤分歧、離群（看**一堆內部**的點）\n"
             "  · **Compare Distributions**＝**兩堆之間**像不像（A vs B 分布距離）\n"
@@ -10897,6 +11980,11 @@ def main() -> None:
         _compare_distributions_ui()
     elif tool == "完整度熱力圖":
         _completeness_ui()
+    elif tool == "Model Diagnostics":
+        _model_diagnostics_ui()
+    elif tool == "誤逮案件":
+        from fp_case_page import render_case_workspace
+        render_case_workspace()
     elif tool == "瑕疵偵測":
         _anomaly_ui()
     elif tool == "🎯 以樣搜樣":

@@ -97,7 +97,12 @@ def evaluate_head_oof(obj_emb, labels, *, source_ids=None, C: float = 1.0,
     holdout: near-duplicates or samples from the same acquisition batch can
     still leak across folds when group metadata is unavailable.
     """
-    from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+    from sklearn.metrics import (
+        accuracy_score,
+        balanced_accuracy_score,
+        f1_score,
+        precision_recall_fscore_support,
+    )
     from sklearn.model_selection import StratifiedKFold
 
     X = np.asarray(obj_emb, dtype=np.float32)
@@ -143,12 +148,25 @@ def evaluate_head_oof(obj_emb, labels, *, source_ids=None, C: float = 1.0,
             "correct": bool(str(oof_pred[i]) == str(y[i])),
             "probabilities": probs,
         }
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y, oof_pred, labels=classes, zero_division=0,
+    )
+    per_class = {
+        str(label): {
+            "precision": float(precision[i]),
+            "recall": float(recall[i]),
+            "f1": float(f1[i]),
+            "support": int(support[i]),
+        }
+        for i, label in enumerate(classes)
+    }
     return {
         **base,
         "available": True,
         "accuracy": float(accuracy_score(y, oof_pred)),
         "balanced_accuracy": float(balanced_accuracy_score(y, oof_pred)),
         "macro_f1": float(f1_score(y, oof_pred, average="macro", zero_division=0)),
+        "per_class": per_class,
         "samples": samples,
     }
 
