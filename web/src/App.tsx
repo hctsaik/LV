@@ -113,6 +113,8 @@ export default function App() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
   const [selectedMethods, setSelectedMethods] = useState<ProjectionMethod[]>(["sumap"]);
+  const [umapReference, setUmapReference] = useState(false);
+  const [rebuildUmapReference, setRebuildUmapReference] = useState(false);
   const [activeModelId, setActiveModelId] = useState("");
   const [activeMethod, setActiveMethod] = useState<ProjectionMethod>("sumap");
   const [dimension, setDimension] = useState<2 | 3>(2);
@@ -209,6 +211,10 @@ export default function App() {
   }
 
   function toggleMethod(method: ProjectionMethod) {
+    if (method === "umap" && selectedMethods.includes(method)) {
+      setUmapReference(false);
+      setRebuildUmapReference(false);
+    }
     setSelectedMethods((current) =>
       current.includes(method) ? current.filter((item) => item !== method) : [...current, method],
     );
@@ -240,7 +246,10 @@ export default function App() {
     setBusy(true);
     setJob(null);
     try {
-      const created = await api.createJob(selectedFolders, selectedModelIds, selectedMethods);
+      const created = await api.createJob(selectedFolders, selectedModelIds, selectedMethods, {
+        umapReference,
+        rebuildUmapReference,
+      });
       setJob({
         job_id: created.job_id,
         state: "queued",
@@ -271,6 +280,7 @@ export default function App() {
       if (!latest.run_id) throw new Error("The worker completed without returning a run result.");
       const result = await api.run(latest.run_id);
       setRun(result);
+      setRebuildUmapReference(false);
       setNotice(result.warnings.join(" "));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The analysis failed.");
@@ -396,6 +406,37 @@ export default function App() {
               ))}
             </div>
             <div className="field-note">LDA and Supervised UMAP use class labels to arrange points. Their layout is a visual aid, not proof of separability.</div>
+            {selectedMethods.includes("umap") && (
+              <div className="umap-reference-controls">
+                <label className="choice-option">
+                  <input
+                    type="checkbox"
+                    aria-label="Keep UMAP reference frame"
+                    checked={umapReference}
+                    disabled={busy}
+                    onChange={(event) => {
+                      setUmapReference(event.target.checked);
+                      if (!event.target.checked) setRebuildUmapReference(false);
+                    }}
+                  />
+                  <span>Keep UMAP reference frame</span>
+                </label>
+                {umapReference && (
+                  <>
+                    <p>Known images keep their coordinates between runs. New images are transformed into the saved frame; rebuild after the dataset changes substantially.</p>
+                    <button
+                      type="button"
+                      className="rebuild-reference"
+                      aria-pressed={rebuildUmapReference}
+                      disabled={busy}
+                      onClick={() => setRebuildUmapReference((current) => !current)}
+                    >
+                      {rebuildUmapReference ? "Rebuild queued for next run" : "Rebuild UMAP reference"}
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </section>
 
           {error && <div className="alert alert-error" role="alert">{error}</div>}

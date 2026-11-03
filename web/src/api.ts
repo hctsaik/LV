@@ -91,10 +91,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean; api_version: string; models_available: number }>("/api/v1/health"),
   models: () => request<{ items: ModelOption[] }>("/api/v1/models"),
-  createJob: (folders: string[], modelIds: string[], methods: ProjectionMethod[]) =>
+  createJob: (
+    folders: string[],
+    modelIds: string[],
+    methods: ProjectionMethod[],
+    options: { umapReference?: boolean; rebuildUmapReference?: boolean } = {},
+  ) =>
     request<{ job_id: string; state: string }>("/api/v1/visualize/jobs", {
       method: "POST",
-      body: JSON.stringify({ folders, model_ids: modelIds, methods }),
+      body: JSON.stringify({
+        folders,
+        model_ids: modelIds,
+        methods,
+        umap_reference: options.umapReference ?? false,
+        rebuild_umap_reference: options.rebuildUmapReference ?? false,
+      }),
     }),
   job: (jobId: string) => request<JobStatus>("/api/v1/jobs/" + encodeURIComponent(jobId)),
   cancel: (jobId: string) => request<{ job_id: string; state: string }>(

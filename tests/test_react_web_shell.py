@@ -264,6 +264,78 @@ def test_case_lv_web_01_ic_02_multi_model_projection_views(
     assert run["method"] == "pca"
 
 
+def test_case_lv_web_01_ic_03_umap_reference_survives_data_growth(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """Fixed UMAP keeps prior image coordinates and transforms only newly added content."""
+    cache_root = tmp_path.parent / f"{tmp_path.name}-lv-cache"
+    with _client(monkeypatch, tmp_path, embedder=_fake_embedder()) as client:
+        payload = {
+            "folders": [str(folder) for folder in classifier_fixture["folders"]],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["umap"],
+            "umap_reference": True,
+        }
+        pre_existing_image = classifier_fixture["root"] / "train" / "cherry" / "pre-existing-image.png"
+        pre_existing_image.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32), (60, 90, 170)).save(pre_existing_image)
+        first = _run_custom(client, payload)
+        assert first["state"] == "completed", first
+        first_run = client.get(f"/api/v1/runs/{first['run_id']}").json()
+        first_points = {
+            point["filename"]: (point["x"], point["y"], point["z"])
+            for point in first_run["points"]
+        }
+        assert any("Fixed UMAP reference rebuilt" in warning for warning in first_run["warnings"])
+
+        second = _run_custom(client, payload)
+        assert second["state"] == "completed", second
+        second_run = client.get(f"/api/v1/runs/{second['run_id']}").json()
+        second_points = {
+            point["filename"]: (point["x"], point["y"], point["z"])
+            for point in second_run["points"]
+        }
+        assert first_points == second_points
+        assert any("Fixed UMAP reference reused (+0 new images)" in warning
+                   for warning in second_run["warnings"])
+
+        new_image = classifier_fixture["root"] / "train" / "cherry" / "new-reference-image.png"
+        Image.new("RGB", (32, 32), (25, 140, 200)).save(new_image)
+        grown = _run_custom(client, payload)
+        assert grown["state"] == "completed", grown
+        grown_run = client.get(f"/api/v1/runs/{grown['run_id']}").json()
+        grown_points = {
+            point["filename"]: (point["x"], point["y"], point["z"])
+            for point in grown_run["points"]
+        }
+        assert len(grown_points) == 6
+        assert {name: grown_points[name] for name in first_points} == first_points
+        assert any("Fixed UMAP reference reused (+1 new images)" in warning
+                   for warning in grown_run["warnings"])
+
+        rebuild = _run_custom(client, {**payload, "rebuild_umap_reference": True})
+        assert rebuild["state"] == "completed", rebuild
+        rebuild_run = client.get(f"/api/v1/runs/{rebuild['run_id']}").json()
+        assert any("Fixed UMAP reference rebuilt" in warning for warning in rebuild_run["warnings"])
+
+    references = list(cache_root.rglob("umap_ref.pkl"))
+    assert len(references) == 1
+    assert references[0].is_file()
+    assert not list(classifier_fixture["root"].rglob("umap_ref.pkl"))
+
+
+def test_case_lv_web_01_ic_03_rebuild_requires_fixed_umap_option(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/v1/visualize/jobs", json={
+            "folders": [str(tmp_path)],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["pca"],
+            "rebuild_umap_reference": True,
+        })
+    assert response.status_code == 422
+    assert response.json()["code"] == "INVALID_UMAP_REFERENCE"
+
+
 def test_case_lv_web_01_ic_02_single_class_supervision_falls_back_to_pca(
     monkeypatch, tmp_path
 ):

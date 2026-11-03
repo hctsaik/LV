@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 import uvicorn
@@ -171,6 +172,106 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             page.get_by_role("button", name="Add folder").click()
             page.get_by_role("button", name="Run analysis").click()
             expect(page.get_by_role("alert")).to_contain_text("No images were found", timeout=10_000)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
+def test_lv_web_01_ic_03_fixed_umap_frame_keeps_old_images_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The React control persists a real UMAP reducer and preserves old image coordinates."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    dataset = _fixture(tmp_path / "umap-reference-fixture")
+    pre_existing_image = dataset / "train" / "cherry" / "pre-existing-image.png"
+    pre_existing_image.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 64), (60, 90, 170)).save(pre_existing_image)
+    cache_dir = tmp_path / "lv-app-cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_dir))
+
+    def model_loader(_model_id: str):
+        def embed(path: Path) -> np.ndarray:
+            pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            vector[3] = len(path.name) / 10.0
+            return vector
+        return embed
+
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=model_loader,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads: list[dict] = []
+
+            def capture_run(response):
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                    run_payloads.append(response.json())
+
+            page.on("response", capture_run)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_test_id("projection-umap").check()
+            page.get_by_label("Keep UMAP reference frame").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+
+            def run_and_wait(expected_count: int) -> dict:
+                page.get_by_role("button", name="Run analysis").click()
+                expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=180_000)
+                deadline = time.monotonic() + 20
+                while len(run_payloads) < expected_count and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                assert len(run_payloads) == expected_count
+                return run_payloads[-1]
+
+            first_run = run_and_wait(1)
+            first_points = {
+                point["filename"]: (point["x"], point["y"], point["z"])
+                for point in first_run["points"]
+            }
+            expect(page.get_by_text("Fixed UMAP reference rebuilt", exact=False)).to_be_visible()
+
+            second_run = run_and_wait(2)
+            second_points = {
+                point["filename"]: (point["x"], point["y"], point["z"])
+                for point in second_run["points"]
+            }
+            assert first_points == second_points
+            expect(page.get_by_text("Fixed UMAP reference reused (+0 new images)", exact=False)).to_be_visible()
+
+            new_image = dataset / "train" / "cherry" / "reference-added.png"
+            new_image.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (64, 64), (25, 140, 200)).save(new_image)
+            grown_run = run_and_wait(3)
+            grown_points = {
+                point["filename"]: (point["x"], point["y"], point["z"])
+                for point in grown_run["points"]
+            }
+            assert len(grown_points) == 6
+            assert {name: grown_points[name] for name in first_points} == first_points
+            expect(page.get_by_text("Fixed UMAP reference reused (+1 new images)", exact=False)).to_be_visible()
+
+            page.get_by_role("button", name="Rebuild UMAP reference").click()
+            expect(page.get_by_role("button", name="Rebuild queued for next run")).to_be_visible()
+            rebuilt_run = run_and_wait(4)
+            assert any("Fixed UMAP reference rebuilt" in warning for warning in rebuilt_run["warnings"])
+            assert len(list(cache_dir.rglob("umap_ref.pkl"))) == 1
+            assert not list(dataset.rglob("umap_ref.pkl"))
             browser.close()
     finally:
         if server is not None:

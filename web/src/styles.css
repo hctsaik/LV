@@ -42,6 +42,11 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .folder-list button { border: 0; background: transparent; color: #8995a7; font-size: 17px; line-height: 12px; padding: 0 2px; }
 .folder-list button:hover { color: #a54d5a; }
 .field-note { margin-top: 7px; color: #99a2b0; font-size: 9px; line-height: 1.55; }
+.umap-reference-controls { margin-top: 12px; padding: 10px; border: 1px solid #e4e8ef; border-radius: 7px; background: #f8f9fb; }
+.umap-reference-controls .choice-option { margin: 0; }
+.umap-reference-controls p { margin: 7px 0 8px 20px; color: #77849a; font-size: 9px; line-height: 1.5; }
+.rebuild-reference { margin-left: 20px; border: 1px solid #d7dee8; border-radius: 5px; padding: 5px 8px; color: #52627a; background: #fff; font-size: 9px; }
+.rebuild-reference[aria-pressed=true] { border-color: #e3b270; color: #8a5728; background: #fff8ed; }
 .model-section { margin-top: 23px; }
 .field-label-spaced { margin-top: 13px; }
 .model-empty { margin-top: 7px; color: #a35b49; font-size: 10px; line-height: 1.5; }

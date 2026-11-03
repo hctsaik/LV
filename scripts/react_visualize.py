@@ -38,7 +38,15 @@ def _is_under(path: Path, folder: Path) -> bool:
         return False
 
 
-def _project_embeddings(embeddings: np.ndarray, labels: Sequence[str], methods: Sequence[str]) -> tuple[dict[str, np.ndarray], list[str]]:
+def _project_embeddings(
+    embeddings: np.ndarray,
+    labels: Sequence[str],
+    methods: Sequence[str],
+    *,
+    umap_reference_path: Path | None = None,
+    umap_reference_keys: Sequence[str] | None = None,
+    rebuild_umap_reference: bool = False,
+) -> tuple[dict[str, np.ndarray], list[str]]:
     """Project image embeddings with the same parameters as the legacy Visualize flow."""
     from sklearn.manifold import TSNE
 
@@ -73,14 +81,28 @@ def _project_embeddings(embeddings: np.ndarray, labels: Sequence[str], methods: 
                     perplexity=perplexity,
                 ).fit_transform(embeddings)
             elif method == "umap":
-                import umap
-
                 neighbors = min(15, max(2, n_samples - 1))
-                coordinates = umap.UMAP(
-                    n_components=n_components,
-                    n_neighbors=neighbors,
-                    random_state=42,
-                ).fit_transform(embeddings)
+                if umap_reference_path is not None and umap_reference_keys is not None:
+                    from umap_ref import stable_umap
+
+                    coordinates, new_count, refitted = stable_umap(
+                        embeddings,
+                        umap_reference_keys,
+                        umap_reference_path,
+                        n_components,
+                        neighbors,
+                        rebuild=rebuild_umap_reference,
+                    )
+                    state = "rebuilt" if refitted else f"reused (+{new_count} new images)"
+                    warnings.append(f"Fixed UMAP reference {state}.")
+                else:
+                    import umap
+
+                    coordinates = umap.UMAP(
+                        n_components=n_components,
+                        n_neighbors=neighbors,
+                        random_state=42,
+                    ).fit_transform(embeddings)
             elif method == "lda":
                 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
@@ -129,6 +151,8 @@ def run_image_classifier(
     *,
     model_names: Sequence[str] | None = None,
     methods: Sequence[str] = ("pca",),
+    umap_reference: bool = False,
+    rebuild_umap_reference: bool = False,
     model_loader: Callable[[str], Callable[[Path], np.ndarray]] = load_model,
     progress: Callable[[int, int], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
@@ -173,6 +197,10 @@ def run_image_classifier(
         raise VisualizationInputError("METHOD_UNAVAILABLE", "Choose at least one supported projection method.")
     if any(method not in {"pca", "tsne", "umap", "lda", "sumap"} for method in selected_methods):
         raise VisualizationInputError("METHOD_UNAVAILABLE", "A selected projection method is unavailable.")
+    if rebuild_umap_reference and (not umap_reference or "umap" not in selected_methods):
+        raise VisualizationInputError(
+            "INVALID_UMAP_REFERENCE", "Rebuild requires the fixed UMAP reference option and UMAP projection."
+        )
 
     check_cancelled()
     records = discover_images_classifier(resolved_folders, allow_flat=True)
@@ -207,6 +235,7 @@ def run_image_classifier(
         check_cancelled()
         embed_fn = model_loader(selected_model)
         all_embeddings: list[np.ndarray] = []
+        all_keys: list[str] = []
         for folder in resolved_folders:
             paths = paths_by_folder.get(folder, [])
             if not paths:
@@ -214,6 +243,7 @@ def run_image_classifier(
             check_cancelled()
             entries = manifest_by_folder[folder]
             keys = [entries[rel_key(folder, path)]["sha256"] for path in paths]
+            all_keys.extend(keys)
             cache_path = manifest_path_for(folder).parent / f"embeddings_{selected_model}" / "embeddings.npz"
 
             def on_item(done: int, _folder_total: int) -> None:
@@ -239,7 +269,19 @@ def run_image_classifier(
             raise VisualizationInputError("INVALID_EMBEDDINGS", "The selected model returned an empty embedding.")
         embeddings_by_model[selected_model] = raw
         embedding_shapes[selected_model] = [int(raw.shape[0]), int(raw.shape[1])]
-        projections, projection_warnings = _project_embeddings(raw, labels, selected_methods)
+        umap_reference_path = None
+        if umap_reference and "umap" in selected_methods:
+            from umap_ref import ref_path_for
+
+            umap_reference_path = ref_path_for(resolved_folders[0], selected_model)
+        projections, projection_warnings = _project_embeddings(
+            raw,
+            labels,
+            selected_methods,
+            umap_reference_path=umap_reference_path,
+            umap_reference_keys=all_keys if umap_reference_path is not None else None,
+            rebuild_umap_reference=rebuild_umap_reference,
+        )
         projections_by_model[selected_model] = projections
         warnings.extend(f"{selected_model}: {warning}" for warning in projection_warnings)
         check_cancelled()

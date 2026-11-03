@@ -30,6 +30,8 @@ class CreateVisualizationJob(BaseModel):
     method: str = "pca"
     model_ids: list[str] = Field(default_factory=list, max_length=8)
     methods: list[str] = Field(default_factory=list, max_length=5)
+    umap_reference: bool = False
+    rebuild_umap_reference: bool = False
 
 
 class CreateCompareJob(BaseModel):
@@ -175,6 +177,8 @@ def create_app(
                 job.request.folders,
                 model_names=selected_models,
                 methods=selected_methods,
+                umap_reference=job.request.umap_reference,
+                rebuild_umap_reference=job.request.rebuild_umap_reference,
                 model_loader=loader,
                 progress=update_progress,
                 cancelled=job.cancel_event.is_set,
@@ -222,6 +226,15 @@ def create_app(
 
     @app.post("/api/v1/visualize/jobs", status_code=202)
     def create_visualization_job(request: CreateVisualizationJob) -> dict:
+        selected_methods = request.methods or [request.method]
+        if request.rebuild_umap_reference and (
+            not request.umap_reference or "umap" not in selected_methods
+        ):
+            raise HTTPException(status_code=422, detail={
+                "code": "INVALID_UMAP_REFERENCE",
+                "message": "Rebuild requires the fixed UMAP reference option and UMAP projection.",
+                "request_id": uuid.uuid4().hex,
+            })
         job_id = uuid.uuid4().hex
         job = _Job(job_id=job_id, request=request)
         with app.state.lock:
