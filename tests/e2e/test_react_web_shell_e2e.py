@@ -2912,6 +2912,27 @@ def test_lv_web_03_obj_01_crop_policy_controls_match_manual_and_autotune_request
 
     folders, source_hashes = _object_coverage_fixture(tmp_path / "object-policy-controls")
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "object-policy-controls-cache"))
+    grant_ids = ["hostgrant_coverage_train", "hostgrant_coverage_test"]
+    granted_paths = dict(zip(grant_ids, folders, strict=True))
+    nativeapp_calls = []
+    monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+    monkeypatch.setenv("NATIVEAPP_API", "http://127.0.0.1:8765")
+
+    def resolve_folder_grant(request, timeout):
+        payload = json.loads(request.data)
+        nativeapp_calls.append(payload)
+        assert request.full_url == "http://127.0.0.1:8765/host/grants/resolve"
+        assert request.get_method() == "POST"
+        assert request.get_header("Origin") is None
+        assert timeout == 10
+        assert payload["app_id"] == "visuallatent"
+        path = granted_paths[payload["grant_id"]]
+        return BytesIO(json.dumps({
+            "app_id": "visuallatent",
+            "grant_id": payload["grant_id"],
+            "path": str(path),
+            "display_name": path.name,
+        }).encode("utf-8"))
 
     def object_loader(_model_id: str, **_kwargs):
         def embed(crop: Image.Image) -> np.ndarray:
@@ -2931,6 +2952,7 @@ def test_lv_web_03_obj_01_crop_policy_controls_match_manual_and_autotune_request
     server = server_thread = None
     try:
         server, server_thread, base_url = _start_api(application)
+        monkeypatch.setattr(urllib.request, "urlopen", resolve_folder_grant)
         from playwright.sync_api import expect, sync_playwright
 
         with sync_playwright() as p:
@@ -2938,19 +2960,32 @@ def test_lv_web_03_obj_01_crop_policy_controls_match_manual_and_autotune_request
             page = browser.new_page(viewport={"width": 1500, "height": 1100})
             page.set_default_timeout(20_000)
             coverage_requests = []
+            autotune_requests = []
             page.on(
                 "request",
                 lambda request: coverage_requests.append(request.post_data_json)
                 if request.url.endswith("/api/v1/coverage/jobs") and request.method == "POST"
                 else None,
             )
+            page.on(
+                "request",
+                lambda request: autotune_requests.append(request.post_data_json)
+                if request.url.endswith("/api/v1/object-policy/autotune/jobs") and request.method == "POST"
+                else None,
+            )
+            page.add_init_script(
+                "const folderPicks = " + json.dumps([
+                    {"path": str(path), "grant_id": grant_id, "display_name": path.name}
+                    for path, grant_id in zip(folders, grant_ids, strict=True)
+                ]) + "; window.cimHost = { chooseFile: async () => folderPicks.shift() };"
+            )
             page.goto(base_url, wait_until="networkidle")
             page.get_by_role("button", name="Coverage", exact=True).click()
             page.get_by_label("Analysis unit").select_option("object")
             expect(page.get_by_test_id("coverage-object-policy")).to_be_visible()
             for folder in folders:
-                page.get_by_label("Coverage image folder").fill(str(folder))
-                page.get_by_role("button", name="Add coverage folder").click()
+                page.locator(".host-picker").first.click()
+                expect(page.get_by_role("list", name="Coverage folders")).to_contain_text(folder.name)
 
             page.get_by_test_id("coverage-object-pad").fill("0.22")
             page.get_by_test_id("coverage-object-resolution").select_option("280")
@@ -2966,6 +3001,8 @@ def test_lv_web_03_obj_01_crop_policy_controls_match_manual_and_autotune_request
             )
             manual_policy = {"pad": 0.22, "target_res": 280, "head": "meanpool"}
             assert coverage_requests[-1]["object_policy"] == manual_policy
+            assert coverage_requests[-1]["folder_grant_ids"] == grant_ids
+            assert len(nativeapp_calls) == 2
             with application.state.lock:
                 first_run = next(iter(application.state.coverage_runs.values()))
                 assert first_run["object_policy"] == manual_policy
@@ -2974,6 +3011,9 @@ def test_lv_web_03_obj_01_crop_policy_controls_match_manual_and_autotune_request
             expect(page.get_by_text(
                 "Applied the best object crop policy. Run coverage analysis to use it."
             )).to_be_visible(timeout=120_000)
+            assert len(autotune_requests) == 1
+            assert autotune_requests[-1]["folder_grant_ids"] == grant_ids
+            assert len(nativeapp_calls) == 4
             active_policy_text = page.get_by_test_id("coverage-object-policy-active").inner_text()
             import re
 
