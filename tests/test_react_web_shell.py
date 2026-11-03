@@ -691,3 +691,49 @@ def test_case_lv_web_01_od_02_rejects_invalid_object_policy(monkeypatch, tmp_pat
         })
     assert response.status_code == 422
     assert response.json()["code"] == "INVALID_REQUEST"
+
+
+def test_case_lv_web_01_view_01_detector_image_route_draws_yolo_overlay(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "overlay-detector"
+    folder = root / "train"
+    images, labels = folder / "images", folder / "labels"
+    labels.mkdir(parents=True)
+    (root / "classes.txt").write_text("part\n", encoding="utf-8")
+    image_path = images / "overlay.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (64, 64), (40, 90, 150)).save(image_path)
+    label_path = labels / "overlay.txt"
+    label_path.write_text("0 0.5 0.5 0.6 0.6\n", encoding="utf-8")
+    second_image = images / "overlay-second.png"
+    Image.new("RGB", (64, 64), (190, 35, 45)).save(second_image)
+    second_label = labels / "overlay-second.txt"
+    second_label.write_text("0 0.3 0.3 0.3 0.3\n", encoding="utf-8")
+    originals = {
+        path: path.read_bytes()
+        for path in (image_path, label_path, second_image, second_label, root / "classes.txt")
+    }
+
+    with _client(monkeypatch, tmp_path) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder)],
+            "model_ids": ["dinov2_vits14"],
+            "methods": ["pca"],
+            "mode": "object_detector",
+            "class_names": ["part"],
+        })
+        assert job["state"] == "completed", job
+        base = f"/api/v1/runs/{job['run_id']}/images/0"
+        raw = client.get(base, params={"overlay": "false"})
+        overlay = client.get(base, params={"overlay": "true"})
+
+    assert raw.status_code == overlay.status_code == 200
+    assert raw.headers["content-type"].startswith("image/png")
+    assert overlay.headers["content-type"].startswith("image/jpeg")
+    from io import BytesIO
+    raw_pixels = np.asarray(Image.open(BytesIO(raw.content)).convert("RGB"))
+    overlay_pixels = np.asarray(Image.open(BytesIO(overlay.content)).convert("RGB"))
+    assert raw_pixels.shape == overlay_pixels.shape == (64, 64, 3)
+    assert not np.array_equal(raw_pixels, overlay_pixels)
+    assert {path: path.read_bytes() for path in originals} == originals

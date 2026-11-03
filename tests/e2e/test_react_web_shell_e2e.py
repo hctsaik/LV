@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import hashlib
+import re
 import socket
 import threading
 import time
@@ -675,6 +676,10 @@ def test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d(
             preview = page.get_by_test_id("selected-image")
             expect(preview).to_be_visible()
             expect(preview).to_have_js_property("naturalWidth", 51)
+            expect(page.get_by_label("Show YOLO boxes")).to_have_count(0)
+            page.get_by_label("Object preview mode").get_by_label("Source image").check()
+            expect(page.get_by_label("Show YOLO boxes")).to_be_visible()
+            expect(preview).to_have_attribute("src", re.compile("overlay=true.*view=source"))
             expect(page.get_by_test_id("selected-object-bbox")).to_have_text("0.720, 0.500, 0.300, 0.700")
             page.get_by_test_id("dimension-3d").click()
             expect(page.locator("[data-testid='embedding-plot-3d'] .js-plotly-plot")).to_be_visible(timeout=60_000)
@@ -691,6 +696,127 @@ def test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d(
 
     assert {path: path.read_bytes() for path in source_bytes} == source_bytes
     assert {path for path in dataset.rglob("*") if path.is_file()} == set(source_bytes)
+
+
+def test_lv_web_01_view_01_selection_gallery_yolo_navigation_and_mode_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Selection order, viewer navigation, YOLO toggle and mode reset stay aligned."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    from playwright.sync_api import expect, sync_playwright
+
+    detector_root = tmp_path / "detector-viewer"
+    detector_folder = detector_root / "train"
+    detector_images, detector_labels = detector_folder / "images", detector_folder / "labels"
+    detector_labels.mkdir(parents=True)
+    (detector_root / "classes.txt").write_text("good\nbad\n", encoding="utf-8")
+    source_files = [detector_root / "classes.txt"]
+    for index, (label, color) in enumerate((
+        (0, (220, 35, 45)), (1, (35, 180, 70)), (0, (35, 65, 215)),
+    )):
+        image_path = detector_images / f"detector-{index}.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 64), color).save(image_path)
+        label_path = detector_labels / f"detector-{index}.txt"
+        label_path.write_text(f"{label} 0.5 0.5 0.6 0.6\n", encoding="utf-8")
+        source_files.extend((image_path, label_path))
+    source_before = {path: path.read_bytes() for path in source_files}
+
+    classifier_folder = tmp_path / "classifier" / "train"
+    for index, (label, color) in enumerate((
+        ("apple", (200, 35, 45)), ("banana", (35, 180, 70)), ("apple", (35, 65, 215)),
+    )):
+        image_path = classifier_folder / label / f"classifier-{index}.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (32, 32), color).save(image_path)
+
+    def embed(path: Path) -> np.ndarray:
+        pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        vector = np.zeros(384, dtype=np.float32)
+        vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+        vector[3] = len(path.name) / 100.0
+        return vector
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "lv-cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda _model_id: embed,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            run_payloads = []
+
+            def capture_run(response):
+                if "/api/v1/runs/" in response.url and "/images/" not in response.url and response.ok:
+                    run_payloads.append(response.json())
+
+            page.on("response", capture_run)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Dataset mode").select_option("object_detector")
+            page.get_by_label("Detection granularity").select_option("whole_image")
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            page.get_by_label("Image folder").fill(str(detector_folder))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(3)
+            points = page.get_by_test_id("embedding-point")
+            points.nth(0).click()
+            points.nth(1).click(modifiers=["Shift"])
+            expect(page.get_by_test_id("selection-summary")).to_have_text("Selected 2 images")
+            gallery = page.get_by_test_id("selection-gallery-item")
+            expect(gallery).to_have_count(2)
+            display_order = [int(gallery.nth(i).get_attribute("data-index")) for i in range(2)]
+            assert len(set(display_order)) == 2
+            gallery.first.click()
+            record_by_index = {row["index"]: row for row in run_payloads[-1]["records"]}
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(
+                record_by_index[display_order[0]]["filename"]
+            )
+            overlay_toggle = page.get_by_label("Show YOLO boxes")
+            expect(overlay_toggle).to_be_checked()
+            expect(page.get_by_test_id("selected-image")).to_have_attribute("src", re.compile("overlay=true"))
+            overlay_toggle.uncheck()
+            expect(page.get_by_test_id("selected-image")).to_have_attribute("src", re.compile("overlay=false"))
+            page.get_by_role("button", name="Next selected image").click()
+            expect(page.get_by_test_id("selected-image-name")).to_have_text(
+                record_by_index[display_order[1]]["filename"]
+            )
+            expect(page.get_by_label("Show YOLO boxes")).not_to_be_checked()
+            page.get_by_role("button", name="Close image viewer").click()
+            expect(page.get_by_test_id("selected-image")).to_have_count(0)
+            expect(page.get_by_test_id("selection-gallery-item")).to_have_count(2)
+
+            page.get_by_role("button", name=f"Remove {detector_folder}").click()
+            page.get_by_label("Dataset mode").select_option("image_classifier")
+            page.get_by_label("Image folder").fill(str(classifier_folder))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(3)
+            page.get_by_test_id("embedding-point").first.click()
+            expect(page.get_by_test_id("selected-image")).to_be_visible()
+            page.get_by_label("Dataset mode").select_option("object_detector")
+            expect(page.get_by_test_id("empty-canvas")).to_be_visible()
+            page.get_by_label("Dataset mode").select_option("image_classifier")
+            expect(page.get_by_test_id("empty-canvas")).to_be_visible()
+            expect(page.get_by_test_id("embedding-point")).to_have_count(0)
+            expect(page.get_by_test_id("selected-image")).to_have_count(0)
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert {path: path.read_bytes() for path in source_before} == source_before
+    assert {path for path in detector_root.rglob("*") if path.is_file()} == set(source_before)
 
 
 def test_lv_web_01_od_01_detector_whole_image_and_class_priority(

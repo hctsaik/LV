@@ -100,11 +100,29 @@ button:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
 .plot-legend i { width: 7px; height: 7px; border-radius: 50%; }
 .legend-separator { height: 12px; width: 1px; background: #e3e7ed; }
 .plot-legend small { color: #9aa4b3; font-size: 8px; }
+.selection-gallery { margin: 12px 0 2px; padding: 12px 0 0 37px; border-top: 1px solid #edf0f4; }
+.selection-gallery-heading { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; color: #596982; font-size: 10px; }
+.selection-gallery-heading span { color: #8793a6; font-size: 9px; }
+.selection-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 8px; max-height: 270px; overflow: auto; }
+.selection-gallery-item { min-width: 0; padding: 6px; border: 1px solid #e5e9ef; border-radius: 7px; background: #fff; color: #65748b; text-align: left; }
+.selection-gallery-item:hover, .selection-gallery-item-active { border-color: #8da1c1; background: #f8faff; }
+.selection-gallery-item img { display: block; width: 100%; height: 74px; object-fit: contain; border-radius: 4px; background: #f3f5f8; }
+.selection-gallery-item span { display: block; overflow: hidden; margin-top: 5px; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.selection-gallery > p { margin: 0; color: #9aa4b3; font-size: 9px; }
 .empty-filter { display: grid; flex: 1; min-height: 220px; place-items: center; color: #99a3b1; font-size: 11px; }
 .detail-card { padding: 15px; display: flex; flex-direction: column; }
 .detail-card-heading { display: flex; align-items: center; justify-content: space-between; padding-bottom: 12px; border-bottom: 1px solid #eef0f4; }
 .detail-card-heading h3 { margin: 5px 0 0; color: #35425a; font: 700 13px Manrope, "Segoe UI", sans-serif; }
 .detail-count { color: #9ba5b3; font-size: 9px; }
+.viewer-navigation { display: flex; align-items: center; justify-content: center; gap: 11px; margin-top: 11px; }
+.viewer-navigation button { width: 25px; height: 23px; border: 1px solid #e0e5ed; border-radius: 5px; background: #fff; color: #667792; font-size: 15px; line-height: 1; }
+.viewer-navigation button:disabled { cursor: not-allowed; opacity: .4; }
+.viewer-navigation span { min-width: 48px; color: #7f8ba0; font-size: 9px; text-align: center; }
+.viewer-navigation .viewer-close { margin-left: auto; color: #9a7780; }
+.viewer-overlay-toggle { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: #68758c; font-size: 9px; }
+.object-view-mode { display: flex; gap: 14px; margin: 9px 0 0; padding: 0; border: 0; color: #68758c; font-size: 9px; }
+.object-view-mode label { display: flex; align-items: center; gap: 4px; }
+.object-view-mode input, .viewer-overlay-toggle input { margin: 0; accent-color: #526e9f; }
 .image-preview { display: grid; place-items: center; height: 178px; margin-top: 13px; overflow: hidden; border-radius: 6px; background: #f3f5f8; }
 .image-preview img { display: block; max-width: 100%; max-height: 100%; object-fit: contain; }
 .image-name { overflow: hidden; margin-top: 11px; color: #39465c; font-size: 11px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }

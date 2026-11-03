@@ -161,6 +161,18 @@ export const api = {
   run: (runId: string) => request<VisualizationRun>(
     "/api/v1/runs/" + encodeURIComponent(runId),
   ),
+  runImageUrl: (
+    runId: string,
+    index: number,
+    options: { overlay?: boolean; view?: "selected" | "source" } = {},
+  ) => {
+    const base = window.NATIVEAPP_LOCAL_API || "";
+    const query = new URLSearchParams({
+      overlay: options.overlay ? "true" : "false",
+      view: options.view ?? "selected",
+    });
+    return base + "/api/v1/runs/" + encodeURIComponent(runId) + "/images/" + index + "?" + query.toString();
+  },
   runBlocks: (
     runId: string,
     modelId: string,

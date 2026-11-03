@@ -33,10 +33,25 @@ function colorMap(points: EmbeddingPoint[]) {
   return new Map(labels.map((label, index) => [label, labelColors[index % labelColors.length]]));
 }
 
+function spatialSelectionOrder(indices: number[], points: EmbeddingPoint[], rows = 12) {
+  const pointByIndex = new Map(points.map((point) => [point.index, point]));
+  const usable = indices.filter((index) => pointByIndex.has(index));
+  if (!usable.length) return [];
+  const ys = usable.map((index) => pointByIndex.get(index)!.y);
+  const yMin = Math.min(...ys);
+  const yMax = Math.max(...ys);
+  const rowFor = (index: number) => yMax === yMin
+    ? 0
+    : Math.floor(((yMax - pointByIndex.get(index)!.y) / (yMax - yMin)) * (rows - 1e-9));
+  return usable.sort((left, right) =>
+    rowFor(left) - rowFor(right) || pointByIndex.get(left)!.x - pointByIndex.get(right)!.x,
+  );
+}
+
 function ScatterPlot2D({ points, selectedIndices, onSelect }: {
   points: EmbeddingPoint[];
   selectedIndices: number[];
-  onSelect: (index: number) => void;
+  onSelect: (index: number, additive?: boolean) => void;
 }) {
   const width = 860;
   const height = 480;
@@ -81,7 +96,7 @@ function ScatterPlot2D({ points, selectedIndices, onSelect }: {
               data-index={point.index}
               className={"point " + (active ? "point-active" : "")}
               transform={"translate(" + x + " " + y + ")"}
-              onClick={() => onSelect(point.index)}
+              onClick={(event) => onSelect(point.index, event.shiftKey)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" || event.key === " ") onSelect(point.index);
               }}
@@ -101,7 +116,7 @@ function ScatterPlot({ points, selectedIndices, clusters, onSelect, dimension, v
   points: EmbeddingPoint[];
   selectedIndices: number[];
   clusters: KMeansBlocks | null;
-  onSelect: (index: number) => void;
+  onSelect: (index: number, additive?: boolean) => void;
   dimension: 2 | 3;
   viewKey: string;
 }) {
@@ -141,6 +156,8 @@ export default function App() {
   const [run, setRun] = useState<VisualizationRun | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [selectedIndices, setSelectedIndices] = useState<number[]>([]);
+  const [showYoloOverlay, setShowYoloOverlay] = useState(true);
+  const [viewerImageMode, setViewerImageMode] = useState<"selected" | "source">("selected");
   const [blockCount, setBlockCount] = useState(12);
   const [selectedBlockId, setSelectedBlockId] = useState<number | null>(null);
   const [blocks, setBlocks] = useState<KMeansBlocks | null>(null);
@@ -200,6 +217,11 @@ export default function App() {
   const splits = useMemo(() => [...new Set(run?.records.map((record) => record.split) || [])].sort(), [run]);
   const selectedRecord = selectedIndex === null ? null : run?.records[selectedIndex] || null;
   const selectedBlock = blocks?.blocks.find((block) => block.block_id === selectedBlockId) || null;
+  const selectionGalleryIndices = useMemo(
+    () => currentView ? spatialSelectionOrder(selectedIndices, currentView.points) : [],
+    [selectedIndices, currentView],
+  );
+  const viewerPosition = selectedIndex === null ? -1 : selectionGalleryIndices.indexOf(selectedIndex);
 
   useEffect(() => {
     const runId = job?.run_id;
@@ -310,6 +332,8 @@ export default function App() {
     setRun(null);
     setSelectedIndex(null);
     setSelectedIndices([]);
+    setViewerImageMode("selected");
+    setShowYoloOverlay(true);
     setSelectedBlockId(null);
     setBlocks(null);
     setBlockProjection(null);
@@ -385,9 +409,14 @@ export default function App() {
     }
   }
 
-  function selectPoint(index: number) {
+  function selectPoint(index: number, additive = false) {
     setSelectedIndex(index);
-    setSelectedIndices([index]);
+    setSelectedIndices((current) => additive ? [...new Set([...current, index])] : [index]);
+  }
+
+  function navigateViewer(offset: number) {
+    const target = selectionGalleryIndices[viewerPosition + offset];
+    if (target !== undefined) setSelectedIndex(target);
   }
 
   function addBlockSelection(indices: number[]) {
@@ -399,6 +428,10 @@ export default function App() {
   function clearSelection() {
     setSelectedIndex(null);
     setSelectedIndices([]);
+  }
+
+  function closeViewer() {
+    setSelectedIndex(null);
   }
 
   return (
@@ -476,6 +509,8 @@ export default function App() {
                 setRun(null);
                 setJob(null);
                 clearSelection();
+                setViewerImageMode("selected");
+                setShowYoloOverlay(true);
                 setLabelFilter("all");
                 setSplitFilter("all");
               }}
@@ -497,6 +532,7 @@ export default function App() {
                     setRun(null);
                     setJob(null);
                     clearSelection();
+                    setViewerImageMode("selected");
                   }}
                 >
                   <option value="whole_image">Whole image</option>
@@ -755,14 +791,66 @@ export default function App() {
                   <span data-testid="selection-summary" className="selection-summary">Selected {selectedIndices.length} {run.source_granularity === "object" ? "objects" : "images"}</span>
                   {selectedIndices.length > 0 && <button type="button" className="clear-selection" onClick={clearSelection}>Clear selection</button>}
                 </div>
+                <section className="selection-gallery" data-testid="selection-gallery" aria-label="Selected image thumbnails">
+                  <div className="selection-gallery-heading">
+                    <strong>Selected {run.source_granularity === "object" ? "objects" : "images"}</strong>
+                    <span>{selectionGalleryIndices.length}</span>
+                  </div>
+                  {selectionGalleryIndices.length ? (
+                    <div className="selection-gallery-grid">
+                      {selectionGalleryIndices.map((index) => {
+                        const record = run.records[index];
+                        return (
+                          <button
+                            key={index}
+                            type="button"
+                            className={"selection-gallery-item" + (selectedIndex === index ? " selection-gallery-item-active" : "")}
+                            data-testid="selection-gallery-item"
+                            data-index={index}
+                            aria-label={"View " + record.filename + (record.object_index === undefined ? "" : ", object " + (record.object_index + 1))}
+                            aria-pressed={selectedIndex === index}
+                            onClick={() => setSelectedIndex(index)}
+                          >
+                            <img src={api.runImageUrl(job?.run_id || "", index)} alt="" loading="lazy" />
+                            <span>{record.label}｜{record.filename}{record.object_index === undefined ? "" : ` · object ${record.object_index + 1}`}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p>Select one or more points to see matching thumbnails here.</p>
+                  )}
+                </section>
               </section>
 
               <aside className="detail-card">
                 <div className="detail-card-heading"><div><div className="eyebrow">{run.source_granularity === "object" ? "OBJECT DETAIL" : "IMAGE DETAIL"}</div><h3>{selectedRecord ? (run.source_granularity === "object" ? "Selected object" : "Selected image") : "Select a point"}</h3></div><span className="detail-count">{selectedRecord ? "#" + (selectedRecord.index + 1) : "—"}</span></div>
                 {selectedRecord && run ? (
                   <>
-                    <div className="image-preview"><img data-testid="selected-image" src={"/api/v1/runs/" + encodeURIComponent(job?.run_id || "") + "/images/" + selectedRecord.index} alt={selectedRecord.filename} /></div>
+                    <div className="viewer-navigation">
+                      <button type="button" aria-label="Previous selected image" onClick={() => navigateViewer(-1)} disabled={viewerPosition <= 0}>‹</button>
+                      <span data-testid="viewer-position">{viewerPosition >= 0 ? `${viewerPosition + 1} / ${selectionGalleryIndices.length}` : "—"}</span>
+                      <button type="button" aria-label="Next selected image" onClick={() => navigateViewer(1)} disabled={viewerPosition < 0 || viewerPosition >= selectionGalleryIndices.length - 1}>›</button>
+                      <button type="button" className="viewer-close" aria-label="Close image viewer" onClick={closeViewer}>×</button>
+                    </div>
+                    {run.source_granularity === "object" && (
+                      <fieldset className="object-view-mode" aria-label="Object preview mode">
+                        <label><input type="radio" name="object-view-mode" value="selected" checked={viewerImageMode === "selected"} onChange={() => setViewerImageMode("selected")} /> Object crop</label>
+                        <label><input type="radio" name="object-view-mode" value="source" checked={viewerImageMode === "source"} onChange={() => setViewerImageMode("source")} /> Source image</label>
+                      </fieldset>
+                    )}
+                    <div className="image-preview"><img data-testid="selected-image" src={api.runImageUrl(job?.run_id || "", selectedRecord.index, {
+                      overlay: run.source_mode === "object_detector" && showYoloOverlay,
+                      view: run.source_granularity === "object" ? viewerImageMode : "selected",
+                    })} alt={selectedRecord.filename} /></div>
                     <div className="image-name" data-testid="selected-image-name" title={selectedRecord.filename}>{selectedRecord.filename}{selectedRecord.object_index !== undefined ? ` · object ${selectedRecord.object_index + 1}` : ""}</div>
+                    {run.source_mode === "object_detector" && run.class_names.length > 0 &&
+                      (run.source_granularity !== "object" || viewerImageMode === "source") && (
+                      <label className="viewer-overlay-toggle">
+                        <input type="checkbox" aria-label="Show YOLO boxes" checked={showYoloOverlay} onChange={(event) => setShowYoloOverlay(event.target.checked)} />
+                        <span>Show YOLO boxes</span>
+                      </label>
+                    )}
                     <div className="metadata-list">
                       <div><span>Class</span><strong>{selectedRecord.label}</strong></div>
                       <div><span>Split</span><strong>{selectedRecord.split}</strong></div>
@@ -774,12 +862,12 @@ export default function App() {
                     </div>
                   </>
                 ) : (
-                  <div className="detail-empty"><div className="image-placeholder" aria-hidden="true">▧</div><p>Select a point in the scatter plot to preview the matching image and its metadata.</p></div>
+                  <div className="detail-empty"><div className="image-placeholder" aria-hidden="true">▧</div><p>Select a point or thumbnail to preview the matching image and its metadata.</p></div>
                 )}
               </aside>
             </div>
           ) : (
-            <div className="empty-canvas">
+            <div className="empty-canvas" data-testid="empty-canvas">
               <div className="empty-illustration" aria-hidden="true"><span className="orbit orbit-one" /><span className="orbit orbit-two" /><i className="dot dot-one" /><i className="dot dot-two" /><i className="dot dot-three" /><i className="dot dot-four" /><b>LV</b></div>
               <h3>Local intelligence, visualized</h3>
               <p>Once the model finishes extracting features, images will appear here as an interactive map.</p>

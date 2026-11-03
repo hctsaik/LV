@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的 React UI/API 邊界與分期切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽，以及 Object Detector 整圖／物件級切片；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
+> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽、Object Detector 整圖／物件級切片，以及 selection viewer；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
 
 ## 1. 邊界
 
@@ -25,7 +25,7 @@
 | `GET /api/v1/runs/{run_id}` | 讀 run metadata 與投影索引 | 順序穩定的 records、model/method、類別、split、點座標 |
 | `POST /api/v1/runs/{run_id}/blocks` | 對目前投影的可見 record indices 執行 KMeans | K（4–30）、非空 block membership 與 3D centers；不足樣本時降低 effective K |
 | `POST /api/v1/runs/{run_id}/block-projection` | 將選定 block 的原始 embedding 投影到 2D | 只回 record index 與 PCA 座標；cache 路徑及 embedding 不回給 UI |
-| `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案 |
+| `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案；detector 可用 `overlay=true` 讀取 YOLO overlay，object run 可用 `view=source` 讀取來源整圖 |
 | `POST /api/v1/compare/jobs` | 建立整圖 A/B comparison job | Folder A／B 各一至 32 個資料夾、LV feature model；同側影像合併並去重 |
 | `GET /api/v1/compare/jobs/{job_id}` / `DELETE /api/v1/compare/jobs/{job_id}` | 讀進度／要求取消 | 共用單一 worker 槽，回報結果 ID 或可恢復錯誤 |
 | `GET /api/v1/compare/runs/{run_id}` | 讀 A/B 形心漂移、計數、警告與順序穩定的影像記錄 | 不回傳私有本機圖片路徑或 embedding |
@@ -66,6 +66,13 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 - class filter 與 2D／3D 檢視沿用 run record index，切換時選取對應同一候選物件。選取物件的圖片 route 依 run index 從來源圖即時計算相同 padding crop；3D KMeans block explorer 僅用於 Image Classifier，避免對不同的 object embedding contract 暗示支援。
 - `test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback` 與 `test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d` 使用 deterministic features，覆蓋 policy 傳遞、bbox crop、候選順序、類別 filter、2D／3D、選取讀回及來源 bytes 不變；不構成真實模型數值 parity 或 NativeApp host 證據。
 
+### LV-WEB-01-VIEW-01 — Selection gallery and image viewer
+
+- Scatter point click replaces selection; Shift-click adds points. The selected-thumbnail wall follows the legacy spatial order: high y first in twelve horizontal bands, then ascending x within each band. Clicking a thumbnail changes the active viewer record without changing the selected set.
+- Previous／next follows the same displayed thumbnail order. Closing the viewer clears only the active image. In Object Detector mode, the YOLO overlay toggle defaults on and remains in the same state while navigating images; requests use only run ID and record index. The worker draws overlays in memory and never writes to source images.
+- Object-level runs retain the OD-02 crop preview and also allow viewing the source image with its YOLO overlay. Switching Image Classifier／Object Detector or object granularity clears the current run and selection; returning to the earlier mode does not restore stale results.
+- `test_case_lv_web_01_view_01_detector_image_route_draws_yolo_overlay` checks distinct raw/overlay responses and source bytes; `test_lv_web_01_view_01_selection_gallery_yolo_navigation_and_mode_isolation` visibly checks selection order, thumbnail review, overlay persistence, close behavior, and mode isolation using deterministic features. These checks do not establish NativeApp picker/grant integration.
+
 ### LV-WEB-02-IMG-01 — Image-level Compare Distributions
 
 - 兩側各接受一至 32 個資料夾；同一側依選取順序合併，重複路徑／圖片去重。每個根資料夾先使用 `compare_distributions.get_image_paths` 的直接 JPG／JPEG／PNG 全域排序；若該根沒有直接圖片，才遞迴搜尋子資料夾並略過 embedding、crop、thumbnail cache。壞檔略過並顯示警告。
@@ -83,7 +90,7 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 
 ## 5. React 驗收契約
 
-**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01 / LV-WEB-01-OD-02**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
+**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01 / LV-WEB-01-OD-02 / LV-WEB-01-VIEW-01**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
 
 - 選 fixture 資料夾、DINOv2-small、PCA，按 Run；UI 顯示 4 個點，API 向量 shape 為 4×384 且值有限、非零。PCA 維度遵循原 Streamlit 主流程 `min(3, max(1, n-2))`，小於 2 維時補零軸。
 - IC-02 對每個選取模型分別驗證 embedding cache、shape 和點索引一致；切換已產生的投影及 2D／3D 後，類別／split 與每個點的原始影像對應不變。UMAP 跨 run 固定參考座標另由 IC-03 驗收。
@@ -93,6 +100,7 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 - IC-04：在可見 3D chart 檢查 KMeans center labels；選定非空 block 後，2D box/lasso 把命中的 record indices 加入既有多選；確認切 2D／3D 後選取數和 record 身分一致，Clear selection 才清除；block API 不回原始向量或 cache path。`test_case_lv_web_01_ic_04_kmeans_blocks_and_embedding_drilldown` 與 `test_lv_web_01_ic_04_kmeans_block_selection_round_trips_across_dimensions` 使用 deterministic features，證明 React/API 接線與既有 PCA/KMeans 行為，尚未證明真實模型或 NativeApp parity。
 - OD-01：固定 YOLO fixture 中，所選類別檔優先於資料集 `classes.txt`；清除所選檔後，自動類別優先於手動輸入；無自動或手動類別時顯示明確錯誤。以兩個模型驗證各 model/method view 的 record order、label/split 和點選讀回一致，並核對來源 image、labels、classes bytes 不變。`test_case_lv_web_01_od_01_detector_whole_image_class_sources_and_models` 和可見 `test_lv_web_01_od_01_detector_whole_image_and_class_priority` 使用 deterministic features；真實模型數值 parity 與 NativeApp OS picker/worker lifecycle 仍待驗。
 - OD-02：固定 YOLO fixture 中逐筆比對 image-then-box record 順序、class ID/name、bbox、score 與 split；驗證指定 padding／解析度／head 進入 embedder，預覽 crop 與相同 bbox policy 一致。class filter 與 2D／3D 切換後保持候選 index 和選取 identity；核對 source image、labels、classes bytes 不變。`test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback` 與可見 `test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d` 使用 deterministic features；真實模型數值 parity 與 NativeApp OS picker/worker lifecycle 仍待驗。
+- VIEW-01：Shift-click 後 selected set 與 thumbnail-wall record index 一致；縮圖順序沿用 Streamlit spatial order；點縮圖後前／後導覽仍依同一 index 序列。YOLO overlay 切換須更新影像且跨圖保留設定；來源 bytes 不變。切換 Image Classifier／Object Detector 再切回時不重現舊 run、selection 或 viewer。API overlay bytes test 與可見 E2E 使用 deterministic features。
 - 模型缺失、空資料夾和取消須呈現可恢復狀態；不回報成功或改用假的 backend。worker 關閉與 NativeApp lifecycle 由 AC6 驗收。
 - 新 worker PID 讀取相同 run 若有持久結果時必須一致；尚未列入保存語義的暫存 run 不宣稱跨重啟持久。
 

@@ -634,7 +634,12 @@ def create_app(
         }
 
     @app.get("/api/v1/runs/{run_id}/images/{index}")
-    def get_run_image(run_id: str, index: int) -> Response:
+    def get_run_image(
+        run_id: str,
+        index: int,
+        overlay: bool = False,
+        view: Literal["selected", "source"] = "selected",
+    ) -> Response:
         with app.state.lock:
             run = app.state.runs.get(run_id)
             if run is None:
@@ -646,7 +651,7 @@ def create_app(
             is_object = run.get("source_granularity") == "object"
             object_record = run["records"][index] if is_object else None
         try:
-            if is_object and object_record is not None:
+            if is_object and object_record is not None and view == "selected":
                 from io import BytesIO
 
                 from interaction import crop_bbox
@@ -665,6 +670,18 @@ def create_app(
                 )
                 output = BytesIO()
                 crop.convert("RGB").save(output, format="JPEG", quality=90)
+                content = output.getvalue()
+                media_type = "image/jpeg"
+            elif overlay and run.get("source_mode") == "object_detector" and run.get("class_names"):
+                from io import BytesIO
+
+                from interaction import draw_yolo_boxes, yolo_label_path_for
+
+                rendered = draw_yolo_boxes(path, yolo_label_path_for(path), run["class_names"])
+                if rendered is None:
+                    raise OSError("The source image is unreadable")
+                output = BytesIO()
+                rendered.convert("RGB").save(output, format="JPEG", quality=92)
                 content = output.getvalue()
                 media_type = "image/jpeg"
             else:

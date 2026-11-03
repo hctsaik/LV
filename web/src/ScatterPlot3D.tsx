@@ -16,7 +16,7 @@ export default function ScatterPlot3D({ points, selectedIndex, selectedIndices, 
   selectedIndex?: number | null;
   selectedIndices?: number[];
   clusters?: KMeansBlocks | null;
-  onSelect: (index: number) => void;
+  onSelect: (index: number, additive?: boolean) => void;
   viewKey: string;
 }) {
   const colors = colorMap(points);
@@ -68,7 +68,10 @@ export default function ScatterPlot3D({ points, selectedIndex, selectedIndices, 
 
   function selectPoint(event: Readonly<PlotMouseEvent>) {
     const custom = event.points?.[0]?.customdata;
-    if (Array.isArray(custom)) onSelect(Number(custom[0]));
+    if (Array.isArray(custom)) {
+      const shiftKey = Boolean((event.event as MouseEvent | undefined)?.shiftKey);
+      onSelect(Number(custom[0]), shiftKey);
+    }
   }
 
   return (
@@ -89,7 +92,7 @@ export default function ScatterPlot3D({ points, selectedIndex, selectedIndices, 
             data-testid="embedding-point"
             aria-label={"Select " + point.filename + ", " + point.label + ", " + point.split}
             aria-pressed={selected.has(point.index)}
-            onClick={() => onSelect(point.index)}
+            onClick={(event) => onSelect(point.index, event.shiftKey)}
           />
         ))}
       </div>
