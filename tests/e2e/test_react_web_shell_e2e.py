@@ -1069,6 +1069,142 @@ def test_lv_web_01_rank_01_visible_ranking_viewer_and_csv(
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_rank_01_real_dinov2_visible_streamlit_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Pinned DINOv2 rankings match Streamlit scores and keep their honest framing."""
+    import app as legacy_app
+
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
+    dataset = _fixture(tmp_path / "ranking-real")
+    source_hashes = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*.png")
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "ranking-real-cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir=models_dir),
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(15_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("model-choice-dinov2_vits14").check()
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (dataset / "train", dataset / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text(
+                "Completed", timeout=180_000
+            )
+            expect(page.get_by_test_id("ranking-workspace")).to_be_visible()
+            expect(page.get_by_test_id("ranked-result")).to_have_count(4)
+
+            run_id = next(iter(application.state.runs))
+            with application.state.lock:
+                run = application.state.runs[run_id]
+                raw_embeddings = application.state.raw_embeddings[run_id]["dinov2_vits14"].copy()
+            assert raw_embeddings.shape == (4, 384)
+            assert np.isfinite(raw_embeddings).all() and np.any(raw_embeddings != 0)
+            labels = [record["label"] for record in run["records"]]
+            k = min(5, len(run["records"]) - 1)
+            legacy_scores = {
+                "outlier": legacy_app.compute_outlier_scores(
+                    raw_embeddings, raw_embeddings, k=k, candidates_in_reference=True
+                ),
+                "disagreement": legacy_app.compute_label_disagreement(
+                    raw_embeddings, labels, k=k
+                ),
+            }
+
+            def assert_metric_matches_streamlit(metric: str) -> list[int]:
+                response = page.request.get(
+                    base_url + f"/api/v1/runs/{run_id}/rankings",
+                    params={"model_id": "dinov2_vits14", "metric": metric},
+                )
+                assert response.status == 200
+                payload = response.json()
+                assert payload["k"] == k
+                assert payload["score_direction"] == "descending"
+                scores = legacy_scores[metric]
+                expected_indices = sorted(
+                    range(len(scores)), key=lambda index: (-float(scores[index]), index)
+                )
+                actual_results = payload["results"]
+                assert [row["index"] for row in actual_results] == expected_indices
+                np.testing.assert_allclose(
+                    [row["score"] for row in actual_results],
+                    [scores[index] for index in expected_indices],
+                    rtol=1e-7,
+                    atol=1e-7,
+                )
+                return expected_indices
+
+            def assert_visible_rows(metric: str, expected_indices: list[int]) -> None:
+                rows = page.get_by_test_id("ranked-result")
+                expect(rows).to_have_count(len(expected_indices))
+                assert [int(row.get_attribute("data-index")) for row in rows.all()] == expected_indices
+                visible_scores = [
+                    float(row.locator("small").inner_text().split("·")[-1].strip())
+                    for row in rows.all()
+                ]
+                np.testing.assert_allclose(
+                    visible_scores,
+                    [legacy_scores[metric][index] for index in expected_indices],
+                    atol=0.00005,
+                )
+
+            outlier_indices = assert_metric_matches_streamlit("outlier")
+            assert_visible_rows("outlier", outlier_indices)
+            assert "not determine image quality" in page.get_by_test_id(
+                "ranking-interpretation"
+            ).inner_text()
+
+            with page.expect_response(
+                lambda response: "/rankings?" in response.url
+                and "metric=disagreement" in response.url
+                and response.ok
+            ):
+                page.get_by_label("Ranking criterion").select_option("disagreement")
+            expect(page.get_by_test_id("ranking-status")).to_contain_text("highest first")
+            disagreement_indices = assert_metric_matches_streamlit("disagreement")
+            assert_visible_rows("disagreement", disagreement_indices)
+
+            with page.expect_download() as download_info:
+                page.get_by_test_id("ranking-export").click()
+            download = download_info.value
+            assert download.suggested_filename == "disagreement_ranking.csv"
+            with Path(download.path()).open(encoding="utf-8", newline="") as handle:
+                csv_rows = list(csv.DictReader(handle))
+            assert [int(row["index"]) for row in csv_rows] == disagreement_indices
+            np.testing.assert_allclose(
+                [float(row["score"]) for row in csv_rows],
+                [legacy_scores["disagreement"][index] for index in disagreement_indices],
+                rtol=1e-7,
+                atol=1e-7,
+            )
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dataset.rglob("*.png")
+    }, "real-model ranking changed its source images"
+
+
 def test_lv_web_01_ic_04_kmeans_drilldown_and_multiselection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
