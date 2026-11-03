@@ -24,6 +24,7 @@ import {
   type JobStatus,
   type ModelOption,
   type ObjectPolicyAutotuneResult,
+  type ObjectPolicyProfileMatch,
   type ProjectionMethod,
   type RankingMetric,
   type RankingResult,
@@ -294,6 +295,11 @@ export default function App() {
     scope: string;
     result: ObjectPolicyAutotuneResult;
   } | null>(null);
+  const [objectPolicyProfileMatch, setObjectPolicyProfileMatch] = useState<{
+    scope: string;
+    match: ObjectPolicyProfileMatch;
+  } | null>(null);
+  const [objectPolicyProfileMatching, setObjectPolicyProfileMatching] = useState(false);
   const [objectPolicyProfileName, setObjectPolicyProfileName] = useState("");
   const [classNamesDraft, setClassNamesDraft] = useState("");
   const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "class_similarity" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "evaluation" | "anomaly" | "fewshot">("visualize");
@@ -406,6 +412,37 @@ export default function App() {
     });
     return () => { active = false; };
   }, []);
+
+  useEffect(() => {
+    if (!connected || analysisMode !== "detector" || analysisUnit !== "object") {
+      setObjectPolicyProfileMatch(null);
+      setObjectPolicyProfileMatching(false);
+      return;
+    }
+    const selectedFolders = effectiveFolders();
+    if (!selectedFolders.length) {
+      setObjectPolicyProfileMatch(null);
+      setObjectPolicyProfileMatching(false);
+      return;
+    }
+    let active = true;
+    const classNames = classNamesDraft.split(",").map((name) => name.trim()).filter(Boolean);
+    const scope = objectPolicyProfileScope(selectedFolders);
+    setObjectPolicyProfileMatch(null);
+    setObjectPolicyProfileMatching(true);
+    api.matchObjectPolicyProfile({
+      folders: selectedFolders,
+      folderGrantIds: api.folderGrantIds(selectedFolders),
+      classNames,
+    }).then((match) => {
+      if (active) setObjectPolicyProfileMatch({ scope, match });
+    }).catch(() => {
+      if (active) setObjectPolicyProfileMatch(null);
+    }).finally(() => {
+      if (active) setObjectPolicyProfileMatching(false);
+    });
+    return () => { active = false; };
+  }, [connected, analysisMode, analysisUnit, folders, folderDraft, classNamesDraft]);
 
   useEffect(() => {
     if (!run) return;
@@ -916,11 +953,22 @@ export default function App() {
     });
   }
 
+  function objectPolicyProfileScope(selectedFolders: string[]) {
+    return JSON.stringify({
+      folders: selectedFolders,
+      classNames: classNamesDraft.split(",").map((name) => name.trim()).filter(Boolean),
+    });
+  }
+
   const objectPolicyTuning = objectPolicySubmitting || (objectPolicyJob !== null
     && ["queued", "running", "cancelling"].includes(objectPolicyJob.state));
   const visibleObjectPolicyResult = objectPolicyTuneResult
     && objectPolicyTuneResult.scope === objectPolicyScope(effectiveFolders(), selectedModelIds[0] || "")
     ? objectPolicyTuneResult.result
+    : null;
+  const visibleObjectPolicyProfileMatch = objectPolicyProfileMatch
+    && objectPolicyProfileMatch.scope === objectPolicyProfileScope(effectiveFolders())
+    ? objectPolicyProfileMatch.match
     : null;
 
   async function runObjectPolicyAutotune() {
@@ -1660,6 +1708,34 @@ export default function App() {
                       <option value="meanpool">Mean pool</option>
                     </select>
                     <div className="field-note">Each YOLO box uses this crop policy. Autotune scores six candidates by macro kNN class purity using the first selected feature model.</div>
+                    {objectPolicyProfileMatching && (
+                      <div className="field-note" data-testid="object-policy-profile-check" role="status">
+                        Checking for a saved profile that matches this dataset…
+                      </div>
+                    )}
+                    {visibleObjectPolicyProfileMatch && (
+                      <>
+                        <div className="field-note" data-testid="object-policy-fingerprint">
+                          {visibleObjectPolicyProfileMatch.fingerprint.n_objects.toLocaleString()} labeled objects · {visibleObjectPolicyProfileMatch.fingerprint.n_classes} classes · median short side {Math.round(visibleObjectPolicyProfileMatch.fingerprint.size_q[1] || 0)} px
+                        </div>
+                        {visibleObjectPolicyProfileMatch.similar_profile && (
+                          <div className="alert alert-info" data-testid="object-policy-profile-suggestion" role="status">
+                            Similar saved profile: {visibleObjectPolicyProfileMatch.similar_profile.name} ({visibleObjectPolicyProfileMatch.similar_profile.similarity.toFixed(2)}).
+                            <button
+                              className="secondary-action"
+                              type="button"
+                              data-testid="object-policy-apply-profile"
+                              onClick={() => {
+                                setObjectPolicy(visibleObjectPolicyProfileMatch.similar_profile!.policy);
+                                setNotice("Applied the similar saved profile. Run analysis to use it.");
+                              }}
+                            >
+                              Apply saved profile
+                            </button>
+                          </div>
+                        )}
+                      </>
+                    )}
                     <button
                       className="secondary-action"
                       type="button"
@@ -1693,7 +1769,7 @@ export default function App() {
                         <div className="field-note">
                           {visibleObjectPolicyResult.fingerprint.n_objects.toLocaleString()} labeled objects · {visibleObjectPolicyResult.fingerprint.n_classes} classes · median short side {Math.round(visibleObjectPolicyResult.fingerprint.size_q[1] || 0)} px
                         </div>
-                        {visibleObjectPolicyResult.similar_profile && (
+                        {visibleObjectPolicyResult.similar_profile && !visibleObjectPolicyProfileMatch?.similar_profile && (
                           <div className="alert alert-info" data-testid="object-policy-profile-suggestion" role="status">
                             Similar saved profile: {visibleObjectPolicyResult.similar_profile.name} ({visibleObjectPolicyResult.similar_profile.similarity.toFixed(2)}).
                             <button

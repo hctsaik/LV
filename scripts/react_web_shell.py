@@ -168,6 +168,12 @@ class SaveObjectPolicyProfileRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)
 
 
+class ObjectPolicyProfileMatchRequest(BaseModel):
+    folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
+    class_names: list[str] = Field(default_factory=list, max_length=256)
+
+
 class CreateClassSimilarityJob(BaseModel):
     model_id: str = Field(min_length=1, max_length=128)
     k: int = Field(default=5, ge=1, le=20)
@@ -334,6 +340,7 @@ def _resolve_request_folders(
     request: (
         CreateVisualizationJob
         | CreateObjectPolicyAutotuneJob
+        | ObjectPolicyProfileMatchRequest
         | CreateDetectionEvaluationRequest
     ),
 ) -> list[str]:
@@ -2989,6 +2996,94 @@ def create_app(
         threading.Thread(target=execute, args=(job,), daemon=True, name=f"lv-web-{job_id[:8]}").start()
         return {"job_id": job_id, "state": job.state}
 
+    def load_object_policy_profiles(oe) -> dict[str, dict]:
+        profile_path = app.state.curation_store.path.parent / "object_policy_profiles.json"
+
+        def usable_profiles(items: list[dict]) -> dict[str, dict]:
+            normalized = {}
+            for item in items:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                fingerprint = item.get("fingerprint")
+                if not isinstance(fingerprint, dict):
+                    continue
+                size_q, ar_q = fingerprint.get("size_q"), fingerprint.get("ar_q")
+                if not isinstance(size_q, list) or len(size_q) != 3:
+                    continue
+                if not isinstance(ar_q, list) or len(ar_q) != 3:
+                    continue
+                try:
+                    size_q = [float(value) for value in size_q]
+                    ar_q = [float(value) for value in ar_q]
+                    if not all(math.isfinite(value) for value in size_q + ar_q):
+                        continue
+                    policy = ComparisonObjectPolicy.model_validate(item.get("policy")).model_dump()
+                    name = str(item["name"]).strip()
+                    if not name:
+                        continue
+                    normalized[name] = {
+                        **item,
+                        "name": name,
+                        "fingerprint": {
+                            "n_objects": int(fingerprint["n_objects"]),
+                            "n_classes": int(fingerprint["n_classes"]),
+                            "size_q": size_q,
+                            "ar_q": ar_q,
+                        },
+                        "policy": policy,
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return normalized
+
+        profiles_by_name = usable_profiles(oe.load_profiles(profile_path))
+        legacy_profile_path = Path(oe.PROFILES_PATH)
+        if legacy_profile_path.resolve() != profile_path.resolve():
+            legacy_profiles = usable_profiles(oe.load_profiles(legacy_profile_path))
+            profiles_by_name = legacy_profiles | profiles_by_name
+        return profiles_by_name
+
+    def match_object_policy_profile(oe, fingerprint: dict) -> dict | None:
+        try:
+            profile, similarity = oe.match_profile(
+                fingerprint,
+                list(load_object_policy_profiles(oe).values()),
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.info("Ignoring unreadable LV object policy profiles")
+            return None
+        if not profile or similarity < 0.6:
+            return None
+        return {
+            "name": str(profile["name"]),
+            "similarity": float(similarity),
+            "policy": ComparisonObjectPolicy.model_validate(profile["policy"]).model_dump(),
+        }
+
+    @app.post("/api/v1/object-policy/profile-match")
+    def get_object_policy_profile_match(request: ObjectPolicyProfileMatchRequest) -> dict:
+        import object_eval as oe
+
+        folders = [Path(folder) for folder in _resolve_request_folders(request)]
+        images = [image for folder in folders for image in oe.list_images(folder)]
+        if not images:
+            raise HTTPException(
+                status_code=422,
+                detail="The selected folder contains no readable image files.",
+            )
+        class_names = oe.classes_for(folders[0]) or request.class_names or None
+        try:
+            fingerprint = oe.dataset_fingerprint(images, class_names)
+        except (ValueError, FileNotFoundError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="The selected folder's images or labels could not be read.",
+            ) from exc
+        return {
+            "fingerprint": fingerprint,
+            "similar_profile": match_object_policy_profile(oe, fingerprint),
+        }
+
     def execute_object_policy_job(job: _ObjectPolicyAutotuneJob) -> None:
         try:
             import object_eval as oe
@@ -3042,62 +3137,7 @@ def create_app(
                     }
                 return
 
-            profile_path = app.state.curation_store.path.parent / "object_policy_profiles.json"
-            def usable_profiles(items: list[dict]) -> dict[str, dict]:
-                normalized = {}
-                for item in items:
-                    if not isinstance(item, dict) or not item.get("name"):
-                        continue
-                    fingerprint = item.get("fingerprint")
-                    if not isinstance(fingerprint, dict):
-                        continue
-                    size_q, ar_q = fingerprint.get("size_q"), fingerprint.get("ar_q")
-                    if not isinstance(size_q, list) or len(size_q) != 3:
-                        continue
-                    if not isinstance(ar_q, list) or len(ar_q) != 3:
-                        continue
-                    try:
-                        size_q = [float(value) for value in size_q]
-                        ar_q = [float(value) for value in ar_q]
-                        if not all(math.isfinite(value) for value in size_q + ar_q):
-                            continue
-                        policy = ComparisonObjectPolicy.model_validate(item.get("policy")).model_dump()
-                        name = str(item["name"]).strip()
-                        if not name:
-                            continue
-                        normalized[name] = {
-                            **item,
-                            "name": name,
-                            "fingerprint": {
-                                "n_objects": int(fingerprint["n_objects"]),
-                                "n_classes": int(fingerprint["n_classes"]),
-                                "size_q": size_q,
-                                "ar_q": ar_q,
-                            },
-                            "policy": policy,
-                        }
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                return normalized
-
-            profiles_by_name = usable_profiles(oe.load_profiles(profile_path))
-            legacy_profile_path = Path(oe.PROFILES_PATH)
-            if legacy_profile_path.resolve() != profile_path.resolve():
-                legacy_profiles = usable_profiles(oe.load_profiles(legacy_profile_path))
-                profiles_by_name = legacy_profiles | profiles_by_name
-            try:
-                profile, similarity = oe.match_profile(fingerprint, list(profiles_by_name.values()))
-            except (KeyError, TypeError, ValueError):
-                logger.info("Ignoring unreadable LV object policy profiles")
-                profile, similarity = None, 0.0
-            suggested_profile = (
-                {
-                    "name": str(profile["name"]),
-                    "similarity": float(similarity),
-                    "policy": ComparisonObjectPolicy.model_validate(profile["policy"]).model_dump(),
-                }
-                if profile and similarity >= 0.6 else None
-            )
+            suggested_profile = match_object_policy_profile(oe, fingerprint)
             result = {
                 "rows": rows,
                 "best_policy": best_policy,

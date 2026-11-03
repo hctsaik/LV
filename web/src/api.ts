@@ -34,6 +34,11 @@ export type ObjectPolicyAutotuneResult = {
   } | null;
 };
 
+export type ObjectPolicyProfileMatch = {
+  fingerprint: ObjectPolicyAutotuneResult["fingerprint"];
+  similar_profile: ObjectPolicyAutotuneResult["similar_profile"];
+};
+
 export type JobStatus = {
   job_id: string;
   state: "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
@@ -1597,6 +1602,18 @@ export const api = {
       "/api/v1/object-policy/autotune/jobs/" + encodeURIComponent(jobId) + "/profile",
       { method: "POST", body: JSON.stringify({ name }) },
     ),
+  matchObjectPolicyProfile: (input: {
+    folders: string[];
+    folderGrantIds: Array<string | null>;
+    classNames: string[];
+  }) => request<ObjectPolicyProfileMatch>("/api/v1/object-policy/profile-match", {
+    method: "POST",
+    body: JSON.stringify({
+      folders: input.folders,
+      folder_grant_ids: input.folderGrantIds,
+      class_names: input.classNames,
+    }),
+  }),
   rememberFolderGrant: (path: string, grantId: string) => {
     nativeFolderGrants.set(path, grantId);
   },
