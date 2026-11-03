@@ -962,8 +962,8 @@ def test_case_lv_web_03_img_01_coverage_sparsity_projection_selection_inputs(
     }
 
 
-@pytest.mark.parametrize("method", ["umap", "sumap"])
-def test_case_lv_web_03_img_01_umap_3d_small_sample_falls_back_to_pca(method, monkeypatch):
+@pytest.mark.parametrize("method", ["umap", "sumap", "lda"])
+def test_case_lv_web_03_img_01_projection_3d_small_sample_falls_back_to_pca(method, monkeypatch):
     import sys
     import types
 

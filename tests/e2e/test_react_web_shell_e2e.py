@@ -1599,6 +1599,20 @@ def test_lv_web_03_img_01_visible_coverage_projection_box_selection_and_clear(
                 page.get_by_test_id("coverage-dimension-3d").click()
             expect(page.locator("[data-testid='coverage-plot'] [data-testid='coverage-plot-3d']")).to_be_visible()
             expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+
+            with page.expect_response(lambda response: "/coverage/runs/" in response.url
+                                      and response.url.endswith("/projections")
+                                      and response.request.method == "POST" and response.ok) as lda_fallback_response:
+                page.get_by_label("Projection method").select_option("lda")
+            lda_fallback = lda_fallback_response.value.json()
+            assert lda_fallback["requested_method"] == "lda"
+            assert lda_fallback["method"] == "pca"
+            assert any("at least 5 images for a 3d layout" in warning.lower()
+                       for warning in lda_fallback["warnings"])
+            expect(page.get_by_role("status").filter(
+                has_text="lda needs at least 5 images for a 3d layout",
+            )).to_be_visible()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
             page.get_by_test_id("coverage-point").nth(0).focus()
             page.get_by_test_id("coverage-point").nth(0).press("Enter")
             expect(page.get_by_test_id("coverage-selected-count")).to_have_text("3 selected")
@@ -1860,10 +1874,10 @@ def test_lv_web_03_img_01_real_model_visible_streamlit_sparsity_parity(
     }, "real-model coverage changed the source dataset"
 
 
-def test_lv_web_03_img_01_real_model_umap_visible_streamlit_projection_parity(
+def test_lv_web_03_img_01_real_model_projection_visible_streamlit_parity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """Real-model React UMAP matches Streamlit in 2D and 3D with a sufficient sample count."""
+    """Real-model React UMAP and supervised projections match Streamlit in 2D and 3D."""
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
     pytest.importorskip("umap")
@@ -1915,6 +1929,7 @@ def test_lv_web_03_img_01_real_model_umap_visible_streamlit_projection_parity(
             assert vectors.shape == (5, 384)
             assert run["method"] == run["requested_method"] == "umap"
             assert run["dimension"] == 2
+            labels = [record["label"] for record in run["records"]]
 
             monkeypatch.setattr(legacy_app.st, "session_state", {})
             legacy_2d, _ = legacy_app._cov_projection(
@@ -1958,6 +1973,50 @@ def test_lv_web_03_img_01_real_model_umap_visible_streamlit_projection_parity(
                 "aria-pressed", "true",
             )
             expect(page.get_by_test_id("coverage-point")).to_have_count(5)
+
+            def assert_supervised_parity(response, method: str, dimension: int) -> None:
+                projection = response.json()
+                assert projection["requested_method"] == method
+                assert projection["method"] == method
+                monkeypatch.setattr(legacy_app.st, "session_state", {})
+                expected, _ = legacy_app._cov_project5(
+                    vectors, None, labels, None, method, dimension,
+                    f"img01-real-{method}-{dimension}-{run_id}", "",
+                )
+                actual = np.asarray([
+                    [point[axis] for axis in ("x", "y", "z")[:dimension]]
+                    for point in projection["points"]
+                ])
+                np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+                expect(page.get_by_test_id("coverage-point")).to_have_count(5)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as lda_2d_response:
+                page.get_by_label("Projection method").select_option("lda")
+            assert_supervised_parity(lda_2d_response.value, "lda", 2)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as lda_3d_response:
+                page.get_by_test_id("coverage-dimension-3d").click()
+            assert_supervised_parity(lda_3d_response.value, "lda", 3)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as sumap_3d_response:
+                page.get_by_label("Projection method").select_option("sumap")
+            assert_supervised_parity(sumap_3d_response.value, "sumap", 3)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as sumap_2d_response:
+                page.get_by_test_id("coverage-dimension-2d").click()
+            assert_supervised_parity(sumap_2d_response.value, "sumap", 2)
     finally:
         if server is not None:
             server.should_exit = True
@@ -1967,7 +2026,7 @@ def test_lv_web_03_img_01_real_model_umap_visible_streamlit_projection_parity(
     assert source_hashes == {
         path: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in source_hashes
-    }, "real-model UMAP coverage changed the source dataset"
+    }, "real-model coverage projections changed the source dataset"
 
 
 def test_lv_web_03_attr_01_visible_attribute_grid_calibration_and_candidate_mining(
