@@ -3066,6 +3066,58 @@ def test_lv_web_01_edge_01_single_unicode_path_and_unreadable_file_visible(
             server_thread.join(timeout=10)
 
 
+def test_lv_web_01_edge_01_unreadable_only_folder_is_rejected_visible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A folder containing only corrupt images fails visibly without touching its source."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    image_folder = tmp_path / "資料 集" / "train" / "損壞影像"
+    image_folder.mkdir(parents=True)
+    unreadable_path = image_folder / "無法解碼.jpg"
+    unreadable_path.write_bytes(b"not an image")
+    source_hash = hashlib.sha256(unreadable_path.read_bytes()).hexdigest()
+    embed_calls: list[Path] = []
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    def embed(path: Path) -> np.ndarray:
+        embed_calls.append(path)
+        return np.array([1.0] + [0.0] * 383, dtype=np.float32)
+
+    application = create_app(
+        model_catalog=lambda: ["fixture-model"],
+        model_loader=lambda _model_id: embed,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_label("Image folder").fill(str(image_folder.parent))
+            page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+
+            expect(page.get_by_role("alert")).to_contain_text(
+                "No readable images were found", timeout=10_000
+            )
+            expect(page.locator(".completion-label")).to_have_count(0)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(0)
+            assert embed_calls == []
+            assert hashlib.sha256(unreadable_path.read_bytes()).hexdigest() == source_hash
+            assert sorted(path.name for path in image_folder.iterdir()) == [unreadable_path.name]
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+
 def test_lv_web_01_ic_01_cancel_is_visible_in_react(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """AC4: the visible UI can cancel a running job and shows its terminal state."""
     dataset = _fixture(tmp_path / "classifier-fixture")
