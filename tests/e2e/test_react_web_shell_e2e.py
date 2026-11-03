@@ -4248,7 +4248,7 @@ def test_lv_web_01_od_01_missing_class_names_is_visible(
 def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """React selects object granularity, filters boxes, and previews the selected source bbox."""
+    """React object curation previews source boxes and exercises grant-bound copy/symlink export."""
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
     folders = _detector_fixture(tmp_path / "detector-object-fixture")
@@ -4282,6 +4282,8 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
     source_sidecar_bytes = selected_sidecar.read_bytes()
     subset_dir = tmp_path / "visible-object-subset"
     subset_dir.mkdir()
+    symlink_dir = tmp_path / "visible-object-symlink-subset"
+    symlink_dir.mkdir()
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("NATIVEAPP_APP_ID", raising=False)
 
@@ -4308,16 +4310,28 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             page.add_init_script(
-                "window.cimHost = {chooseFile: async () => ("
-                + json.dumps({"path": str(subset_dir), "grant_id": "hostgrant_subset"})
-                + ")};"
+                "const curationFolderChoices = "
+                + json.dumps([
+                    {"path": str(subset_dir), "grant_id": "hostgrant_subset"},
+                    {"path": str(symlink_dir), "grant_id": "hostgrant_symlink"},
+                ])
+                + "; let curationFolderIndex = 0;"
+                + " window.cimHost = {chooseFile: async () => curationFolderChoices["
+                + "Math.min(curationFolderIndex++, curationFolderChoices.length - 1)]};"
             )
             run_payloads = []
             subset_requests = []
+            subset_export_results = []
             page.on(
                 "response",
                 lambda response: run_payloads.append(response.json())
                 if _is_run_summary_response(response) and response.ok
+                else None,
+            )
+            page.on(
+                "response",
+                lambda response: subset_export_results.append(response.json())
+                if response.url.endswith("/api/v1/curation/subset/export") and response.ok
                 else None,
             )
             page.on(
@@ -4412,10 +4426,15 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
 
             monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
 
+            grant_destinations = {
+                "hostgrant_subset": subset_dir,
+                "hostgrant_symlink": symlink_dir,
+            }
+
             def resolve_subset_grant(grant_id: str, app_id: str) -> Path:
-                assert grant_id == "hostgrant_subset"
+                assert grant_id in grant_destinations
                 assert app_id == "visuallatent"
-                return subset_dir.resolve()
+                return grant_destinations[grant_id].resolve()
 
             monkeypatch.setattr(
                 react_web_shell,
@@ -4435,6 +4454,8 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             expect(page.locator(".alert-info")).to_contain_text(
                 "YOLO subset exported: 2 image(s)"
             )
+            assert subset_export_results[-1]["exported"] == 2
+            assert subset_export_results[-1]["errors"] == 0
             assert [request["destination_folder_grant_id"] for request in subset_requests] == [
                 "hostgrant_subset", "hostgrant_subset",
             ]
@@ -4449,6 +4470,52 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             assert exported_sidecar.read_bytes() == source_sidecar_bytes
             assert len(exported_train_label.read_text(encoding="utf-8").splitlines()) == len(source_yolo_lines) == 2
             assert len(exported_test_label.read_text(encoding="utf-8").splitlines()) == 1
+
+            page.get_by_label("Subset image handling").select_option("symlink")
+            page.get_by_test_id("curation-subset-choose-folder").click()
+            expect(page.get_by_label("Subset destination folder")).to_have_value(str(symlink_dir))
+            page.get_by_test_id("curation-subset-preview-button").click()
+            expect(page.get_by_test_id("curation-subset-preview")).to_contain_text(
+                "Preflight: 2 available · 2 unique · 0 duplicate(s) · 0 missing"
+            )
+            with page.expect_response(
+                lambda response: response.url.endswith("/api/v1/curation/subset/export")
+                and response.ok
+            ) as symlink_export_response:
+                page.get_by_test_id("curation-subset-export-button").click()
+            symlink_result = symlink_export_response.value.json()
+            symlinked_images = [
+                symlink_dir / "images" / "train" / "02.png",
+                symlink_dir / "images" / "test" / "03.png",
+            ]
+            successful_symlinks = sum(path.is_symlink() for path in symlinked_images)
+            assert symlink_result["exported"] == successful_symlinks
+            assert symlink_result["errors"] == len(symlinked_images) - successful_symlinks
+            assert all(not path.exists() or path.is_symlink() for path in symlinked_images)
+            if symlink_result["errors"]:
+                expect(page.locator(".alert-info")).to_contain_text(
+                    "Export completed with issues: 0 image(s)"
+                )
+                expect(page.locator(".alert-info")).to_contain_text(
+                    f"{symlink_result['errors']} error(s)"
+                )
+                assert symlink_result["partial"] is True
+            else:
+                expect(page.locator(".alert-info")).to_contain_text(
+                    "YOLO subset exported: 2 image(s)"
+                )
+                assert symlink_result["partial"] is False
+                assert symlink_result["exported"] == 2
+                symlinked_train_image, symlinked_test_image = symlinked_images
+                assert symlinked_train_image.is_symlink()
+                assert symlinked_train_image.resolve() == selected_image.resolve()
+                assert symlinked_train_image.read_bytes() == source_image_bytes
+                assert symlinked_test_image.is_symlink()
+                assert symlinked_test_image.resolve() == (folders[1] / "images" / "03.png").resolve()
+            assert [request["destination_folder_grant_id"] for request in subset_requests] == [
+                "hostgrant_subset", "hostgrant_subset",
+                "hostgrant_symlink", "hostgrant_symlink",
+            ]
 
             with (subset_dir / "manifest.csv").open(encoding="utf-8", newline="") as handle:
                 manifest_rows = list(csv.DictReader(handle))

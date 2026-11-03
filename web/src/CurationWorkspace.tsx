@@ -251,10 +251,12 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
         preview_token: currentSubsetPreview.preview_token,
       });
       setSubsetPreview(null);
+      const hasIssues = response.partial || response.warnings > 0;
       setNotice(
-        `${response.partial ? "Export completed with unresolved items" : "YOLO subset exported"}: `
+        `${hasIssues ? "Export completed with issues" : "YOLO subset exported"}: `
         + `${response.exported} image(s), ${response.deduplicated} duplicate(s), `
         + `${response.unresolved} unresolved, ${response.skipped} skipped, `
+        + `${response.corrupt} corrupt, ${response.errors} error(s), ${response.warnings} warning(s), `
         + `${response.annotations_preserved} original-format annotation(s) preserved. `
         + response.training_warning,
       );
