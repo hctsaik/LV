@@ -113,6 +113,29 @@ export type ImageRanking = {
   total: number;
   items: RankedIndex[];
 };
+export type CurationSource = "manual" | "search" | "similar" | "duplicate" | "outlier" | "disagreement";
+export type CurationCandidate = { index: number; source: CurationSource; score?: number | null };
+export type CurationItem = {
+  id: string;
+  index: number;
+  filename: string;
+  label: string;
+  split: string;
+  sha256: string | null;
+  source: CurationSource;
+  score: number | null;
+  reason: string;
+  level?: "image" | "object";
+  object_index?: number | null;
+  bbox?: [number, number, number, number] | null;
+};
+export type CurationCart = {
+  item_count: number;
+  items: CurationItem[];
+  source_counts: Record<string, number>;
+  added?: number;
+  skipped?: number;
+};
 
 export type ComparePoint = {
   group: "a" | "b";
@@ -266,6 +289,26 @@ export const api = {
       method: options.method,
     }),
   }),
+  curationCart: () => request<CurationCart>("/api/v1/curation-cart"),
+  addCurationItems: (runId: string, items: CurationCandidate[]) =>
+    request<CurationCart>("/api/v1/curation-cart/items", {
+      method: "POST",
+      body: JSON.stringify({ run_id: runId, items }),
+    }),
+  setCurationReasons: (itemIds: string[], reason: string) =>
+    request<CurationCart>("/api/v1/curation-cart/reasons", {
+      method: "PATCH",
+      body: JSON.stringify({ item_ids: itemIds, reason }),
+    }),
+  removeCurationItem: (itemId: string) =>
+    request<CurationCart>("/api/v1/curation-cart/items/" + encodeURIComponent(itemId), { method: "DELETE" }),
+  clearCurationCart: (confirm: boolean) => request<CurationCart>("/api/v1/curation-cart", {
+    method: "DELETE",
+    body: JSON.stringify({ confirm }),
+  }),
+  curationCartCsvUrl: () => (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/curation-cart.csv",
+  curationCartJsonUrl: () => (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/curation-cart.json",
+  curationCartZipUrl: () => (window.NATIVEAPP_LOCAL_API || "") + "/api/v1/curation-cart.zip",
   createCompareJob: (foldersA: string[], foldersB: string[], modelId: string) =>
     request<{ job_id: string; state: string }>("/api/v1/compare/jobs", {
       method: "POST",

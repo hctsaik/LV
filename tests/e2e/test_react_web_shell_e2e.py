@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import socket
@@ -12,6 +13,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -585,6 +587,101 @@ def test_lv_web_02_img_01_visible_compare_contract(tmp_path: Path, monkeypatch: 
             server_thread.join(timeout=10)
 
     assert all(path.read_bytes() == content for path, content in source_bytes.items())
+
+
+def test_lv_web_01_cart_01_visible_selection_reason_and_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """CART-01: visible selection, reason editing, downloads and removal match the cart API."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    from playwright.sync_api import expect, sync_playwright
+
+    root = _fixture(tmp_path / "curation-dataset")
+    source_bytes = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+    def embed(path: Path) -> np.ndarray:
+        pixels = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32)
+        vector = np.zeros(384, dtype=np.float32)
+        vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+        vector[3] = len(path.name) / 10.0
+        return vector
+
+    cache_root = tmp_path / "lv-cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(cache_root))
+    application = create_app(
+        model_catalog=lambda: ["cart-test"],
+        model_loader=lambda _model: embed,
+    )
+    server = server_thread = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(accept_downloads=True)
+            page.goto(base_url, wait_until="networkidle")
+            expect(page.get_by_test_id("curation-cart")).to_be_visible()
+            expect(page.get_by_test_id("curation-cart-count")).to_have_text("0")
+
+            page.get_by_label("Supervised UMAP").uncheck()
+            page.get_by_label("PCA").check()
+            for folder in (root / "train", root / "test"):
+                page.get_by_label("Image folder").fill(str(folder))
+                page.get_by_role("button", name="Add folder").click()
+            page.get_by_role("button", name="Run analysis").click()
+            expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=60_000)
+            points = page.get_by_test_id("embedding-point")
+            expect(points).to_have_count(4)
+            points.nth(0).click()
+            points.nth(1).click(modifiers=["Shift"])
+            expect(page.get_by_test_id("selection-summary")).to_contain_text("Selected 2 images")
+            page.get_by_test_id("cart-add-selection").click()
+            expect(page.get_by_test_id("curation-cart-notice")).to_contain_text("Added 2")
+            expect(page.get_by_test_id("curation-cart-count")).to_have_text("2")
+            expect(page.get_by_test_id("curation-cart-item")).to_have_count(2)
+
+            page.get_by_label("Curation reason").fill("Keep one example from each split")
+            page.get_by_test_id("curation-cart-save-reason").click()
+            expect(page.get_by_test_id("curation-cart-notice")).to_contain_text("Reason updated for 2")
+            expect(page.get_by_text("Keep one example from each split").first).to_be_visible()
+
+            with page.expect_download() as csv_download:
+                page.get_by_test_id("curation-cart-csv").click()
+            csv_file = Path(csv_download.value.path())
+            csv_rows = list(csv.DictReader(io.StringIO(csv_file.read_text(encoding="utf-8"))))
+            assert len(csv_rows) == 2
+            assert all(row["reason"] == "Keep one example from each split" for row in csv_rows)
+            assert all(row["path"] for row in csv_rows)
+
+            with page.expect_download() as json_download:
+                page.get_by_test_id("curation-cart-json").click()
+            json_payload = json.loads(Path(json_download.value.path()).read_text(encoding="utf-8"))
+            assert json_payload["schema_version"] == 1
+            assert len(json_payload["items"]) == 2
+            assert all(item["sha256"] for item in json_payload["items"])
+
+            with page.expect_download() as zip_download:
+                page.get_by_test_id("curation-cart-zip").click()
+            with zipfile.ZipFile(zip_download.value.path()) as archive:
+                assert "manifest.csv" in archive.namelist()
+                assert len([name for name in archive.namelist() if name.startswith("images/")]) == 2
+
+            page.get_by_test_id("curation-cart-item").first.get_by_role("button", name="Remove").click()
+            expect(page.get_by_test_id("curation-cart-count")).to_have_text("1")
+            page.get_by_label("Confirm clear curation cart").check()
+            page.get_by_test_id("curation-cart-clear").click()
+            expect(page.get_by_test_id("curation-cart-count")).to_have_text("0")
+            expect(page.get_by_test_id("curation-cart-empty")).to_be_visible()
+            browser.close()
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert {path: path.read_bytes() for path in source_bytes} == source_bytes
+    saved = json.loads((cache_root / "curation_cart.json").read_text(encoding="utf-8"))
+    assert saved["items"] == []
 
 
 def test_lv_web_01_search_01_visible_chain_cross_model_and_csv(

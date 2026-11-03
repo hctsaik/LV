@@ -1,7 +1,7 @@
 # 31 `react_web_shell` — LV React UI 與本機 API 架構
 
 > M24 的 React UI/API 邊界與分期切片。需求：[react_web_migration.md](../1_user_needs/react_web_migration.md)；PRD：[react_web_migration_prd.md](../2_PO_PRD/react_web_migration_prd.md)。
-> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽、Object Detector 整圖／物件級切片、selection viewer、整圖相似／文字／重複查詢與離群／分歧排名複查；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
+> 目前有 LV-WEB-01 Image Classifier 整圖、固定 UMAP reference、3D KMeans 區塊導覽、Object Detector 整圖／物件級切片、selection viewer、整圖相似／文字／重複查詢、離群／分歧排名複查與持久 curation cart；LV-WEB-02 Compare Distributions 整圖 A/B 也有部分實作。各 journey 是否完成，依 case inventory 的證據狀態判定。
 
 ## 1. 邊界
 
@@ -32,6 +32,11 @@
 | `GET /api/v1/runs/{run_id}/text-search.csv` | 匯出以文搜圖候選 | 下載與 Streamlit `records_to_csv` 同欄位的候選 CSV |
 | `POST /api/v1/runs/{run_id}/duplicates` | 掃描 phash 或 embedding 重複候選 | 支援 Hamming／cosine threshold 與跨 split 篩選；回傳有序成對 record metadata，不刪除來源資料 |
 | `GET /api/v1/runs/{run_id}/images/{index}` | 載入單一縮圖／影像 | 只依 run record index 解析已登錄檔案；detector 可用 `overlay=true` 讀取 YOLO overlay，object run 可用 `view=source` 讀取來源整圖 |
+| `GET /api/v1/curation-cart` | 讀取已保存的策展清單 | 回 item identity、來源、理由與 hash，不回本機路徑 |
+| `POST /api/v1/curation-cart/items` | 依 run ID／record index 加入清單 | 接受 manual/search/similar/duplicate/outlier/disagreement 來源；同一來源路徑重複加入保留第一次 metadata，object rows 另用 object index 區分 |
+| `PATCH /api/v1/curation-cart/reasons` | 更新指定清單項目的理由 | 可對 UI 目前篩選的項目批次套用文字理由 |
+| `DELETE /api/v1/curation-cart/items/{item_id}`／`DELETE /api/v1/curation-cart` | 移除項目／清空整份清單 | 清空請求必須帶 `confirm: true` |
+| `GET /api/v1/curation-cart.csv`／`.json`／`.zip` | 匯出清單 | CSV／JSON 保留來源身分和理由；ZIP 含原圖及 manifest；缺檔記錄在 manifest |
 | `POST /api/v1/compare/jobs` | 建立整圖 A/B comparison job | Folder A／B 各一至 32 個資料夾、LV feature model；同側影像合併並去重 |
 | `GET /api/v1/compare/jobs/{job_id}` / `DELETE /api/v1/compare/jobs/{job_id}` | 讀進度／要求取消 | 共用單一 worker 槽，回報結果 ID 或可恢復錯誤 |
 | `GET /api/v1/compare/runs/{run_id}` | 讀 A/B 形心漂移、計數、警告與順序穩定的影像記錄 | 不回傳私有本機圖片路徑或 embedding |
@@ -117,7 +122,7 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 
 ## 5. React 驗收契約
 
-**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01 / LV-WEB-01-OD-02 / LV-WEB-01-VIEW-01 / LV-WEB-01-SEARCH-01 / LV-WEB-01-SEARCH-02 / LV-WEB-01-RANK-01**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
+**Case ID: LV-WEB-01-IC-01 / LV-WEB-01-IC-02 / LV-WEB-01-IC-03 / LV-WEB-01-IC-04 / LV-WEB-01-OD-01 / LV-WEB-01-OD-02 / LV-WEB-01-VIEW-01 / LV-WEB-01-SEARCH-01 / LV-WEB-01-SEARCH-02 / LV-WEB-01-RANK-01 / LV-WEB-01-CART-01**。前置：凍結 LV source revision/profile、固定 fixture 與模型權重身分、`LV_CACHE_DIR` 指向隔離位置。
 
 - 選 fixture 資料夾、DINOv2-small、PCA，按 Run；UI 顯示 4 個點，API 向量 shape 為 4×384 且值有限、非零。PCA 維度遵循原 Streamlit 主流程 `min(3, max(1, n-2))`，小於 2 維時補零軸。
 - IC-02 對每個選取模型分別驗證 embedding cache、shape 和點索引一致；切換已產生的投影及 2D／3D 後，類別／split 與每個點的原始影像對應不變。UMAP 跨 run 固定參考座標另由 IC-03 驗收。
@@ -129,8 +134,9 @@ Image Classifier job 可附 `umap_reference` 與 `rebuild_umap_reference` 布林
 - OD-02：固定 YOLO fixture 中逐筆比對 image-then-box record 順序、class ID/name、bbox、score 與 split；驗證指定 padding／解析度／head 進入 embedder，預覽 crop 與相同 bbox policy 一致。class filter 與 2D／3D 切換後保持候選 index 和選取 identity；核對 source image、labels、classes bytes 不變。`test_case_lv_web_01_od_02_object_embeddings_policy_order_and_crop_readback` 與可見 `test_lv_web_01_od_02_visible_object_embeddings_policy_filters_and_3d` 使用 deterministic features；真實模型數值 parity 與 NativeApp OS picker/worker lifecycle 仍待驗。
 - VIEW-01：Shift-click 後 selected set 與 thumbnail-wall record index 一致；縮圖順序沿用 Streamlit spatial order；點縮圖後前／後導覽仍依同一 index 序列。YOLO overlay 切換須更新影像且跨圖保留設定；來源 bytes 不變。切換 Image Classifier／Object Detector 再切回時不重現舊 run、selection 或 viewer。API overlay bytes test 與可見 E2E 使用 deterministic features。
 - SEARCH-01：從選取影像啟動查詢，結果不含 query 且 cosine distance 升冪；使用候選續查後可回到前一個 query；切換已在 run 中計算的 model 後，保留 query chain 並按新模型重新排序。CSV 第一筆資料是目前 query，後續資料和 React 結果順序一致；圖片來源 bytes 不變。API 與可見 E2E 使用 deterministic vectors，尚未證明真實模型排序或 NativeApp parity。
-- SEARCH-02：Chinese-CLIP 文字查詢回傳與固定文字向量一致的前 K 張，繁體 query 由文字塔正規化；文字結果可以啟動 SEARCH-01 image chain，CSV 只包含候選。phash／embedding duplicate pair 須依 distance 和 index 穩定排序；cross-split 只回不同 split 的候選對；兩側可回讀，來源不被改寫。deterministic API/UI 通過；本機無 Chinese-CLIP 權重，真實模型 parity、NativeApp grants 與 CART-01 handoff 待驗。
+- SEARCH-02：Chinese-CLIP 文字查詢回傳與固定文字向量一致的前 K 張，繁體 query 由文字塔正規化；文字結果可以啟動 SEARCH-01 image chain，CSV 只包含候選。phash／embedding duplicate pair 須依 distance 和 index 穩定排序；cross-split 只回不同 split 的候選對；兩側可回讀，來源不被改寫。deterministic API/UI 通過；本機無 Chinese-CLIP 權重，真實模型 parity 與 NativeApp grants 待驗；cart 加入流程由 CART-01 覆蓋，跨工具 handoff 仍待驗。
 - RANK-01：以 legacy `compute_outlier_scores` 與 `compute_label_disagreement` 的同一 k 和 self-exclusion 規則對照數值；驗證無選取時 Top-50 預設／分歧切換、選取集 split filter、檔名與 12-band spatial 順序，並確認排名卡與上一張／下一張共用顯示順序。確認排名不改變 selected set、來源 bytes 不變，分數提示只供人工複查。deterministic API 與可見 UI E2E 通過；真模型數值 parity、NativeApp grants／ARM64 待驗。
+- CART-01：從手動多選、排名候選、文字搜尋、相似圖與重複圖加入 app-owned cart；同一路徑重複加入保留首次 metadata，物件列用路徑加 object index 識別。編輯可見列理由、來源篩選、逐筆移除與確認清空；CSV 欄位沿用既有 index／filename／path／label／split／sha256／source／score／reason，JSON 保留同一身分，ZIP 含原始影像及 manifest。cart 存在 `LV_CACHE_DIR/curation_cart.json`，worker 重建後讀回；畫面 GET 不暴露本機路徑，來源檔案只讀。API 與可見 React E2E 分別由 `test_case_lv_web_01_cart_01_persists_deduplicates_and_exports`、`test_case_lv_web_01_cart_01_keeps_object_identity_for_boxes_on_one_image` 及 `test_lv_web_01_cart_01_visible_selection_reason_and_exports` 驗收；NativeApp cache/grant 與跨工具 handoff 仍待驗。
 - 模型缺失、空資料夾和取消須呈現可恢復狀態；不回報成功或改用假的 backend。worker 關閉與 NativeApp lifecycle 由 AC6 驗收。
 - 新 worker PID 讀取相同 run 若有持久結果時必須一致；尚未列入保存語義的暫存 run 不宣稱跨重啟持久。
 

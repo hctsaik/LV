@@ -4,6 +4,8 @@ import {
   type EmbeddingPoint,
   type KMeansBlocks,
   type BlockProjection,
+  type CurationCart,
+  type CurationCandidate,
   type DuplicateScan,
   type JobStatus,
   type ImageRanking,
@@ -173,6 +175,14 @@ export default function App() {
   const [rankingError, setRankingError] = useState("");
   const [rankingLimit, setRankingLimit] = useState(60);
   const [rankViewerMode, setRankViewerMode] = useState(false);
+  const [curationCart, setCurationCart] = useState<CurationCart | null>(null);
+  const [cartLoading, setCartLoading] = useState(true);
+  const [cartBusy, setCartBusy] = useState(false);
+  const [cartError, setCartError] = useState("");
+  const [cartNotice, setCartNotice] = useState("");
+  const [cartSourceFilter, setCartSourceFilter] = useState("all");
+  const [cartReasonDraft, setCartReasonDraft] = useState("");
+  const [cartClearConfirm, setCartClearConfirm] = useState(false);
   const [similarOpen, setSimilarOpen] = useState(false);
   const [textSearchMode, setTextSearchMode] = useState(false);
   const [similarChain, setSimilarChain] = useState<number[]>([]);
@@ -228,6 +238,15 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    api.curationCart()
+      .then((result) => active && setCurationCart(result))
+      .catch((reason: unknown) => active && setCartError(reason instanceof Error ? reason.message : "Unable to load the saved curation cart."))
+      .finally(() => active && setCartLoading(false));
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
     if (!run) return;
     const preferredModel = run.models.includes("dinov2_vitb14") ? "dinov2_vitb14" : run.models[0];
     const availableForModel = run.views.filter((view) => view.model_id === preferredModel);
@@ -270,6 +289,9 @@ export default function App() {
     : rankedIndices.slice(0, Math.min(rankingLimit, 240)), [rankingRequestIndices, rankedIndices, rankingLimit]);
   const viewerIndices = rankViewerMode ? rankingShownIndices : selectionGalleryIndices;
   const viewerPosition = selectedIndex === null ? -1 : viewerIndices.indexOf(selectedIndex);
+  const cartFilteredItems = useMemo(() => curationCart?.items.filter((item) =>
+    cartSourceFilter === "all" || item.source === cartSourceFilter,
+  ) || [], [curationCart, cartSourceFilter]);
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
 
   useEffect(() => {
@@ -633,6 +655,68 @@ export default function App() {
       setDuplicateError(reason instanceof Error ? reason.message : "Unable to scan duplicate candidates.");
     } finally {
       setDuplicateLoading(false);
+    }
+  }
+
+  async function addToCurationCart(candidates: CurationCandidate[]) {
+    const runId = job?.run_id;
+    if (!runId || !candidates.length) return;
+    setCartBusy(true);
+    setCartError("");
+    setCartNotice("");
+    try {
+      const result = await api.addCurationItems(runId, candidates);
+      setCurationCart(result);
+      setCartNotice(`Added ${result.added || 0} · skipped ${result.skipped || 0} already in the cart.`);
+    } catch (reason) {
+      setCartError(reason instanceof Error ? reason.message : "Unable to add these records to the curation cart.");
+    } finally {
+      setCartBusy(false);
+    }
+  }
+
+  async function removeFromCurationCart(itemId: string) {
+    setCartBusy(true);
+    setCartError("");
+    try {
+      setCurationCart(await api.removeCurationItem(itemId));
+      setCartNotice("Curation item removed.");
+    } catch (reason) {
+      setCartError(reason instanceof Error ? reason.message : "Unable to remove this curation item.");
+    } finally {
+      setCartBusy(false);
+    }
+  }
+
+  async function applyCurationReason() {
+    if (!cartFilteredItems.length) return;
+    setCartBusy(true);
+    setCartError("");
+    try {
+      const result = await api.setCurationReasons(
+        cartFilteredItems.map((item) => item.id), cartReasonDraft.trim(),
+      );
+      setCurationCart(result);
+      setCartNotice(`Reason updated for ${cartFilteredItems.length} items.`);
+    } catch (reason) {
+      setCartError(reason instanceof Error ? reason.message : "Unable to save the curation reason.");
+    } finally {
+      setCartBusy(false);
+    }
+  }
+
+  async function clearCurationCart() {
+    if (!cartClearConfirm) return;
+    setCartBusy(true);
+    setCartError("");
+    try {
+      setCurationCart(await api.clearCurationCart(true));
+      setCartClearConfirm(false);
+      setCartNotice("The curation cart was cleared.");
+    } catch (reason) {
+      setCartError(reason instanceof Error ? reason.message : "Unable to clear the curation cart.");
+    } finally {
+      setCartBusy(false);
     }
   }
 
@@ -1036,8 +1120,11 @@ export default function App() {
                 </div>
                 <section className="selection-gallery" data-testid="selection-gallery" aria-label="Selected image thumbnails">
                   <div className="selection-gallery-heading">
-                    <strong>Selected {run.source_granularity === "object" ? "objects" : "images"}</strong>
-                    <span>{selectionGalleryIndices.length}</span>
+                    <div><strong>Selected {run.source_granularity === "object" ? "objects" : "images"}</strong><span>{selectionGalleryIndices.length}</span></div>
+                    <button type="button" data-testid="cart-add-selection" disabled={!selectedIndices.length || cartBusy}
+                      onClick={() => void addToCurationCart(selectedIndices.map((index) => ({ index, source: "manual" })))}>
+                      Add selection to cart
+                    </button>
                   </div>
                   {selectionGalleryIndices.length ? (
                     <div className="selection-gallery-grid">
@@ -1098,24 +1185,34 @@ export default function App() {
                         <div className="ranking-gallery-grid">
                           {rankingShownIndices.map((index, position) => {
                             const record = run.records[index];
+                            const rankedItem = ranking?.items.find((item) => item.index === index);
+                            const source: CurationCandidate["source"] = rankingSort === "outlier" || rankingSort === "disagreement"
+                              ? rankingSort : "manual";
                             return (
-                              <button
-                                key={index}
-                                type="button"
-                                className={"selection-gallery-item" + (rankViewerMode && selectedIndex === index ? " selection-gallery-item-active" : "")}
-                                data-testid="ranked-review-item"
-                                data-index={index}
-                                data-rank={position + 1}
-                                aria-label={`Review ranked candidate ${position + 1}: ${record.filename}`}
-                                aria-pressed={rankViewerMode && selectedIndex === index}
-                                onClick={() => { setSelectedIndex(index); setRankViewerMode(true); }}
-                              >
-                                <img src={api.runImageUrl(job?.run_id || "", index, {
-                                  overlay: run.source_mode === "object_detector" && showYoloOverlay,
-                                  view: run.source_granularity === "object" ? viewerImageMode : "selected",
-                                })} alt="" loading="lazy" />
-                                <span>{record.label}｜{record.filename}{record.object_index === undefined ? "" : ` · object ${record.object_index + 1}`}</span>
-                              </button>
+                              <div className="ranking-gallery-entry" key={index}>
+                                <button
+                                  type="button"
+                                  className={"selection-gallery-item" + (rankViewerMode && selectedIndex === index ? " selection-gallery-item-active" : "")}
+                                  data-testid="ranked-review-item"
+                                  data-index={index}
+                                  data-rank={position + 1}
+                                  aria-label={`Review ranked candidate ${position + 1}: ${record.filename}`}
+                                  aria-pressed={rankViewerMode && selectedIndex === index}
+                                  onClick={() => { setSelectedIndex(index); setRankViewerMode(true); }}
+                                >
+                                  <img src={api.runImageUrl(job?.run_id || "", index, {
+                                    overlay: run.source_mode === "object_detector" && showYoloOverlay,
+                                    view: run.source_granularity === "object" ? viewerImageMode : "selected",
+                                  })} alt="" loading="lazy" />
+                                  <span>{record.label}｜{record.filename}{record.object_index === undefined ? "" : ` · object ${record.object_index + 1}`}</span>
+                                </button>
+                                <button type="button" className="cart-candidate-button" disabled={cartBusy}
+                                  aria-label={`Add ${record.filename} to cart`}
+                                  onClick={() => void addToCurationCart([{ index, source,
+                                    score: source === "manual" ? null : rankedItem?.score }])}>
+                                  Add to cart
+                                </button>
+                              </div>
                             );
                           })}
                         </div>
@@ -1171,6 +1268,10 @@ export default function App() {
                                 <div><strong>{record.label}｜{record.filename}</strong><small>Cosine distance · d={record.distance.toFixed(4)}</small></div>
                                 <button type="button" aria-label={`Use ${record.filename} as image query`}
                                   onClick={() => pivotTextResult(record.index)}>Continue by image</button>
+                                <button type="button" className="cart-candidate-button" disabled={cartBusy}
+                                  onClick={() => void addToCurationCart([{ index: record.index, source: "search", score: record.distance }])}>
+                                  Add to cart
+                                </button>
                               </article>
                             ))}
                           </div>
@@ -1209,6 +1310,10 @@ export default function App() {
                             <div><strong>{record.label}｜{record.filename}</strong><small>Cosine distance · d={record.distance.toFixed(4)}</small></div>
                             <button type="button" aria-label={`Search from ${record.filename}`}
                               onClick={() => continueSimilarSearch(record.index)}>Use as next query</button>
+                            <button type="button" className="cart-candidate-button" disabled={cartBusy}
+                              onClick={() => void addToCurationCart([{ index: record.index, source: "similar", score: record.distance }])}>
+                              Add to cart
+                            </button>
                           </article>
                         ))}
                       </div>
@@ -1259,7 +1364,15 @@ export default function App() {
                               <img src={api.runImageUrl(job?.run_id || "", pair.left.index)} alt="" loading="lazy" />
                               <span>{pair.left.label}｜{pair.left.filename} · {pair.left.split}</span>
                             </button>
-                            <div className="duplicate-pair-distance"><small>Pair {index + 1}</small><strong>d={duplicateResults.method === "phash" ? Math.round(pair.distance) : pair.distance.toFixed(4)}</strong></div>
+                            <div className="duplicate-pair-distance"><small>Pair {index + 1}</small><strong>d={duplicateResults.method === "phash" ? Math.round(pair.distance) : pair.distance.toFixed(4)}</strong>
+                              <button type="button" className="cart-candidate-button" disabled={cartBusy}
+                                onClick={() => void addToCurationCart([
+                                  { index: pair.left.index, source: "duplicate", score: pair.distance },
+                                  { index: pair.right.index, source: "duplicate", score: pair.distance },
+                                ])}>
+                                Add pair
+                              </button>
+                            </div>
                             <button type="button" aria-label={`Review right ${pair.right.filename}`} onClick={() => { setSelectedIndex(pair.right.index); setRankViewerMode(false); }}>
                               <img src={api.runImageUrl(job?.run_id || "", pair.right.index)} alt="" loading="lazy" />
                               <span>{pair.right.label}｜{pair.right.filename} · {pair.right.split}</span>
@@ -1325,6 +1438,53 @@ export default function App() {
               <div className="empty-facts"><span><b>01</b> Choose a dataset</span><span><b>02</b> Run your local model</span><span><b>03</b> Explore each image</span></div>
             </div>
           )}
+
+          <section className="curation-cart-panel" data-testid="curation-cart" aria-label="Curation cart">
+            <div className="curation-cart-heading">
+              <div><div className="eyebrow">CURATION</div><h3>Curation cart <span data-testid="curation-cart-count">{curationCart?.item_count ?? 0}</span></h3>
+                <p>Saved in the LV app cache; available after the local worker restarts.</p></div>
+              <div className="curation-cart-downloads">
+                <a data-testid="curation-cart-csv" href={api.curationCartCsvUrl()} download="curation_cart.csv">CSV</a>
+                <a data-testid="curation-cart-json" href={api.curationCartJsonUrl()} download="curation_cart.json">JSON</a>
+                <a data-testid="curation-cart-zip" href={api.curationCartZipUrl()} download="curation_cart_images.zip">Images ZIP</a>
+              </div>
+            </div>
+            {cartLoading ? <p className="curation-cart-status" role="status">Loading saved items…</p> : null}
+            {cartError && <p className="curation-cart-status curation-cart-error" role="alert">{cartError}</p>}
+            {cartNotice && <p className="curation-cart-status" data-testid="curation-cart-notice" role="status">{cartNotice}</p>}
+            <div className="curation-cart-toolbar">
+              <label><span>Source</span><select aria-label="Filter curation cart source" value={cartSourceFilter}
+                onChange={(event) => setCartSourceFilter(event.target.value)}>
+                <option value="all">All sources</option>
+                <option value="manual">Manual</option><option value="search">Text search</option>
+                <option value="similar">Similar images</option><option value="duplicate">Duplicate pairs</option>
+                <option value="outlier">Outlier ranking</option><option value="disagreement">Label disagreement</option>
+              </select></label>
+              <span data-testid="curation-cart-filter-count">Showing {cartFilteredItems.length} of {curationCart?.item_count ?? 0}</span>
+              <label className="curation-reason-input"><span>Reason for visible items</span><input aria-label="Curation reason" maxLength={2000}
+                value={cartReasonDraft} onChange={(event) => setCartReasonDraft(event.target.value)}
+                placeholder="Why are these images being kept?" /></label>
+              <button type="button" data-testid="curation-cart-save-reason" disabled={cartBusy || !cartFilteredItems.length}
+                onClick={() => void applyCurationReason()}>Save reason</button>
+              <label className="curation-clear-confirm"><input type="checkbox" aria-label="Confirm clear curation cart"
+                checked={cartClearConfirm} onChange={(event) => setCartClearConfirm(event.target.checked)} />Confirm clear</label>
+              <button type="button" data-testid="curation-cart-clear" disabled={cartBusy || !cartClearConfirm || !curationCart?.item_count}
+                onClick={() => void clearCurationCart()}>Clear cart</button>
+            </div>
+            {cartFilteredItems.length ? (
+              <div className="curation-cart-list">
+                {cartFilteredItems.map((item) => (
+                  <article className="curation-cart-item" key={item.id} data-testid="curation-cart-item" data-item-id={item.id}>
+                    <div><strong>{item.label}｜{item.filename}{item.object_index === undefined || item.object_index === null ? "" : ` · object ${item.object_index + 1}`}</strong>
+                      <small>{item.split} · {item.source}{item.score === null ? "" : ` · score ${item.score.toFixed(4)}`}{item.sha256 ? ` · sha ${item.sha256.slice(0, 12)}` : ""}</small>
+                      {item.reason && <span className="curation-cart-reason">{item.reason}</span>}</div>
+                    <button type="button" aria-label={`Remove ${item.filename} from cart`} disabled={cartBusy}
+                      onClick={() => void removeFromCurationCart(item.id)}>Remove</button>
+                  </article>
+                ))}
+              </div>
+            ) : !cartLoading ? <p className="curation-cart-empty" data-testid="curation-cart-empty">{curationCart?.item_count ? "No saved items match this source." : "Your curation cart is empty."}</p> : null}
+          </section>
           <footer className="canvas-footer"><span>VisualLatent · React Web</span><span>Worker API v1</span></footer>
         </main>
       </div>

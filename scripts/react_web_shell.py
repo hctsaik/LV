@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import mimetypes
 import os
 import threading
@@ -20,6 +21,12 @@ from starlette.staticfiles import StaticFiles
 
 from _utils import available_models, load_model, load_text_encoder, supports_text_query
 from react_compare import CompareCancelled, CompareInputError, project_comparison, run_image_comparison
+from react_curation import (
+    CurationCartError,
+    curation_item_id,
+    load_curation_cart,
+    save_curation_cart,
+)
 from react_visualize import JobCancelled, VisualizationInputError, run_visualization
 
 API_VERSION = "1"
@@ -98,6 +105,26 @@ class CreateRanking(BaseModel):
     method: str = Field(default="pca", min_length=1, max_length=16)
 
 
+class CurationCandidate(BaseModel):
+    index: int = Field(ge=0)
+    source: Literal["manual", "search", "similar", "duplicate", "outlier", "disagreement"] = "manual"
+    score: float | None = Field(default=None, allow_inf_nan=False)
+
+
+class AddCurationItems(BaseModel):
+    run_id: str = Field(min_length=1, max_length=128)
+    items: list[CurationCandidate] = Field(min_length=1, max_length=100_000)
+
+
+class SetCurationReasons(BaseModel):
+    item_ids: list[str] = Field(min_length=1, max_length=100_000)
+    reason: str = Field(max_length=2_000)
+
+
+class ClearCurationCart(BaseModel):
+    confirm: bool = False
+
+
 @dataclass
 class _Job:
     job_id: str
@@ -139,6 +166,36 @@ def _job_view(job: _Job) -> dict:
         "error": job.error,
         "can_cancel": job.state in {"queued", "running", "cancelling"},
     }
+
+
+def _curation_cart_payload(items: list[dict], *, added: int | None = None,
+                           skipped: int | None = None) -> dict:
+    public_fields = (
+        "id", "index", "filename", "label", "split", "sha256", "source",
+        "score", "reason", "level", "object_index", "bbox",
+    )
+    payload = {
+        "item_count": len(items),
+        "items": [{key: item.get(key) for key in public_fields if key in item}
+                  for item in items],
+        "source_counts": {
+            source: sum(1 for item in items if item.get("source") == source)
+            for source in sorted({str(item.get("source", "manual")) for item in items})
+        },
+    }
+    if added is not None:
+        payload["added"] = added
+    if skipped is not None:
+        payload["skipped"] = skipped
+    return payload
+
+
+def _curation_store_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail={
+        "code": "CURATION_CART_UNAVAILABLE",
+        "message": "The saved curation cart could not be read or written in the app cache.",
+        "request_id": uuid.uuid4().hex,
+    })
 
 
 def _run_embedding_matrix(run: dict, model_id: str) -> np.ndarray:
@@ -449,6 +506,7 @@ def create_app(
     app.state.text_vectors = {}
     app.state.compare_projection_active = False
     app.state.lock = threading.RLock()
+    app.state.curation_lock = threading.RLock()
 
     @app.exception_handler(HTTPException)
     async def http_error(_request: Request, exc: HTTPException) -> JSONResponse:
@@ -836,6 +894,181 @@ def create_app(
                 key: value for key, value in run.items()
                 if key != "image_paths" and not key.startswith("_")
             }
+
+    @app.get("/api/v1/curation-cart")
+    def get_curation_cart() -> dict:
+        try:
+            with app.state.curation_lock:
+                return _curation_cart_payload(load_curation_cart())
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+
+    @app.post("/api/v1/curation-cart/items")
+    def add_curation_items(request: AddCurationItems) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(request.run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+        records = run.get("records", [])
+        if any(candidate.index >= len(records) for candidate in request.items):
+            raise HTTPException(status_code=422, detail={
+                "code": "INVALID_RECORD_INDEX",
+                "message": "A curation candidate index is outside this run.",
+                "request_id": uuid.uuid4().hex,
+            })
+
+        candidates: list[dict] = []
+        paths = run.get("image_paths", [])
+        hashes = run.get("_sha256s", [])
+        for candidate in request.items:
+            index = candidate.index
+            record = records[index]
+            if index >= len(paths):
+                raise HTTPException(status_code=409, detail={
+                    "code": "RUN_IMAGE_UNAVAILABLE",
+                    "message": "A curation candidate no longer has a run-bound image.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            source_path = str(Path(paths[index]).resolve())
+            object_index = record.get("object_index")
+            score = candidate.score
+            if score is None and candidate.source in {"outlier", "disagreement"}:
+                model_scores = run.get("_ranking_scores", {}).get(run.get("model_id", ""), {})
+                values = model_scores.get(candidate.source)
+                if values is not None and index < len(values):
+                    score = float(values[index])
+            item = {
+                "id": curation_item_id(source_path, object_index),
+                "index": index,
+                "filename": str(record.get("filename", Path(source_path).name)),
+                "path": source_path,
+                "label": str(record.get("label", "")),
+                "split": str(record.get("split", "")),
+                "sha256": hashes[index] if index < len(hashes) and hashes[index] else None,
+                "source": candidate.source,
+                "score": round(float(score), 4) if score is not None else None,
+                "reason": "",
+                "level": "object" if object_index is not None else "image",
+                "object_index": object_index,
+                "bbox": record.get("bbox"),
+            }
+            candidates.append(item)
+
+        try:
+            with app.state.curation_lock:
+                items = load_curation_cart()
+                known = {item["id"] for item in items}
+                added = 0
+                skipped = 0
+                for candidate in candidates:
+                    if candidate["id"] in known:
+                        skipped += 1
+                        continue
+                    items.append(candidate)
+                    known.add(candidate["id"])
+                    added += 1
+                if added:
+                    save_curation_cart(items)
+                return _curation_cart_payload(items, added=added, skipped=skipped)
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+
+    @app.patch("/api/v1/curation-cart/reasons")
+    def set_curation_reasons(request: SetCurationReasons) -> dict:
+        try:
+            with app.state.curation_lock:
+                items = load_curation_cart()
+                by_id = {item["id"]: item for item in items}
+                requested_ids = list(dict.fromkeys(request.item_ids))
+                if any(item_id not in by_id for item_id in requested_ids):
+                    raise HTTPException(status_code=404, detail={
+                        "code": "CART_ITEM_NOT_FOUND",
+                        "message": "One or more curation items are no longer in the cart.",
+                        "request_id": uuid.uuid4().hex,
+                    })
+                for item_id in requested_ids:
+                    by_id[item_id]["reason"] = request.reason
+                save_curation_cart(items)
+                return _curation_cart_payload(items)
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+
+    @app.delete("/api/v1/curation-cart/items/{item_id}")
+    def remove_curation_item(item_id: str) -> dict:
+        if len(item_id) != 64 or any(char not in "0123456789abcdef" for char in item_id):
+            raise HTTPException(status_code=422, detail={
+                "code": "INVALID_CART_ITEM_ID",
+                "message": "The curation item identifier is invalid.",
+                "request_id": uuid.uuid4().hex,
+            })
+        try:
+            with app.state.curation_lock:
+                items = load_curation_cart()
+                remaining = [item for item in items if item["id"] != item_id]
+                if len(remaining) != len(items):
+                    save_curation_cart(remaining)
+                return _curation_cart_payload(remaining)
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+
+    @app.delete("/api/v1/curation-cart")
+    def clear_curation_cart(request: ClearCurationCart) -> dict:
+        if not request.confirm:
+            raise HTTPException(status_code=409, detail={
+                "code": "CONFIRMATION_REQUIRED",
+                "message": "Confirm that the full curation cart should be cleared.",
+                "request_id": uuid.uuid4().hex,
+            })
+        try:
+            with app.state.curation_lock:
+                save_curation_cart([])
+                return _curation_cart_payload([])
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+
+    @app.get("/api/v1/curation-cart.csv")
+    def export_curation_cart_csv() -> Response:
+        try:
+            with app.state.curation_lock:
+                items = load_curation_cart()
+            from interaction import snapshots_to_csv
+
+            content = snapshots_to_csv(items)
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+        return Response(content=content, media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="curation_cart.csv"',
+                                 "Cache-Control": "no-store"})
+
+    @app.get("/api/v1/curation-cart.json")
+    def export_curation_cart_json() -> Response:
+        try:
+            with app.state.curation_lock:
+                items = load_curation_cart()
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+        content = json.dumps({"schema_version": 1, "items": items},
+                             ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        return Response(content=content, media_type="application/json; charset=utf-8",
+                        headers={"Content-Disposition": 'attachment; filename="curation_cart.json"',
+                                 "Cache-Control": "no-store"})
+
+    @app.get("/api/v1/curation-cart.zip")
+    def export_curation_cart_zip() -> Response:
+        try:
+            with app.state.curation_lock:
+                items = load_curation_cart()
+        except CurationCartError:
+            raise _curation_store_unavailable() from None
+        from interaction import zip_selected_images
+
+        records_for_zip = [{
+            "path": item["path"], "label": item["label"], "split": item["split"],
+        } for item in items]
+        content = zip_selected_images(records_for_zip, list(range(len(items))))
+        return Response(content=content, media_type="application/zip",
+                        headers={"Content-Disposition": 'attachment; filename="curation_cart_images.zip"',
+                                 "Cache-Control": "no-store"})
 
     @app.post("/api/v1/runs/{run_id}/rankings")
     def rank_run_images(run_id: str, request: CreateRanking) -> dict:

@@ -420,6 +420,7 @@ def _run_object_visualization(
         "_object_policy": policy,
         "_embedding_sources": {name: [] for name in model_names},
         "_ranking_scores": ranking_scores,
+        "_sha256s": [source_hashes[row["image_path"]] for row in ordered_objects],
     }
 
 
@@ -689,6 +690,10 @@ def run_visualization(
     ranking_scores = _compute_rank_scores(
         embeddings_by_model, [str(record["label"]) for record in records],
     )
+    sha256s = [""] * len(records)
+    for source in embedding_sources.get(selected_models[0], []):
+        for index, key in zip(source.get("indices", []), source.get("keys", [])):
+            sha256s[int(index)] = str(key)
     return {
         "source_mode": mode,
         "source_granularity": "whole_image",
@@ -710,6 +715,7 @@ def run_visualization(
         "_embedding_sources": embedding_sources,
         "_phashes": [phash_by_path.get(str(Path(record["path"]).resolve())) for record in records],
         "_ranking_scores": ranking_scores,
+        "_sha256s": sha256s,
     }
 
 

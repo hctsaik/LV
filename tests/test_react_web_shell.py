@@ -5,8 +5,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import time
+import zipfile
 from pathlib import Path
 from threading import Event
 
@@ -1042,3 +1044,140 @@ def test_case_lv_web_01_view_01_detector_image_route_draws_yolo_overlay(
     assert raw_pixels.shape == overlay_pixels.shape == (64, 64, 3)
     assert not np.array_equal(raw_pixels, overlay_pixels)
     assert {path: path.read_bytes() for path in originals} == originals
+
+
+def test_case_lv_web_01_cart_01_persists_deduplicates_and_exports(
+    classifier_fixture, monkeypatch, tmp_path
+):
+    """CART-01: the saved cart survives worker recreation and preserves export identity."""
+    originals = {
+        path: path.read_bytes()
+        for folder in classifier_fixture["folders"]
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+    cache_root = tmp_path.parent / f"{tmp_path.name}-lv-cache"
+
+    with _client(monkeypatch, tmp_path) as client:
+        job = _run(client, classifier_fixture["folders"])
+        assert job["state"] == "completed", job
+        run_id = job["run_id"]
+        assert client.get("/api/v1/curation-cart").json()["item_count"] == 0
+
+        added = client.post("/api/v1/curation-cart/items", json={
+            "run_id": run_id,
+            "items": [
+                {"index": 0, "source": "manual"},
+                {"index": 0, "source": "search", "score": 0.125},
+                {"index": 1, "source": "outlier", "score": 0.375},
+            ],
+        })
+        assert added.status_code == 200, added.text
+        payload = added.json()
+        assert (payload["item_count"], payload["added"], payload["skipped"]) == (2, 2, 1)
+        assert all("path" not in item for item in payload["items"])
+        assert payload["items"][0]["source"] == "manual"
+        assert payload["items"][0]["score"] is None
+        assert payload["items"][1]["score"] == 0.375
+        assert payload["items"][1]["sha256"]
+
+        item_ids = [item["id"] for item in payload["items"]]
+        reason_response = client.patch("/api/v1/curation-cart/reasons", json={
+            "item_ids": item_ids,
+            "reason": "Review for balanced validation coverage",
+        })
+        assert reason_response.status_code == 200, reason_response.text
+        assert {item["reason"] for item in reason_response.json()["items"]} == {
+            "Review for balanced validation coverage"
+        }
+        assert client.request(
+            "DELETE", "/api/v1/curation-cart", json={"confirm": False}
+        ).status_code == 409
+
+        csv_response = client.get("/api/v1/curation-cart.csv")
+        assert csv_response.status_code == 200
+        rows = list(csv.DictReader(io.StringIO(csv_response.text)))
+        assert [row["source"] for row in rows] == ["manual", "outlier"]
+        assert rows[1]["score"] == "0.375"
+        assert all(row["reason"] == "Review for balanced validation coverage" for row in rows)
+
+        zip_response = client.get("/api/v1/curation-cart.zip")
+        assert zip_response.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(zip_response.content)) as archive:
+            names = archive.namelist()
+            assert "manifest.csv" in names
+            assert len([name for name in names if name.startswith("images/")]) == 2
+            assert "status,arcname" in archive.read("manifest.csv").decode("utf-8")
+
+        persisted_path = cache_root / "curation_cart.json"
+        stored = json.loads(persisted_path.read_text(encoding="utf-8"))
+        assert stored["schema_version"] == 1
+        assert stored["items"][0]["path"]
+        assert stored["items"][0]["reason"] == "Review for balanced validation coverage"
+
+    # A fresh FastAPI app models a worker restart; it reads the app-owned cache.
+    with TestClient(create_app()) as restarted_worker:
+        restored = restarted_worker.get("/api/v1/curation-cart")
+        assert restored.status_code == 200
+        assert restored.json()["item_count"] == 2
+        json_response = restarted_worker.get("/api/v1/curation-cart.json")
+        exported = json_response.json()
+        assert exported["schema_version"] == 1
+        assert [item["source"] for item in exported["items"]] == ["manual", "outlier"]
+        assert all(item["reason"] == "Review for balanced validation coverage" for item in exported["items"])
+        assert all(Path(item["path"]).is_absolute() for item in exported["items"])
+        removed = restarted_worker.delete(f"/api/v1/curation-cart/items/{exported['items'][0]['id']}")
+        assert removed.status_code == 200
+        assert removed.json()["item_count"] == 1
+        cleared = restarted_worker.request(
+            "DELETE", "/api/v1/curation-cart", json={"confirm": True}
+        )
+        assert cleared.status_code == 200
+        assert cleared.json()["item_count"] == 0
+
+    assert {path: path.read_bytes() for path in originals} == originals
+
+
+def test_case_lv_web_01_cart_01_keeps_object_identity_for_boxes_on_one_image(
+    monkeypatch, tmp_path
+):
+    root = tmp_path / "cart-objects"
+    folder = root / "train"
+    images, labels = folder / "images", folder / "labels"
+    labels.mkdir(parents=True)
+    (root / "classes.txt").write_text("part\n", encoding="utf-8")
+    image_path = images / "same-image.png"
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (80, 60), (70, 120, 180)).save(image_path)
+    (labels / "same-image.txt").write_text(
+        "0 0.25 0.5 0.2 0.4\n0 0.75 0.5 0.2 0.4\n", encoding="utf-8"
+    )
+    source_before = image_path.read_bytes()
+
+    def object_loader(_model: str, _policy: dict):
+        def embed(crop: Image.Image) -> np.ndarray:
+            pixels = np.asarray(crop.convert("RGB"), dtype=np.float32)
+            vector = np.zeros(384, dtype=np.float32)
+            vector[:3] = pixels.mean(axis=(0, 1)) / 255.0 + 0.01
+            return vector
+        return embed
+
+    with _client(monkeypatch, tmp_path, object_model_loader=object_loader) as client:
+        job = _run_custom(client, {
+            "folders": [str(folder)], "model_ids": ["dinov2_vits14"],
+            "methods": ["pca"], "mode": "object_detector", "granularity": "object",
+        })
+        assert job["state"] == "completed", job
+        run = client.get(f"/api/v1/runs/{job['run_id']}").json()
+        assert [row["object_index"] for row in run["records"]] == [0, 1]
+        added = client.post("/api/v1/curation-cart/items", json={
+            "run_id": job["run_id"],
+            "items": [{"index": 0}, {"index": 1}],
+        })
+        assert added.status_code == 200, added.text
+        items = added.json()["items"]
+
+    assert len(items) == 2
+    assert items[0]["id"] != items[1]["id"]
+    assert [item["object_index"] for item in items] == [0, 1]
+    assert image_path.read_bytes() == source_before
