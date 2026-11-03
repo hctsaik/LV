@@ -1382,7 +1382,11 @@ def test_lv_web_01_ic_04_real_model_matches_streamlit_kmeans_and_drilldown(
                     return
                 request = response.request.post_data_json
                 if request:
-                    block_responses.append((request, response.json()))
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        return
+                    block_responses.append((request, payload))
 
             page.on("response", capture_blocks)
             page.goto(base_url, wait_until="networkidle")
@@ -4222,7 +4226,9 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
 def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Pinned real-model object analysis can hand selected crops into Curation."""
+    """Pinned object flow matches Streamlit vectors and KMeans drilldown in React."""
+    import app as legacy_app
+
     models_dir = _pinned_dinov2_models_dir(tmp_path)
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
@@ -4247,14 +4253,28 @@ def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
             run_payloads = []
+            block_responses: list[tuple[dict, dict]] = []
             page.on(
                 "response",
                 lambda response: run_payloads.append(response.json())
                 if _is_run_summary_response(response) and response.ok
                 else None,
             )
+
+            def capture_blocks(response):
+                if not response.ok or not urlparse(response.url).path.endswith("/blocks"):
+                    return
+                request = response.request.post_data_json
+                if request:
+                    try:
+                        payload = response.json()
+                    except Exception:
+                        return
+                    block_responses.append((request, payload))
+
+            page.on("response", capture_blocks)
             page.goto(base_url, wait_until="networkidle")
             page.get_by_label("Analysis mode").select_option("detector")
             page.get_by_label("Detection unit").select_option("object")
@@ -4283,6 +4303,38 @@ def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
                 ("03.png", "stain", 0),
                 ("04.png", "class_8", 0),
             ]
+            with application.state.lock:
+                run_id = application.state.current_run_id
+                stored_run = application.state.runs[run_id]
+                raw_embeddings = application.state.raw_embeddings[run_id][
+                    "dinov2_vits14"
+                ].copy()
+            assert raw_embeddings.shape == (5, 384)
+            class_names = list(run["class_names"])
+            monkeypatch.setattr(legacy_app.st, "session_state", {})
+            monkeypatch.setattr(
+                legacy_app,
+                "load_model",
+                lambda model_id, **kwargs: load_model(
+                    model_id, models_dir=models_dir, **kwargs,
+                ),
+            )
+            legacy_records, legacy_vectors, _legacy_token = legacy_app._crop_and_embed_objects(
+                legacy_app.discover_images(folders, class_names),
+                "dinov2_vits14",
+                class_names,
+                0.12,
+                base_token=f"react-web-od-02-{run_id}",
+                policy=run["object_policy"],
+            )
+            assert len(legacy_records) == len(stored_run["records"]) == 5
+            np.testing.assert_allclose(raw_embeddings, legacy_vectors, rtol=1e-6, atol=1e-7)
+            for expected, actual in zip(legacy_records, stored_run["records"], strict=True):
+                assert actual["filename"] == expected["image_path"].name
+                assert actual["label"] == expected["label"]
+                assert actual["class_id"] == expected["class_id"]
+                assert actual["obj_index"] == expected["obj_index"]
+                np.testing.assert_allclose(actual["bbox"], expected["bbox"], rtol=0, atol=1e-7)
             page.get_by_label("Filter by class").select_option(label="stain")
             stain_points = page.get_by_test_id("embedding-point")
             expect(stain_points).to_have_count(2)
@@ -4308,6 +4360,85 @@ def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
                 ("03.png", "stain", "object", 0, run["records"][3]["bbox"]),
             ]
             assert all("path" not in item and "image_path" not in item for item in curation["items"])
+
+            page.get_by_label("Filter by class").select_option(label="All classes")
+            page.get_by_label("Display method").select_option("pca")
+            page.get_by_test_id("dimension-3d").click()
+            expect(page.get_by_test_id("embedding-plot-3d")).to_be_visible(timeout=60_000)
+            kmeans_count = page.get_by_test_id("kmeans-count")
+            kmeans_count.focus()
+            kmeans_count.press("Home")
+            expect(page.get_by_test_id("kmeans-status")).to_contain_text(
+                "4 個區塊", timeout=30_000,
+            )
+            expect(page.get_by_test_id("cluster-block-select")).to_be_enabled()
+
+            pca_view = next(
+                view for view in stored_run["views"]
+                if view["model_id"] == "dinov2_vits14" and view["method"] == "pca"
+            )
+            view_points = sorted(pca_view["points"], key=lambda point: point["index"])
+            indices = [int(point["index"]) for point in view_points]
+            coordinates = np.asarray(
+                [[point["x"], point["y"], point["z"]] for point in view_points],
+                dtype=float,
+            )
+            monkeypatch.setattr(legacy_app.st, "session_state", {})
+            legacy_blocks, legacy_centers = legacy_app._viz_kmeans_blocks(
+                coordinates, indices, 4, f"real-object-{run_id}",
+            )
+            base_responses = [
+                (request, response)
+                for request, response in reversed(block_responses)
+                if request.get("k") == 4
+            ]
+            assert base_responses, f"Captured KMeans requests: {[item[0] for item in block_responses]}"
+            base_request, base_response = base_responses[0]
+            assert base_request["model_id"] == "dinov2_vits14"
+            assert base_request["method"] == "pca"
+            react_blocks = {
+                int(point["index"]): int(point["block_id"])
+                for point in base_response["points"]
+            }
+            assert react_blocks == legacy_blocks
+            react_centers = sorted(base_response["centers"], key=lambda item: item["block_id"])
+            np.testing.assert_allclose(
+                [[center["x"], center["y"], center["z"]] for center in react_centers],
+                legacy_centers,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+            largest = max(base_response["centers"], key=lambda center: center["count"])
+            page.get_by_test_id("cluster-block-select").select_option(str(largest["block_id"]))
+            expect(page.get_by_test_id("block-point")).to_have_count(
+                largest["count"], timeout=30_000,
+            )
+            selected_response = next(
+                response
+                for request, response in reversed(block_responses)
+                if request.get("k") == 4 and request.get("block_id") == largest["block_id"]
+            )
+            members = sorted(
+                index for index, block_id in legacy_blocks.items()
+                if block_id == largest["block_id"]
+            )
+            if len(members) > 2 and float(np.var(legacy_vectors[members])) > 0.0:
+                expected_drilldown = legacy_app.PCA(
+                    n_components=2, random_state=42,
+                ).fit_transform(legacy_vectors[members])
+            else:
+                expected_drilldown = coordinates[members, :2]
+            assert [point["index"] for point in selected_response["drilldown_points"]] == members
+            np.testing.assert_allclose(
+                [[point["x"], point["y"]] for point in selected_response["drilldown_points"]],
+                expected_drilldown,
+                rtol=1e-6,
+                atol=1e-6,
+            )
+            expect(page.get_by_test_id("block-drilldown")).to_be_visible()
+            expect(page.get_by_test_id("block-drilldown")).to_contain_text(
+                f"#{largest['block_id']}"
+            )
 
             page.get_by_test_id("open-curation").click()
             expect(page.get_by_test_id("curation-item")).to_have_count(2)

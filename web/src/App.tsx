@@ -459,7 +459,7 @@ export default function App() {
     currentRunId,
     diagnosticResolution,
   ]);
-  const usesClassifierBlocks = run?.mode === "classifier" && run.unit === "image";
+  const usesKMeansBlocks = run !== null;
   const canSearchSimilar = run?.mode === "classifier" && run.unit === "image";
   const similarQueryIndex = similarChain[similarChain.length - 1] ?? null;
   const canSearchText = Boolean(
@@ -575,7 +575,7 @@ export default function App() {
     const requestId = ++blockRequest.current;
     const runId = job?.run_id;
     if (
-      dimension !== 3 || !usesClassifierBlocks || !runId || !currentView || !currentRecords.length
+      dimension !== 3 || !usesKMeansBlocks || !runId || !currentView || !currentRecords.length
     ) {
       setBlockData(null);
       setSelectedBlock(null);
@@ -610,7 +610,7 @@ export default function App() {
     });
     return () => { blockRequest.current += 1; };
   }, [
-    dimension, usesClassifierBlocks, job?.run_id, currentView, currentRecords.length,
+    dimension, usesKMeansBlocks, job?.run_id, currentView, currentRecords.length,
     activeModelId, blockCount, labelFilter, splitFilter, selectedBlock,
   ]);
 
@@ -1721,10 +1721,10 @@ export default function App() {
                     onAddSelection={addSelection}
                     dimension={dimension}
                     viewKey={activeModelId + "-" + currentView.method + "-" + splitFilter + "-" + labelFilter}
-                    clusterCenters={dimension === 3 && usesClassifierBlocks ? blockData?.centers : undefined}
+                    clusterCenters={dimension === 3 && usesKMeansBlocks ? blockData?.centers : undefined}
                   />
                 ) : <div className="empty-filter">No images match these filters.</div>}
-                {dimension === 3 && usesClassifierBlocks && currentRecords.length > 0 && (
+                {dimension === 3 && usesKMeansBlocks && currentRecords.length > 0 && (
                   <section className="block-drilldown" data-testid="kmeans-blocks">
                     <div className="block-controls">
                       <label>

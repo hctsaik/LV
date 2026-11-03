@@ -591,8 +591,8 @@ def run_image_visualization(
         # dHash values are computed and cached by the run's manifest. Keep them
         # worker-private and aligned to records for duplicate review.
         "_phashes": record_phashes,
-        # Kept only in the local worker for the legacy classifier 3D block
-        # drilldown. The HTTP run response deliberately omits this field.
+        # Kept only in the local worker for 3D block drilldown. The HTTP run
+        # response deliberately omits this field.
         "_raw_embeddings": embeddings_by_model
         if (mode == "classifier" and unit == "image") or include_raw_embeddings else {},
         "_ranking_scores": ranking_scores,

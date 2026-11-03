@@ -2756,6 +2756,7 @@ def create_app(
                 ),
                 umap_reference=job.request.umap_reference,
                 umap_rebuild=job.request.umap_rebuild,
+                include_raw_embeddings=True,
                 model_loader=loader,
                 object_model_loader=object_loader,
                 progress=update_progress,
@@ -7789,8 +7790,8 @@ def create_app(
             raw_by_model = app.state.raw_embeddings.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
-        if run.get("mode") != "classifier" or run.get("unit") != "image":
-            raise HTTPException(status_code=409, detail="KMeans blocks require classifier image embeddings")
+        if run.get("mode") not in {"classifier", "detector"} or run.get("unit") not in {"image", "object"}:
+            raise HTTPException(status_code=409, detail="KMeans blocks require a supported visualization run")
         raw = (raw_by_model or {}).get(request.model_id)
         if raw is None:
             raise HTTPException(status_code=404, detail="Raw embeddings are unavailable for this model")
