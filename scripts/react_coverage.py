@@ -58,6 +58,12 @@ def coverage_projection(
     elif method in {"lda", "sumap"} and (sample_count < 4 or len(unique_labels) < 2):
         warnings.append(f"{method} needs at least four images from two classes; PCA is shown instead.")
         selected_method = "pca"
+    elif method in {"umap", "sumap"} and component_count + 1 >= sample_count:
+        minimum_images = component_count + 2
+        warnings.append(
+            f"{method} needs at least {minimum_images} images for a {dimension}D layout; PCA is shown instead."
+        )
+        selected_method = "pca"
 
     try:
         if selected_method == "pca":

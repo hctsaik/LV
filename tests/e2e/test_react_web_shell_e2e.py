@@ -1608,6 +1608,24 @@ def test_lv_web_03_img_01_visible_coverage_projection_box_selection_and_clear(
                 page.get_by_test_id("coverage-dimension-2d").click()
             expect(page.get_by_test_id("coverage-selected-count")).to_have_text("3 selected")
 
+            with page.expect_response(lambda response: "/coverage/runs/" in response.url
+                                      and response.url.endswith("/projections")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_label("Projection method").select_option("umap")
+            with page.expect_response(lambda response: "/coverage/runs/" in response.url
+                                      and response.url.endswith("/projections")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_test_id("coverage-dimension-3d").click()
+            expect(page.locator(".coverage-warning[role='status']")
+                   .filter(has_text="at least 5 images for a 3D layout")).to_be_visible()
+            expect(page.locator("[data-testid='coverage-plot'] [data-testid='coverage-plot-3d']")).to_be_visible()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+            with page.expect_response(lambda response: "/coverage/runs/" in response.url
+                                      and response.url.endswith("/projections")
+                                      and response.request.method == "POST" and response.ok):
+                page.get_by_test_id("coverage-dimension-2d").click()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(4)
+
             with page.expect_response(lambda response: response.url.endswith("/sparsity")
                                       and response.request.method == "POST" and response.ok):
                 page.get_by_test_id("coverage-k").fill("1")
@@ -1840,6 +1858,116 @@ def test_lv_web_03_img_01_real_model_visible_streamlit_sparsity_parity(
         path: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in source_hashes
     }, "real-model coverage changed the source dataset"
+
+
+def test_lv_web_03_img_01_real_model_umap_visible_streamlit_projection_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Real-model React UMAP matches Streamlit in 2D and 3D with a sufficient sample count."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+    pytest.importorskip("umap")
+
+    import app as legacy_app
+
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
+    dataset = _fixture(tmp_path / "coverage-real-umap")
+    Image.new("RGB", (48, 32), (40, 70, 180)).save(dataset / "train" / "apple" / "image-05.png")
+    folders = [dataset / "train", dataset / "test"]
+    source_hashes = {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for folder in folders
+        for path in folder.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "coverage-real-umap-cache"))
+    application = create_app(
+        model_catalog=lambda: ["dinov2_vits14"],
+        model_loader=lambda model_id: load_model(model_id, models_dir),
+    )
+    server = server_thread = browser = None
+    try:
+        server, server_thread, base_url = _start_api(application)
+        from playwright.sync_api import expect, sync_playwright
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1500, "height": 1100})
+            page.set_default_timeout(120_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_role("button", name="Coverage", exact=True).click()
+            for folder in folders:
+                page.get_by_label("Coverage image folder").fill(str(folder))
+                page.get_by_role("button", name="Add coverage folder").click()
+            expect(page.get_by_label("Feature model")).to_have_value("dinov2_vits14")
+            page.get_by_label("Projection method").select_option("umap")
+            page.get_by_role("button", name="Run coverage analysis").click()
+            expect(page.get_by_test_id("coverage-job-status")).to_contain_text(
+                "Completed", timeout=300_000,
+            )
+            expect(page.get_by_test_id("coverage-point")).to_have_count(5)
+
+            with application.state.lock:
+                assert len(application.state.coverage_runs) == 1
+                run_id, stored_run = next(iter(application.state.coverage_runs.items()))
+                run = dict(stored_run)
+                vectors = application.state.coverage_embeddings[run_id].copy()
+            assert vectors.shape == (5, 384)
+            assert run["method"] == run["requested_method"] == "umap"
+            assert run["dimension"] == 2
+
+            monkeypatch.setattr(legacy_app.st, "session_state", {})
+            legacy_2d, _ = legacy_app._cov_projection(
+                vectors, None, "umap", 2, f"img01-real-umap-{run_id}", "",
+            )
+            legacy_3d, _ = legacy_app._cov_projection(
+                vectors, None, "umap", 3, f"img01-real-umap-{run_id}", "",
+            )
+            react_2d = np.asarray([[point["x"], point["y"]] for point in run["points"]])
+            np.testing.assert_allclose(react_2d, legacy_2d, rtol=1e-5, atol=1e-5)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as projection_3d_response:
+                page.get_by_test_id("coverage-dimension-3d").click()
+            projection_3d = projection_3d_response.value.json()
+            assert projection_3d["method"] == "umap"
+            react_3d = np.asarray([
+                [point["x"], point["y"], point["z"]]
+                for point in projection_3d["points"]
+            ])
+            np.testing.assert_allclose(react_3d, legacy_3d, rtol=1e-5, atol=1e-5)
+            expect(page.locator(
+                "[data-testid='coverage-plot'] [data-testid='coverage-plot-3d']",
+            )).to_be_visible()
+            expect(page.get_by_test_id("coverage-point")).to_have_count(5)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/projections")
+                and response.request.method == "POST" and response.ok,
+            ) as projection_2d_response:
+                page.get_by_test_id("coverage-dimension-2d").click()
+            projection_2d = projection_2d_response.value.json()
+            react_2d_switched = np.asarray([
+                [point["x"], point["y"]]
+                for point in projection_2d["points"]
+            ])
+            np.testing.assert_allclose(react_2d_switched, legacy_2d, rtol=1e-5, atol=1e-5)
+            expect(page.get_by_test_id("coverage-dimension-2d")).to_have_attribute(
+                "aria-pressed", "true",
+            )
+            expect(page.get_by_test_id("coverage-point")).to_have_count(5)
+    finally:
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert source_hashes == {
+        path: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in source_hashes
+    }, "real-model UMAP coverage changed the source dataset"
 
 
 def test_lv_web_03_attr_01_visible_attribute_grid_calibration_and_candidate_mining(

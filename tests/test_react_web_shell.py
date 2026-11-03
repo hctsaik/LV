@@ -923,6 +923,21 @@ def test_case_lv_web_03_img_01_coverage_sparsity_projection_selection_inputs(
         assert len(projection["points"]) == 4
         assert all(np.isfinite([point["x"], point["y"]]).all() for point in projection["points"])
 
+        small_umap_3d = client.post(
+            f"/api/v1/coverage/runs/{run_id}/projections",
+            json={"method": "umap", "dimension": 3},
+        )
+        assert small_umap_3d.status_code == 200, small_umap_3d.text
+        fallback_projection = small_umap_3d.json()
+        assert fallback_projection["requested_method"] == "umap"
+        assert fallback_projection["method"] == "pca"
+        assert fallback_projection["dimension"] == 3
+        assert any("at least 5 images for a 3d layout" in warning.lower()
+                   for warning in fallback_projection["warnings"])
+        assert len(fallback_projection["points"]) == 4
+        assert all(np.isfinite([point["x"], point["y"], point["z"]]).all()
+                   for point in fallback_projection["points"])
+
         changed_k = client.post(
             f"/api/v1/coverage/runs/{run_id}/sparsity",
             json={"k": 1},
@@ -945,6 +960,37 @@ def test_case_lv_web_03_img_01_coverage_sparsity_projection_selection_inputs(
         path: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in source_hashes
     }
+
+
+@pytest.mark.parametrize("method", ["umap", "sumap"])
+def test_case_lv_web_03_img_01_umap_3d_small_sample_falls_back_to_pca(method, monkeypatch):
+    import sys
+    import types
+
+    from react_coverage import coverage_projection
+
+    fake_umap = types.ModuleType("umap")
+
+    def unexpected_umap_call(**_kwargs):
+        raise AssertionError("UMAP must not run when the requested 3D layout is underdetermined.")
+
+    fake_umap.UMAP = unexpected_umap_call
+    monkeypatch.setitem(sys.modules, "umap", fake_umap)
+    embeddings = np.asarray([
+        [1.0, 0.0, 0.1, 0.0],
+        [0.9, 0.2, 0.0, 0.1],
+        [0.0, 1.0, 0.2, 0.0],
+        [0.1, 0.9, 0.0, 0.2],
+    ])
+
+    coordinates, used_method, warnings = coverage_projection(
+        embeddings, ["apple", "apple", "banana", "banana"], method, 3,
+    )
+
+    assert used_method == "pca"
+    assert coordinates.shape == (4, 3)
+    assert np.isfinite(coordinates).all()
+    assert any("at least 5 images for a 3d layout" in warning.lower() for warning in warnings)
 
 
 def test_case_lv_web_03_attr_01_attribute_grid_calibration_and_cell_candidate_readback(
