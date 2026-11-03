@@ -58,6 +58,8 @@ from curation_store import CurationStore, CurationStoreError
 from fp_case_store import FalsePositiveCaseStore, public_case
 from fp_external_models import ExternalModelRegistry, MAX_MODEL_BYTES
 from fp_external_runtime import Runtime as ExternalOnnxRuntime, compare_reference as compare_external_reference
+from fp_external_evaluation import export_training as export_fp_training
+from fp_external_evaluation import paired_evaluation as run_fp_paired_evaluation
 from fp_case_search import add_candidate as add_fp_search_candidate
 from fp_case_search import model_recipe as fp_case_model_recipe
 from fp_case_search import search_case as run_fp_case_search
@@ -549,6 +551,29 @@ class RunExternalModelRequest(BaseModel):
     reference: dict | None = None
     score_atol: float = Field(default=0.001, ge=0.0, le=0.1)
     box_atol: float = Field(default=0.001, ge=0.0, le=0.1)
+
+
+class RunFalsePositiveEvaluationRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    baseline_profile_id: str = Field(min_length=1, max_length=64)
+    baseline_profile_revision: int = Field(default=1, ge=1)
+    candidate_profile_id: str = Field(min_length=1, max_length=64)
+    candidate_profile_revision: int = Field(default=1, ge=1)
+    manifest: dict
+    base_dir: str = Field(default="", max_length=4096)
+    min_support: int = Field(default=10, ge=1, le=5000)
+    max_miss_increase: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+    min_fp_reduction: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
+
+
+class ExportFalsePositiveTrainingRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    complete_images: list[str] = Field(min_length=1, max_length=5000)
+    class_assignments: dict[str, str] = Field(default_factory=dict, max_length=10000)
+    class_names: list[str] = Field(min_length=1, max_length=256)
+    reviewer: str = Field(min_length=1, max_length=256)
+    reason: str = Field(min_length=1, max_length=4000)
+    confirmed_complete: bool
 
 
 class CreateComparisonJob(BaseModel):
@@ -1654,6 +1679,164 @@ def create_app(
             saved = save_fp_case(case_snapshot)
         saved_run = next(row for row in saved["external_runs"] if row["id"] == run["id"])
         return {"case": saved, "run": saved_run}
+
+    @app.post("/api/v1/fp-cases/{case_id}/evaluations", status_code=201)
+    def evaluate_fp_case_models(
+        case_id: str, request: RunFalsePositiveEvaluationRequest
+    ) -> dict:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            case_snapshot = copy.deepcopy(case)
+        registry = app.state.external_model_registry
+        try:
+            baseline_profile = registry.get(
+                request.baseline_profile_id, request.baseline_profile_revision
+            )
+            candidate_profile = registry.get(
+                request.candidate_profile_id, request.candidate_profile_revision
+            )
+            result = run_fp_paired_evaluation(
+                case_snapshot,
+                app.state.fp_case_store,
+                registry.runtime_config(
+                    request.baseline_profile_id, request.baseline_profile_revision
+                ),
+                registry.runtime_config(
+                    request.candidate_profile_id, request.candidate_profile_revision
+                ),
+                request.manifest,
+                base_dir=request.base_dir or None,
+                min_support=request.min_support,
+                max_miss_increase=request.max_miss_increase,
+                min_fp_reduction=request.min_fp_reduction,
+                baseline_profile={
+                    "id": baseline_profile["id"],
+                    "revision": baseline_profile["revision"],
+                    "name": baseline_profile["name"],
+                    "asset_sha256": baseline_profile["asset"]["sha256"],
+                },
+                candidate_profile={
+                    "id": candidate_profile["id"],
+                    "revision": candidate_profile["revision"],
+                    "name": candidate_profile["name"],
+                    "asset_sha256": candidate_profile["asset"]["sha256"],
+                },
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("LV paired external-model evaluation failed (case=%s)", case_id)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "EXTERNAL_EVALUATION_FAILED",
+                    "message": "固定資料集評估失敗；請確認模型、資料集與本機執行環境後重試。",
+                    "request_id": uuid.uuid4().hex,
+                },
+            ) from exc
+        with app.state.fp_case_lock:
+            latest = get_fp_case(case_id)
+            check_fp_revision(latest, request.expected_revision)
+            saved = save_fp_case(case_snapshot)
+        saved_result = next(
+            row for row in saved["evaluations"] if row["id"] == result["id"]
+        )
+        return {"case": saved, "evaluation": saved_result}
+
+    @app.post("/api/v1/fp-cases/{case_id}/training-exports", status_code=201)
+    def create_fp_training_export(
+        case_id: str, request: ExportFalsePositiveTrainingRequest
+    ) -> dict:
+        if request.confirmed_complete is not True:
+            raise HTTPException(
+                status_code=422,
+                detail="訓練交接需要明確確認整張影像與標註完整性",
+            )
+        if len(request.complete_images) != len(set(request.complete_images)):
+            raise HTTPException(status_code=422, detail="完整影像清單不可重複")
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            check_fp_revision(case, request.expected_revision)
+            case_snapshot = copy.deepcopy(case)
+        try:
+            record, payload = export_fp_training(
+                case_snapshot,
+                app.state.fp_case_store,
+                complete_images=request.complete_images,
+                class_assignments=request.class_assignments,
+                class_names=request.class_names,
+                reviewer=request.reviewer,
+                reason=request.reason,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        training_root = (app.state.fp_case_store.root / "training").resolve()
+        export_root = (training_root / case_id).resolve()
+        if not export_root.is_relative_to(training_root):
+            raise HTTPException(status_code=422, detail="案件訓練交接位置無效")
+        export_root.mkdir(parents=True, exist_ok=True)
+        archive_path = (export_root / record["zip_file"]).resolve()
+        if not archive_path.is_relative_to(export_root):
+            raise HTTPException(status_code=422, detail="訓練交接檔案名稱無效")
+        staged_path = archive_path.with_name("." + archive_path.name + ".tmp")
+        try:
+            staged_path.write_bytes(payload)
+            os.replace(staged_path, archive_path)
+            with app.state.fp_case_lock:
+                latest = get_fp_case(case_id)
+                check_fp_revision(latest, request.expected_revision)
+                saved = save_fp_case(case_snapshot)
+        except HTTPException:
+            archive_path.unlink(missing_ok=True)
+            raise
+        except Exception:
+            archive_path.unlink(missing_ok=True)
+            raise
+        finally:
+            staged_path.unlink(missing_ok=True)
+        saved_record = next(
+            row
+            for row in saved["training_exports"]
+            if row["id"] == record["id"]
+        )
+        return {"case": saved, "training_export": saved_record}
+
+    @app.get(
+        "/api/v1/fp-cases/{case_id}/training-exports/{export_id}/archive.zip"
+    )
+    def download_fp_training_export(case_id: str, export_id: str) -> Response:
+        with app.state.fp_case_lock:
+            case = get_fp_case(case_id)
+            record = next(
+                (
+                    row
+                    for row in case.get("training_exports", [])
+                    if row.get("id") == export_id
+                    and row.get("zip_file") == export_id + ".zip"
+                ),
+                None,
+            )
+            if record is None:
+                raise HTTPException(status_code=404, detail="找不到訓練交接 ZIP")
+            training_root = (app.state.fp_case_store.root / "training").resolve()
+            export_root = (training_root / case_id).resolve()
+            if not export_root.is_relative_to(training_root):
+                raise HTTPException(status_code=409, detail="案件訓練交接位置無效")
+            archive_path = (export_root / record["zip_file"]).resolve()
+            if not archive_path.is_relative_to(export_root) or not archive_path.is_file():
+                raise HTTPException(status_code=404, detail="訓練交接 ZIP 不存在")
+            payload = archive_path.read_bytes()
+        return Response(
+            payload,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{export_id}.zip"',
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     def get_external_run(case_id: str, run_id: str) -> tuple[dict, dict, Path]:
         case = get_fp_case(case_id)

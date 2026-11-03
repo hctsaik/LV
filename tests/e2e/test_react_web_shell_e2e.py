@@ -3980,6 +3980,195 @@ def test_lv_web_05_ext_01_visible_onnx_profile_inference_replay_and_evidence(
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == source_hash
 
 
+def test_lv_web_05_ext_01_visible_paired_evaluation_and_training_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Visible React journey for paired holdout results and reviewed YOLO ZIP export."""
+    if not (ROOT / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the web workspace with npm run build before running this E2E")
+
+    from playwright.sync_api import expect, sync_playwright
+    import fp_external_evaluation
+
+    class FixtureRuntime:
+        def __init__(self, config: dict):
+            self.config = config
+            marker = Path(config["model_path"]).read_bytes()
+            self.bias = 0.3 if marker == b"baseline-fixture" else 0.0
+            self.identity = {
+                "contract_id": "a" * 64 if self.bias else "b" * 64,
+                "model_sha256": "c" * 64 if self.bias else "d" * 64,
+            }
+
+        def infer(self, data: bytes) -> dict:
+            pixels = np.asarray(Image.open(BytesIO(data)).convert("RGB"), dtype=np.float32)
+            crack = min(1.0, float(pixels.mean() / 255.0) + self.bias)
+            alarm = crack >= float(self.config["threshold"])
+            return {"prediction": {
+                "task": "classification",
+                "alarm": alarm,
+                "class": "crack" if alarm else "good",
+                "decision": "crack" if alarm else "good",
+                "scores": {"good": 1.0 - crack, "crack": crack},
+                "detections": [],
+            }}
+
+    monkeypatch.setattr(fp_external_evaluation, "Runtime", FixtureRuntime)
+    monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "fp-cases"))
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+
+    baseline_model = tmp_path / "baseline.onnx"
+    candidate_model = tmp_path / "candidate.onnx"
+    baseline_model.write_bytes(b"baseline-fixture")
+    candidate_model.write_bytes(b"candidate-fixture")
+    holdout_normal = tmp_path / "normal.png"
+    holdout_defect = tmp_path / "defect.png"
+    Image.new("RGB", (80, 60), (80, 80, 80)).save(holdout_normal)
+    Image.new("RGB", (80, 60), (230, 230, 230)).save(holdout_defect)
+    manifest = {
+        "schema_version": 1,
+        "purpose": "case_regression",
+        "items": [
+            {"id": "normal", "path": str(holdout_normal), "truth": "normal", "verified": True},
+            {"id": "defect", "path": str(holdout_defect), "truth": "defect", "verified": True},
+        ],
+    }
+    application = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    server, server_thread, base_url = _start_api(application)
+
+    def post_json(path: str, body: dict) -> dict:
+        request = urllib.request.Request(
+            base_url + path,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def create_profile(path: Path, marker_name: str) -> dict:
+        upload_request = urllib.request.Request(
+            base_url + "/api/v1/external-model-assets?filename="
+            + marker_name.replace(" ", "-") + ".onnx",
+            data=path.read_bytes(),
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(upload_request, timeout=20) as response:
+            asset = json.loads(response.read().decode("utf-8"))
+        config = {
+            "model_version": marker_name,
+            "output_format": "classification",
+            "class_names": ["good", "crack"],
+            "normal_classes": ["good"],
+            "input_size": [32, 32],
+            "resize": "stretch",
+            "threshold": 0.5,
+        }
+        return post_json(
+            "/api/v1/external-model-profiles",
+            {"name": marker_name, "asset_sha256": asset["sha256"], "config": config},
+        )
+
+    try:
+        baseline_profile = create_profile(baseline_model, "Visible baseline")
+        candidate_profile = create_profile(candidate_model, "Visible candidate")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(
+                viewport={"width": 1480, "height": 1120}, accept_downloads=True
+            )
+            page.set_default_timeout(20_000)
+            page.goto(base_url, wait_until="networkidle")
+            page.get_by_test_id("open-fp-cases").click()
+            page.get_by_label("案件名稱（可留空）").fill("Paired evaluation and training")
+            page.get_by_label("新案件來源類型").select_option("original")
+            source_path = tmp_path / "reported.png"
+            Image.new("RGB", (80, 60), (220, 220, 220)).save(source_path)
+            page.get_by_label("建立案件圖片").set_input_files(str(source_path))
+            with page.expect_response(
+                lambda response: response.url.rstrip("/").endswith("/api/v1/fp-cases")
+                and response.request.method == "POST" and response.ok,
+            ) as created_response:
+                page.get_by_role("button", name="建立案件", exact=True).click()
+            created_case = created_response.value.json()
+            page.get_by_test_id("fp-open-case-" + created_case["id"]).click()
+            expect(page.get_by_test_id("fp-evaluation-training")).to_be_visible()
+            page.get_by_label("評估改善前模型").select_option(baseline_profile["id"])
+            page.get_by_label("評估改善後模型").select_option(candidate_profile["id"])
+            page.get_by_label("評估清單 JSON 內容").fill(json.dumps(manifest))
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/evaluations")
+                and response.request.method == "POST" and response.ok,
+            ) as evaluation_response:
+                page.get_by_test_id("fp-run-paired-evaluation").click()
+            evaluated = evaluation_response.value.json()
+            expect(page.get_by_test_id("fp-paired-evaluation-result")).to_contain_text(
+                "case_regression_only"
+            )
+            assert evaluated["evaluation"]["baseline"]["false_alarms"] == 1
+            assert evaluated["evaluation"]["candidate"]["false_alarms"] == 0
+
+            case = evaluated["case"]
+            region = post_json(
+                "/api/v1/fp-cases/" + case["id"] + "/regions",
+                {
+                    "expected_revision": case["revision"],
+                    "source_id": case["sources"][0]["id"],
+                    "roi": [0.2, 0.2, 0.6, 0.7],
+                    "label": "model-suggestion",
+                },
+            )
+            case = region["case"]
+            item_id = case["items"][0]["id"]
+            review_request = urllib.request.Request(
+                base_url + "/api/v1/fp-cases/" + case["id"] + "/regions/" + item_id + "/review",
+                data=json.dumps({
+                    "expected_revision": case["revision"],
+                    "verdict": "defect",
+                    "reviewer": "Visible reviewer",
+                    "reason": "Confirmed a true defect in this region.",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="PATCH",
+            )
+            with urllib.request.urlopen(review_request, timeout=20) as response:
+                case = json.loads(response.read().decode("utf-8"))
+            page.reload(wait_until="networkidle")
+            page.get_by_test_id("open-fp-cases").click()
+            page.get_by_test_id("fp-open-case-" + case["id"]).click()
+            expect(page.get_by_test_id("fp-evaluation-training")).to_be_visible()
+            page.locator(".fp-ext-training-images input[type=checkbox]").first.check()
+            page.get_by_label("訓練類別 item:" + item_id).select_option("crack")
+            page.get_by_label("訓練覆核者").fill("Visible reviewer")
+            page.get_by_label("完整標註依據").fill("The whole image was checked and all defect boxes were reviewed.")
+            page.get_by_label("確認影像標註完整").check()
+
+            with page.expect_download() as zip_download:
+                with page.expect_response(
+                    lambda response: response.url.endswith("/training-exports")
+                    and response.request.method == "POST" and response.ok,
+                ) as export_response:
+                    page.get_by_test_id("fp-create-training-export").click()
+            exported = export_response.value.json()["training_export"]
+            assert exported["n_images"] == 1 and exported["n_boxes"] == 1
+            archive_path = zip_download.value.path()
+            assert archive_path
+            with zipfile.ZipFile(archive_path) as archive:
+                sha = case["sources"][0]["sha256"]
+                label = archive.read("labels/" + sha + ".txt").decode("utf-8")
+                assert label.startswith("0 0.400000000 0.450000000 0.400000000 0.500000000")
+                assert "provenance.json" in archive.namelist()
+            expect(page.get_by_test_id("fp-evaluation-training")).to_contain_text(
+                exported["id"]
+            )
+            browser.close()
+    finally:
+        server.should_exit = True
+        server_thread.join(timeout=10)
+
+
 def test_lv_web_05_retrieve_01_visible_explicit_search_and_candidate_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

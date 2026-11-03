@@ -10,6 +10,7 @@ import {
 import FalsePositiveCaseReport from "./FalsePositiveCaseReport";
 import FalsePositiveReviewBatches from "./FalsePositiveReviewBatches";
 import FalsePositiveExternalModels from "./FalsePositiveExternalModels";
+import FalsePositiveEvaluationTraining from "./FalsePositiveEvaluationTraining";
 
 const verdicts: Array<{ value: FalsePositiveRegion["review"]["verdict"]; label: string }> = [
   { value: "pending", label: "待覆核" },
@@ -677,6 +678,14 @@ export default function FalsePositiveCaseWorkspace() {
               key={selectedCase.id}
               caseData={selectedCase}
               selectedSourceId={selectedSource?.id || ""}
+              onCaseUpdated={(next) => {
+                setSelectedCase(next);
+                void refreshCases();
+              }}
+            />
+            <FalsePositiveEvaluationTraining
+              key={"evaluation-training-" + selectedCase.id}
+              caseData={selectedCase}
               onCaseUpdated={(next) => {
                 setSelectedCase(next);
                 void refreshCases();

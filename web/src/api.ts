@@ -1086,6 +1086,7 @@ export type FalsePositiveRegion = {
   score: number | null;
   prediction_id: string;
   origin: string;
+  withdrawn?: boolean;
   review: {
     verdict: "pending" | "normal" | "defect" | "disputed" | "insufficient";
     reviewer: string;
@@ -1223,6 +1224,47 @@ export type FalsePositiveExternalRun = {
   evidence_id: string;
 };
 
+export type FalsePositiveEvaluation = {
+  id: string;
+  at: string;
+  dataset_fingerprint: string;
+  manifest: Record<string, unknown>;
+  baseline_profile: { id: string; revision: number; name: string; asset_sha256: string };
+  candidate_profile: { id: string; revision: number; name: string; asset_sha256: string };
+  baseline_identity: Record<string, unknown>;
+  candidate_identity: Record<string, unknown>;
+  baseline: {
+    normal_images: number; defect_images: number; false_alarms: number; misses: number;
+    false_alarm_rate: number | null; miss_rate: number | null; abstentions: number;
+    groups: Record<string, Record<string, number>>;
+    detection: { tp: number; fp: number; fn: number; iou: number; precision: number | null; recall: number | null } | null;
+  };
+  candidate: FalsePositiveEvaluation["baseline"];
+  gate: { status: string; reasons: string[]; policy: Record<string, number> };
+  per_image: Array<Record<string, unknown>>;
+  limitation: string;
+  evidence_id: string;
+};
+
+export type FalsePositiveTrainingExport = {
+  id: string;
+  at: string;
+  case_id: string;
+  case_revision: number;
+  format: "yolo_detection";
+  class_names: string[];
+  complete_images_declared: true;
+  reviewer: string;
+  reason: string;
+  image_sha256: string[];
+  n_images: number;
+  n_boxes: number;
+  n_negative_images: number;
+  zip_file: string;
+  provenance: Array<Record<string, unknown>>;
+  evidence_id: string;
+};
+
 export type FalsePositiveCase = {
   schema_version: number;
   id: string;
@@ -1238,6 +1280,8 @@ export type FalsePositiveCase = {
   claims: FalsePositiveClaim[];
   batches: FalsePositiveBatch[];
   external_runs: FalsePositiveExternalRun[];
+  evaluations: FalsePositiveEvaluation[];
+  training_exports: FalsePositiveTrainingExport[];
   reply_status: "draft" | "replied";
   cause_status: "unknown" | "hypothesis";
   improvement_status: string;
@@ -1900,6 +1944,41 @@ export const api = {
   externalModelEvidenceZip: (caseId: string, runId: string) => requestGetBlob(
     "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/external-runs/"
       + encodeURIComponent(runId) + "/evidence.zip",
+  ),
+  evaluateFalsePositiveCase: (caseId: string, input: {
+    expected_revision: number;
+    baseline_profile_id: string;
+    baseline_profile_revision: number;
+    candidate_profile_id: string;
+    candidate_profile_revision: number;
+    manifest: Record<string, unknown>;
+    base_dir?: string;
+    min_support: number;
+    max_miss_increase: number;
+    min_fp_reduction: number;
+  }) => request<{ case: FalsePositiveCase; evaluation: FalsePositiveEvaluation }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/evaluations", {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  ),
+  exportFalsePositiveTraining: (caseId: string, input: {
+    expected_revision: number;
+    complete_images: string[];
+    class_assignments: Record<string, string>;
+    class_names: string[];
+    reviewer: string;
+    reason: string;
+    confirmed_complete: boolean;
+  }) => request<{ case: FalsePositiveCase; training_export: FalsePositiveTrainingExport }>(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/training-exports", {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  ),
+  falsePositiveTrainingZip: (caseId: string, exportId: string) => requestGetBlob(
+    "/api/v1/fp-cases/" + encodeURIComponent(caseId) + "/training-exports/"
+      + encodeURIComponent(exportId) + "/archive.zip",
   ),
   falsePositiveCase: (caseId: string) =>
     request<FalsePositiveCase>("/api/v1/fp-cases/" + encodeURIComponent(caseId)),

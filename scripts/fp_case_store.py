@@ -30,6 +30,8 @@ CASE_DEFAULTS = {
     "effort_minutes": 0.0,
     "effort_log": [],
     "external_runs": [],
+    "evaluations": [],
+    "training_exports": [],
 }
 
 
