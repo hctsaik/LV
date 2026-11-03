@@ -783,6 +783,7 @@ class SetCurationReasonRequest(BaseModel):
 class CurationSubsetPreviewRequest(BaseModel):
     source: str = Field(default="all", max_length=128)
     destination: str = Field(min_length=1, max_length=4096)
+    destination_folder_grant_id: str | None = Field(default=None, min_length=1, max_length=256)
     mode: Literal["copy", "symlink", "manifest-only"] = "copy"
     on_exists: Literal["skip", "rename", "overwrite"] = "skip"
 
@@ -7283,10 +7284,14 @@ def create_app(
         )
 
     def prepare_curation_subset(
-        source: str, destination: str, mode: str, on_exists: str,
+        source: str, destination: str, destination_folder_grant_id: str | None,
+        mode: str, on_exists: str,
     ):
         import export_subset as _export_subset
 
+        destination = _resolve_nativeapp_folder_list(
+            [destination], [destination_folder_grant_id],
+        )[0]
         export_items, source_roots, summary, fingerprint = build_curation_subset_plan(
             source,
         )
@@ -7318,17 +7323,19 @@ def create_app(
         return export_items, source_roots, summary, token, resolved_destination
 
     def curation_subset_preview(
-        source: str, destination: str, mode: str, on_exists: str,
+        source: str, destination: str, destination_folder_grant_id: str | None,
+        mode: str, on_exists: str,
     ) -> dict:
         _items, _roots, summary, token, _destination = prepare_curation_subset(
-            source, destination, mode, on_exists,
+            source, destination, destination_folder_grant_id, mode, on_exists,
         )
         return {**summary, "preview_token": token, "destination_safe": True}
 
     @app.post("/api/v1/curation/subset/preview")
     def preview_curation_subset(request: CurationSubsetPreviewRequest) -> dict:
         return curation_subset_preview(
-            request.source, request.destination, request.mode, request.on_exists,
+            request.source, request.destination, request.destination_folder_grant_id,
+            request.mode, request.on_exists,
         )
 
     @app.post("/api/v1/curation/subset/export")
@@ -7344,6 +7351,7 @@ def create_app(
         ) = prepare_curation_subset(
             request.source,
             request.destination,
+            request.destination_folder_grant_id,
             request.mode,
             request.on_exists,
         )

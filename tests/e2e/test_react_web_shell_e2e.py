@@ -4280,7 +4280,10 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
     source_image_bytes = selected_image.read_bytes()
     source_yolo_lines = selected_yolo.read_text(encoding="utf-8").splitlines()
     source_sidecar_bytes = selected_sidecar.read_bytes()
+    subset_dir = tmp_path / "visible-object-subset"
+    subset_dir.mkdir()
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("NATIVEAPP_APP_ID", raising=False)
 
     def object_loader(_model_id: str, **_kwargs):
         def embed(crop: Image.Image) -> np.ndarray:
@@ -4304,11 +4307,26 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
+            page.add_init_script(
+                "window.cimHost = {chooseFile: async () => ("
+                + json.dumps({"path": str(subset_dir), "grant_id": "hostgrant_subset"})
+                + ")};"
+            )
             run_payloads = []
+            subset_requests = []
             page.on(
                 "response",
                 lambda response: run_payloads.append(response.json())
                 if _is_run_summary_response(response) and response.ok
+                else None,
+            )
+            page.on(
+                "request",
+                lambda request: subset_requests.append(json.loads(request.post_data or "{}"))
+                if request.url.endswith((
+                    "/api/v1/curation/subset/preview",
+                    "/api/v1/curation/subset/export",
+                ))
                 else None,
             )
             page.goto(base_url, wait_until="networkidle")
@@ -4390,8 +4408,22 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             expect(item_metadata.nth(0)).to_contain_text("stain · train · manual · object 2")
             expect(item_metadata.nth(1)).to_contain_text("stain · test · manual · object 1")
 
-            subset_dir = tmp_path / "visible-object-subset"
-            page.get_by_label("Subset destination folder").fill(str(subset_dir))
+            import react_web_shell
+
+            monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+
+            def resolve_subset_grant(grant_id: str, app_id: str) -> Path:
+                assert grant_id == "hostgrant_subset"
+                assert app_id == "visuallatent"
+                return subset_dir.resolve()
+
+            monkeypatch.setattr(
+                react_web_shell,
+                "_resolve_nativeapp_folder_grant",
+                resolve_subset_grant,
+            )
+            page.get_by_test_id("curation-subset-choose-folder").click()
+            expect(page.get_by_label("Subset destination folder")).to_have_value(str(subset_dir))
             page.get_by_test_id("curation-subset-preview-button").click()
             expect(page.get_by_test_id("curation-subset-preview")).to_contain_text(
                 "Preflight: 2 available · 2 unique · 0 duplicate(s) · 0 missing"
@@ -4403,6 +4435,9 @@ def test_lv_web_01_od_02_object_flow_through_visible_react_ui(
             expect(page.locator(".alert-info")).to_contain_text(
                 "YOLO subset exported: 2 image(s)"
             )
+            assert [request["destination_folder_grant_id"] for request in subset_requests] == [
+                "hostgrant_subset", "hostgrant_subset",
+            ]
 
             exported_train_image = subset_dir / "images" / "train" / "02.png"
             exported_test_image = subset_dir / "images" / "test" / "03.png"

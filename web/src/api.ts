@@ -967,6 +967,7 @@ export type AddCurationResponse = CurationItemsResponse & { added: number; skipp
 export type CurationSubsetOptions = {
   source: string;
   destination: string;
+  destination_folder_grant_id?: string | null;
   mode: "copy" | "symlink" | "manifest-only";
   on_exists: "skip" | "rename" | "overwrite";
 };

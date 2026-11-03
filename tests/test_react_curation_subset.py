@@ -194,3 +194,81 @@ def test_react_curation_subset_preflight_safe_export_and_object_lineage(
         assert overwrite_export.status_code == 200, overwrite_export.text
         assert overwrite_export.json()["exported"] == 1
         assert overwrite_image.read_bytes() == image.read_bytes()
+
+
+def test_react_curation_subset_managed_destination_requires_bound_folder_grant(
+    tmp_path: Path, monkeypatch,
+):
+    source = tmp_path / "dataset"
+    image_dir = source / "train" / "images"
+    image_dir.mkdir(parents=True)
+    image = image_dir / "sample.png"
+    Image.new("RGB", (24, 24), (100, 40, 180)).save(image)
+    destination = tmp_path / "selected-output"
+    destination.mkdir()
+    another_destination = tmp_path / "other-output"
+    another_destination.mkdir()
+
+    monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "managed-cache"))
+    monkeypatch.setenv("NATIVEAPP_APP_ID", "visuallatent")
+    resolved_grants: list[tuple[str, str]] = []
+
+    def resolve(grant_id: str, app_id: str) -> Path:
+        resolved_grants.append((grant_id, app_id))
+        return destination.resolve()
+
+    monkeypatch.setattr(
+        "react_web_shell._resolve_nativeapp_folder_grant", resolve,
+    )
+    app = create_app(model_catalog=lambda: [], model_loader=lambda _model: None)
+    with TestClient(app) as client:
+        app.state.curation_store.add([{
+            "path": str(image), "image_path": str(image), "filename": image.name,
+            "sha256": _sha256(image), "label": "sample", "split": "train",
+            "source": "manual", "reason": "reviewed", "level": "image",
+        }])
+        base_request = {
+            "source": "all", "destination": str(destination),
+            "mode": "copy", "on_exists": "skip",
+        }
+
+        missing = client.post(
+            "/api/v1/curation/subset/preview", json=base_request,
+        )
+        assert missing.status_code == 403
+        assert missing.json()["code"] == "FOLDER_GRANT_REQUIRED"
+
+        mismatched = client.post("/api/v1/curation/subset/preview", json={
+            **base_request,
+            "destination": str(another_destination),
+            "destination_folder_grant_id": "hostgrant_fixture",
+        })
+        assert mismatched.status_code == 403
+        assert mismatched.json()["code"] == "FOLDER_GRANT_MISMATCH"
+        assert str(destination) not in mismatched.text
+
+        granted_request = {
+            **base_request,
+            "destination_folder_grant_id": "hostgrant_fixture",
+        }
+        preview = client.post(
+            "/api/v1/curation/subset/preview", json=granted_request,
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["destination_safe"] is True
+        assert str(destination) not in preview.text
+
+        exported = client.post("/api/v1/curation/subset/export", json={
+            **granted_request,
+            "preview_token": preview.json()["preview_token"],
+        })
+        assert exported.status_code == 200, exported.text
+        assert exported.json()["exported"] == 1
+        assert str(destination) not in exported.text
+        assert (destination / "manifest.csv").is_file()
+
+    assert resolved_grants == [
+        ("hostgrant_fixture", "visuallatent"),
+        ("hostgrant_fixture", "visuallatent"),
+        ("hostgrant_fixture", "visuallatent"),
+    ]

@@ -18,6 +18,7 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
   const [sourceFilter, setSourceFilter] = useState("all");
   const [reasonDraft, setReasonDraft] = useState("");
   const [subsetDestination, setSubsetDestination] = useState("");
+  const [subsetDestinationGrantId, setSubsetDestinationGrantId] = useState<string | null>(null);
   const [subsetMode, setSubsetMode] = useState<CurationSubsetOptions["mode"]>("copy");
   const [subsetOnExists, setSubsetOnExists] = useState<CurationSubsetOptions["on_exists"]>("skip");
   const [subsetPreview, setSubsetPreview] = useState<{ key: string; data: CurationSubsetPreview } | null>(null);
@@ -69,9 +70,10 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
   const subsetRequest = useMemo<CurationSubsetOptions>(() => ({
     source: sourceFilter,
     destination: subsetDestination.trim(),
+    destination_folder_grant_id: subsetDestinationGrantId,
     mode: subsetMode,
     on_exists: subsetOnExists,
-  }), [sourceFilter, subsetDestination, subsetMode, subsetOnExists]);
+  }), [sourceFilter, subsetDestination, subsetDestinationGrantId, subsetMode, subsetOnExists]);
   const subsetKey = useMemo(() => JSON.stringify({
     ...subsetRequest,
     itemIds: visibleItems.map((item) => item.id),
@@ -261,6 +263,30 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
       setError(reason instanceof Error ? reason.message : "Could not export the YOLO subset.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function chooseSubsetDestination() {
+    setError("");
+    setNotice("");
+    if (!window.cimHost?.chooseFile) {
+      setNotice("Native folder picker is not connected. Enter a local folder path or open this app from NativeApp.");
+      return;
+    }
+    try {
+      const result = await window.cimHost.chooseFile();
+      if (result.canceled) return;
+      const paths = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
+      if (paths.length !== 1) throw new Error("Choose one destination folder at a time.");
+      if (result.grant_id) api.rememberFolderGrant(paths[0], result.grant_id);
+      setSubsetDestination(paths[0]);
+      setSubsetDestinationGrantId(result.grant_id || null);
+      setSubsetPreview(null);
+      setNotice(result.grant_id
+        ? "Output folder selected. NativeApp will verify its folder permission before preview and export."
+        : "Output folder selected.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "The folder picker failed.");
     }
   }
 
@@ -582,8 +608,11 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
               aria-label="Subset destination folder"
               data-testid="curation-subset-destination"
               value={subsetDestination}
-              onChange={(event) => setSubsetDestination(event.target.value)}
-              placeholder="C:\\output\\my_subset"
+              onChange={(event) => {
+                setSubsetDestination(event.target.value);
+                setSubsetDestinationGrantId(null);
+              }}
+              placeholder="/path/to/output"
             />
           </label>
           <label>
@@ -603,6 +632,7 @@ export default function CurationWorkspace({ onCountChange, currentRunId, onRunUp
             </select>
           </label>
           <div className="curation-subset-buttons">
+            <button type="button" data-testid="curation-subset-choose-folder" onClick={() => void chooseSubsetDestination()}>Choose output folder</button>
             <button type="button" data-testid="curation-subset-preview-button" disabled={busy || !visibleItems.length || !subsetRequest.destination} onClick={() => void previewSubset()}>Preview export</button>
             <button type="button" className="primary" data-testid="curation-subset-export-button" disabled={busy || !currentSubsetPreview || !visibleItems.length} onClick={() => void exportSubset()}>Export subset</button>
           </div>
