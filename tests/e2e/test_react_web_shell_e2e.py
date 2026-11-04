@@ -6589,6 +6589,113 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
             assert actual_files == expected_files
             assert (output / "classes.txt").read_text(encoding="utf-8").splitlines() == bundle["head"]["classes"]
 
+            def file_tree_bytes(folder: Path) -> dict[str, bytes]:
+                return {
+                    path.relative_to(folder).as_posix(): path.read_bytes()
+                    for path in folder.rglob("*") if path.is_file()
+                }
+
+            class_names = list(bundle["head"]["classes"])
+            assert set(class_names) == {"scratch", "stain"}
+            react_prelabel_cases = {
+                "all_050": {
+                    "files": file_tree_bytes(output),
+                    "accepted": sorted(
+                        (item["pred"], f"{item['confidence']:.2f}")
+                        for item in preview["items"] if item["accept"]
+                    ),
+                    "accepted_count": preview["accepted"],
+                }
+            }
+
+            def set_range_value(slider, desired: float) -> None:
+                current = float(slider.input_value())
+                steps = round((desired - current) / 0.05)
+                key = "ArrowRight" if steps > 0 else "ArrowLeft"
+                for _ in range(abs(steps)):
+                    slider.press(key)
+                assert float(slider.input_value()) == pytest.approx(desired, abs=1e-5)
+
+            def run_react_prelabel_case(
+                case_id: str, min_conf: float, target_classes: list[str],
+            ) -> None:
+                set_range_value(page.get_by_test_id("anomaly-prelabel-min-conf"), min_conf)
+                for label in class_names:
+                    page.get_by_role("checkbox", name=f"預標類別 {label}").set_checked(
+                        label in target_classes,
+                    )
+                with page.expect_response(
+                    lambda response: "/prelabel/preview" in response.url
+                    and response.request.method == "POST"
+                    and response.ok,
+                    timeout=30000,
+                ) as response_info:
+                    page.get_by_test_id("anomaly-prelabel-preview").click()
+                expect(page.get_by_test_id("anomaly-prelabel-summary")).to_be_visible(timeout=30000)
+                case_preview = response_info.value.json()
+                assert case_preview["min_conf"] == pytest.approx(min_conf)
+                assert set(case_preview["target_classes"]) == set(target_classes)
+                case_decisions = legacy_prelabel.prelabel_records(
+                    run["records"], run["obj_emb"], run["scores"], bundle["head"],
+                    anomaly_threshold=run["threshold"], min_conf=min_conf,
+                    target_classes=target_classes,
+                )
+                assert case_preview["total"] == len(case_decisions) == 16
+                assert case_preview["accepted"] == sum(item["accept"] for item in case_decisions)
+                for row, decision in zip(case_preview["items"], case_decisions):
+                    assert row["index"] == decision["item"]
+                    assert row["pred"] == decision["pred"]
+                    assert row["confidence"] == pytest.approx(decision["conf"], abs=1e-7)
+                    assert row["accept"] is decision["accept"]
+                    item = page.get_by_test_id(f"anomaly-prelabel-item-{decision['item']}")
+                    expect(item).to_contain_text(f"預測 {decision['pred']}")
+                    expect(item).to_contain_text("接受" if decision["accept"] else "不接受")
+
+                case_output = tmp_path / f"react-prelabel-{case_id}"
+                page.get_by_test_id("anomaly-prelabel-output-dir").fill(str(case_output))
+                page.get_by_test_id("anomaly-prelabel-export").click()
+                expect(page.get_by_test_id("anomaly-notice")).to_contain_text("預標匯出完成", timeout=30000)
+                expected_case_lines = legacy_prelabel.to_yolo_lines(
+                    run["records"], case_decisions, class_names=class_names,
+                )
+                expected_case_files = {
+                    f"{Path(image_path).stem}.txt": "\n".join(lines) + "\n"
+                    for image_path, lines in expected_case_lines.items()
+                }
+                case_files = file_tree_bytes(case_output)
+                actual_case_labels = {
+                    Path(name).name: (case_output / name).read_text(encoding="utf-8")
+                    for name, content in case_files.items() if name.startswith("labels/")
+                }
+                assert actual_case_labels == expected_case_files
+                assert case_files["classes.txt"].decode("utf-8").splitlines() == class_names
+                react_prelabel_cases[case_id] = {
+                    "files": case_files,
+                    "accepted": sorted(
+                        (item["pred"], f"{item['confidence']:.2f}")
+                        for item in case_preview["items"] if item["accept"]
+                    ),
+                    "accepted_count": case_preview["accepted"],
+                }
+
+            # Cover low/default/high confidence against all, each individual,
+            # and no selected target classes through the visible React controls.
+            prelabel_cases = [
+                ("all_000", 0.00, class_names),
+                ("all_095", 0.95, class_names),
+                ("scratch_000", 0.00, ["scratch"]),
+                ("scratch_050", 0.50, ["scratch"]),
+                ("scratch_095", 0.95, ["scratch"]),
+                ("stain_000", 0.00, ["stain"]),
+                ("stain_050", 0.50, ["stain"]),
+                ("stain_095", 0.95, ["stain"]),
+                ("none_000", 0.00, []),
+                ("none_050", 0.50, []),
+                ("none_095", 0.95, []),
+            ]
+            for case_id, min_conf, target_classes in prelabel_cases:
+                run_react_prelabel_case(case_id, min_conf, target_classes)
+
             original_bank_sha = page.get_by_test_id("anomaly-run-summary").inner_text().split("bank SHA-256 ")[-1].split("…")[0]
             page.locator(".anomaly-object").first.get_by_role("button", name="顯示 Patch 熱圖").click()
             heatmap = page.locator(".anomaly-object-heatmap").first
@@ -6677,10 +6784,7 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                     r"([^\n]+?)\s*·\s*信心\s*([0-9.]+)\s*·\s*✅收",
                     legacy_preview_text,
                 )
-                react_captions = [
-                    (item["pred"], f"{item['confidence']:.2f}")
-                    for item in preview["items"] if item["accept"]
-                ]
+                react_captions = sorted(react_prelabel_cases["all_050"]["accepted"][:12])
                 assert legacy_accepted == preview["accepted"]
 
                 legacy_output = parity_root / "prelabel-output"
@@ -6694,12 +6798,6 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                     timeout=60000,
                 )
                 wait_idle(legacy_page)
-
-                def file_tree_bytes(folder: Path) -> dict[str, bytes]:
-                    return {
-                        path.relative_to(folder).as_posix(): path.read_bytes()
-                        for path in folder.rglob("*") if path.is_file()
-                    }
 
                 legacy_files = file_tree_bytes(legacy_output)
                 react_files = file_tree_bytes(output)
@@ -6715,6 +6813,149 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                     "streamlit": sorted(legacy_captions),
                     "react": sorted(react_captions),
                 }, ensure_ascii=False)
+
+                def selected_legacy_classes() -> set[str]:
+                    widget = legacy_page.locator(".st-key-anomaly_prelabel_classes")
+                    tag_texts = widget.locator('[data-baseweb="tag"]').all_text_contents()
+                    return {
+                        label for label in class_names
+                        if any(label in text for text in tag_texts)
+                    }
+
+                def set_legacy_classes(target_classes: list[str]) -> None:
+                    target = set(target_classes)
+                    current = selected_legacy_classes()
+                    while current:
+                        widget = legacy_page.locator(".st-key-anomaly_prelabel_classes")
+                        combo = widget.get_by_role("combobox").first
+                        combo.click()
+                        combo.press("Backspace")
+                        legacy_page.wait_for_function(
+                            "expected => document.querySelectorAll("
+                            "'.st-key-anomaly_prelabel_classes [data-baseweb=\"tag\"]'"
+                            ").length < expected",
+                            arg=len(current),
+                            timeout=10000,
+                        )
+                        wait_idle(legacy_page)
+                        _open_prelabel(legacy_page)
+                        updated = selected_legacy_classes()
+                        assert len(updated) < len(current), {
+                            "before": sorted(current),
+                            "after": sorted(updated),
+                        }
+                        current = updated
+                    for label in sorted(target):
+                        widget = legacy_page.locator(".st-key-anomaly_prelabel_classes")
+                        expected_count = len(selected_legacy_classes()) + 1
+                        widget.locator('[role="combobox"]').first.click()
+                        legacy_page.get_by_role("option", name=label, exact=True).click()
+                        legacy_page.wait_for_function(
+                            "expected => document.querySelectorAll("
+                            "'.st-key-anomaly_prelabel_classes [data-baseweb=\"tag\"]'"
+                            ").length === expected",
+                            arg=expected_count,
+                            timeout=10000,
+                        )
+                        wait_idle(legacy_page)
+                        _open_prelabel(legacy_page)
+                    assert selected_legacy_classes() == target, {
+                        "expected": sorted(target),
+                        "actual": sorted(selected_legacy_classes()),
+                    }
+
+                def run_legacy_prelabel_case(
+                    case_id: str, min_conf: float, target_classes: list[str],
+                ) -> None:
+                    _open_prelabel(legacy_page)
+                    # Streamlit renders sliders as role=slider elements, not
+                    # native input elements. Keep the lookup scoped to the
+                    # keyed widget so other sliders on the page cannot match.
+                    slider = legacy_page.locator(
+                        ".st-key-anomaly_prelabel_min_conf",
+                    ).get_by_role("slider")
+                    assert slider.count() == 1, f"{case_id}: expected one min-confidence slider"
+                    current = float(slider.get_attribute("aria-valuenow"))
+                    steps = round((min_conf - current) / 0.05)
+                    key = "ArrowRight" if steps > 0 else "ArrowLeft"
+                    for _ in range(abs(steps)):
+                        slider.press(key)
+                    wait_idle(legacy_page)
+                    _open_prelabel(legacy_page)
+                    assert float(slider.get_attribute("aria-valuenow")) == pytest.approx(
+                        min_conf, abs=1e-5,
+                    )
+                    set_legacy_classes(target_classes)
+                    _open_prelabel(legacy_page)
+
+                    react_case = react_prelabel_cases[case_id]
+                    legacy_page.wait_for_function(
+                        """expected => {
+                            const preview = document.querySelector(
+                                '.st-key-anomaly_prelabel_preview',
+                            );
+                            const text = preview?.innerText || '';
+                            const count = text.match(/接受\\s*(\\d+)/);
+                            const captions = [...text.matchAll(
+                                /([^\\n]+?)\\s*·\\s*信心\\s*([0-9.]+)\\s*·\\s*✅收/g,
+                            )].map(match => [match[1].trim(), match[2]])
+                                .sort((a, b) => (a[0] + '\\0' + a[1]).localeCompare(b[0] + '\\0' + b[1]));
+                            return count
+                                && Number(count[1]) === expected.accepted_count
+                                && JSON.stringify(captions) === JSON.stringify(expected.accepted);
+                        }""",
+                        arg={
+                            "accepted_count": react_case["accepted_count"],
+                            "accepted": [
+                                list(item) for item in sorted(react_case["accepted"][:12])
+                            ],
+                        },
+                        timeout=30000,
+                    )
+
+                    case_preview_text = legacy_page.locator(
+                        ".st-key-anomaly_prelabel_preview",
+                    ).inner_text()
+                    case_accepted = _accept_count(legacy_page)
+                    case_captions = sorted(re.findall(
+                        r"([^\n]+?)\s*·\s*信心\s*([0-9.]+)\s*·\s*✅收",
+                        case_preview_text,
+                    ))
+                    assert case_accepted == react_case["accepted_count"]
+                    assert case_captions == sorted(react_case["accepted"][:12]), json.dumps({
+                        "case": case_id,
+                        "streamlit": case_captions,
+                        "react": sorted(react_case["accepted"][:12]),
+                    }, ensure_ascii=False)
+
+                    case_output = parity_root / f"prelabel-output-{case_id}"
+                    legacy_page.locator('.st-key-anomaly_prelabel_out_dir input').first.fill(
+                        str(case_output),
+                    )
+                    legacy_page.locator('.st-key-anomaly_prelabel_out_dir input').first.press("Enter")
+                    wait_idle(legacy_page)
+                    _open_prelabel(legacy_page)
+                    legacy_page.locator('.st-key-anomaly_prelabel_export_btn button').click()
+                    legacy_page.wait_for_function(
+                        "() => (document.querySelector('[data-testid=\"stMain\"]')?.innerText || '').includes('預標匯出完成')",
+                        timeout=60000,
+                    )
+                    wait_idle(legacy_page)
+                    case_files = file_tree_bytes(case_output)
+                    assert case_files == react_case["files"], json.dumps({
+                        "case": case_id,
+                        "streamlit_files": sorted(case_files),
+                        "react_files": sorted(react_case["files"]),
+                        "different_files": [
+                            name for name in sorted(set(case_files) | set(react_case["files"]))
+                            if case_files.get(name) != react_case["files"].get(name)
+                        ],
+                    }, ensure_ascii=False)
+                    expect(legacy_page.locator('[data-testid="stException"]')).to_have_count(0)
+
+                for case_id, min_conf, target_classes in prelabel_cases:
+                    run_legacy_prelabel_case(case_id, min_conf, target_classes)
+
                 assert source_hashes == {
                     path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
                     for path in root.rglob("*") if path.is_file()
