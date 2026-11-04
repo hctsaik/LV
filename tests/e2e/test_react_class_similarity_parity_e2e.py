@@ -40,9 +40,11 @@ def _source_hashes(root: Path) -> dict[str, str]:
 
 def _create_streamlit_reference_worktree(path: Path) -> Path:
     resolved = path.resolve()
+    # Git checks are noninteractive; avoid inheriting a closed pytest/Playwright stdin.
     available = subprocess.run(
         ["git", "cat-file", "-e", f"{STREAMLIT_REFERENCE_COMMIT}^{{commit}}"],
         cwd=ROOT,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,
@@ -55,6 +57,7 @@ def _create_streamlit_reference_worktree(path: Path) -> Path:
     subprocess.run(
         ["git", "worktree", "add", "--detach", str(resolved), STREAMLIT_REFERENCE_COMMIT],
         cwd=ROOT,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=True,
@@ -69,6 +72,7 @@ def _remove_streamlit_reference_worktree(path: Path, *, temp_root: Path) -> None
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(resolved)],
         cwd=ROOT,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=True,
