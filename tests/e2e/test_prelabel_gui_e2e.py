@@ -65,7 +65,7 @@ def test_e1_e4_prelabel_export_readback(app_server, browser, yolo_defect_at_nmin
     try:
         enter_anomaly(page, app_server)
         build_main = build_model(page, ds["root"], semantic_text="瑕疵類別")
-        assert "能分辨瑕疵種類" in build_main, f"應建出能分辨瑕疵種類模型;實際:{build_main[:400]}"
+        assert "能分辨瑕疵種類" in build_main, f"應建出能分辨瑕疵種類模型;實際尾段:{build_main[-1200:]}"
         set_model_dir(page, tmp_path / "mdl")
         page.locator('.st-key-anomaly_save_model_btn button').click()
         wait_idle(page)

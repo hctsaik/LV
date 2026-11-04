@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -20,6 +21,50 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _process_group_options() -> dict:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _stop_process_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=10)
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
+@pytest.fixture(scope="session")
+def browser():
+    """Provide the Chromium browser directly, without requiring pytest-playwright."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        instance = playwright.chromium.launch(headless=True)
+        try:
+            yield instance
+        finally:
+            instance.close()
+
+
+@pytest.fixture()
+def page(browser):
+    """Give each legacy UI test an isolated browser context and page."""
+    context = browser.new_context(viewport={"width": 1920, "height": 1080})
+    try:
+        yield context.new_page()
+    finally:
+        context.close()
 
 
 @pytest.fixture(scope="session")
@@ -74,14 +119,15 @@ def app_server(synthetic_dataset, tmp_path_factory) -> str:
         # session_state 起跑,folder list 不會經由磁碟檔在測試之間殘留(跨測試/跨 run 汙染根因)。
         "LV_UI_STATE": str(_state / "no_persist" / "ui_state.json"),
     }
-    log = open(REPO_ROOT / "tests" / "e2e" / "_server.log", "w", encoding="utf-8")
+    log_path = tmp_path_factory.mktemp("lv_streamlit_log") / "streamlit.log"
+    log = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
         [sys.executable, "-m", "streamlit", "run", "scripts/app.py",
          "--server.port", str(port), "--server.headless", "true",
          "--server.fileWatcherType", "none",
          "--browser.gatherUsageStats", "false"],
         cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        **_process_group_options(),
     )
     base = f"http://localhost:{port}"
     deadline = time.time() + 60
@@ -90,7 +136,7 @@ def app_server(synthetic_dataset, tmp_path_factory) -> str:
             log.close()
             raise RuntimeError(
                 "streamlit exited early:\n"
-                + (REPO_ROOT / "tests" / "e2e" / "_server.log").read_text(encoding="utf-8")[-3000:]
+                + log_path.read_text(encoding="utf-8")[-3000:]
             )
         try:
             with urllib.request.urlopen(f"{base}/_stcore/health", timeout=2) as r:
@@ -99,10 +145,11 @@ def app_server(synthetic_dataset, tmp_path_factory) -> str:
         except OSError:
             time.sleep(0.5)
     else:
+        _stop_process_tree(proc)
+        log.close()
         raise RuntimeError("streamlit did not become healthy in 60s")
     yield base
-    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                   capture_output=True)
+    _stop_process_tree(proc)
     log.close()
 
 
@@ -131,7 +178,7 @@ def explain_app_server(synthetic_dataset, tmp_path_factory, e2e_cache_dir) -> st
          "--server.fileWatcherType", "none",
          "--browser.gatherUsageStats", "false"],
         cwd=REPO_ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        **_process_group_options(),
     )
     base = f"http://localhost:{port}"
     deadline = time.time() + 60
@@ -149,15 +196,13 @@ def explain_app_server(synthetic_dataset, tmp_path_factory, e2e_cache_dir) -> st
         except OSError:
             time.sleep(0.5)
     else:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                       capture_output=True)
+        _stop_process_tree(proc)
         log.close()
         raise RuntimeError("streamlit (explainability) did not become healthy in 60s")
     try:
         yield base
     finally:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                       capture_output=True)
+        _stop_process_tree(proc)
         log.close()
 
 

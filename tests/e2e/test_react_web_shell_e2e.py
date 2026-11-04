@@ -6380,7 +6380,7 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     """Run the default React worker builder against the pinned real DINOv2 weights."""
-    models_dir = Path(os.environ.get("LV_MODELS_DIR", ROOT / "models")).resolve()
+    models_dir = _pinned_dinov2_models_dir(tmp_path)
     weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
     if not weights.is_file():
         pytest.skip(f"real DINOv2-small weights are unavailable: {weights}")
@@ -6390,6 +6390,15 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
         pytest.skip("build the web workspace with npm run build before running this E2E")
 
     from playwright.sync_api import expect, sync_playwright
+    import _utils
+
+    monkeypatch.setattr(_utils, "_DEFAULT_MODELS_DIR", models_dir)
+    monkeypatch.setattr(_utils.available_models, "__defaults__", (models_dir,))
+    monkeypatch.setattr(
+        _utils.load_model,
+        "__defaults__",
+        (models_dir, *_utils.load_model.__defaults__[1:]),
+    )
 
     monkeypatch.setenv("LV_MODELS_DIR", str(models_dir))
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
@@ -6424,6 +6433,7 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
             page.set_default_timeout(300000)
             job_payloads: list[dict] = []
             score_payloads: list[dict] = []
+            prelabel_payloads: list[dict] = []
 
             def capture_job(response):
                 if response.request.method == "GET" and "/api/v1/anomaly/jobs/" in response.url and response.ok:
@@ -6433,8 +6443,13 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 if response.request.method == "GET" and "/api/v1/anomaly/score-jobs/" in response.url and response.ok:
                     score_payloads.append(response.json())
 
+            def capture_prelabel_preview(response):
+                if "/api/v1/anomaly/runs/" in response.url and "/prelabel/preview" in response.url and response.ok:
+                    prelabel_payloads.append(response.json())
+
             page.on("response", capture_job)
             page.on("response", capture_score_job)
+            page.on("response", capture_prelabel_preview)
             page.goto(base_url, wait_until="networkidle")
             page.get_by_test_id("open-anomaly-bank").click()
             page.get_by_test_id("anomaly-train-folders").fill(str(root))
@@ -6472,6 +6487,67 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 and payload.get("result", {}).get("score_mode") == "patch"
                 for payload in score_payloads
             )
+
+            # Exercise real-model prelabel in the React UI and compare every
+            # visible row and exported YOLO line with the existing prelabel core.
+            page.get_by_test_id("anomaly-prelabel-preview").click()
+            expect(page.get_by_test_id("anomaly-prelabel-summary")).to_be_visible(timeout=30000)
+            expect(page.get_by_test_id("anomaly-prelabel-item-0")).to_be_visible()
+            page.wait_for_function(
+                "document.querySelector('[data-testid=\"anomaly-prelabel-item-0\"] img')?.naturalWidth > 0",
+                timeout=30000,
+            )
+            assert prelabel_payloads, "the visible preview should request the local prelabel API"
+            preview = prelabel_payloads[-1]
+            run_id = application.state.current_anomaly_run_id
+            run = application.state.anomaly_runs[run_id]
+            bundle_id = application.state.current_anomaly_model_id
+            bundle = application.state.anomaly_models[bundle_id]
+            import prelabel as legacy_prelabel
+
+            expected_decisions = legacy_prelabel.prelabel_records(
+                run["records"], run["obj_emb"], run["scores"], bundle["head"],
+                anomaly_threshold=run["threshold"], min_conf=preview["min_conf"],
+                target_classes=preview["target_classes"],
+            )
+            assert preview["total"] == len(expected_decisions) == 4
+            assert preview["accepted"] == sum(item["accept"] for item in expected_decisions)
+            assert len(preview["items"]) == len(expected_decisions)
+            for row, decision in zip(preview["items"], expected_decisions):
+                index = decision["item"]
+                record = run["records"][index]
+                assert row["index"] == index
+                assert row["filename"] == Path(record["image_path"]).name
+                assert row["label"] == record["label"]
+                assert row["obj_index"] == record["obj_index"]
+                assert row["bbox"] == pytest.approx(record["bbox"], abs=1e-7)
+                assert row["score"] == pytest.approx(run["scores"][index], abs=1e-7)
+                assert row["pred"] == decision["pred"]
+                assert row["confidence"] == pytest.approx(decision["conf"], abs=1e-7)
+                assert row["accept"] is decision["accept"]
+                item = page.get_by_test_id(f"anomaly-prelabel-item-{index}")
+                expect(item).to_contain_text(f"預測 {decision['pred']}")
+                expect(item).to_contain_text("接受" if decision["accept"] else "不接受")
+
+            output = tmp_path / "real-dino-prelabel-output"
+            page.get_by_test_id("anomaly-prelabel-output-dir").fill(str(output))
+            page.get_by_test_id("anomaly-prelabel-export").click()
+            expect(page.get_by_test_id("anomaly-notice")).to_contain_text("預標匯出完成", timeout=30000)
+            expected_lines = legacy_prelabel.to_yolo_lines(
+                run["records"], expected_decisions,
+                class_names=bundle["head"]["classes"],
+            )
+            expected_files = {
+                f"{Path(image_path).stem}.txt": "\n".join(lines) + "\n"
+                for image_path, lines in expected_lines.items()
+            }
+            actual_files = {
+                path.name: path.read_text(encoding="utf-8")
+                for path in (output / "labels").glob("*.txt")
+            }
+            assert actual_files == expected_files
+            assert (output / "classes.txt").read_text(encoding="utf-8").splitlines() == bundle["head"]["classes"]
+
             original_bank_sha = page.get_by_test_id("anomaly-run-summary").inner_text().split("bank SHA-256 ")[-1].split("…")[0]
             page.locator(".anomaly-object").first.get_by_role("button", name="顯示 Patch 熱圖").click()
             heatmap = page.locator(".anomaly-object-heatmap").first
