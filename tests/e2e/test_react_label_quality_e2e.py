@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,39 @@ def _source_hashes(root: Path) -> dict[str, str]:
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in root.rglob("*") if path.is_file()
     }
+
+
+def _add_visible_streamlit_folder(page, path: Path) -> None:
+    """Enter a folder through the visible Streamlit control after transient reruns."""
+    selector = ".st-key-viz_folder_list_add input"
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        inputs = page.locator(selector)
+        for index in range(inputs.count() - 1, -1, -1):
+            candidate = inputs.nth(index)
+            try:
+                if not candidate.is_visible(timeout=250) or not candidate.is_enabled(timeout=250):
+                    continue
+                candidate.fill(str(path))
+                candidate.press("Enter")
+                page.wait_for_function(
+                    "([s, p]) => Array.from(document.querySelectorAll(s))"
+                    ".filter(el => el.offsetParent !== null)"
+                    ".every(el => el.value !== p)",
+                    arg=[selector, str(path)],
+                    timeout=15000,
+                )
+                from .conftest import wait_idle
+
+                wait_idle(page)
+                from playwright.sync_api import expect
+
+                expect(page.get_by_text(str(path), exact=True).last).to_be_visible(timeout=8000)
+                return
+            except Exception:
+                continue
+        page.wait_for_timeout(100)
+    raise AssertionError(f"no stable visible Streamlit folder input for {path}")
 
 
 def test_lv_web_01_lq_01_visible_confusion_and_mislabel_review(
@@ -111,7 +145,7 @@ def test_lv_web_01_lq_01_visible_streamlit_react_real_model_parity(
     import base64
     import numpy as np
     from _utils import available_models, load_model
-    from .conftest import _add_folder, _ensure_sidebar, _stop_process_tree, load_app, wait_idle
+    from .conftest import _ensure_sidebar, _stop_process_tree, load_app, wait_idle
 
     models_dir = _pinned_dinov2_models_dir(tmp_path)
     train = _label_quality_fixture(tmp_path / "shared-label-quality-fixture")
@@ -188,7 +222,7 @@ def test_lv_web_01_lq_01_visible_streamlit_react_real_model_parity(
             load_app(legacy_page, legacy_url)
             legacy_page.locator(".st-key-viz_mode").get_by_text("Image Classifier").click()
             wait_idle(legacy_page)
-            _add_folder(legacy_page, "viz_folder_list", str(train))
+            _add_visible_streamlit_folder(legacy_page, train)
             methods = legacy_page.locator(".st-key-viz_methods")
             methods.get_by_role("button", name="Clear all").click()
             wait_idle(legacy_page)

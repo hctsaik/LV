@@ -6378,10 +6378,12 @@ def test_lv_web_06_bank_01_visible_build_save_worker_restart_and_load(
 
 def _start_streamlit_for_react_parity(
     models_dir: Path, run_root: Path, *, cache_dir: Path | None = None,
+    source_root: Path | None = None,
 ):
-    """Launch the visible legacy UI with isolated app state and an optional shared cache."""
+    """Launch a visible legacy UI source tree with isolated state and an optional shared cache."""
     from .conftest import _process_group_options
 
+    run_root.mkdir(parents=True, exist_ok=True)
     log_path = run_root / "streamlit.log"
     log_file = log_path.open("w", encoding="utf-8")
     port = _free_port()
@@ -6402,7 +6404,7 @@ def _start_streamlit_for_react_parity(
             "--server.fileWatcherType", "none",
             "--browser.gatherUsageStats", "false",
         ],
-        cwd=ROOT,
+        cwd=source_root or ROOT,
         env=env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
