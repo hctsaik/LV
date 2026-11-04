@@ -28,6 +28,13 @@ type ReviewDraft = {
   reason: string;
 };
 
+type RoiDrag = {
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+};
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "案件操作失敗。";
 }
@@ -92,6 +99,9 @@ export default function FalsePositiveCaseWorkspace() {
   const [regionLabel, setRegionLabel] = useState("");
   const [regionScore, setRegionScore] = useState("");
   const [regionRoi, setRegionRoi] = useState<[string, string, string, string]>(["0", "0", "1", "1"]);
+  const [roiDrawing, setRoiDrawing] = useState(false);
+  const [roiDrag, setRoiDrag] = useState<RoiDrag | null>(null);
+  const [roiSelection, setRoiSelection] = useState<[number, number, number, number] | null>(null);
   const [normalFolder, setNormalFolder] = useState("");
   const [defectFolder, setDefectFolder] = useState("");
   const [candidateScope, setCandidateScope] = useState<"whole_image" | "same_roi">("whole_image");
@@ -115,6 +125,12 @@ export default function FalsePositiveCaseWorkspace() {
   const selectedReviewDraft = selectedRegion
     ? updateReviewDraft(reviewDrafts, selectedRegion)
     : null;
+  const drawnRoi = roiDrag ? [
+    Math.min(roiDrag.startX, roiDrag.currentX),
+    Math.min(roiDrag.startY, roiDrag.currentY),
+    Math.max(roiDrag.startX, roiDrag.currentX),
+    Math.max(roiDrag.startY, roiDrag.currentY),
+  ] as [number, number, number, number] : roiSelection;
   const activeSearch = useMemo<FalsePositiveSearch | null>(
     () => selectedCase?.searches.find((search) => search.id === activeSearchId)
       || selectedCase?.searches[selectedCase.searches.length - 1]
@@ -127,6 +143,56 @@ export default function FalsePositiveCaseWorkspace() {
   const activeSearchSource = activeSearchRegion
     ? selectedCase?.sources.find((source) => source.id === activeSearchRegion.source_id) || null
     : null;
+
+  function normalizedRoiPoint(event: React.PointerEvent<HTMLDivElement>) {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return null;
+    return {
+      x: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
+      y: Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
+    };
+  }
+
+  function startRoiDrawing(event: React.PointerEvent<HTMLDivElement>) {
+    if (!roiDrawing || event.button !== 0) return;
+    const point = normalizedRoiPoint(event);
+    if (!point) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setRoiDrag({ startX: point.x, startY: point.y, currentX: point.x, currentY: point.y });
+  }
+
+  function moveRoiDrawing(event: React.PointerEvent<HTMLDivElement>) {
+    if (!roiDrag) return;
+    const point = normalizedRoiPoint(event);
+    if (!point) return;
+    setRoiDrag((current) => current
+      ? { ...current, currentX: point.x, currentY: point.y }
+      : null);
+  }
+
+  function finishRoiDrawing(event: React.PointerEvent<HTMLDivElement>) {
+    if (!roiDrag) return;
+    const point = normalizedRoiPoint(event);
+    if (!point) {
+      setRoiDrag(null);
+      return;
+    }
+    const x1 = Math.min(roiDrag.startX, point.x);
+    const y1 = Math.min(roiDrag.startY, point.y);
+    const x2 = Math.max(roiDrag.startX, point.x);
+    const y2 = Math.max(roiDrag.startY, point.y);
+    setRoiDrag(null);
+    if (x2 - x1 < 0.005 || y2 - y1 < 0.005) {
+      setError("框選範圍太小；請在影像上拖曳較大的區域，或直接編輯 ROI 數值。");
+      return;
+    }
+    const selectedRoi: [number, number, number, number] = [x1, y1, x2, y2];
+    setRoiSelection(selectedRoi);
+    setRegionRoi(selectedRoi.map((value) => value.toFixed(4)) as [string, string, string, string]);
+    setError("");
+    setNotice("ROI 已從影像框選；送出前仍可調整座標。");
+  }
 
   async function refreshCases(selectId?: string) {
     const response = await api.falsePositiveCases();
@@ -194,6 +260,9 @@ export default function FalsePositiveCaseWorkspace() {
       setSelectedCase(created);
       setSelectedSourceId(created.sources[0]?.id || "");
       setSelectedRegionId("");
+      setRoiSelection(null);
+      setRoiDrag(null);
+      setRoiDrawing(false);
       setActiveSearchId("");
       setNewTitle("");
       setNewDescription("");
@@ -219,6 +288,9 @@ export default function FalsePositiveCaseWorkspace() {
       setSelectedCase(opened);
       setSelectedSourceId(opened.sources[0]?.id || "");
       setSelectedRegionId(opened.items[0]?.id || "");
+      setRoiSelection(null);
+      setRoiDrag(null);
+      setRoiDrawing(false);
       setActiveSearchId(opened.searches[opened.searches.length - 1]?.id || "");
       setReviewDrafts(Object.fromEntries(opened.items.map((item) => [item.id, {
         verdict: item.review.verdict,
@@ -315,6 +387,7 @@ export default function FalsePositiveCaseWorkspace() {
       await refreshCases();
       setRegionLabel("");
       setRegionScore("");
+      setRoiSelection(null);
       setNotice("爭議區域已加入，狀態為待覆核。");
     } catch (reason) {
       setError(errorMessage(reason));
@@ -436,6 +509,9 @@ export default function FalsePositiveCaseWorkspace() {
     setSelectedCase(null);
     setSelectedSourceId("");
     setSelectedRegionId("");
+    setRoiSelection(null);
+    setRoiDrag(null);
+    setRoiDrawing(false);
     setActiveSearchId("");
     setError("");
     setNotice("");
@@ -533,7 +609,7 @@ export default function FalsePositiveCaseWorkspace() {
                       key={source.id}
                       data-testid={`fp-source-${source.id}`}
                       aria-pressed={selectedSource?.id === source.id}
-                      onClick={() => setSelectedSourceId(source.id)}
+                      onClick={() => { setSelectedSourceId(source.id); setRoiSelection(null); setRoiDrag(null); }}
                     >
                       <strong>{sourceKindLabel(source.kind)} · {source.name}</strong>
                       <small>{shortHash(source.sha256)}</small>
@@ -541,12 +617,26 @@ export default function FalsePositiveCaseWorkspace() {
                   ))}
                 </div>
                 {selectedSource && <>
+                  <button
+                    type="button"
+                    className="fp-secondary-button fp-roi-draw-toggle"
+                    aria-pressed={roiDrawing}
+                    onClick={() => { setRoiDrawing((active) => !active); setRoiDrag(null); }}
+                  >{roiDrawing ? "停止影像框選" : "在影像上框選 ROI"}</button>
+                  {roiDrawing && <p className="fp-roi-draw-help">拖曳影像建立 ROI；座標會同步到下方欄位，可再微調。</p>}
                   <figure className="fp-source-preview">
-                    <div className="fp-image-stage">
+                    <div
+                      className={`fp-image-stage${roiDrawing ? " fp-image-stage-drawing" : ""}`}
+                      onPointerDown={startRoiDrawing}
+                      onPointerMove={moveRoiDrawing}
+                      onPointerUp={finishRoiDrawing}
+                      onPointerCancel={() => setRoiDrag(null)}
+                    >
                       <img
                         data-testid="fp-source-image"
                         src={api.falsePositiveSourceImageUrl(selectedCase.id, selectedSource.id)}
                         alt={`${sourceKindLabel(selectedSource.kind)} ${selectedSource.name}`}
+                        draggable={false}
                       />
                       {previewRegion && <svg
                         data-testid="fp-selected-region-roi"
@@ -560,6 +650,14 @@ export default function FalsePositiveCaseWorkspace() {
                           width={previewRegion.roi[2] - previewRegion.roi[0]}
                           height={previewRegion.roi[3] - previewRegion.roi[1]}
                         />
+                      </svg>}
+                      {drawnRoi && <svg
+                        data-testid="fp-drawn-region-roi"
+                        aria-label="正在框選的 ROI"
+                        viewBox="0 0 1 1"
+                        preserveAspectRatio="none"
+                      >
+                        <rect className="fp-draft-roi" x={drawnRoi[0]} y={drawnRoi[1]} width={drawnRoi[2] - drawnRoi[0]} height={drawnRoi[3] - drawnRoi[1]} />
                       </svg>}
                     </div>
                   </figure>
@@ -607,7 +705,7 @@ export default function FalsePositiveCaseWorkspace() {
                   <div className="fp-roi-grid" aria-label="Normalized ROI">
                     {regionRoi.map((value, index) => (
                       <label key={index}>ROI {(["x1", "y1", "x2", "y2"] as const)[index]}
-                        <input aria-label={`ROI ${(["x1", "y1", "x2", "y2"] as const)[index]}`} inputMode="decimal" value={value} onChange={(event) => setRegionRoi((current) => current.map((part, position) => position === index ? event.target.value : part) as [string, string, string, string])} />
+                        <input aria-label={`ROI ${(["x1", "y1", "x2", "y2"] as const)[index]}`} inputMode="decimal" value={value} onChange={(event) => { setRoiSelection(null); setRegionRoi((current) => current.map((part, position) => position === index ? event.target.value : part) as [string, string, string, string]); }} />
                       </label>
                     ))}
                   </div>
@@ -616,9 +714,9 @@ export default function FalsePositiveCaseWorkspace() {
 
                 {selectedCase.items.length === 0 ? <div className="fp-empty-regions">尚無爭議區域。可以手動新增，或匯入 YOLO 預測檔。</div> : <>
                   <div className="fp-region-nav" aria-label="區域導航">
-                    <button type="button" className="fp-secondary-button" disabled={selectedRegionIndex <= 0} onClick={() => setSelectedRegionId(selectedCase.items[selectedRegionIndex - 1]?.id || "")}>上一區域</button>
+                    <button type="button" className="fp-secondary-button" disabled={selectedRegionIndex <= 0} onClick={() => { setSelectedRegionId(selectedCase.items[selectedRegionIndex - 1]?.id || ""); setRoiSelection(null); }}>上一區域</button>
                     <span data-testid="fp-region-position">{Math.max(selectedRegionIndex + 1, 1)} / {selectedCase.items.length}</span>
-                    <button type="button" className="fp-secondary-button" disabled={selectedRegionIndex < 0 || selectedRegionIndex >= selectedCase.items.length - 1} onClick={() => setSelectedRegionId(selectedCase.items[selectedRegionIndex + 1]?.id || "")}>下一區域</button>
+                    <button type="button" className="fp-secondary-button" disabled={selectedRegionIndex < 0 || selectedRegionIndex >= selectedCase.items.length - 1} onClick={() => { setSelectedRegionId(selectedCase.items[selectedRegionIndex + 1]?.id || ""); setRoiSelection(null); }}>下一區域</button>
                   </div>
                   <div className="fp-region-tabs" aria-label="選擇案件區域">
                     {selectedCase.items.map((item, index) => (
@@ -627,7 +725,7 @@ export default function FalsePositiveCaseWorkspace() {
                         key={item.id}
                         data-testid={`fp-region-tab-${item.id}`}
                         aria-current={item.id === selectedRegionId ? "step" : undefined}
-                        onClick={() => setSelectedRegionId(item.id)}
+                        onClick={() => { setSelectedRegionId(item.id); setRoiSelection(null); }}
                       >
                         <strong>區域 {index + 1} · {item.label || "未命名"}</strong>
                         <small>{verdictLabels.get(item.review.verdict)}</small>
