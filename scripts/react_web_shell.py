@@ -471,6 +471,7 @@ class CreateExternalModelProfileRequest(BaseModel):
 
 class CreateAnomalyModelJobRequest(BaseModel):
     train_folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     model_id: str = Field(min_length=1, max_length=128)
     score_mode: Literal["patch", "object"] = "patch"
     target_res: Literal[224, 336, 448] = 224
@@ -533,6 +534,7 @@ class LabelFewshotMonitorItemRequest(BaseModel):
 
 class CreateAnomalyScoreJobRequest(BaseModel):
     target_folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     contamination: float = Field(default=0.05, ge=0.0, le=1.0, allow_inf_nan=False)
     class_names: list[str] = Field(default_factory=list, max_length=256)
 
@@ -556,6 +558,7 @@ class AnomalyPrelabelPreviewRequest(AnomalyPrelabelRequest):
 
 class AnomalyPrelabelExportRequest(AnomalyPrelabelRequest):
     output_dir: str = Field(min_length=1, max_length=4096)
+    output_folder_grant_id: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class LoadAnomalyModelRequest(BaseModel):
@@ -3251,10 +3254,12 @@ def create_app(
                     job.message = str(message)[:240]
 
             if app.state.anomaly_model_builder is not None:
-                bundle = app.state.anomaly_model_builder(job.request.model_dump(), progress=update_progress)
+                request_data = job.request.model_dump(exclude={"folder_grant_ids"})
+                bundle = app.state.anomaly_model_builder(request_data, progress=update_progress)
             else:
                 from react_anomaly import build_model
-                bundle = build_model(job.request.model_dump(), progress=update_progress)
+                request_data = job.request.model_dump(exclude={"folder_grant_ids"})
+                bundle = build_model(request_data, progress=update_progress)
             if job.cancel_event.is_set():
                 raise JobCancelled()
             model_id = "am_" + uuid.uuid4().hex[:16]
@@ -3304,6 +3309,10 @@ def create_app(
 
     @app.post("/api/v1/anomaly/models/jobs", status_code=202)
     def create_anomaly_model_job(request: CreateAnomalyModelJobRequest) -> dict:
+        resolved_folders = _resolve_nativeapp_folder_list(
+            request.train_folders, request.folder_grant_ids,
+        )
+        request = request.model_copy(update={"train_folders": resolved_folders})
         if request.model_id not in set(catalog()):
             raise HTTPException(status_code=422, detail="選取的模型未安裝")
         job_id = uuid.uuid4().hex
@@ -3349,7 +3358,8 @@ def create_app(
             if scorer is None:
                 from react_anomaly import score_targets
                 scorer = score_targets
-            run = scorer(job.request.model_dump(), bundle, progress=update_progress)
+            request_data = job.request.model_dump(exclude={"folder_grant_ids"})
+            run = scorer(request_data, bundle, progress=update_progress)
             if not run.get("records"):
                 raise ValueError("找不到符合模型物件來源的目標影像或標註")
             run_id = uuid.uuid4().hex
@@ -3396,6 +3406,10 @@ def create_app(
 
     @app.post("/api/v1/anomaly/score-jobs", status_code=202)
     def create_anomaly_score_job(request: CreateAnomalyScoreJobRequest) -> dict:
+        resolved_folders = _resolve_nativeapp_folder_list(
+            request.target_folders, request.folder_grant_ids,
+        )
+        request = request.model_copy(update={"target_folders": resolved_folders})
         job_id = uuid.uuid4().hex
         with app.state.lock:
             model_id = app.state.current_anomaly_model_id
@@ -3584,6 +3598,10 @@ def create_app(
     def export_anomaly_prelabels(
         run_id: str, request: AnomalyPrelabelExportRequest,
     ) -> dict:
+        output_dir = _resolve_nativeapp_folder_list(
+            [request.output_dir], [request.output_folder_grant_id],
+        )[0]
+        request = request.model_copy(update={"output_dir": output_dir})
         state = anomaly_prelabel_state(run_id, request.expected_revision)
         decisions = anomaly_prelabel_decisions(state, request)
         try:

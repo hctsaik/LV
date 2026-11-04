@@ -61,6 +61,38 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
 
   const availableModels = useMemo(() => models.filter((item) => item.available), [models]);
 
+  async function chooseAnomalyFolder(target: "training" | "score" | "prelabel") {
+    setError("");
+    setNotice("");
+    if (!window.cimHost?.chooseFile) {
+      setNotice("NativeApp 資料夾選擇器尚未連線；可在欄位中輸入本機資料夾路徑。");
+      return;
+    }
+    try {
+      const result = await window.cimHost.chooseFile();
+      if (result.canceled) return;
+      const chosen = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
+      if (chosen.length !== 1) throw new Error("請一次選擇一個資料夾，才能綁定 NativeApp 權限。");
+      const path = chosen[0];
+      if (!path) throw new Error("NativeApp 沒有回傳資料夾路徑。");
+      if (target === "prelabel") {
+        setPrelabelOutputDir(path);
+      } else {
+        const current = target === "training" ? foldersText : targetFoldersText;
+        const paths = splitLines(current);
+        if (!paths.includes(path) && paths.length >= 32) {
+          throw new Error("最多可選擇 32 個資料夾。");
+        }
+        const update = target === "training" ? setFoldersText : setTargetFoldersText;
+        update((value) => [...new Set([...splitLines(value), path])].join("\n"));
+      }
+      if (result.grant_id) api.rememberFolderGrant(path, result.grant_id);
+      setNotice("已選擇 NativeApp 資料夾；執行時會驗證對應的本機資料夾權限。");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "NativeApp 資料夾選擇失敗。");
+    }
+  }
+
   async function refreshModels() {
     const response = await api.anomalyModels();
     setSavedModels(response.items);
@@ -93,6 +125,7 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
     try {
       const created = await api.createAnomalyModelJob({
         train_folders: folders,
+        folder_grant_ids: api.folderGrantIds(folders),
         model_id: modelId,
         score_mode: scoreMode,
         target_res: targetRes,
@@ -202,6 +235,7 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
     try {
       const created = await api.createAnomalyScoreJob({
         target_folders: folders,
+        folder_grant_ids: api.folderGrantIds(folders),
         contamination,
         class_names: splitLines(classNames.replaceAll(",", "\n")),
       });
@@ -307,6 +341,7 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
         min_conf: prelabelMinConf,
         target_classes: prelabelClasses,
         output_dir: prelabelOutputDir.trim(),
+        output_folder_grant_id: api.folderGrantIds([prelabelOutputDir.trim()])[0] ?? null,
       });
       setNotice(`預標匯出完成：接受 ${result.accepted} 個物件，寫入 ${result.written} 個標註檔。來源資料未修改。`);
     } catch (reason) {
@@ -332,8 +367,9 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
         <form className="anomaly-build-form" onSubmit={(event) => void build(event)}>
           <label className="anomaly-wide">訓練／參考資料夾（每行一個本機路徑）
             <textarea aria-label="瑕疵偵測訓練資料夾" data-testid="anomaly-train-folders" rows={3} value={foldersText} disabled={working} onChange={(event) => setFoldersText(event.target.value)} placeholder="C:\\data\\product\\train" />
-            <small>YOLO 模式需有 images/ 與 labels/；若資料沒有框，改選整張影像。NativeApp 資料夾權限橋接尚待接線。</small>
+            <small>YOLO 模式需有 images/ 與 labels/；若資料沒有框，改選整張影像。NativeApp 會在送出前驗證資料夾授權。</small>
           </label>
+          <button type="button" className="secondary-action anomaly-wide" disabled={working} onClick={() => void chooseAnomalyFolder("training")}>從 NativeApp 選訓練資料夾</button>
           <label>特徵模型
             <select aria-label="瑕疵偵測模型" data-testid="anomaly-model" value={modelId} disabled={working || availableModels.length === 0} onChange={(event) => setModelId(event.target.value)}>
               {availableModels.map((model) => <option key={model.model_id} value={model.model_id}>{model.name}</option>)}
@@ -407,8 +443,9 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
         <form className="anomaly-score-form" onSubmit={(event) => void scoreTargets(event)}>
           <label className="anomaly-wide">目標資料夾（每行一個本機路徑）
             <textarea aria-label="瑕疵偵測目標資料夾" data-testid="anomaly-target-folders" rows={3} value={targetFoldersText} disabled={scoreWorking || working} onChange={(event) => setTargetFoldersText(event.target.value)} placeholder="C:\\data\\product\\test" />
-            <small>模型的特徵模型、分數依據、解析度與物件來源固定沿用建模設定。NativeApp 資料夾權限橋接尚待接線。</small>
+            <small>模型的特徵模型、分數依據、解析度與物件來源固定沿用建模設定；NativeApp 會驗證本次選取的資料夾。</small>
           </label>
+          <button type="button" className="secondary-action anomaly-wide" disabled={working || scoreWorking} onClick={() => void chooseAnomalyFolder("score")}>從 NativeApp 選目標資料夾</button>
           <label>預估異常比例
             <input aria-label="瑕疵偵測污染率" data-testid="anomaly-contamination" type="number" min={0} max={1} step={0.01} value={contamination} disabled={working || scoreWorking} onChange={(event) => setContamination(Number(event.target.value))} />
           </label>
@@ -480,6 +517,7 @@ export default function AnomalyBankWorkspace({ models, connected, onCurationCoun
               <label>YOLO 標註輸出資料夾（須位於來源資料夾之外）
                 <input aria-label="預標輸出資料夾" data-testid="anomaly-prelabel-output-dir" value={prelabelOutputDir} disabled={prelabelWorking} onChange={(event) => setPrelabelOutputDir(event.target.value)} placeholder="C:\\data\\prelabel-output" />
               </label>
+              <button type="button" className="secondary-action" disabled={prelabelWorking} onClick={() => void chooseAnomalyFolder("prelabel")}>選擇輸出資料夾</button>
               <button type="button" className="run-button" data-testid="anomaly-prelabel-export" disabled={prelabelWorking || !prelabelOutputDir.trim() || !connected} onClick={() => void exportPrelabels()}>
                 {prelabelWorking ? "正在匯出…" : `匯出接受的預標（${prelabelPreview.accepted}）`}
               </button>

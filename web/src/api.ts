@@ -1388,6 +1388,7 @@ export const api = {
     requestBlob("/api/v1/class-similarity/jobs/" + encodeURIComponent(jobId) + "/report", input),
   createAnomalyModelJob: (input: {
     train_folders: string[];
+    folder_grant_ids?: Array<string | null>;
     model_id: string;
     score_mode: "patch" | "object";
     target_res: number;
@@ -1503,7 +1504,12 @@ export const api = {
     "/api/v1/anomaly/models/load",
     { method: "POST", body: JSON.stringify({ model_id: modelId }) },
   ),
-  createAnomalyScoreJob: (input: { target_folders: string[]; contamination: number; class_names?: string[] }) =>
+  createAnomalyScoreJob: (input: {
+    target_folders: string[];
+    folder_grant_ids?: Array<string | null>;
+    contamination: number;
+    class_names?: string[];
+  }) =>
     request<{ job_id: string; state: string }>("/api/v1/anomaly/score-jobs", {
       method: "POST",
       body: JSON.stringify(input),
@@ -1532,7 +1538,10 @@ export const api = {
       "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/prelabel/preview",
       { method: "POST", body: JSON.stringify(input) },
     ),
-  exportAnomalyPrelabels: (runId: string, input: AnomalyPrelabelOptions & { output_dir: string }) =>
+  exportAnomalyPrelabels: (runId: string, input: AnomalyPrelabelOptions & {
+    output_dir: string;
+    output_folder_grant_id?: string | null;
+  }) =>
     request<AnomalyPrelabelExport>(
       "/api/v1/anomaly/runs/" + encodeURIComponent(runId) + "/prelabel/export",
       { method: "POST", body: JSON.stringify(input) },
