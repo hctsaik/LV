@@ -355,3 +355,171 @@ def test_real_mvtec_capsule_gradcam(
         ctx.close()
 
     assert _fingerprint(source) == source_before, "original MVTec capsule data changed"
+
+
+def test_real_mvtec_capsule_gradcam_react_matches_streamlit(
+    explain_app_server, browser, mvtec_capsule_gradcam_dataset,
+    e2e_cache_dir, tmp_path, monkeypatch,
+):
+    """Compare legacy and React Grad-CAM UI outputs on the same real MVTec cases."""
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+
+    from react_web_shell import create_app
+    from .test_react_web_shell_e2e import _is_run_summary_response, _start_api
+
+    source, dataset, selected_name = mvtec_capsule_gradcam_dataset
+    source_before = _fingerprint(source)
+    dataset_before = _fingerprint(dataset)
+    models_dir = Path(
+        os.environ.get("LV_MODELS_DIR") or Path(__file__).resolve().parents[2] / "models"
+    ).expanduser().resolve()
+    weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
+    if not weights.is_file():
+        pytest.skip(f"set LV_MODELS_DIR to the pinned DINOv2 model folder: {weights}")
+    assert hashlib.sha256(weights.read_bytes()).hexdigest() == (
+        "b938bf1bc15cd2ec0feacfe3a1bb553fe8ea9ca46a7e1d8d00217f29aef60cd9"
+    )
+    if not (Path(__file__).resolve().parents[2] / "web" / "dist" / "index.html").is_file():
+        pytest.skip("build the React workspace with npm run build before this E2E")
+
+    # Capture the real legacy Streamlit journey and its user-facing exports.
+    legacy_page = browser.new_page(viewport={"width": 1920, "height": 1080})
+    legacy_page.set_default_timeout(30000)
+    try:
+        _run_visualize(legacy_page, explain_app_server, dataset)
+        _click_card_for_class(legacy_page, _CAPSULE_TARGET, selected_name)
+        wait_idle(legacy_page)
+        viewer = legacy_page.locator(".st-key-viz_image_viewer")
+        expect(viewer.locator('[data-testid="stImage"] img').first).to_be_visible()
+        viewer.scroll_into_view_if_needed()
+        _open_expander(legacy_page, "可解釋性")
+        legacy_page.locator(".st-key-viz_explain_mode").locator(
+            "text=分類理由"
+        ).last.click()
+        wait_idle(legacy_page)
+        _open_expander(legacy_page, "可解釋性")
+        _click_key_button(legacy_page, "viz_explain_train_head")
+        wait_idle(legacy_page, timeout=120000)
+        expect(legacy_page.get_by_text("session head", exact=False).first).to_be_visible()
+        _open_expander(legacy_page, "可解釋性")
+        target_box = legacy_page.locator(
+            ".st-key-viz_explain_target [data-baseweb='select']"
+        ).first
+        target_box.click()
+        legacy_page.get_by_role("option", name=_CAPSULE_TARGET, exact=True).click()
+        legacy_page.keyboard.press("Escape")
+        wait_idle(legacy_page)
+        legacy_cache_before_explain = _fingerprint(e2e_cache_dir)
+        _click_key_button(legacy_page, "viz_explain_analyze")
+        legacy_page.wait_for_selector("text=對比分類證據", timeout=180000)
+        wait_idle(legacy_page, timeout=120000)
+        expect(legacy_page.locator('[data-testid="stException"]')).to_have_count(0)
+
+        with legacy_page.expect_download() as png_download:
+            _visible_key_button(legacy_page, "viz_explain_dl_png").click()
+        legacy_png = Path(png_download.value.path()).read_bytes()
+        with legacy_page.expect_download() as json_download:
+            _visible_key_button(legacy_page, "viz_explain_dl_json").click()
+        legacy_metadata = json.loads(
+            Path(json_download.value.path()).read_text(encoding="utf-8")
+        )
+        assert _fingerprint(e2e_cache_dir) == legacy_cache_before_explain
+    finally:
+        legacy_page.close()
+
+    # Run the same dataset and target through the visible React application.
+    react_cache = tmp_path / "react-cache"
+    monkeypatch.setenv("LV_CACHE_DIR", str(react_cache))
+    # Keep the production model loader so the diagnostic head records the
+    # checkpoint identity required by Grad-CAM preflight.
+    application = create_app()
+    server = server_thread = None
+    react_context = browser.new_context(viewport={"width": 1500, "height": 1100})
+    react_page = react_context.new_page()
+    react_page.set_default_timeout(30000)
+    try:
+        server, server_thread, base_url = _start_api(application)
+        run_payloads: list[dict] = []
+        react_page.on(
+            "response",
+            lambda response: run_payloads.append(response.json())
+            if _is_run_summary_response(response) and response.ok
+            else None,
+        )
+        react_page.goto(base_url, wait_until="networkidle")
+        react_page.get_by_test_id("model-choice-dinov2_vits14").check()
+        react_page.get_by_label("Supervised UMAP").uncheck()
+        react_page.get_by_label("PCA").check()
+        react_page.get_by_label("Image folder").fill(str(dataset))
+        react_page.get_by_role("button", name="Add folder").click()
+        react_page.get_by_role("button", name="Run analysis").click()
+        expect(react_page.get_by_test_id("job-status")).to_contain_text(
+            "Completed", timeout=300000
+        )
+        assert run_payloads, "React did not load the MVTec Visualize result"
+        run = run_payloads[-1]
+        record_index = next(
+            record["index"] for record in run["records"]
+            if record["label"] == _CAPSULE_TARGET and record["filename"] == selected_name
+        )
+        react_page.get_by_test_id("embedding-point").nth(record_index).click()
+        expect(react_page.get_by_test_id("selected-image-name")).to_have_text(selected_name)
+        react_page.get_by_test_id("open-diagnostics-reference").click()
+        expect(react_page.get_by_test_id("diagnostic-reference-status")).to_contain_text(
+            "Context current"
+        )
+        react_page.get_by_test_id("diagnostic-head-build").click()
+        expect(react_page.get_by_test_id("diagnostic-head-status")).to_contain_text(
+            "Head ready: 224×224", timeout=180000
+        )
+        react_page.get_by_test_id("diagnostic-method").select_option("gradcam")
+        react_page.get_by_test_id("diagnostic-target-class").select_option(_CAPSULE_TARGET)
+        react_page.get_by_test_id("diagnostic-display-mode").select_option("signed")
+        with react_page.expect_response(
+            lambda response: response.url.endswith("/explanations")
+            and response.request.method == "POST",
+            timeout=180000,
+        ) as explanation_response:
+            react_page.get_by_test_id("diagnostic-explain-run").click()
+        assert explanation_response.value.ok, explanation_response.value.text()
+        react_metadata = explanation_response.value.json()
+        expect(react_page.get_by_test_id("diagnostic-target-result")).to_contain_text(
+            _CAPSULE_TARGET
+        )
+        react_cache_before_download = _fingerprint(react_cache)
+        with react_page.expect_download() as react_png_download:
+            react_page.get_by_test_id("diagnostic-download-png").click()
+        react_png = Path(react_png_download.value.path()).read_bytes()
+        with react_page.expect_download() as react_json_download:
+            react_page.get_by_test_id("diagnostic-download-json").click()
+        react_download_metadata = json.loads(
+            Path(react_json_download.value.path()).read_text(encoding="utf-8")
+        )
+        assert _fingerprint(react_cache) == react_cache_before_download
+    finally:
+        react_context.close()
+        if server is not None:
+            server.should_exit = True
+        if server_thread is not None:
+            server_thread.join(timeout=10)
+
+    assert legacy_metadata["model_id"] == react_download_metadata["model_id"] == "dinov2_vits14"
+    assert legacy_metadata["target_class"] == react_download_metadata["target_class"] == _CAPSULE_TARGET
+    assert legacy_metadata["predicted_class"] == react_download_metadata["predicted_class"]
+    assert legacy_metadata["reference_class"] == react_download_metadata["reference_class"]
+    assert legacy_metadata["grid"] == react_download_metadata["grid"]
+    react_scores = np.asarray(react_download_metadata["raw_scores"], dtype=np.float32)
+    np.testing.assert_allclose(
+        [legacy_metadata["raw_min"], legacy_metadata["raw_max"], legacy_metadata["raw_sum"]],
+        [float(react_scores.min()), float(react_scores.max()), float(react_scores.sum())],
+        rtol=0,
+        atol=1e-6,
+    )
+    legacy_pixels = np.asarray(Image.open(BytesIO(legacy_png)).convert("RGB"))
+    react_pixels = np.asarray(Image.open(BytesIO(react_png)).convert("RGB"))
+    np.testing.assert_array_equal(react_pixels, legacy_pixels)
+    assert _fingerprint(source) == source_before, "original MVTec capsule data changed"
+    assert _fingerprint(dataset) == dataset_before, "the copied MVTec cases changed"
