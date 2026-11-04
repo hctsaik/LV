@@ -6429,7 +6429,7 @@ def _start_streamlit_for_react_parity(
 def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yolo_defect_at_nmin,
 ):
-    """Compare the visible React and Streamlit prelabel journeys on one real-model dataset."""
+    """Compare visible real-model scoring, filtering, and prelabel behavior across both UIs."""
     models_dir = _pinned_dinov2_models_dir(tmp_path)
     weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
     if not weights.is_file():
@@ -6454,9 +6454,32 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
     root = yolo_defect_at_nmin["root"]
+    # Keep the training fixture untouched; per-image target stripes create a
+    # non-degenerate score range for the real-model filter parity case.
+    target_root = tmp_path / "score-target"
+    shutil.copytree(root, target_root)
+    from PIL import ImageDraw
+
+    for index, image_path in enumerate(sorted((target_root / "images").glob("*.jpg"))):
+        with Image.open(image_path) as source_image:
+            image = source_image.convert("RGB")
+        draw = ImageDraw.Draw(image)
+        stripe_x = 78 + (index % 5) * 8
+        stripe_width = 4 + (index % 6) * 3
+        level = (index * 47 + 19) % 256
+        draw.rectangle(
+            (stripe_x, 0, min(127, stripe_x + stripe_width), 127),
+            fill=(level, 255 - level, (level * 3) % 256),
+        )
+        image.save(image_path, quality=92)
+
     source_hashes = {
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in root.rglob("*") if path.is_file()
+    }
+    target_hashes = {
+        path.relative_to(target_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in target_root.rglob("*") if path.is_file()
     }
     application = create_app(
         model_catalog=lambda: available_models(models_dir),
@@ -6518,7 +6541,7 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
             bundle_id = application.state.current_anomaly_model_id
             react_model_dir = tmp_path / "cache" / "react_anomaly_models" / bundle_id
 
-            page.get_by_test_id("anomaly-target-folders").fill(str(root))
+            page.get_by_test_id("anomaly-target-folders").fill(str(target_root))
             page.get_by_test_id("anomaly-score").click()
             expect(page.get_by_test_id("anomaly-run-summary")).to_contain_text("16", timeout=300000)
             expect(page.get_by_test_id("anomaly-review-workspace")).to_be_visible()
@@ -6529,9 +6552,157 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 and payload.get("result", {}).get("score_mode") == "patch"
                 for payload in score_payloads
             )
+            run_id = application.state.current_anomaly_run_id
+            run = application.state.anomaly_runs[run_id]
+            expect(page.locator(".anomaly-object")).to_have_count(len(run["records"]))
+            react_score_cards = page.locator(".anomaly-object").all()
+            react_rank = [
+                int(card.get_attribute("data-testid").rsplit("-", 1)[-1])
+                for card in react_score_cards
+            ]
+            assert react_rank == [int(index) for index in run["ranking"]]
+            for index, card in zip(react_rank, react_score_cards):
+                record = run["records"][index]
+                text = card.inner_text()
+                score_match = re.search(r"異常分數\s+([0-9.]+)", text)
+                assert score_match, text
+                assert float(score_match.group(1)) == pytest.approx(
+                    float(run["scores"][index]), abs=5.1e-7,
+                )
+                assert Path(record["image_path"]).name in text
+                assert str(record["label"]) in text
+                assert ("異常候選" if run["labels"][index] == "bad" else "正常候選") in text
+
+            def expected_inspector_options(indices: list[int]) -> list[str]:
+                return [
+                    f"{float(run['scores'][index]):.3f} · "
+                    f"{Path(run['records'][index]['image_path']).name} "
+                    f"#{int(run['records'][index].get('obj_index') or 0)} · "
+                    f"{run['records'][index]['label']}"
+                    for index in indices
+                ]
+
+            def read_streamlit_inspector_options(expected_count: int) -> list[str]:
+                selector = legacy_page.locator(
+                    '.st-key-anomaly_inspect [data-baseweb="select"]:visible',
+                ).first
+                for _ in range(3):
+                    selector.click()
+                    try:
+                        legacy_page.wait_for_selector('[role="option"]', timeout=6000)
+                        break
+                    except Exception:
+                        legacy_page.keyboard.press("Escape")
+                        wait_idle(legacy_page)
+                else:
+                    raise AssertionError("Streamlit inspector options did not open")
+
+                seen: list[str] = []
+                for _ in range(12):
+                    for value in legacy_page.get_by_role("option").all_inner_texts():
+                        normalized = " ".join(value.split())
+                        if normalized and normalized not in seen:
+                            seen.append(normalized)
+                    if len(seen) >= expected_count:
+                        break
+                    moved = legacy_page.evaluate("""() => {
+                        const option = document.querySelector('[role="option"]');
+                        const scrollable = [];
+                        for (let node = option?.parentElement; node && node !== document.body;
+                             node = node.parentElement) {
+                            const style = getComputedStyle(node);
+                            if (node.scrollHeight > node.clientHeight + 1
+                                && /auto|scroll/.test(style.overflowY)) {
+                                scrollable.push(node);
+                            }
+                        }
+                        const list = scrollable[0];
+                        if (!list) return false;
+                        const before = list.scrollTop;
+                        list.scrollTop = Math.min(
+                            list.scrollHeight, before + Math.max(220, list.clientHeight),
+                        );
+                        return list.scrollTop !== before;
+                    }""")
+                    legacy_page.wait_for_timeout(220)
+                    if not moved:
+                        before_count = len(seen)
+                        legacy_page.get_by_role("option").last.hover()
+                        legacy_page.mouse.wheel(0, 320)
+                        legacy_page.wait_for_timeout(220)
+                        for value in legacy_page.get_by_role("option").all_inner_texts():
+                            normalized = " ".join(value.split())
+                            if normalized and normalized not in seen:
+                                seen.append(normalized)
+                        if len(seen) == before_count:
+                            break
+                legacy_page.keyboard.press("Escape")
+                wait_idle(legacy_page)
+                return seen
+
+            def streamlit_range_sliders():
+                legacy_page.wait_for_function("""() => Array.from(document.querySelectorAll(
+                    '.st-key-anomaly_heat_filter_apply',
+                )).filter(element => element.offsetParent !== null).length === 1""")
+                widget = legacy_page.locator(
+                    ".st-key-anomaly_heat_filter_apply:visible",
+                ).first
+                sliders = widget.locator('[role="slider"]:visible')
+                assert sliders.count() == 2, {
+                    "visible_widgets": legacy_page.locator(
+                        ".st-key-anomaly_heat_filter_apply:visible",
+                    ).count(),
+                    "visible_sliders": sliders.count(),
+                }
+                return sliders
 
             # Exercise real-model prelabel in the React UI and compare every
             # visible row and exported YOLO line with the existing prelabel core.
+            def assert_react_class_filter(label: str) -> None:
+                page.get_by_label("瑕疵類別篩選").select_option(label)
+                page.get_by_role("button", name="套用篩選").click()
+                expected_indices = [
+                    int(index) for index in run["ranking"]
+                    if run["records"][int(index)]["label"] == label
+                ]
+                expect(page.locator(".anomaly-object")).to_have_count(len(expected_indices))
+                actual_indices = [
+                    int(card.get_attribute("data-testid").rsplit("-", 1)[-1])
+                    for card in page.locator(".anomaly-object").all()
+                ]
+                assert actual_indices == expected_indices
+                assert all(run["records"][index]["label"] == label for index in actual_indices)
+
+            def assert_react_score_range(score_min: float, score_max: float) -> list[int]:
+                page.get_by_label("瑕疵類別篩選").select_option("")
+                page.get_by_label("瑕疵最低分數").fill(str(score_min))
+                page.get_by_label("瑕疵最高分數").fill(str(score_max))
+                page.get_by_role("button", name="套用篩選").click()
+                expected_indices = [
+                    int(index) for index in run["ranking"]
+                    if score_min <= float(run["scores"][int(index)]) <= score_max
+                ]
+                expect(page.locator(".anomaly-object")).to_have_count(len(expected_indices))
+                actual_indices = [
+                    int(card.get_attribute("data-testid").rsplit("-", 1)[-1])
+                    for card in page.locator(".anomaly-object").all()
+                ]
+                assert actual_indices == expected_indices
+                expect(page.get_by_test_id("anomaly-review-workspace")).to_contain_text(
+                    f"篩選結果 {len(expected_indices)} 筆",
+                )
+                return expected_indices
+
+            def clear_react_score_filters() -> None:
+                page.get_by_label("瑕疵類別篩選").select_option("")
+                page.get_by_label("瑕疵最低分數").fill("")
+                page.get_by_label("瑕疵最高分數").fill("")
+                page.get_by_role("button", name="套用篩選").click()
+                expect(page.locator(".anomaly-object")).to_have_count(len(run["records"]))
+
+            assert_react_class_filter("scratch")
+            clear_react_score_filters()
+
             page.get_by_test_id("anomaly-prelabel-preview").click()
             expect(page.get_by_test_id("anomaly-prelabel-summary")).to_be_visible(timeout=30000)
             expect(page.get_by_test_id("anomaly-prelabel-item-0")).to_be_visible()
@@ -6541,8 +6712,6 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
             )
             assert prelabel_payloads, "the visible preview should request the local prelabel API"
             preview = prelabel_payloads[-1]
-            run_id = application.state.current_anomaly_run_id
-            run = application.state.anomaly_runs[run_id]
             bundle = application.state.anomaly_models[bundle_id]
             import prelabel as legacy_prelabel
 
@@ -6711,12 +6880,19 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 for path in root.rglob("*") if path.is_file()
             }
             assert after_hashes == source_hashes, "anomaly model build must leave the selected dataset unchanged"
+            after_target_hashes = {
+                path.relative_to(target_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in target_root.rglob("*") if path.is_file()
+            }
+            assert after_target_hashes == target_hashes, "anomaly scoring and export must leave target images unchanged"
 
             # Re-run the same 16-object, same-weight workflow through the
             # legacy Streamlit UI. Sharing feature caches keeps both cold-start
             # model builds on the same canonical cached vectors before comparing
             # the visible decisions and exported files.
-            from ._anomaly_wizard import apply_model, build_model, enter_anomaly, set_model_dir
+            from ._anomaly_wizard import (
+                TAB_APPLY, apply_model, build_model, click_tab, enter_anomaly, set_model_dir,
+            )
             from .conftest import _stop_process_tree, wait_idle
             from .test_prelabel_gui_e2e import _accept_count, _open_prelabel
 
@@ -6776,7 +6952,66 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 expect(legacy_page.locator('[data-testid="stMain"]')).to_contain_text(
                     "模型已載入",
                 )
-                apply_model(legacy_page, root)
+                apply_model(legacy_page, target_root)
+                legacy_main = legacy_page.locator('[data-testid="stMain"]').inner_text()
+                legacy_bad_match = re.search(r"判為可疑\(bad\)\s*(\d+)\s*個", legacy_main)
+                assert legacy_bad_match, legacy_main[-2000:]
+                assert int(legacy_bad_match.group(1)) == int(run["n_bad"])
+                assert read_streamlit_inspector_options(len(run["records"])) == expected_inspector_options(
+                    [int(index) for index in run["ranking"]],
+                )
+
+                range_thumbs = streamlit_range_sliders()
+                initial_min = float(range_thumbs.nth(0).get_attribute("aria-valuenow"))
+                range_thumbs.nth(0).focus()
+                for _ in range(1):
+                    legacy_page.keyboard.press("PageUp")
+                wait_idle(legacy_page)
+                click_tab(legacy_page, TAB_APPLY)
+                range_thumbs = streamlit_range_sliders()
+                filtered_min = float(range_thumbs.nth(0).get_attribute("aria-valuenow"))
+                filtered_max = float(range_thumbs.nth(1).get_attribute("aria-valuenow"))
+                assert filtered_min > initial_min
+                score_indices = [
+                    int(index) for index in run["ranking"]
+                    if filtered_min <= float(run["scores"][int(index)]) <= filtered_max
+                ]
+                assert 0 < len(score_indices) < len(run["records"]), {
+                    "initial_min": initial_min,
+                    "filtered_min": filtered_min,
+                    "filtered_max": filtered_max,
+                    "scores": sorted(float(value) for value in run["scores"]),
+                }
+                assert assert_react_score_range(filtered_min, filtered_max) == score_indices
+                assert read_streamlit_inspector_options(len(score_indices)) == expected_inspector_options(
+                    score_indices,
+                )
+
+                range_thumbs.nth(0).focus()
+                for _ in range(1):
+                    legacy_page.keyboard.press("PageDown")
+                wait_idle(legacy_page)
+                click_tab(legacy_page, TAB_APPLY)
+                restored_min = float(
+                    streamlit_range_sliders().nth(0).get_attribute("aria-valuenow")
+                )
+                assert restored_min == pytest.approx(initial_min, abs=1e-5)
+                clear_react_score_filters()
+
+                class_filter = legacy_page.locator(".st-key-anomaly_class_filter_apply")
+                class_filter.get_by_role("combobox").first.click()
+                legacy_page.get_by_role("option", name="scratch", exact=True).click()
+                wait_idle(legacy_page)
+                click_tab(legacy_page, TAB_APPLY)
+                scratch_indices = [
+                    int(index) for index in run["ranking"]
+                    if run["records"][int(index)]["label"] == "scratch"
+                ]
+                assert len(scratch_indices) == 8
+                assert read_streamlit_inspector_options(len(scratch_indices)) == expected_inspector_options(
+                    scratch_indices,
+                )
+
                 _open_prelabel(legacy_page)
                 legacy_preview_text = legacy_page.locator('.st-key-anomaly_prelabel_preview').inner_text()
                 legacy_accepted = _accept_count(legacy_page)
