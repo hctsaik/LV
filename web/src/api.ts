@@ -489,6 +489,29 @@ export type ClassSimilarityItem = {
   tied_rival_classes: string[];
 };
 
+export type LabelQualityResult = {
+  run_id: string;
+  model_id: string;
+  unit: VisualizeUnit;
+  k: number;
+  record_count: number;
+  classes: string[];
+  confusion: number[][];
+  counts: number[];
+  mismatch_count: number;
+  candidates: Array<{
+    index: number;
+    filename: string;
+    own: string;
+    suggested: string;
+    suggested_frac: number;
+    own_frac: number;
+    disagreement: number;
+    bbox: [number, number, number, number] | null;
+    obj_index: number | null;
+  }>;
+};
+
 export type ClassSimilarityBoxSummary = {
   label: string;
   n_total: number;
@@ -1359,6 +1382,11 @@ async function uploadFile<T>(path: string, file: File): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean; api_version: string; models_available: number }>("/api/v1/health"),
   models: () => request<{ items: ModelOption[] }>("/api/v1/models"),
+  createLabelQualityResult: (runId: string, input: { model_id: string; k: number }) =>
+    request<LabelQualityResult>(
+      "/api/v1/runs/" + encodeURIComponent(runId) + "/label-quality",
+      { method: "POST", body: JSON.stringify(input) },
+    ),
   createClassSimilarityJob: (runId: string, input: { model_id: string; k: number; analysis_split: string }) =>
     request<{ job_id: string; run_id: string; state: string }>(
       "/api/v1/runs/" + encodeURIComponent(runId) + "/class-similarity/jobs",

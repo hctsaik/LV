@@ -180,6 +180,11 @@ class CreateClassSimilarityJob(BaseModel):
     analysis_split: str = Field(default="all", max_length=128)
 
 
+class CreateLabelQualityRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=128)
+    k: int = Field(default=5, ge=1, le=20)
+
+
 class ClassSimilarityEvaluationTemplateRequest(BaseModel):
     scope: Literal["all", "selected"] = "all"
     purpose: Literal["tuning", "heldout"] = "tuning"
@@ -6111,6 +6116,111 @@ def create_app(
             )
         except OSError:
             return False
+
+    @app.post("/api/v1/runs/{run_id}/label-quality")
+    def create_label_quality_result(run_id: str, request: CreateLabelQualityRequest) -> dict:
+        with app.state.lock:
+            run = app.state.runs.get(run_id)
+            if run is None:
+                raise HTTPException(status_code=404, detail="Run not found")
+            if app.state.current_run_id != run_id:
+                raise HTTPException(status_code=409, detail={
+                    "code": "STALE_LABEL_QUALITY_RUN",
+                    "message": "This Visualize run is no longer current. Run Visualize again before label review.",
+                    "request_id": uuid.uuid4().hex,
+                })
+            raw_by_model = app.state.raw_embeddings.get(run_id, {})
+            raw_embeddings = raw_by_model.get(request.model_id)
+            records = [dict(record) for record in run.get("records", [])]
+            run_snapshot = dict(run)
+            unit = str(run.get("unit") or "image")
+            model_id = request.model_id
+        if len(records) != len(run_snapshot.get("image_paths", [])):
+            raise HTTPException(status_code=409, detail={
+                "code": "LABEL_QUALITY_SOURCE_IDENTITY_INCOMPLETE",
+                "message": "The run's records and source images are no longer aligned.",
+                "request_id": uuid.uuid4().hex,
+            })
+        if raw_embeddings is None:
+            raise HTTPException(status_code=404, detail="Model embeddings are not available for this run")
+        labels = np.asarray([str(record.get("label") or "") for record in records])
+        if len(records) < 3 or len(set(labels.tolist())) < 2:
+            raise HTTPException(status_code=422, detail={
+                "code": "LABEL_QUALITY_DATA_INSUFFICIENT",
+                "message": "At least three records from two classes are required for label-quality review.",
+                "request_id": uuid.uuid4().hex,
+            })
+        embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+        if (
+            embeddings.ndim != 2
+            or embeddings.shape[0] != len(records)
+            or not np.isfinite(embeddings).all()
+        ):
+            raise HTTPException(status_code=409, detail={
+                "code": "LABEL_QUALITY_EMBEDDINGS_INVALID",
+                "message": "The run's original high-dimensional features are incomplete or invalid.",
+                "request_id": uuid.uuid4().hex,
+            })
+        if not diagnostic_run_sources_current(run_snapshot):
+            raise HTTPException(status_code=409, detail={
+                "code": "STALE_LABEL_QUALITY_SOURCE",
+                "message": "A source image changed after this Visualize run. Run Visualize again before label review.",
+                "request_id": uuid.uuid4().hex,
+            })
+
+        try:
+            from object_eval import neighbor_confusion
+
+            result = neighbor_confusion(embeddings, labels, k=request.k)
+        except Exception as exc:
+            logger.exception("LV label-quality analysis failed")
+            raise HTTPException(status_code=422, detail={
+                "code": "LABEL_QUALITY_ANALYSIS_FAILED",
+                "message": "The label-quality analysis could not be completed. Check the local worker log and retry.",
+                "request_id": uuid.uuid4().hex,
+            }) from exc
+
+        with app.state.lock:
+            still_current = app.state.current_run_id == run_id
+        if not still_current or not diagnostic_run_sources_current(run_snapshot):
+            raise HTTPException(status_code=409, detail={
+                "code": "STALE_LABEL_QUALITY_SOURCE",
+                "message": "Visualize changed or a source image changed during label review. Run Visualize again.",
+                "request_id": uuid.uuid4().hex,
+            })
+
+        candidates = sorted(
+            (item for item in result["per_object"] if item["mismatch"]),
+            key=lambda item: item["suggested_frac"],
+            reverse=True,
+        )
+        public_candidates = []
+        for item in candidates[:30]:
+            index = int(item["idx"])
+            record = records[index]
+            public_candidates.append({
+                "index": index,
+                "filename": str(record.get("filename") or Path(run_snapshot["image_paths"][index]).name),
+                "own": str(item["own"]),
+                "suggested": str(item["suggested"]),
+                "suggested_frac": float(item["suggested_frac"]),
+                "own_frac": float(item["own_frac"]),
+                "disagreement": float(item["disagreement"]),
+                "bbox": record.get("bbox"),
+                "obj_index": record.get("obj_index"),
+            })
+        return {
+            "run_id": run_id,
+            "model_id": model_id,
+            "unit": unit,
+            "k": int(request.k),
+            "record_count": len(records),
+            "classes": [str(value) for value in result["classes"]],
+            "confusion": np.asarray(result["confusion"], dtype=np.float64).tolist(),
+            "counts": np.asarray(result["counts"], dtype=np.int64).tolist(),
+            "mismatch_count": len(candidates),
+            "candidates": public_candidates,
+        }
 
     def diagnostic_head_key(run_id: str, run: dict, model_id: str, resolution: int) -> str:
         policy = dict(run.get("object_policy") or {})

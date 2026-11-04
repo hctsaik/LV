@@ -38,6 +38,7 @@ import CompareDistributions from "./CompareDistributions";
 import CurationWorkspace from "./CurationWorkspace";
 import EvaluationWorkspace from "./EvaluationWorkspace";
 import FalsePositiveCaseWorkspace from "./FalsePositiveCaseWorkspace";
+import LabelQualityWorkspace from "./LabelQualityWorkspace";
 const LazyScatterPlot2D = lazy(() => import("./ScatterPlot2D"));
 const LazyScatterPlot3D = lazy(() => import("./ScatterPlot3D"));
 const LazyGroupDiffWorkspace = lazy(() => import("./GroupDiffWorkspace"));
@@ -308,7 +309,7 @@ export default function App() {
   const [objectPolicyProfileMatching, setObjectPolicyProfileMatching] = useState(false);
   const [objectPolicyProfileName, setObjectPolicyProfileName] = useState("");
   const [classNamesDraft, setClassNamesDraft] = useState("");
-  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "class_similarity" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "evaluation" | "anomaly" | "fewshot">("visualize");
+  const [activeTool, setActiveTool] = useState<"visualize" | "diagnostics" | "class_similarity" | "label_quality" | "compare" | "groupdiff" | "curation" | "coverage" | "false_positive" | "evaluation" | "anomaly" | "fewshot">("visualize");
   const [coverageMounted, setCoverageMounted] = useState(false);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [selectedModelIds, setSelectedModelIds] = useState<string[]>([]);
@@ -1332,6 +1333,7 @@ export default function App() {
         <nav className="tool-nav" aria-label="LV tools">
           <button type="button" className={activeTool === "visualize" ? "active" : ""} aria-current={activeTool === "visualize" ? "page" : undefined} onClick={() => setActiveTool("visualize")}>Visualize</button>
           {run && currentRunId && <button type="button" data-testid="open-class-similarity" className={activeTool === "class_similarity" ? "active" : ""} aria-current={activeTool === "class_similarity" ? "page" : undefined} onClick={() => setActiveTool("class_similarity")}>類別相似度</button>}
+          {run && currentRunId && <button type="button" data-testid="open-label-quality" className={activeTool === "label_quality" ? "active" : ""} aria-current={activeTool === "label_quality" ? "page" : undefined} onClick={() => setActiveTool("label_quality")}>混淆／標錯</button>}
           {diagnosticReference && <button type="button" data-testid="open-diagnostics" className={activeTool === "diagnostics" ? "active" : ""} aria-current={activeTool === "diagnostics" ? "page" : undefined} onClick={() => setActiveTool("diagnostics")}>Diagnostics</button>}
           <button type="button" className={activeTool === "compare" ? "active" : ""} aria-current={activeTool === "compare" ? "page" : undefined} onClick={() => setActiveTool("compare")}>Compare</button>
           <button type="button" className={activeTool === "coverage" ? "active" : ""} aria-current={activeTool === "coverage" ? "page" : undefined} onClick={() => { setCoverageMounted(true); setActiveTool("coverage"); }}>Coverage</button>
@@ -1601,6 +1603,21 @@ export default function App() {
         </main>
       ) : activeTool === "false_positive" ? (
         <FalsePositiveCaseWorkspace />
+      ) : activeTool === "label_quality" && run && currentRunId ? (
+        <LabelQualityWorkspace
+          key={`${currentRunId}-${activeModelId}`}
+          runId={currentRunId}
+          modelId={activeModelId}
+          unit={run.unit}
+          records={run.records}
+          onReturn={() => setActiveTool("visualize")}
+          onOpenRecord={(index) => {
+            setActiveTool("visualize");
+            setSelectedIndex(index);
+            setSelectedIndices((current) => current.includes(index) ? current : [...current, index]);
+          }}
+          onAddSelection={addSelection}
+        />
       ) : activeTool === "class_similarity" && run && currentRunId ? (
         <ClassSimilarityWorkspace
           key={`${currentRunId}-${activeModelId}`}
