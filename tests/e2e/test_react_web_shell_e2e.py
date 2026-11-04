@@ -6376,10 +6376,60 @@ def test_lv_web_06_bank_01_visible_build_save_worker_restart_and_load(
         _stop_worker(second_worker)
 
 
-def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def _start_streamlit_for_react_parity(
+    models_dir: Path, run_root: Path, *, cache_dir: Path | None = None,
 ):
-    """Run the default React worker builder against the pinned real DINOv2 weights."""
+    """Launch the visible legacy UI with isolated app state and an optional shared cache."""
+    from .conftest import _process_group_options
+
+    log_path = run_root / "streamlit.log"
+    log_file = log_path.open("w", encoding="utf-8")
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    env = {
+        **os.environ,
+        "LV_MODELS_DIR": str(models_dir),
+        "LV_CACHE_DIR": str(cache_dir or run_root / "cache"),
+        "LV_CASES_DIR": str(run_root / "cases"),
+        "LV_UI_STATE": str(run_root / "no-persist" / "ui_state.json"),
+        "STREAMLIT_BROWSER_GATHER_USAGE_STATS": "false",
+        "STREAMLIT_SERVER_HEADLESS": "true",
+    }
+    process = subprocess.Popen(
+        [
+            sys.executable, "-m", "streamlit", "run", "scripts/app.py",
+            "--server.port", str(port), "--server.headless", "true",
+            "--server.fileWatcherType", "none",
+            "--browser.gatherUsageStats", "false",
+        ],
+        cwd=ROOT,
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        **_process_group_options(),
+    )
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            log_file.close()
+            pytest.fail("Streamlit reference exited early:\n" + log_path.read_text(encoding="utf-8")[-3000:])
+        try:
+            with urllib.request.urlopen(f"{base_url}/_stcore/health", timeout=1) as response:
+                if response.read().decode().strip() == "ok":
+                    return process, log_file, base_url
+        except OSError:
+            time.sleep(0.2)
+    from .conftest import _stop_process_tree
+
+    _stop_process_tree(process)
+    log_file.close()
+    pytest.fail("Streamlit reference did not become healthy:\n" + log_path.read_text(encoding="utf-8")[-3000:])
+
+
+def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yolo_defect_at_nmin,
+):
+    """Compare the visible React and Streamlit prelabel journeys on one real-model dataset."""
     models_dir = _pinned_dinov2_models_dir(tmp_path)
     weights = models_dir / "dinov2_vits14" / "dinov2_vits14.pth"
     if not weights.is_file():
@@ -6403,20 +6453,7 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
     monkeypatch.setenv("LV_MODELS_DIR", str(models_dir))
     monkeypatch.setenv("LV_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("LV_CASES_DIR", str(tmp_path / "cases"))
-    root = tmp_path / "real-dino-yolo"
-    (root / "images").mkdir(parents=True)
-    (root / "labels").mkdir()
-    (root / "classes.txt").write_text("good\nbad\n", encoding="utf-8")
-    for index, class_id in enumerate((0, 0, 1, 1)):
-        image = Image.new("RGB", (96, 96), (24, 150, 40) if class_id == 0 else (190, 45, 30))
-        if class_id:
-            for x in range(18, 54):
-                for y in range(18, 54):
-                    image.putpixel((x, y), (240, 120, 10))
-        image.save(root / "images" / f"{index}.png")
-        (root / "labels" / f"{index}.txt").write_text(
-            f"{class_id} 0.5 0.5 0.8 0.8\n", encoding="utf-8",
-        )
+    root = yolo_defect_at_nmin["root"]
     source_hashes = {
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in root.rglob("*") if path.is_file()
@@ -6456,7 +6493,7 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
             page.get_by_test_id("anomaly-model").select_option("dinov2_vits14")
             page.get_by_test_id("anomaly-build").click()
             expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("模型已建立", timeout=300000)
-            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("4 個物件")
+            expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("16 個物件")
             expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("embedding D=384")
             expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("只做異常偵測")
             assert any(
@@ -6466,24 +6503,29 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 for payload in job_payloads
             )
             page.get_by_test_id("anomaly-label-semantic").select_option("defect")
-            page.get_by_label("分類頭最小樣本數").fill("2")
             page.get_by_test_id("anomaly-build").click()
             expect(page.get_by_test_id("anomaly-model-status")).to_contain_text("能分辨瑕疵種類", timeout=300000)
             assert any(
                 payload.get("state") == "completed"
                 and payload.get("result", {}).get("summary", {}).get("has_head") is True
-                and payload.get("result", {}).get("summary", {}).get("eligible_classes") == ["bad", "good"]
+                and payload.get("result", {}).get("summary", {}).get("eligible_classes") == ["scratch", "stain"]
                 for payload in job_payloads
             )
+            page.get_by_test_id("anomaly-save").click()
+            expect(page.get_by_test_id("anomaly-notice")).to_contain_text(
+                "已保存至 LV_CACHE_DIR", timeout=30000,
+            )
+            bundle_id = application.state.current_anomaly_model_id
+            react_model_dir = tmp_path / "cache" / "react_anomaly_models" / bundle_id
 
             page.get_by_test_id("anomaly-target-folders").fill(str(root))
             page.get_by_test_id("anomaly-score").click()
-            expect(page.get_by_test_id("anomaly-run-summary")).to_contain_text("4", timeout=300000)
+            expect(page.get_by_test_id("anomaly-run-summary")).to_contain_text("16", timeout=300000)
             expect(page.get_by_test_id("anomaly-review-workspace")).to_be_visible()
             expect(page.locator(".anomaly-object").first).to_be_visible()
             assert any(
                 payload.get("state") == "completed"
-                and payload.get("result", {}).get("n_objects") == 4
+                and payload.get("result", {}).get("n_objects") == 16
                 and payload.get("result", {}).get("score_mode") == "patch"
                 for payload in score_payloads
             )
@@ -6501,7 +6543,6 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
             preview = prelabel_payloads[-1]
             run_id = application.state.current_anomaly_run_id
             run = application.state.anomaly_runs[run_id]
-            bundle_id = application.state.current_anomaly_model_id
             bundle = application.state.anomaly_models[bundle_id]
             import prelabel as legacy_prelabel
 
@@ -6510,7 +6551,7 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 anomaly_threshold=run["threshold"], min_conf=preview["min_conf"],
                 target_classes=preview["target_classes"],
             )
-            assert preview["total"] == len(expected_decisions) == 4
+            assert preview["total"] == len(expected_decisions) == 16
             assert preview["accepted"] == sum(item["accept"] for item in expected_decisions)
             assert len(preview["items"]) == len(expected_decisions)
             for row, decision in zip(preview["items"], expected_decisions):
@@ -6563,6 +6604,127 @@ def test_lv_web_06_bank_01_real_dinov2_normal_bank_build(
                 for path in root.rglob("*") if path.is_file()
             }
             assert after_hashes == source_hashes, "anomaly model build must leave the selected dataset unchanged"
+
+            # Re-run the same 16-object, same-weight workflow through the
+            # legacy Streamlit UI. Sharing feature caches keeps both cold-start
+            # model builds on the same canonical cached vectors before comparing
+            # the visible decisions and exported files.
+            from ._anomaly_wizard import apply_model, build_model, enter_anomaly, set_model_dir
+            from .conftest import _stop_process_tree, wait_idle
+            from .test_prelabel_gui_e2e import _accept_count, _open_prelabel
+
+            parity_root = tmp_path / "streamlit-parity"
+            parity_root.mkdir()
+            legacy_process, legacy_log, legacy_url = _start_streamlit_for_react_parity(
+                models_dir, parity_root, cache_dir=tmp_path / "cache",
+            )
+            legacy_page = browser.new_page(viewport={"width": 1920, "height": 1080})
+            try:
+                legacy_page.set_default_timeout(300000)
+                enter_anomaly(legacy_page, legacy_url)
+                message = build_model(legacy_page, root, semantic_text="瑕疵類別")
+                assert "能分辨瑕疵種類" in message
+                legacy_model_dir = tmp_path / "cache" / "streamlit-parity-model"
+                set_model_dir(legacy_page, legacy_model_dir)
+                legacy_page.locator('.st-key-anomaly_save_model_btn button').click()
+                wait_idle(legacy_page)
+                expect(legacy_page.locator('[data-testid="stMain"]')).to_contain_text("已存:")
+
+                # Independent builds must persist equivalent model state. The
+                # shared feature cache makes the expected bank and projector
+                # vectors exact on this same-input run.
+                from anomaly_bank_store import load_bank
+                from dino_head import load_head
+
+                legacy_bundle = load_bank(legacy_model_dir)
+                react_bundle = load_bank(react_model_dir)
+                for key in (
+                    "model", "target_res", "score_mode", "object_source",
+                    "patch_dim", "obj_dim", "n_objects", "embedding_recipe",
+                    "label_semantic",
+                ):
+                    assert legacy_bundle["meta"].get(key) == react_bundle["meta"].get(key), key
+                np.testing.assert_array_equal(legacy_bundle["vectors"], react_bundle["vectors"])
+                for key in ("mean", "components", "good_obj_emb", "ref_coords"):
+                    np.testing.assert_array_equal(
+                        legacy_bundle["projection"][key], react_bundle["projection"][key],
+                    )
+                assert legacy_bundle["projection"]["l2norm"] == react_bundle["projection"]["l2norm"]
+                assert legacy_bundle["projection"]["tau"] == react_bundle["projection"]["tau"]
+                legacy_head = load_head(legacy_model_dir / "head.joblib")
+                react_head = load_head(react_model_dir / "head.joblib")
+                np.testing.assert_array_equal(legacy_head["classes"], react_head["classes"])
+                np.testing.assert_array_equal(
+                    legacy_head["model"].coef_, react_head["model"].coef_,
+                )
+                np.testing.assert_array_equal(
+                    legacy_head["model"].intercept_, react_head["model"].intercept_,
+                )
+
+                # Exercise the legacy loader against the React-saved model
+                # package, then compare both visible apply/preview/export runs.
+                set_model_dir(legacy_page, react_model_dir)
+                legacy_page.locator('.st-key-anomaly_load_model_btn button').click()
+                wait_idle(legacy_page)
+                expect(legacy_page.locator('[data-testid="stMain"]')).to_contain_text(
+                    "模型已載入",
+                )
+                apply_model(legacy_page, root)
+                _open_prelabel(legacy_page)
+                legacy_preview_text = legacy_page.locator('.st-key-anomaly_prelabel_preview').inner_text()
+                legacy_accepted = _accept_count(legacy_page)
+                legacy_captions = re.findall(
+                    r"([^\n]+?)\s*·\s*信心\s*([0-9.]+)\s*·\s*✅收",
+                    legacy_preview_text,
+                )
+                react_captions = [
+                    (item["pred"], f"{item['confidence']:.2f}")
+                    for item in preview["items"] if item["accept"]
+                ]
+                assert legacy_accepted == preview["accepted"]
+
+                legacy_output = parity_root / "prelabel-output"
+                legacy_page.locator('.st-key-anomaly_prelabel_out_dir input').first.fill(str(legacy_output))
+                legacy_page.locator('.st-key-anomaly_prelabel_out_dir input').first.press("Enter")
+                wait_idle(legacy_page)
+                _open_prelabel(legacy_page)
+                legacy_page.locator('.st-key-anomaly_prelabel_export_btn button').click()
+                legacy_page.wait_for_function(
+                    "() => (document.querySelector('[data-testid=\"stMain\"]')?.innerText || '').includes('預標匯出完成')",
+                    timeout=60000,
+                )
+                wait_idle(legacy_page)
+
+                def file_tree_bytes(folder: Path) -> dict[str, bytes]:
+                    return {
+                        path.relative_to(folder).as_posix(): path.read_bytes()
+                        for path in folder.rglob("*") if path.is_file()
+                    }
+
+                legacy_files = file_tree_bytes(legacy_output)
+                react_files = file_tree_bytes(output)
+                assert legacy_files == react_files, json.dumps({
+                    name: {
+                        "streamlit": legacy_files.get(name, b"").decode("utf-8", errors="replace"),
+                        "react": react_files.get(name, b"").decode("utf-8", errors="replace"),
+                    }
+                    for name in sorted(set(legacy_files) | set(react_files))
+                    if legacy_files.get(name) != react_files.get(name)
+                }, ensure_ascii=False)
+                assert sorted(legacy_captions) == sorted(react_captions), json.dumps({
+                    "streamlit": sorted(legacy_captions),
+                    "react": sorted(react_captions),
+                }, ensure_ascii=False)
+                assert source_hashes == {
+                    path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in root.rglob("*") if path.is_file()
+                }
+                expect(legacy_page.locator('[data-testid="stException"]')).to_have_count(0)
+            finally:
+                legacy_page.close()
+                _stop_process_tree(legacy_process)
+                legacy_log.close()
+
             browser.close()
     finally:
         server.should_exit = True
