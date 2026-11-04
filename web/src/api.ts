@@ -1403,6 +1403,7 @@ export const api = {
   }),
   createFewshotSampleBankJob: (input: {
     sample_folders: string[];
+    folder_grant_ids?: Array<string | null>;
     model_id: string;
     object_source: "yolo" | "whole_image";
     class_names?: string[];
@@ -1419,6 +1420,7 @@ export const api = {
   createFewshotScanJob: (input: {
     sample_bank_id: string;
     target_folders: string[];
+    folder_grant_ids?: Array<string | null>;
     k: number;
     min_proposal_conf: number;
   }) => request<{ job_id: string; state: string }>("/api/v1/fewshot/scans/jobs", {
@@ -1448,6 +1450,7 @@ export const api = {
     theta: number;
     class_overrides: Record<string, string>;
     output_dir: string;
+    output_folder_grant_id?: string | null;
     copy_images: boolean;
   }) => request<{
     written: number;

@@ -485,6 +485,7 @@ class CreateAnomalyModelJobRequest(BaseModel):
 
 class CreateFewshotSampleBankJobRequest(BaseModel):
     sample_folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     model_id: str = Field(min_length=1, max_length=128)
     object_source: Literal["yolo", "whole_image"] = "yolo"
     class_names: list[str] = Field(default_factory=list, max_length=256)
@@ -493,6 +494,7 @@ class CreateFewshotSampleBankJobRequest(BaseModel):
 class CreateFewshotScanJobRequest(BaseModel):
     sample_bank_id: str = Field(min_length=36, max_length=36)
     target_folders: list[str] = Field(min_length=1, max_length=32)
+    folder_grant_ids: list[str | None] = Field(default_factory=list, max_length=32)
     k: int = Field(default=100, ge=10, le=500, multiple_of=10)
     min_proposal_conf: float = Field(default=0.0, ge=0.0, le=1.0, allow_inf_nan=False)
 
@@ -512,6 +514,7 @@ class ExportFewshotCandidatesRequest(BaseModel):
     theta: float = Field(default=0.3, ge=0.0, le=1.0, allow_inf_nan=False)
     class_overrides: dict[str, str] = Field(default_factory=dict, max_length=500)
     output_dir: str = Field(min_length=1, max_length=4096)
+    output_folder_grant_id: str | None = Field(default=None, min_length=1, max_length=256)
     copy_images: bool = True
 
 
@@ -2068,8 +2071,11 @@ def create_app(
             raise HTTPException(status_code=503, detail="無法讀取本機模型清單") from exc
         if request.model_id not in available:
             raise HTTPException(status_code=422, detail="所選本機特徵模型不存在或尚未安裝")
+        granted_folders = _resolve_nativeapp_folder_list(
+            request.sample_folders, request.folder_grant_ids,
+        )
         folders = []
-        for value in request.sample_folders:
+        for value in granted_folders:
             try:
                 folder = Path(value).expanduser().resolve(strict=True)
             except (OSError, RuntimeError) as exc:
@@ -2077,7 +2083,7 @@ def create_app(
             if not folder.is_dir():
                 raise HTTPException(status_code=422, detail="樣本資料夾不存在或無法讀取")
             folders.append(str(folder))
-        normalized = request.model_copy(update={"sample_folders": folders})
+        normalized = request.model_copy(update={"sample_folders": folders, "folder_grant_ids": []})
         job_id = uuid.uuid4().hex
         job = _FewshotSampleBankJob(job_id=job_id, request=normalized)
         with app.state.lock:
@@ -2253,6 +2259,13 @@ def create_app(
 
     @app.post("/api/v1/fewshot/scans/jobs", status_code=202)
     def create_fewshot_scan_job(request: CreateFewshotScanJobRequest) -> dict:
+        granted_folders = _resolve_nativeapp_folder_list(
+            request.target_folders, request.folder_grant_ids,
+        )
+        request = request.model_copy(update={
+            "target_folders": granted_folders,
+            "folder_grant_ids": [],
+        })
         bank_dir = fewshot_sample_bank_path(request.sample_bank_id)
         try:
             import sample_bank
@@ -2439,6 +2452,13 @@ def create_app(
 
     @app.post("/api/v1/fewshot/scans/exports")
     def export_fewshot_scan(request: ExportFewshotCandidatesRequest) -> dict:
+        output_dir = _resolve_nativeapp_folder_list(
+            [request.output_dir], [request.output_folder_grant_id],
+        )[0]
+        request = request.model_copy(update={
+            "output_dir": output_dir,
+            "output_folder_grant_id": None,
+        })
         with app.state.fewshot_lock:
             scan = app.state.fewshot_scans.get(request.scan_id)
             if scan is None:

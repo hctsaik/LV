@@ -68,6 +68,40 @@ export default function FewshotSampleBankWorkspace({ models, connected }: Props)
     }
   }, [availableModels, modelId]);
 
+  async function chooseFewshotFolder(target: "sample" | "scan" | "export") {
+    const reportError = target === "sample" ? setError : target === "scan" ? setScanError : setExportError;
+    const reportNotice = target === "sample" ? setNotice : target === "scan" ? setScanNotice : setExportNotice;
+    reportError("");
+    reportNotice("");
+    if (!window.cimHost?.chooseFile) {
+      reportNotice("NativeApp 資料夾選擇器尚未連線；可在欄位中輸入本機資料夾路徑。");
+      return;
+    }
+    try {
+      const result = await window.cimHost.chooseFile();
+      if (result.canceled) return;
+      const chosen = result.paths?.length ? result.paths : (result.path ? [result.path] : []);
+      if (chosen.length !== 1) throw new Error("請一次選擇一個資料夾，才能綁定 NativeApp 權限。");
+      const path = chosen[0];
+      if (!path) throw new Error("NativeApp 沒有回傳資料夾路徑。");
+      if (target === "export") {
+        setExportDirectory(path);
+      } else {
+        const current = target === "sample" ? sampleFolders : targetFolders;
+        const paths = splitLines(current);
+        if (!paths.includes(path) && paths.length >= 32) {
+          throw new Error("最多可選擇 32 個資料夾。");
+        }
+        const update = target === "sample" ? setSampleFolders : setTargetFolders;
+        update((value) => [...new Set([...splitLines(value), path])].join("\n"));
+      }
+      if (result.grant_id) api.rememberFolderGrant(path, result.grant_id);
+      reportNotice("已選擇 NativeApp 資料夾；送出時會驗證對應的本機權限。");
+    } catch (reason) {
+      reportError(reason instanceof Error ? reason.message : "NativeApp 資料夾選擇失敗。");
+    }
+  }
+
   async function build(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const folders = splitLines(sampleFolders);
@@ -84,6 +118,7 @@ export default function FewshotSampleBankWorkspace({ models, connected }: Props)
     try {
       const created = await api.createFewshotSampleBankJob({
         sample_folders: folders,
+        folder_grant_ids: api.folderGrantIds(folders),
         model_id: modelId,
         object_source: objectSource,
         class_names: splitLines(classNames),
@@ -151,6 +186,7 @@ export default function FewshotSampleBankWorkspace({ models, connected }: Props)
       const created = await api.createFewshotScanJob({
         sample_bank_id: bank.sample_bank_id,
         target_folders: folders,
+        folder_grant_ids: api.folderGrantIds(folders),
         k: topK,
         min_proposal_conf: minProposalConfidence,
       });
@@ -227,6 +263,7 @@ export default function FewshotSampleBankWorkspace({ models, connected }: Props)
           return label && label !== candidate.suggested_class ? [[candidate.item_id, label]] : [];
         })),
         output_dir: exportDirectory.trim(),
+        output_folder_grant_id: api.folderGrantIds([exportDirectory.trim()])[0] ?? null,
         copy_images: copyImages,
       });
       setExportNotice(
@@ -334,6 +371,8 @@ export default function FewshotSampleBankWorkspace({ models, connected }: Props)
               onChange={(event) => setSampleFolders(event.target.value)} />
             <small>YOLO 模式使用影像與標註框；整張影像模式不讀取 labels。</small>
           </label>
+          <button type="button" className="secondary-action anomaly-wide" disabled={working}
+            onClick={() => void chooseFewshotFolder("sample")}>從 NativeApp 選樣本資料夾</button>
           <label>特徵模型
             <select aria-label="以樣搜樣特徵模型" data-testid="fewshot-model" value={modelId}
               disabled={working || availableModels.length === 0}
@@ -395,6 +434,8 @@ export default function FewshotSampleBankWorkspace({ models, connected }: Props)
               placeholder={'C:\\datasets\\to-review'} value={targetFolders} disabled={scanWorking || adding || exporting}
               onChange={(event) => setTargetFolders(event.target.value)} />
           </label>
+          <button type="button" className="secondary-action anomaly-wide" disabled={scanWorking || adding || exporting}
+            onClick={() => void chooseFewshotFolder("scan")}>從 NativeApp 選目標資料夾</button>
           <label>前 K 個候選
             <input aria-label="以樣搜樣前 K 個" data-testid="fewshot-top-k" type="number" min={10} max={500} step={10}
               value={topK} disabled={scanWorking || adding || exporting} onChange={(event) => setTopK(Number(event.target.value))} />
@@ -432,6 +473,8 @@ export default function FewshotSampleBankWorkspace({ models, connected }: Props)
                 disabled={exporting || scanWorking || adding}
                 onChange={(event) => setExportDirectory(event.target.value)} />
             </label>
+            <button type="button" className="secondary-action" disabled={exporting || scanWorking || adding}
+              onClick={() => void chooseFewshotFolder("export")}>選擇輸出資料夾</button>
             <label className="anomaly-curation-choice">
               <input type="checkbox" data-testid="fewshot-export-copy-images" checked={copyImages}
                 disabled={exporting || scanWorking || adding}
