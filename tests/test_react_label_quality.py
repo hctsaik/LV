@@ -74,6 +74,13 @@ def test_label_quality_api_uses_full_embeddings_and_keeps_paths_private(tmp_path
         assert {candidate["index"] for candidate in result["candidates"][1:]} == {2, 3}
         assert str(tmp_path) not in json.dumps(result)
 
+        default_request = client.post(
+            f"/api/v1/runs/{run_id}/label-quality",
+            json={"model_id": "fixture-model"},
+        )
+        assert default_request.status_code == 200, default_request.text
+        assert default_request.json()["k"] == 10
+
         paths[0].write_bytes(paths[0].read_bytes() + b"changed")
         stale = client.post(
             f"/api/v1/runs/{run_id}/label-quality",

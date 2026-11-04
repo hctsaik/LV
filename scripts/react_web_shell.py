@@ -182,7 +182,7 @@ class CreateClassSimilarityJob(BaseModel):
 
 class CreateLabelQualityRequest(BaseModel):
     model_id: str = Field(min_length=1, max_length=128)
-    k: int = Field(default=5, ge=1, le=20)
+    k: int = Field(default=10, ge=1, le=20)
 
 
 class ClassSimilarityEvaluationTemplateRequest(BaseModel):

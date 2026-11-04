@@ -463,13 +463,19 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
             page = browser.new_page()
             run_payloads = []
             run_ids = []
+            label_quality_payloads = []
 
             def capture_run(response):
                 if _is_run_summary_response(response) and response.ok:
                     run_ids.append(urlparse(response.url).path.rstrip("/").rsplit("/", 1)[-1])
                     run_payloads.append(response.json())
 
+            def capture_label_quality(response):
+                if response.ok and "/label-quality" in urlparse(response.url).path:
+                    label_quality_payloads.append(response.json())
+
             page.on("response", capture_run)
+            page.on("response", capture_label_quality)
             page.goto(base_url, wait_until="networkidle")
             page.get_by_test_id("model-choice-dinov2_vits14").check()
             page.get_by_label("Supervised UMAP").uncheck()
@@ -579,6 +585,46 @@ def test_lv_web_01_ic_01_ic_02_real_model(tmp_path: Path, monkeypatch: pytest.Mo
                         actual.rival_neighbors, expected.rival_neighbors, strict=True
                     )
                 )
+            page.get_by_role("button", name="Return to Visualize").click()
+
+            page.get_by_test_id("open-label-quality").click()
+            expect(page.get_by_test_id("label-quality-workspace")).to_be_visible()
+            expect(page.get_by_label("Label quality K")).to_have_value("10")
+            page.get_by_test_id("label-quality-calculate").click()
+            expect(page.get_by_test_id("label-quality-summary")).to_contain_text("K=10", timeout=30_000)
+            assert label_quality_payloads, "React UI did not request label-quality results"
+            label_quality = label_quality_payloads[-1]
+            assert label_quality["run_id"] == real_run_id
+            assert label_quality["model_id"] == "dinov2_vits14"
+            assert label_quality["k"] == 10
+            with application.state.lock:
+                label_records = list(application.state.runs[real_run_id]["records"])
+                label_embeddings = application.state.raw_embeddings[real_run_id]["dinov2_vits14"].copy()
+            from object_eval import neighbor_confusion
+
+            expected_label_quality = neighbor_confusion(
+                label_embeddings,
+                [str(record.get("label") or "") for record in label_records],
+                k=10,
+            )
+            assert label_quality["classes"] == expected_label_quality["classes"]
+            np.testing.assert_array_equal(label_quality["counts"], expected_label_quality["counts"])
+            np.testing.assert_allclose(
+                label_quality["confusion"], expected_label_quality["confusion"],
+                rtol=1e-7, atol=1e-8,
+            )
+            expected_mismatches = sorted(
+                (item for item in expected_label_quality["per_object"] if item["mismatch"]),
+                key=lambda item: item["suggested_frac"], reverse=True,
+            )[:30]
+            assert len(label_quality["candidates"]) == len(expected_mismatches)
+            for actual, expected in zip(label_quality["candidates"], expected_mismatches, strict=True):
+                assert actual["index"] == expected["idx"]
+                assert actual["own"] == expected["own"]
+                assert actual["suggested"] == expected["suggested"]
+                assert actual["suggested_frac"] == pytest.approx(expected["suggested_frac"])
+                assert actual["own_frac"] == pytest.approx(expected["own_frac"])
+                assert actual["disagreement"] == pytest.approx(expected["disagreement"])
             page.get_by_role("button", name="Return to Visualize").click()
 
             for folder in (dataset / "train", dataset / "test"):

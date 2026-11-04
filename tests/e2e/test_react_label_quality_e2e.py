@@ -16,18 +16,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _label_quality_fixture(root: Path) -> Path:
     train = root / "train"
-    specs = [
-        ("apple", (220, 35, 45)),
-        ("apple", (218, 40, 48)),
-        ("apple", (225, 30, 43)),
-        ("apple", (215, 45, 50)),
-        # Deliberately mislabeled: its image features match the banana group.
-        ("apple", (30, 190, 70)),
-        ("banana", (32, 188, 72)),
-        ("banana", (28, 194, 68)),
-        ("banana", (35, 186, 75)),
-        ("banana", (30, 192, 65)),
-    ]
+    specs = [("apple", (220 - index % 5, 35 + index % 6, 45 + index % 4)) for index in range(12)]
+    # Deliberately mislabeled: its image features match the banana group.
+    specs.append(("apple", (30, 190, 70)))
+    specs.extend(
+        ("banana", (30 + index % 5, 190 + index % 6, 70 + index % 4))
+        for index in range(10)
+    )
     for index, (label, color) in enumerate(specs):
         folder = train / label
         folder.mkdir(parents=True, exist_ok=True)
@@ -73,18 +68,18 @@ def test_lv_web_01_lq_01_visible_confusion_and_mislabel_review(
             page.get_by_role("button", name="Add folder").click()
             page.get_by_role("button", name="Run analysis").click()
             expect(page.get_by_test_id("job-status")).to_contain_text("Completed", timeout=30000)
-            expect(page.get_by_test_id("embedding-point")).to_have_count(9)
+            expect(page.get_by_test_id("embedding-point")).to_have_count(23)
 
             page.get_by_test_id("open-label-quality").click()
             expect(page.get_by_test_id("label-quality-workspace")).to_be_visible()
-            page.get_by_label("Label quality K").fill("5")
+            expect(page.get_by_label("Label quality K")).to_have_value("10")
             page.get_by_test_id("label-quality-calculate").click()
             expect(page.get_by_test_id("label-quality-confusion-matrix")).to_be_visible()
             expect(page.get_by_test_id("label-quality-summary")).to_contain_text("1 suspected label issue")
             candidate = page.get_by_test_id("label-quality-candidate")
             expect(candidate).to_have_count(1)
             expect(candidate).to_contain_text("apple → banana")
-            expect(candidate.get_by_role("img", name="img-04.png")).to_be_visible()
+            expect(candidate.get_by_role("img", name="img-12.png")).to_be_visible()
 
             page.get_by_test_id("label-quality-select-candidates").click()
             expect(page.get_by_role("status")).to_contain_text("Added 1 suspected record(s)")

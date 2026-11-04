@@ -25,7 +25,7 @@ export default function LabelQualityWorkspace({
   onOpenRecord,
   onAddSelection,
 }: Props) {
-  const [k, setK] = useState(5);
+  const [k, setK] = useState(10);
   const [result, setResult] = useState<LabelQualityResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
