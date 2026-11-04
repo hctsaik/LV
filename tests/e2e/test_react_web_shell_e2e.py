@@ -44,12 +44,12 @@ FIXTURE_SHA256 = {
 }
 DETECTOR_FIXTURE_SHA256 = {
     "classes.txt": "6790a8ef4600c53847701c63920499d8ea56375232a8de32fc15b3e26b9d6ba4",
-    "test/images/03.png": "d1db8754763264c772e91c2d290fa34eb4fccde5347547a0b88508a03a78e2a8",
-    "test/images/04.png": "2efc4e09db0248ef37f99e869efbf46b3831f0a8a32aebdc15b91fca3a7bd10d",
+    "test/images/03.png": "6c3f44cb683248541a6592a7e241731df440e74d3490a164f9ccfdda5326da37",
+    "test/images/04.png": "9959fd8060eb6de599f05151cc4aad1143fe0f681d25fa7b2fefa49739a1c21c",
     "test/labels/03.txt": "bbad46a203bf72fa2666bd7b28fb48bdad2e401c2f4d52fef2f8395d13fc6a6d",
     "test/labels/04.txt": "d2a7909432cfee5af8b863bfff69743ee65dd5971a12510c0d1f2bccc97e7b3c",
-    "train/images/01.png": "2bf522ccb76e9a416106fb84e8ce91398058fc5a0df49ee3a2a05a0db0391323",
-    "train/images/02.png": "8acebfda3ba1cbfccce4ed478aa4920f53ae3b7c7e65b8a338a08c432bf63035",
+    "train/images/01.png": "075839d8bf45fd16e41e9ba9f2ba7f6767c86bc2da7599c3c9b2a090d7423f00",
+    "train/images/02.png": "9cc58e0682dfdede3ffcd894909d4dc24ae2c0f78f4512cf4837fb119447015b",
     "train/labels/01.txt": "27870ce778e19c56104999640fb7fcdc18751cab266b594e4c462c4960284748",
     "train/labels/02.txt": "4ea54c88845a9d9e59da0f008b0d72db82edd68ec37f615a00b016e9727aed22",
 }
@@ -58,17 +58,6 @@ COVERAGE_REF_FIXTURE_TREE_SHA256 = {
     "candidate": "2f6e47474450aae0443d6b0e755657f36f81bcd753f6420e0cd03d0c0376782e",
 }
 REAL_KMEANS_FIXTURE_TREE_SHA256 = "819744ee86027ee129e254fb041c2f19520d1f094e7592ea25edb7a18a925b11"
-DETECTOR_FIXTURE_SHA256 = {
-    "classes.txt": "6790a8ef4600c53847701c63920499d8ea56375232a8de32fc15b3e26b9d6ba4",
-    "test/images/03.png": "d1db8754763264c772e91c2d290fa34eb4fccde5347547a0b88508a03a78e2a8",
-    "test/images/04.png": "2efc4e09db0248ef37f99e869efbf46b3831f0a8a32aebdc15b91fca3a7bd10d",
-    "test/labels/03.txt": "bbad46a203bf72fa2666bd7b28fb48bdad2e401c2f4d52fef2f8395d13fc6a6d",
-    "test/labels/04.txt": "d2a7909432cfee5af8b863bfff69743ee65dd5971a12510c0d1f2bccc97e7b3c",
-    "train/images/01.png": "2bf522ccb76e9a416106fb84e8ce91398058fc5a0df49ee3a2a05a0db0391323",
-    "train/images/02.png": "8acebfda3ba1cbfccce4ed478aa4920f53ae3b7c7e65b8a338a08c432bf63035",
-    "train/labels/01.txt": "27870ce778e19c56104999640fb7fcdc18751cab266b594e4c462c4960284748",
-    "train/labels/02.txt": "4ea54c88845a9d9e59da0f008b0d72db82edd68ec37f615a00b016e9727aed22",
-}
 
 
 def _pinned_dinov2_models_dir(tmp_path: Path) -> Path:
@@ -4785,7 +4774,7 @@ def test_lv_web_01_od_02_real_model_object_embeddings_on_arm64(
 def test_lv_web_01_od_01_real_model_visible_detector_ui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Run detector mode through React with the pinned DINOv2 model and YOLO fixture."""
+    """Run detector mode through React and compare it with the legacy Visualize path."""
     models_dir = _pinned_dinov2_models_dir(tmp_path)
     if not (ROOT / "web" / "dist" / "index.html").is_file():
         pytest.skip("build the web workspace with npm run build before running this E2E")
@@ -4851,6 +4840,38 @@ def test_lv_web_01_od_01_real_model_visible_detector_ui(
             page.get_by_test_id("embedding-point").nth(2).click()
             expect(page.get_by_test_id("selected-image-name")).to_have_text("03.png")
             expect(page.get_by_test_id("selected-image")).to_have_js_property("naturalWidth", 32)
+
+            # The legacy Streamlit Visualize path calls these same public
+            # discovery/model helpers, then fits sklearn PCA with this seed and
+            # the sample-count dimensionality rule. Compare both its raw model
+            # vectors and visible React coordinates on the exact same files.
+            from sklearn.decomposition import PCA
+            from _utils import extract_embeddings
+            from visualize_embeddings import discover_images
+
+            legacy_records = discover_images(folders, ["scratch", "stain"])
+            legacy_embeddings = extract_embeddings(
+                [record["path"] for record in legacy_records],
+                load_model("dinov2_vits14", models_dir=models_dir),
+            )
+            legacy_dimensions = min(3, max(1, len(legacy_records) - 2))
+            legacy_pca = PCA(
+                n_components=legacy_dimensions, random_state=42
+            ).fit_transform(legacy_embeddings)
+            active_run_id = application.state.current_run_id
+            assert active_run_id is not None
+            react_embeddings = application.state.raw_embeddings[active_run_id]["dinov2_vits14"]
+            np.testing.assert_allclose(
+                react_embeddings, legacy_embeddings, rtol=1e-5, atol=1e-6
+            )
+            pca_view = next(view for view in run["views"] if view["method"] == "pca")
+            react_pca = np.asarray(
+                [[point["x"], point["y"]] for point in pca_view["points"]],
+                dtype=np.float32,
+            )
+            np.testing.assert_allclose(
+                react_pca, legacy_pca[:, :2], rtol=1e-5, atol=1e-5
+            )
             browser.close()
     finally:
         if server is not None:
