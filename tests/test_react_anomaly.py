@@ -294,6 +294,12 @@ def test_anomaly_prelabel_preview_safe_export_and_revision_guard(monkeypatch, tm
     training = tmp_path / "training"
     training.mkdir()
     output = tmp_path / "prelabel-output"
+    records = [
+        {"image_path": str(image_path), "bbox": [0.5, 0.5, 0.4, 0.6], "label": "part", "split": "test", "obj_index": i}
+        for i in range(2)
+    ]
+    embeddings = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    scores = np.asarray([0.9, 0.95], dtype=np.float64)
 
     def builder(request: dict, *, progress=None) -> dict:
         bundle = fixture_builder(request, progress=progress)
@@ -307,12 +313,9 @@ def test_anomaly_prelabel_preview_safe_export_and_revision_guard(monkeypatch, tm
 
     def scorer(request, bundle, *, progress=None) -> dict:
         return {
-            "records": [
-                {"image_path": str(image_path), "bbox": [0.5, 0.5, 0.4, 0.6], "label": "part", "split": "test", "obj_index": i}
-                for i in range(2)
-            ],
-            "obj_emb": np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
-            "scores": np.asarray([0.9, 0.95], dtype=np.float64),
+            "records": records,
+            "obj_emb": embeddings,
+            "scores": scores,
             "labels": np.asarray(["bad", "bad"], dtype=object),
             "ranking": [1, 0],
             "threshold": 0.5,
@@ -366,6 +369,20 @@ def test_anomaly_prelabel_preview_safe_export_and_revision_guard(monkeypatch, tm
         assert score_job["result"]["model_bundle_id"] == model_bundle_id
         run_id = score_job["result"]["run_id"]
 
+        # Streamlit's _anomaly_prelabel_section uses these same two legacy-core
+        # functions. Calculate its expected decisions on the exact run inputs,
+        # then compare the React API's complete visible rows and exported YOLO
+        # lines against that result.
+        import prelabel
+
+        legacy_decisions = prelabel.prelabel_records(
+            records, embeddings, scores, {"classes": ["scratch", "stain"], "dim": 2},
+            anomaly_threshold=0.5, min_conf=0.5, target_classes=["scratch"],
+        )
+        assert [(row["pred"], row["accept"]) for row in legacy_decisions] == [
+            ("scratch", True), ("stain", False),
+        ]
+
         preview = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/preview", json={
             "expected_revision": 1, "min_conf": 0.5, "target_classes": ["scratch"], "limit": 1,
         })
@@ -377,6 +394,26 @@ def test_anomaly_prelabel_preview_safe_export_and_revision_guard(monkeypatch, tm
         assert str(image_path) not in preview.text
         assert "obj_emb" not in preview.text
 
+        complete_preview = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/preview", json={
+            "expected_revision": 1, "min_conf": 0.5, "target_classes": ["scratch"], "limit": 10,
+        })
+        assert complete_preview.status_code == 200, complete_preview.text
+        expected_rows = [
+            {
+                "index": index,
+                "filename": image_path.name,
+                "label": "part",
+                "obj_index": index,
+                "bbox": record["bbox"],
+                "score": float(scores[index]),
+                "pred": decision["pred"],
+                "confidence": decision["conf"],
+                "accept": decision["accept"],
+            }
+            for index, (record, decision) in enumerate(zip(records, legacy_decisions))
+        ]
+        assert complete_preview.json()["items"] == expected_rows
+
         exported = client.post(f"/api/v1/anomaly/runs/{run_id}/prelabel/export", json={
             "expected_revision": 1, "min_conf": 0.5, "target_classes": ["scratch"],
             "output_dir": str(output),
@@ -385,7 +422,13 @@ def test_anomaly_prelabel_preview_safe_export_and_revision_guard(monkeypatch, tm
         assert exported.json()["accepted"] == exported.json()["objects"] == 1
         assert exported.json()["written"] == 1
         assert str(output) not in exported.text
-        assert (output / "labels" / "target.txt").read_text(encoding="utf-8") == "0 0.500000 0.500000 0.400000 0.600000\n"
+        expected_lines = prelabel.to_yolo_lines(
+            records, legacy_decisions, class_names=["scratch", "stain"],
+        )
+        assert expected_lines == {str(image_path): ["0 0.500000 0.500000 0.400000 0.600000"]}
+        assert (output / "labels" / "target.txt").read_text(encoding="utf-8") == (
+            "\n".join(expected_lines[str(image_path)]) + "\n"
+        )
         assert (output / "classes.txt").read_text(encoding="utf-8").splitlines() == ["scratch", "stain"]
         assert list(source.iterdir()) == [image_path]
 
